@@ -1,0 +1,31 @@
+{
+  "name": "@bitsocial/pubsub-votes",
+  "version": "0.0.0",
+  "description": "Trustless pubsub voting over a shared libp2p/Helia node. Schema + design scaffold (no implementation yet).",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "peerDependencies": {
+    "@pkcprotocol/pkc-js": "0.0.47",
+    "@libp2p/interface": "3.2.2",
+    "helia": "6.1.4",
+    "multiformats": "13.4.2"
+  },
+  "devDependencies": {
+    "@libp2p/interface": "3.2.2",
+    "multiformats": "13.4.2",
+    "typescript": "5.9.3"
+  }
+}
