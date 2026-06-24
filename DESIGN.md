@@ -14,6 +14,19 @@ This document is the design of record. The repo currently implements **schemas a
 - **Weighting v1: 5chan Pass only.** ERC-721 ownership gates eligibility; weight is constant (1 pass = 1 vote). The interpreter design keeps a combo path open (pass eligibility + BSO ERC-20 weight) without a redesign.
 - **Voting is upvote-only in v1.** Downvotes turn a contest into a cheap weapon against competitors; approval-style upvotes (vote for as many boards as you like, capped by `maxVotesPerAddress`) avoid that. The wire keeps a numeric `vote` field so a future criteria could widen the range.
 
+## Votes are off-chain
+
+A vote is never written to a blockchain. Casting a vote is: sign the bundle (ed25519), store it as a dag-cbor node in the host's Helia blockstore (IPFS content-addressing, not a chain), and broadcast the new head CIDs over gossipsub. There is no transaction and no gas.
+
+The chain is **read-only**, and only to decide *who may vote* and *how much*:
+
+- **Eligibility** (`erc721-min-balance`): does the wallet hold the 5chan Pass? This is the Sybil-resistance anchor. Without a scarce, hard-to-forge asset gating votes, anyone could generate unlimited identities and stuff the ballot.
+- **Weight** (`constant` in v1, which reads no chain state at all; `erc20-balance` reserved for the combo path).
+
+`ChainClient` exposes only reads (`getBlockNumber`, `balanceOfErc20`, `balanceOfErc721`); there is no write path by construction. The `blockNumber` carried in a bundle is not a write either: it pins the bucketized historical block every verifier reads balances at, so the tally is deterministic across clients (see "CRDT" and the bucket math in `chain/`).
+
+So the only on-chain action a voter ever takes is acquiring the Pass, once, beforehand and unrelated to voting. Dropping the chain entirely is possible in principle — eligibility and weight are a pluggable interpreter registry, so a non-chain eligibility interpreter could replace `erc721-min-balance` — but that would trade the Pass for some other Sybil-resistance mechanism, which v1 deliberately does not do.
+
 ## Why this resists the hard failure modes
 
 ### Can always-online peers drop votes?
@@ -46,7 +59,7 @@ interpreters/  type -> verifier registry; eligibility + weight
 chain/         historical-block reads (ERC-721 / ERC-20), chainTicker -> RPC
 verify/        bundle signature, wallet binding, timestamp monotonicity   [interfaces only for now]
 crdt/          Merkle-clock + LWW reduction
-transport/     pubsub (broadcast heads) + libp2p fetch (cold-start sync)
+transport/     gossipsub topic (broadcast heads + topic validator) + libp2p fetch (cold-start sync)
 tally/         deterministic per-contest aggregation, lazy top-down verify
 ```
 
@@ -73,6 +86,33 @@ The author signs the bundle with their ed25519 key over a cbor-encoded set of si
 
 Last-write-wins element-set keyed by the eligibility-chain wallet address; value is the bundle; conflict resolution is highest `blockNumber`, tiebreak lowest bundle CID (for determinism across clients). Each bundle is a dag-cbor DAG node linking the heads known at signing, stored in the host's Helia blockstore. Only head CIDs go over pubsub; missing ancestors are fetched by CID. Prune bundles older than `voteExpiryBuckets` and those superseded per wallet.
 
+### Transport: gossipsub topic + validation
+
+The transport is the only module that touches libp2p. Over the host node — reached through the injected `Libp2pHandle`, never the raw Helia object — it does two things: **broadcast and receive head CIDs** on a gossipsub topic, and **fetch bundles by CID** from peers on cold start. The topic is `"bitsocial-votes/" + CID(dag-cbor(criteria))` (see "Criteria document"), so subscribing to it is itself the proof that two peers ran identical rules.
+
+**Custom validation is a gossipsub topic validator.** When the transport subscribes, it installs a validator for the topic — a function returning `accept | reject | ignore` that gossipsub runs on every received message *before re-forwarding it*. `reject` and `ignore` stop a message from propagating, and `reject` also lowers the sender's gossipsub peer score (with StrictSign message signing, the penalty lands on the real origin peer). This is the standard libp2p / `@chainsafe/libp2p-gossipsub` pattern.
+
+#### What stops someone publishing invalid head CIDs?
+
+Nothing stops *publishing* them — and nothing needs to, because a head CID carries **no authority**. It is only a pointer; all trust comes from locally re-verifying the self-authenticating bundle behind it. (Same principle as snapshots above: a publisher has zero authority because state only ever joins by union.) Every way a message can be bad is caught somewhere:
+
+| Published thing | Caught by | Outcome |
+|---|---|---|
+| Malformed bytes / not a bounded list of CIDs | topic validator (layer 1) | `reject` — not forwarded, sender scored down |
+| Well-formed CID that resolves to nothing (or the sender won't serve it) | fetch-on-demand | fetch fails → no-op; state never changes |
+| Resolves to a bundle that fails verification (bad signature, bad or stale wallet binding, vote out of range, expired bucket, over `maxVotesPerAddress`) | offline verify (layer 2) + chain (layer 3) | dropped — never stored, re-served, or counted |
+| Resolves to a valid, eligible, signed bundle | — | a legitimate vote: counted once per Pass-gated wallet (the NFT gate bounds Sybils), LWW makes it deterministic, union makes it un-removable |
+| Replayed/old bundle, or two conflicting bundles from one signer (equivocation) | LWW (higher `blockNumber`, tiebreak lower CID) + binding-timestamp monotonicity + bucket expiry | resolves to one vote every client agrees on; a replayed older bundle is inert |
+| Heads that omit known votes, or a peer that withholds | monotonic union + multi-peer cold-start fetch | cannot subtract a vote an honest peer serves (see "Can always-online peers drop votes?") |
+
+The validator cannot fully verify a vote at gossip time: the message is only head CIDs, the referenced bundle has not been fetched, and full verification needs async chain reads done lazily by the tally. So validation is **layered**:
+
+1. **Topic validator** (cheap, pre-flood): the message decodes to a bounded list of well-formed CIDs, within a size cap, within a per-peer rate. Pure and unit-testable; no network or chain.
+2. **CRDT merge** (after fetching a bundle by CID): run offline verification — bundle signature + wallet binding — before admitting the node to the set or re-serving it. Invalid → drop.
+3. **Tally** (lazy, on-chain): eligibility and weight reads, only for the votes that can still change the visible ranking.
+
+The one residual is **resource exhaustion, not incorrectness**: a flood of plausible-looking but unresolvable CIDs costs wasted fetch attempts. It is bounded by the per-message CID cap and size cap, per-peer rate limiting, gossipsub peer scoring (which prunes persistently-bad senders), and a bounded fetch policy — fetch only unknown CIDs, cap concurrent and total fetches, and stop walking an ancestor chain the moment a node fails to verify.
+
 ### Tally
 
 Deterministic per-contest aggregation. Verify lazily top-down: only verify the votes (signature, wallet binding, chain reads) that can still change the visible ranking, stopping once the remaining unverified weight cannot flip the order. Render provisional immediately and refine.
@@ -94,7 +134,7 @@ Match pkc-js exact versions so DAG nodes interop with the shared Helia 6 node: `
 
 ## Deferred pkc-js work
 
-pkc-js exposes the node only as `pkc.clients.libp2pJsClients[key]._helia` ([src/helia/libp2pjsClient.ts:20](https://github.com/pkcprotocol/pkc-js/blob/master/src/helia/libp2pjsClient.ts#L20)), private-by-convention and typed as raw Helia internals; the libp2p `fetch` service is registered but not exposed. Once this library's needs are firm, add a narrow, documented, version-stable accessor on pkc-js to subscribe/publish a topic and register a protocol/fetch responder, not the raw Helia object (its type churns, for example the multiformats 13/14 split). Track as a pkc-js issue and reference it here.
+pkc-js exposes the node only as `pkc.clients.libp2pJsClients[key]._helia` ([src/helia/libp2pjsClient.ts:20](https://github.com/pkcprotocol/pkc-js/blob/master/src/helia/libp2pjsClient.ts#L20)), private-by-convention and typed as raw Helia internals; the libp2p `fetch` service is registered but not exposed. Once this library's needs are firm, add a narrow, documented, version-stable accessor on pkc-js to subscribe/publish a topic, register a gossipsub topic validator (so invalid messages are dropped before the mesh re-forwards them), and register a protocol/fetch responder, not the raw Helia object (its type churns, for example the multiformats 13/14 split). Track as a pkc-js issue and reference it here.
 
 ## Open questions
 
