@@ -1,3 +1,4 @@
+import { erc20Abi, getAddress } from "viem";
 import { z } from "zod";
 import { ChainTickerSchema } from "../schema/author.js";
 import type { Interpreter } from "./types.js";
@@ -29,10 +30,12 @@ export const erc20Balance: Interpreter<Erc20BalanceOptions> = {
     type: "erc20-balance",
     optionsSchema: Erc20BalanceOptionsSchema,
     async evaluate({ options, walletAddress, ctx }) {
-        const raw = await ctx.chain.balanceOfErc20({
-            contract: options.contract,
-            owner: walletAddress,
-            blockNumber: ctx.blockNumber
+        const raw = await ctx.chain.readContract({
+            address: getAddress(options.contract),
+            abi: erc20Abi,
+            functionName: "balanceOf",
+            args: [getAddress(walletAddress)],
+            blockNumber: BigInt(ctx.blockNumber)
         });
         const scaled = Number(raw) / 10 ** options.decimals;
         return scaled >= options.min ? scaled : 0;

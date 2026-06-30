@@ -1,3 +1,4 @@
+import { createPublicClient, http } from "viem";
 import type { Criteria } from "./schema/criteria.js";
 import type { Libp2pHandle } from "./transport/types.js";
 import type { ChainClientFactory } from "./chain/types.js";
@@ -44,14 +45,13 @@ export function fakeLibp2p(): Libp2pHandle {
     };
 }
 
-/** A chain client factory returning a zero-balance stub. */
+/**
+ * A chain client factory backed by real viem clients. viem clients are lazy (no
+ * connection until a read), and these unit tests never read, so the configured RPC
+ * URL is never contacted.
+ */
 export function fakeChains(): ChainClientFactory {
-    return ({ config }) => ({
-        chainId: config.chainId,
-        getBlockNumber: async () => 0,
-        balanceOfErc20: async () => 0n,
-        balanceOfErc721: async () => 0n
-    });
+    return ({ config }) => createPublicClient({ transport: http(config.rpcUrls[0]) });
 }
 
 /** A minimal signer for write-path tests. */

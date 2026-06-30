@@ -22,7 +22,11 @@ import type { ChainClient } from "../chain/types.js";
 
 /** Everything an interpreter needs to read chain state for one evaluation. */
 export interface ChainReadContext {
-    /** The client for the interpreter's `options.chain`. */
+    /**
+     * The viem `PublicClient` for the interpreter's `options.chain`. Use the full viem
+     * read surface directly (`readContract`, `getBalance`, ...), pinning every call to
+     * the sampled block with `blockNumber: BigInt(ctx.blockNumber)`.
+     */
     chain: ChainClient;
     /** The single sampled block for the bundle's bucket. */
     blockNumber: number;

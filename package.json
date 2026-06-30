@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@ipld/dag-cbor": "9.2.7",
+    "viem": "2.54.0",
     "zod": "4.3.6"
   },
   "peerDependencies": {

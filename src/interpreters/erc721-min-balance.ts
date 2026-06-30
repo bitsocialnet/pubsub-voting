@@ -1,3 +1,4 @@
+import { erc721Abi, getAddress } from "viem";
 import { z } from "zod";
 import { ChainTickerSchema } from "../schema/author.js";
 import type { Interpreter } from "./types.js";
@@ -7,8 +8,8 @@ import type { Interpreter } from "./types.js";
  *
  * Score = the wallet's holding at the bucket block if it meets `min`, else 0. In the
  * eligibility slot, `> 0` admits the wallet (it holds the Pass); in the weight slot it
- * weights by the number of Passes held. The body reads only the injected `ChainClient`,
- * so it carries no libp2p/helia/viem import and is unit-testable against a mock chain.
+ * weights by the number of Passes held. The body reads its own `balanceOf` via the
+ * injected viem client (no libp2p/helia import), unit-testable against a stubbed client.
  */
 
 export const Erc721MinBalanceOptionsSchema = z.object({
@@ -24,10 +25,12 @@ export const erc721MinBalance: Interpreter<Erc721MinBalanceOptions> = {
     type: "erc721-min-balance",
     optionsSchema: Erc721MinBalanceOptionsSchema,
     async evaluate({ options, walletAddress, ctx }) {
-        const balance = await ctx.chain.balanceOfErc721({
-            contract: options.contract,
-            owner: walletAddress,
-            blockNumber: ctx.blockNumber
+        const balance = await ctx.chain.readContract({
+            address: getAddress(options.contract),
+            abi: erc721Abi,
+            functionName: "balanceOf",
+            args: [getAddress(walletAddress)],
+            blockNumber: BigInt(ctx.blockNumber)
         });
         return balance >= BigInt(options.min) ? Number(balance) : 0;
     }

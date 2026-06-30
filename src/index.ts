@@ -16,8 +16,8 @@ export * from "./schema/criteria.js";
 // Interpreters: a single kind, one file per `type`, each owning its option schema and a
 // numeric `evaluate` (the eligibility slot gates on `> 0`, the weight slot uses the
 // magnitude), plus the registry (built-ins, the host-shadowing resolver, and criteria
-// validation). The leaf interpreters are implemented against the injected `ChainClient`;
-// only the `sum` combinator is a stub.
+// validation). The leaf interpreters read through the injected viem `PublicClient`
+// (`ctx.chain`); only the `sum` combinator is a stub.
 export * from "./interpreters/erc721-min-balance.js";
 export * from "./interpreters/constant.js";
 export * from "./interpreters/erc20-balance.js";

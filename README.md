@@ -35,7 +35,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `libp2p` | `Libp2pHandle` | yes | the host's shared node (publish / subscribe / fetch) |
-| `chains` | `ChainClientFactory` | yes | historical-block ERC-20/721 reads for eligibility and weight |
+| `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; interpreters read through it for eligibility and weight |
 | `signer` | `VoteSigner` | no | author identity + ed25519 signing; omit for a read-only voter |
 
 ### Construct a voter
@@ -45,7 +45,7 @@ import { PubsubVoter } from "@bitsocial/pubsub-votes";
 
 const voter = new PubsubVoter({
   libp2p: hostLibp2pHandle(), // host adapts pkc / plebbit / raw Helia → Libp2pHandle
-  chains: viemChainFactory(), // ({ chain, config }) => ChainClient
+  chains: viemChainFactory(), // ({ chain, config }) => viem PublicClient
   signer: mySigner            // optional; omit → read-only voter
 });
 ```
@@ -89,7 +89,7 @@ Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a
 
 ### Custom interpreters
 
-Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block against the injected `ChainClient`. There is **one kind**: `evaluate → number`, a non-negative score where `0` means "does not qualify". The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility > 0 ? weight : 0`. An interpreter that needs a threshold returns `0` below it (so `erc721-min-balance` and `erc20-balance`'s optional `min` can gate), which lets the same interpreter serve either slot.
+Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block. Chain-reading interpreters get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → number`, a non-negative score where `0` means "does not qualify". The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility > 0 ? weight : 0`. An interpreter that needs a threshold returns `0` below it (so `erc721-min-balance` and `erc20-balance`'s optional `min` can gate), which lets the same interpreter serve either slot.
 
 Built-ins: `erc721-min-balance` (v1), `constant` (v1), `erc20-balance` and `sum` (reserved for the pass + BSO combo). A host adds or shadows interpreters by `type` via the `interpreters` option — this is how clients like 5chan or seedit register custom rules without forking the library:
 
@@ -125,7 +125,7 @@ src/
   client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
   errors.ts      NotImplementedError, ReadOnlyError               [implemented]
   interpreters/  one file per `type` + registry/resolver           [leaves implemented]
-  chain/         ChainClient interface (historical-block reads)
+  chain/         ChainClient = viem PublicClient (historical-block reads)
   crdt/          Merkle-CRDT interfaces                           [design only]
   transport/     libp2p transport interfaces (pubsub + fetch)     [design only]
   tally/         tally interfaces                                 [design only]

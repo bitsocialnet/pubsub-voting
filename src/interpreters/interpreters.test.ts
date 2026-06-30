@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { createPublicClient, http } from "viem";
 import type { ChainClient } from "../chain/types.js";
 import type { ChainReadContext, Interpreter } from "./types.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
@@ -9,48 +10,49 @@ import { resolveRegistry, validateCriteriaInterpreters, builtinRegistry } from "
 import { NotImplementedError, UnknownInterpreterError } from "../errors.js";
 import { bizCriteria } from "../test-fixtures.js";
 
-/** A ChainReadContext whose client returns fixed balances, for offline interpreter tests. */
+/**
+ * A ChainReadContext whose viem client returns a fixed `balanceOf`, for offline
+ * interpreter tests. Each interpreter under test does exactly one `readContract`
+ * (ERC-20 or ERC-721 `balanceOf`), so a single stubbed return covers both.
+ */
 function ctxWith(balances: { erc20?: bigint; erc721?: bigint }): ChainReadContext {
-    const chain: ChainClient = {
-        chainId: 8453,
-        getBlockNumber: async () => 100,
-        balanceOfErc20: async () => balances.erc20 ?? 0n,
-        balanceOfErc721: async () => balances.erc721 ?? 0n
-    };
+    const balance = balances.erc20 ?? balances.erc721 ?? 0n;
+    const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
+    chain.readContract = (async () => balance) as ChainClient["readContract"];
     return { chain, blockNumber: 100 };
 }
 
 describe("erc721-min-balance (gate via score > 0)", () => {
-    const options = { type: "erc721-min-balance" as const, chain: "base", contract: "0xpass", min: 2 };
+    const options = { type: "erc721-min-balance" as const, chain: "base", contract: "0x00000000000000000000000000000000000000fa", min: 2 };
 
     it("scores the holding when at or above min (admitted, and usable as weight)", async () => {
-        const score = await erc721MinBalance.evaluate({ options, walletAddress: "0xw", ctx: ctxWith({ erc721: 3n }) });
+        const score = await erc721MinBalance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc721: 3n }) });
         expect(score).toBe(3);
     });
 
     it("scores 0 below min (rejected)", async () => {
-        const score = await erc721MinBalance.evaluate({ options, walletAddress: "0xw", ctx: ctxWith({ erc721: 1n }) });
+        const score = await erc721MinBalance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc721: 1n }) });
         expect(score).toBe(0);
     });
 });
 
 describe("constant", () => {
     it("returns its fixed value with no chain read", async () => {
-        const score = await constant.evaluate({ options: { type: "constant", value: 3 }, walletAddress: "0xw", ctx: ctxWith({}) });
+        const score = await constant.evaluate({ options: { type: "constant", value: 3 }, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({}) });
         expect(score).toBe(3);
     });
 });
 
 describe("erc20-balance (weight, and gate when min is set)", () => {
     it("scales raw units by decimals as a magnitude (min default 0)", async () => {
-        const options = { type: "erc20-balance" as const, chain: "base", contract: "0xbso", decimals: 6, min: 0 };
-        const score = await erc20Balance.evaluate({ options, walletAddress: "0xw", ctx: ctxWith({ erc20: 1_500_000n }) });
+        const options = { type: "erc20-balance" as const, chain: "base", contract: "0x0000000000000000000000000000000000000b50", decimals: 6, min: 0 };
+        const score = await erc20Balance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc20: 1_500_000n }) });
         expect(score).toBe(1.5);
     });
 
     it("scores 0 below min (gate role)", async () => {
-        const options = { type: "erc20-balance" as const, chain: "base", contract: "0xbso", decimals: 6, min: 100 };
-        const score = await erc20Balance.evaluate({ options, walletAddress: "0xw", ctx: ctxWith({ erc20: 1_500_000n }) }); // 1.5 < 100
+        const options = { type: "erc20-balance" as const, chain: "base", contract: "0x0000000000000000000000000000000000000b50", decimals: 6, min: 100 };
+        const score = await erc20Balance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc20: 1_500_000n }) }); // 1.5 < 100
         expect(score).toBe(0);
     });
 });
@@ -58,7 +60,7 @@ describe("erc20-balance (weight, and gate when min is set)", () => {
 describe("sum (reserved combinator)", () => {
     it("throws until its term-resolution protocol lands", async () => {
         await expect(
-            sum.evaluate({ options: { type: "sum", terms: [{ type: "constant" }] }, walletAddress: "0xw", ctx: ctxWith({}) })
+            sum.evaluate({ options: { type: "sum", terms: [{ type: "constant" }] }, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({}) })
         ).rejects.toBeInstanceOf(NotImplementedError);
     });
 });
