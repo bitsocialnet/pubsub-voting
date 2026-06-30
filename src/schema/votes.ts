@@ -4,20 +4,23 @@ import { SignatureSchema, VoteAuthorSchema } from "./author.js";
 /**
  * The Votes wire format.
  *
- * One bundle per author per heartbeat. The bundle is the unit of signing and the
- * value stored at each Merkle-CRDT node. See DESIGN.md "Votes wire" and "CRDT".
+ * One bundle per author per heartbeat, scoped to the topic's single contest. The
+ * bundle is the unit of signing and the value stored at each Merkle-CRDT node. An
+ * empty `votes` array is the withdrawal/abstention form: a newer bundle (higher
+ * blockNumber) with no votes supersedes an earlier one under LWW, removing the vote
+ * from the tally without breaking the monotonic union. See DESIGN.md "Votes wire",
+ * "Cancelling a vote", and "CRDT".
  */
 
 /**
- * A single vote inside a bundle.
- * - `contest` is a directory-slot code; it must be one of `criteria.contests`.
+ * A single vote inside a bundle. The contest is implied by the topic (one contest
+ * per topic), so it is not repeated on the wire.
  * - `board` is the community address being voted for.
  * - `vote` is numeric; its allowed range comes from `criteria.voteSchema`
  *   (v1 is upvote-only, so exactly 1). Range is enforced at verify time, not here,
  *   because the bounds live in the criteria, not in the wire type.
  */
 export const VoteSchema = z.object({
-    contest: z.string().min(1),
     board: z.string().min(1),
     vote: z.number().int()
 });

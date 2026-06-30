@@ -51,12 +51,13 @@ export interface VoteNetwork {
 
     /**
      * Sign the given votes into a bundle for the current bucket, add it to the
-     * CRDT, and broadcast the new heads. Returns the published bundle.
+     * CRDT, and broadcast the new heads. Returns the published bundle. Pass an empty
+     * array to withdraw: a newer empty bundle supersedes the prior one under LWW.
      */
     castVotes(votes: Vote[]): Promise<VotesBundle>;
 
-    /** Current rankings, verified lazily top-down. */
-    getTally(options?: TallyOptions): Promise<ContestTally[]>;
+    /** Current contest ranking, verified lazily top-down. */
+    getTally(options?: TallyOptions): Promise<ContestTally>;
 
     /** Fired when incoming votes change the state. */
     on(event: "update", cb: () => void): void;

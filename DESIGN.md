@@ -45,11 +45,15 @@ Yes. Merkle-CRDT is exactly "a pubsub topic whose peers converge on a shared lat
 
 ### Who publishes snapshots?
 
-Anyone, trustlessly. A snapshot is a head CID plus compacted state that every client re-verifies locally. The publisher has zero authority because state only ever joins by union, so a bad snapshot cannot subtract or forge. 5chan can run a couple of always-on availability nodes as convenience infrastructure (the eth-bootnode / IPFS-gateway pattern), not as an oracle. If they vanish, live gossip plus peer fetch still works with slower cold start.
+Anyone, trustlessly. A snapshot is a head CID plus compacted state that every client re-verifies locally. The publisher has zero authority because state only ever joins by union, so a bad snapshot cannot subtract or forge. The expected availability layer is **bitsocial-seeder**: hosts run it, it joins the vote topics and helps peers cold-start (the eth-bootnode / IPFS-gateway pattern), but it is convenience, not an oracle — union-only means a seeder can never subtract or forge a vote. If all seeders vanish, live gossip plus multi-peer fetch still works, just with slower cold start.
+
+### How fast is cold start?
+
+For a topic with ~1000 votes, cold start is **fetch-bound, not compute-bound**. The state is ~1000 small dag-cbor nodes (each: author + wallet binding, one vote, blockNumber, ed25519 signature, parent CIDs ≈ 0.5–1.5 KB), so ~0.5–1.5 MB total. Walking that many small blocks over bitswap is round-trip-dominated: single-digit to low-tens of seconds against a healthy `bitsocial-seeder`, worse against flaky peers. The crypto is cheap (ed25519 verify is tens of µs each, so ~1000 signatures is well under a second), and chain reads are lazy (tally only, only for ranking-relevant votes), so neither gates the join. The two levers that shrink this number are the **snapshot/compaction** format (fetch one compacted blob instead of N nodes — see "Open questions") and **per-contest topics** (sync only the slot you care about).
 
 ### What happens when criteria change on upgrade?
 
-A criteria change is a new interpreter `type` and/or new criteria bytes, which is a new CID, which is a **new topic**. Old clients that do not implement a `type` named in `requires` recuse themselves rather than miscount. The old topic drains as people update. There is no state migration because the heartbeat republish means there is no long-lived server state.
+A criteria change is a new interpreter `type` and/or new criteria bytes (including the `contest` id, which is part of the encoded object), which is a new CID, which is a **new topic**. Old clients that do not implement a `type` named in `requires` recuse themselves rather than miscount. The old topic drains as people update. There is no state migration because the heartbeat republish means there is no long-lived server state.
 
 ## Components
 
@@ -67,16 +71,27 @@ The first three plus `verify/`, `crdt/`, and `tally/` have no libp2p dependency,
 
 ### Criteria document
 
-Shipped static in the client bundle (offline), and `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. dag-cbor is canonical (sorted keys, rejects `undefined`), so identical bytes yield an identical topic, which is the self-validating binding. Optionally also publish the bytes to IPFS for out-of-band verifiers. One topic for all directories (the criteria lists every contest; each vote names its slot) so a client joins once. The `requires` block is the dependency manifest and doubles as version negotiation.
+Shipped static in the client bundle (offline), and `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. dag-cbor is canonical (sorted keys, rejects `undefined`), so identical bytes yield an identical topic, which is the self-validating binding — and reordering keys does *not* fork the topic, only different values/fields/types do. Optionally also publish the bytes to IPFS for out-of-band verifiers.
+
+**One criteria document describes one contest, so there is one topic per contest (directory slot).** The `contest` value differs per document, which makes each contest's bytes distinct and forks the topic automatically. A client subscribes only to the contests it cares about, so cold start syncs one slot's votes rather than every directory's history — this is the main scaling lever (see "How fast is cold start?"). The `requires` block is the dependency manifest and doubles as version negotiation.
 
 ### Votes wire
 
 ```
 VotesBundle { author, votes: Vote[], blockNumber, signature }
-Vote        { contest, board, vote }
+Vote        { board, vote }
 ```
 
-The author signs the bundle with their ed25519 key over a cbor-encoded set of signed property names, mirroring pkc-js `_signJson` in [src/signer/signatures.ts:142](https://github.com/pkcprotocol/pkc-js/blob/master/src/signer/signatures.ts#L142). Constraints: `votes.length <= maxVotesPerAddress`, and each `vote` within `voteSchema` (v1: exactly 1).
+The contest is not on the wire: one topic decides one contest, so the contest is implied by the topic the bundle was published to. A vote names the `board` and a numeric `vote`.
+
+The author signs the bundle with their ed25519 key over a cbor-encoded set of signed property names, mirroring pkc-js `_signJson` in [src/signer/signatures.ts:142](https://github.com/pkcprotocol/pkc-js/blob/master/src/signer/signatures.ts#L142). Constraints: `votes.length <= maxVotesPerAddress` (v1: 1, the one-vote-per-topic rule), and each `vote` within `voteSchema` (v1: exactly 1). An **empty `votes` array is always valid** — it is the withdrawal form (see "Cancelling a vote").
+
+### Cancelling a vote
+
+There is no delete; the union only grows. A vote is removed two ways, both consistent with the monotonic union:
+
+- **Active withdrawal.** Publish a newer bundle (higher `blockNumber`) with `votes: []`. LWW keyed by wallet picks the newest bundle, which now expresses *no vote*, so the tally drops it. The old bundle bytes may still be served, but `current()` resolves the wallet to the empty one. This is supersession, not deletion — the union still only gains a node.
+- **Passive expiry.** Stop republishing. A bundle is valid for `voteExpiryBuckets` after its `blockNumber` (the issue #25 heartbeat), so a wallet that goes silent has its vote decay on its own. Keeping a vote alive means periodically re-signing with a fresh `blockNumber`. Changing a vote is the same mechanism: a newer bundle naming a different board supersedes the old one.
 
 ### Wallet binding (net-new; pkc-js has the schema but no verifier)
 
@@ -88,7 +103,12 @@ Last-write-wins element-set keyed by the eligibility-chain wallet address; value
 
 ### Transport: gossipsub topic + validation
 
-The transport is the only module that touches libp2p. Over the host node — reached through the injected `Libp2pHandle`, never the raw Helia object — it does two things: **broadcast and receive head CIDs** on a gossipsub topic, and **fetch bundles by CID** from peers on cold start. The topic is `"bitsocial-votes/" + CID(dag-cbor(criteria))` (see "Criteria document"), so subscribing to it is itself the proof that two peers ran identical rules.
+The transport is the only module that touches libp2p. Over the host node — reached through the injected `Libp2pHandle`, never the raw Helia object — it does two things: **broadcast and receive head CIDs** on a gossipsub topic, and **fetch state** from peers on cold start. The topic is `"bitsocial-votes/" + CID(dag-cbor(criteria))` (see "Criteria document"), so subscribing to it is itself the proof that two peers ran identical rules.
+
+Two fetch paths, by data kind:
+
+- **Heads are a mutable pointer** (the current DAG tips for the topic). On cold start they are pulled from up to `k` peers via the libp2p **fetch protocol**, keyed by topic, then unioned (a single liar cannot hide a vote — see "Can always-online peers drop votes?").
+- **Bundles are immutable, content-addressed blocks.** A head CID resolves to a `DagNode { value: VotesBundle, parents: CID[] }` — the actual signed votes plus the heads linked at signing — fetched **by CID via bitswap** through the host's Helia blockstore. The client then walks `parents`, fetching each unknown CID, back to ancestors it already has. Open choice: also serve whole DAG subtrees over the fetch responder so a seeder can answer "everything under this head" in one round trip instead of one bitswap fetch per node.
 
 **Custom validation is a gossipsub topic validator.** When the transport subscribes, it installs a validator for the topic — a function returning `accept | reject | ignore` that gossipsub runs on every received message *before re-forwarding it*. `reject` and `ignore` stop a message from propagating, and `reject` also lowers the sender's gossipsub peer score (with StrictSign message signing, the penalty lands on the real origin peer). This is the standard libp2p / `@chainsafe/libp2p-gossipsub` pattern.
 
@@ -141,3 +161,4 @@ pkc-js exposes the node only as `pkc.clients.libp2pJsClients[key]._helia` ([src/
 - **Wallet-binding signed-message format.** Reuse the existing Bitsocial/plebbit author-wallet convention (likely `{ domainSeparator, authorAddress, timestamp }` signed EIP-191), do not invent. pkc-js defines no format today.
 - **Signer reuse vs direct crypto.** `@pkcprotocol/pkc-js` only exports `.`, `./challenges`, `./rpc`. If the signer utilities are not on the top-level entry, depend on `@noble/curves` + `cborg` directly (the same versions pkc-js uses).
 - **Snapshot/compaction format** for fast cold start. Can land after the live path works.
+- **Application-level peer reputation for layer-2 invalidity.** Gossipsub `reject` scoring only punishes layer-1 badness (malformed bytes / not a bounded CID list), because that is all the topic validator sees. A well-formed head CID that later resolves to an *invalid bundle* (bad signature, stale binding, vote out of range) was already accepted and re-forwarded at gossip time, so gossipsub cannot retroactively score the sender. Penalizing peers that repeatedly serve unverifiable bundles needs a separate reputation in the fetch/serve path. Open: whether v1 needs it, or whether the bounded-fetch policy + per-message caps suffice.
