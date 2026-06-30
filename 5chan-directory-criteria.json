@@ -1,0 +1,297 @@
+{
+  "name": "5chan directory voting",
+  "description": "Authoring manifest for every 5chan directory contest. This file is NOT a criteria document and is never encoded or published. Per the @bitsocial/pubsub-votes model the rules live INSIDE each criteria document, and there is one document (and one pubsub topic) per contest. There is no global rule at runtime. The client derives one complete, standalone criteria document per contest by shallow-merging each `contests` entry over `defaults`: criteria = { ...defaults, ...entry } (entry contributes `name`, `contest`, and any rule fields it overrides; an override replaces that whole top-level field, no deep merge). `defaults` is purely a DRY authoring convenience that is flattened away at derivation. Each derived document is canonically dag-cbor encoded and its CID is the topic: topic = \"bitsocial-votes/\" + CID(dag-cbor(criteria)); editing `defaults` re-forks every inheriting contest in lockstep, editing one entry forks only that contest. In 5chan v1 every slot is gated by the same 5chan Pass, so almost all contests just inherit `defaults`; the /q/ entry below carries an illustrative `eligibility` override to show that eligibility, weight, vote bounds, expiry, and `requires` are all per-contest, not global.",
+  "defaults": {
+    "voteSchema": {
+      "min": 1,
+      "max": 1
+    },
+    "maxVotesPerAddress": 1,
+    "blocksPerBucket": 43200,
+    "voteExpiryBuckets": 30,
+    "eligibility": {
+      "type": "erc721-min-balance",
+      "chain": "base",
+      "contract": "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
+      "min": 1
+    },
+    "weight": {
+      "type": "constant",
+      "value": 1
+    },
+    "requires": {
+      "interpreters": [
+        "erc721-min-balance",
+        "constant"
+      ],
+      "chains": {
+        "base": {
+          "chainId": 8453,
+          "rpcUrls": [
+            "https://mainnet.base.org"
+          ]
+        }
+      }
+    }
+  },
+  "contests": [
+    {
+      "contest": "3",
+      "name": "/3/ - 3DCG"
+    },
+    {
+      "contest": "a",
+      "name": "/a/ - Anime & Manga"
+    },
+    {
+      "contest": "f",
+      "name": "/f/ - Flash"
+    },
+    {
+      "contest": "adv",
+      "name": "/adv/ - Advice"
+    },
+    {
+      "contest": "an",
+      "name": "/an/ - Animals & Nature"
+    },
+    {
+      "contest": "b",
+      "name": "/b/ - Random"
+    },
+    {
+      "contest": "bant",
+      "name": "/bant/ - International/Random"
+    },
+    {
+      "contest": "biz",
+      "name": "/biz/ - Business & Finance"
+    },
+    {
+      "contest": "c",
+      "name": "/c/ - Anime/Cute"
+    },
+    {
+      "contest": "ck",
+      "name": "/ck/ - Food & Cooking"
+    },
+    {
+      "contest": "co",
+      "name": "/co/ - Comics & Cartoons"
+    },
+    {
+      "contest": "diy",
+      "name": "/diy/ - Do It Yourself"
+    },
+    {
+      "contest": "fa",
+      "name": "/fa/ - Fashion"
+    },
+    {
+      "contest": "fit",
+      "name": "/fit/ - Fitness"
+    },
+    {
+      "contest": "g",
+      "name": "/g/ - Technology"
+    },
+    {
+      "contest": "gd",
+      "name": "/gd/ - Graphic Design"
+    },
+    {
+      "contest": "gif",
+      "name": "/gif/ - Adult GIF"
+    },
+    {
+      "contest": "his",
+      "name": "/his/ - History & Humanities"
+    },
+    {
+      "contest": "i",
+      "name": "/i/ - Oekaki"
+    },
+    {
+      "contest": "ic",
+      "name": "/ic/ - Artwork/Critique"
+    },
+    {
+      "contest": "int",
+      "name": "/int/ - International"
+    },
+    {
+      "contest": "jp",
+      "name": "/jp/ - Otaku Culture"
+    },
+    {
+      "contest": "k",
+      "name": "/k/ - Weapons"
+    },
+    {
+      "contest": "lit",
+      "name": "/lit/ - Literature"
+    },
+    {
+      "contest": "m",
+      "name": "/m/ - Mecha"
+    },
+    {
+      "contest": "mlp",
+      "name": "/mlp/ - Pony"
+    },
+    {
+      "contest": "mu",
+      "name": "/mu/ - Music"
+    },
+    {
+      "contest": "n",
+      "name": "/n/ - Transportation"
+    },
+    {
+      "contest": "news",
+      "name": "/news/ - Current News"
+    },
+    {
+      "contest": "o",
+      "name": "/o/ - Auto"
+    },
+    {
+      "contest": "out",
+      "name": "/out/ - Outdoors"
+    },
+    {
+      "contest": "p",
+      "name": "/p/ - Photography"
+    },
+    {
+      "contest": "po",
+      "name": "/po/ - Papercraft & Origami"
+    },
+    {
+      "contest": "pol",
+      "name": "/pol/ - Politically Incorrect"
+    },
+    {
+      "contest": "pw",
+      "name": "/pw/ - Professional Wrestling"
+    },
+    {
+      "contest": "q",
+      "name": "/q/ - 5chan Feedback",
+      "eligibility": {
+        "type": "erc721-min-balance",
+        "chain": "base",
+        "contract": "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
+        "min": 2
+      }
+    },
+    {
+      "contest": "qst",
+      "name": "/qst/ - Quests"
+    },
+    {
+      "contest": "r9k",
+      "name": "/r9k/ - ROBOT9002"
+    },
+    {
+      "contest": "s5s",
+      "name": "/s5s/ - Shit 5chan Says"
+    },
+    {
+      "contest": "sci",
+      "name": "/sci/ - Science & Math"
+    },
+    {
+      "contest": "soc",
+      "name": "/soc/ - Cams & Meetups"
+    },
+    {
+      "contest": "sp",
+      "name": "/sp/ - Sports"
+    },
+    {
+      "contest": "t",
+      "name": "/t/ - Torrents"
+    },
+    {
+      "contest": "tg",
+      "name": "/tg/ - Traditional Games"
+    },
+    {
+      "contest": "toy",
+      "name": "/toy/ - Toys"
+    },
+    {
+      "contest": "trv",
+      "name": "/trv/ - Travel"
+    },
+    {
+      "contest": "tv",
+      "name": "/tv/ - Television & Film"
+    },
+    {
+      "contest": "v",
+      "name": "/v/ - Video Games"
+    },
+    {
+      "contest": "vg",
+      "name": "/vg/ - Video Game Generals"
+    },
+    {
+      "contest": "vip",
+      "name": "/vip/ - Very Important Posts"
+    },
+    {
+      "contest": "vm",
+      "name": "/vm/ - Video Games/Multiplayer"
+    },
+    {
+      "contest": "vmg",
+      "name": "/vmg/ - Video Games/Mobile"
+    },
+    {
+      "contest": "vp",
+      "name": "/vp/ - Pokémon"
+    },
+    {
+      "contest": "vr",
+      "name": "/vr/ - Retro Games"
+    },
+    {
+      "contest": "vrpg",
+      "name": "/vrpg/ - Video Games/RPG"
+    },
+    {
+      "contest": "vst",
+      "name": "/vst/ - Video Games/Strategy"
+    },
+    {
+      "contest": "vt",
+      "name": "/vt/ - Virtual YouTubers"
+    },
+    {
+      "contest": "w",
+      "name": "/w/ - Anime/Wallpapers"
+    },
+    {
+      "contest": "wg",
+      "name": "/wg/ - Wallpapers/General"
+    },
+    {
+      "contest": "wsg",
+      "name": "/wsg/ - Worksafe GIF"
+    },
+    {
+      "contest": "wsr",
+      "name": "/wsr/ - Worksafe Requests"
+    },
+    {
+      "contest": "x",
+      "name": "/x/ - Paranormal"
+    },
+    {
+      "contest": "xs",
+      "name": "/xs/ - Extreme Sports"
+    }
+  ]
+}
