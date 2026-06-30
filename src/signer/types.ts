@@ -3,8 +3,8 @@ import type { Signature, VoteAuthor } from "../schema/author.js";
 /**
  * Identity seam (net-new).
  *
- * This is the third host-injected dependency, alongside `Libp2pHandle` (network) and
- * `ChainClientFactory` (chain). It is what lets a host-agnostic core be driven by
+ * This is the third host-injected dependency, alongside the `HeliaInstance` (network +
+ * blockstore) and `ChainClientFactory` (chain). It lets a host-agnostic core be driven by
  * pkc-js, plebbit, or a raw key without the library ever holding key material: the
  * library assembles the signed payload and asks the host to sign it.
  *

@@ -1,20 +1,26 @@
 import type { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
+import type { Helia } from "helia";
 
 /**
  * Transport interfaces, design only. This is the ONLY part of the library that
- * touches libp2p. The core (schema/verify/crdt/tally) does not import it, so the
+ * touches libp2p/helia. The core (schema/verify/crdt/tally) does not import it, so the
  * engine is testable without a network.
  *
  * Two transports:
  *   - pubsub: broadcast and receive head CIDs (gossipsub), with a topic validator
  *     that drops invalid messages before the mesh re-forwards them.
- *   - fetch: pull a peer's current heads on cold start (libp2p fetch protocol),
- *     then union across several peers so a single liar cannot hide a vote.
+ *   - fetch: resolve vote bundles by CID through the host's blockstore, and pull a
+ *     peer's current heads on cold start, then union across peers so a single liar
+ *     cannot hide a vote.
  *
- * The library does not start a node. It receives an injected handle from the host;
- * today that is pkc.clients.libp2pJsClients[key]._helia, replaced later by a
- * version-stable accessor on pkc-js (see DESIGN.md "Deferred pkc-js work").
+ * The library does not start a node and does not take a host SDK. It receives the
+ * host's already-running **Helia node** directly (e.g. the value `createHelia` returns,
+ * which for a pkc-js host is `pkc.clients.libp2pJsClients[key]._helia`) and drives its
+ * libp2p pubsub + blockstore itself — there is no host-written adapter. The node must
+ * carry a gossipsub service at `libp2p.services.pubsub` and a usable `blockstore`;
+ * construction enforces both (see `requireHeliaServices` / `MissingPubsubError` /
+ * `MissingBlockstoreError`).
  */
 
 /**
@@ -22,41 +28,51 @@ import type { PeerId } from "@libp2p/interface";
  * `TopicValidatorResult` (accept / reject / ignore) but is declared locally:
  * `@libp2p/interface` 3.x no longer re-exports the pubsub types, so the
  * implementation maps these onto whatever enum the host's gossipsub uses.
- *   - "accept": valid; deliver to `onMessage` and let the mesh re-forward it.
+ *   - "accept": valid; deliver to subscribers and let the mesh re-forward it.
  *   - "reject": invalid; drop, do not forward, and penalize the sender's peer score.
  *   - "ignore": drop and do not forward, without penalizing (well-formed but not useful).
  */
 export type TopicValidatorResult = "accept" | "reject" | "ignore";
 
-/** The minimal injected handle the transport needs from the host node. */
-export interface Libp2pHandle {
-    /** Publish bytes to a gossipsub topic. */
-    publish(topic: string, data: Uint8Array): Promise<void>;
-    /**
-     * Subscribe to a gossipsub topic; `onMessage` fires per received message.
-     *
-     * If `validate` is supplied it is installed as the topic validator, run on every
-     * received message *before* the mesh re-forwards it, so a "reject"/"ignore" stops
-     * an invalid message from propagating. It is installed atomically with the
-     * subscription (no window where unvalidated messages flow), and `onMessage` only
-     * fires for messages it accepts. The validator sees just the raw bytes, so it does
-     * cheap structural checks (well-formed, bounded list of CIDs, size, per-peer rate);
-     * full vote verification happens later, after the bundle is fetched by CID.
-     * See DESIGN.md "Transport: gossipsub topic + validation".
-     */
-    subscribe(
-        topic: string,
-        onMessage: (data: Uint8Array, from: PeerId) => void,
-        validate?: (data: Uint8Array, from: PeerId) => TopicValidatorResult | Promise<TopicValidatorResult>
-    ): Promise<void>;
-    unsubscribe(topic: string): Promise<void>;
-    /** Connected peers on a topic, used to pick fetch targets. */
-    peers(topic: string): Promise<PeerId[]>;
-    /** libp2p fetch protocol: request a key from a specific peer. */
-    fetch(peer: PeerId, key: string): Promise<Uint8Array | undefined>;
-    /** Register a libp2p fetch responder for a key prefix (to serve our heads). */
-    handleFetch(keyPrefix: string, handler: (key: string) => Promise<Uint8Array | undefined>): Promise<void>;
+/**
+ * The subset of a libp2p pubsub (gossipsub) service this library drives, declared
+ * structurally because `@libp2p/interface` 3.x no longer re-exports `PubSub`. Any
+ * gossipsub implementation the host registers at `services.pubsub` satisfies this
+ * (e.g. `@chainsafe/libp2p-gossipsub`). Kept minimal on purpose; the full transport
+ * (topic validators, fetch protocol) is design-only and may widen this as it lands.
+ */
+export interface PubsubService {
+    /** Broadcast bytes to a topic mesh. */
+    publish(topic: string, data: Uint8Array): Promise<unknown>;
+    /** Join a topic; received messages arrive via the "message" event. */
+    subscribe(topic: string): void;
+    /** Leave a topic. */
+    unsubscribe(topic: string): void;
+    /** Peers we currently see subscribed to a topic, used to pick fetch targets. */
+    getSubscribers(topic: string): PeerId[];
+    addEventListener(type: "message", listener: (evt: { detail: { topic: string; data: Uint8Array; from?: PeerId } }) => void): void;
+    removeEventListener(type: "message", listener: (evt: { detail: { topic: string; data: Uint8Array; from?: PeerId } }) => void): void;
 }
+
+/**
+ * The subset of a Helia blockstore this library drives, declared structurally. Vote
+ * bundles are content-addressed blocks fetched/stored by CID through it (bitswap
+ * retrieves through the blockstore). The full `Blocks` type carries progress-event
+ * generics we do not need here.
+ */
+export interface BlockstoreLike {
+    get(cid: CID): Promise<Uint8Array>;
+    put(cid: CID, block: Uint8Array): Promise<CID>;
+    has(cid: CID): Promise<boolean>;
+}
+
+/**
+ * The host's running Helia node, as injected into {@link PubsubVoter}. Typed with the
+ * default libp2p `ServiceMap`, so `libp2p.services.pubsub` is `unknown` and cannot be
+ * trusted at compile time (a plain Helia node has no pubsub) — `requireHeliaServices`
+ * validates the gossipsub service and the blockstore at construction and narrows them.
+ */
+export type HeliaInstance = Helia;
 
 /** Live head propagation over pubsub. */
 export interface VoteTransport {

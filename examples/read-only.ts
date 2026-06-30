@@ -9,17 +9,17 @@ import {
     PubsubVoter,
     ReadOnlyError,
     topicFor,
-    type Libp2pHandle,
+    type HeliaInstance,
     type ChainClientFactory,
     type Criteria
 } from "@bitsocial/pubsub-votes";
 
-declare function hostLibp2p(): Libp2pHandle;
+declare function hostHelia(): HeliaInstance;
 declare function viemChains(): ChainClientFactory;
 declare const criteria: Criteria;
 
 // No `signer` → read-only voter.
-const voter = new PubsubVoter({ libp2p: hostLibp2p(), chains: viemChains() });
+const voter = new PubsubVoter({ helia: hostHelia(), chains: viemChains() });
 console.log("read-only:", voter.readOnly); // true
 
 const contest = await voter.contest(criteria);

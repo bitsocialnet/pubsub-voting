@@ -40,6 +40,49 @@ export class UnknownInterpreterError extends Error {
     }
 }
 
+/**
+ * Thrown at construction when the injected Helia node's libp2p has no usable pubsub
+ * (gossipsub) service at `libp2p.services.pubsub`. The library broadcasts and receives
+ * head CIDs over gossipsub, so a node without it cannot participate. Helia's default
+ * libp2p services do NOT include pubsub — the host must register a gossipsub service
+ * (e.g. `@chainsafe/libp2p-gossipsub`) before passing the node in. We fail fast here
+ * rather than letting a later `publish`/`subscribe` fail obscurely. See DESIGN.md
+ * "Transport".
+ */
+export class MissingPubsubError extends Error {
+    constructor() {
+        super(
+            "The injected Helia node's libp2p has no usable pubsub service at " +
+                "`libp2p.services.pubsub`. This library needs a gossipsub service to broadcast " +
+                "and receive votes. Register one before constructing PubsubVoter (Helia's " +
+                "default services do not include pubsub; e.g. add `@chainsafe/libp2p-gossipsub` " +
+                "as `services.pubsub`). See DESIGN.md \"Transport\"."
+        );
+        this.name = "MissingPubsubError";
+    }
+}
+
+/**
+ * Thrown at construction when the injected Helia node has no usable `blockstore`. Vote
+ * bundles are immutable content-addressed blocks fetched by CID through the host's
+ * blockstore (bitswap retrieves through it), so the engine cannot resolve a head without
+ * one. Note "bitswap" is not a separately introspectable property of a Helia node — it
+ * is a block broker wired *beneath* `blockstore` — so the checkable guarantee is a
+ * well-formed blockstore, the surface bitswap retrieves through. See DESIGN.md
+ * "Transport".
+ */
+export class MissingBlockstoreError extends Error {
+    constructor() {
+        super(
+            "The injected Helia node has no usable `blockstore`. This library fetches vote " +
+                "bundles by CID through it (bitswap retrieves through the blockstore), so a " +
+                "node without one cannot resolve votes. Pass a full Helia instance (e.g. the " +
+                "result of `createHelia`). See DESIGN.md \"Transport\"."
+        );
+        this.name = "MissingBlockstoreError";
+    }
+}
+
 /** Thrown when a write (cast/withdraw) is attempted on a voter constructed without a signer. */
 export class ReadOnlyError extends Error {
     constructor() {

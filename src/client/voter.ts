@@ -1,7 +1,8 @@
 import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
 import type { Vote, VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients } from "../chain/types.js";
-import type { Libp2pHandle } from "../transport/types.js";
+import type { BlockstoreLike, HeliaInstance, PubsubService } from "../transport/types.js";
+import { requireHeliaServices } from "../transport/helia.js";
 import type { InterpreterRegistry } from "../interpreters/types.js";
 import { resolveRegistry, validateCriteriaInterpreters } from "../interpreters/registry.js";
 import type { ContestTally, TallyOptions } from "../tally/types.js";
@@ -20,9 +21,10 @@ import { NotImplementedError, ReadOnlyError } from "../errors.js";
  *     should not wire dependencies 63 times.
  *   - `VoteNetwork`: one contest (one topic). Join, sync, cast, read the tally.
  *
- * The three injected seams (libp2p, chains, signer) are the ONLY host contact surface,
- * so the same core runs under pkc-js, plebbit, or a raw node via small adapters. A
- * voter built without a `signer` is read-only.
+ * The three injected seams (helia, chains, signer) are the ONLY host contact surface,
+ * so the same core runs under pkc-js, plebbit, or a raw node. The host passes its
+ * running Helia node directly — no adapter — and the library drives that node's
+ * gossipsub service and blockstore itself. A voter built without a `signer` is read-only.
  */
 
 /** One contest's network: join the topic, keep the CRDT in sync, cast votes, read the tally. */
@@ -67,8 +69,15 @@ export interface VoteClient {
 
 /** Construction options for {@link PubsubVoter}. */
 export interface PubsubVoterOptions {
-    /** Host node handle (network). The only libp2p-touching seam. */
-    libp2p: Libp2pHandle;
+    /**
+     * The host's running Helia node (the value `createHelia` returns; for pkc-js it is
+     * `pkc.clients.libp2pJsClients[key]._helia`). The only host-node seam, passed
+     * directly with no adapter. It MUST carry a gossipsub service at
+     * `libp2p.services.pubsub` and a usable `blockstore`; the constructor throws
+     * `MissingPubsubError` / `MissingBlockstoreError` otherwise (a plain Helia node has
+     * no pubsub). The library never starts or stops this node.
+     */
+    helia: HeliaInstance;
     /**
      * Builds a chain client from a `{ chain, config }` pair. Each contest builds its
      * own clients from `criteria.requires.chains` via this factory, so chains are
@@ -82,7 +91,11 @@ export interface PubsubVoterOptions {
 }
 
 interface ResolvedDeps {
-    libp2p: Libp2pHandle;
+    helia: HeliaInstance;
+    /** The node's gossipsub service, validated once at construction. */
+    pubsub: PubsubService;
+    /** The node's blockstore, validated once at construction. */
+    blockstore: BlockstoreLike;
     chains: ChainClientFactory;
     signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
@@ -136,10 +149,11 @@ class ContestNetwork implements VoteNetwork {
 }
 
 /**
- * The default `VoteClient`. Construct with the host-injected seams: a `libp2p` handle
- * (the only mandatory one — the library never starts or assumes a particular node),
- * a `chains` factory, and an optional `signer`. The library has no knowledge of pkc-js
- * or any other host: a host adapts its own node to `Libp2pHandle` and passes it in.
+ * The default `VoteClient`. Construct with the host-injected seams: a `helia` node
+ * (the only mandatory one — the library never starts or assumes a particular node, but
+ * the node must carry a gossipsub service and a blockstore), a `chains` factory, and an
+ * optional `signer`. The library has no knowledge of pkc-js or any other host: a host
+ * passes its own running Helia node in directly.
  */
 export class PubsubVoter implements VoteClient {
     readonly #deps: ResolvedDeps;
@@ -147,8 +161,14 @@ export class PubsubVoter implements VoteClient {
     readonly #contests = new Map<string, ContestNetwork>();
 
     constructor(options: PubsubVoterOptions) {
+        // Fail fast: the node must expose a gossipsub service and a blockstore. Throws
+        // MissingPubsubError / MissingBlockstoreError at construction (not a lazy failure
+        // on the first publish/fetch) and narrows both handles.
+        const { pubsub, blockstore } = requireHeliaServices(options.helia);
         this.#deps = {
-            libp2p: options.libp2p,
+            helia: options.helia,
+            pubsub,
+            blockstore,
             chains: options.chains,
             signer: options.signer,
             registry: resolveRegistry(options.interpreters)

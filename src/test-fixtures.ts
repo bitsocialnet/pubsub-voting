@@ -1,6 +1,6 @@
 import { createPublicClient, http } from "viem";
 import type { Criteria } from "./schema/criteria.js";
-import type { Libp2pHandle } from "./transport/types.js";
+import type { BlockstoreLike, HeliaInstance, PubsubService } from "./transport/types.js";
 import type { ChainClientFactory } from "./chain/types.js";
 import type { VoteSigner } from "./signer/types.js";
 
@@ -33,16 +33,50 @@ export function bizCriteria(): Criteria {
     };
 }
 
-/** A no-op libp2p handle: construction never calls these in unit tests. */
-export function fakeLibp2p(): Libp2pHandle {
+/** A no-op gossipsub service: construction validates its shape but never calls it. */
+function fakePubsub(): PubsubService {
     return {
-        publish: async () => {},
-        subscribe: async () => {},
-        unsubscribe: async () => {},
-        peers: async () => [],
-        fetch: async () => undefined,
-        handleFetch: async () => {}
+        publish: async () => undefined,
+        subscribe: () => {},
+        unsubscribe: () => {},
+        getSubscribers: () => [],
+        addEventListener: () => {},
+        removeEventListener: () => {}
     };
+}
+
+/** A no-op blockstore: construction validates its shape but never calls it. */
+function fakeBlockstore(): BlockstoreLike {
+    return {
+        get: async () => new Uint8Array(),
+        put: async (cid) => cid,
+        has: async () => false
+    };
+}
+
+/**
+ * Build a Helia node from its parts, asserting in (not `any`) the rest of the `Helia`
+ * surface the library never touches. Construction only reads `libp2p.services.pubsub`
+ * and `blockstore`, so only those are populated; pass `undefined` to omit one and
+ * exercise the construction guards.
+ */
+function makeFakeHelia(pubsub: PubsubService | undefined, blockstore: BlockstoreLike | undefined): HeliaInstance {
+    return { libp2p: { services: { pubsub } }, blockstore } as unknown as HeliaInstance;
+}
+
+/** A Helia node carrying a gossipsub service and a blockstore, as a host injects. */
+export function fakeHelia(): HeliaInstance {
+    return makeFakeHelia(fakePubsub(), fakeBlockstore());
+}
+
+/** A Helia node whose libp2p has no pubsub service, to assert construction rejects it. */
+export function fakeHeliaWithoutPubsub(): HeliaInstance {
+    return makeFakeHelia(undefined, fakeBlockstore());
+}
+
+/** A Helia node with no blockstore, to assert construction rejects it. */
+export function fakeHeliaWithoutBlockstore(): HeliaInstance {
+    return makeFakeHelia(fakePubsub(), undefined);
 }
 
 /**

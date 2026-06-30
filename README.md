@@ -18,7 +18,7 @@ The same engine generalizes to the original use case in [pkc-js issue #25](https
 - The engine is reusable across clients and contests.
 - The core (`schema/`, `verify/`, `crdt/`, `tally/`) is transport-agnostic and unit-testable without a network. libp2p only appears in `transport/`.
 
-This library does not start its own node. It consumes the host's shared libp2p/Helia instance. With pkc-js today that handle is reached at `pkc.clients.libp2pJsClients[key]._helia`; a narrow, version-stable accessor on pkc-js is a planned follow-up (see [DESIGN.md, Deferred pkc-js work](./DESIGN.md#deferred-pkc-js-work)).
+This library does not start its own node. It consumes the host's running Helia node directly — no adapter — and drives that node's gossipsub service and blockstore itself. The node must carry a pubsub service at `libp2p.services.pubsub` (a plain Helia node does not — register e.g. `@chainsafe/libp2p-gossipsub`) and a usable `blockstore`; construction throws `MissingPubsubError` / `MissingBlockstoreError` otherwise. With pkc-js today that node is reached at `pkc.clients.libp2pJsClients[key]._helia`; a version-stable accessor on pkc-js is a planned follow-up (see [DESIGN.md, Deferred pkc-js work](./DESIGN.md#deferred-pkc-js-work)).
 
 ## Design at a glance
 
@@ -30,11 +30,11 @@ See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists 
 
 ## Usage
 
-The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host adapts its own libp2p/Helia node to a `Libp2pHandle` and injects up to three seams into a single `PubsubVoter`:
+The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects up to three seams into a single `PubsubVoter`:
 
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
-| `libp2p` | `Libp2pHandle` | yes | the host's shared node (publish / subscribe / fetch) |
+| `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`) and a `blockstore` (else `MissingBlockstoreError`) |
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; interpreters read through it for eligibility and weight |
 | `signer` | `VoteSigner` | no | author identity + ed25519 signing; omit for a read-only voter |
 
@@ -44,11 +44,13 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 import { PubsubVoter } from "@bitsocial/pubsub-votes";
 
 const voter = new PubsubVoter({
-  libp2p: hostLibp2pHandle(), // host adapts pkc / plebbit / raw Helia → Libp2pHandle
+  helia,                      // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
   chains: viemChainFactory(), // ({ chain, config }) => viem PublicClient
   signer: mySigner            // optional; omit → read-only voter
 });
 ```
+
+Construction throws `MissingPubsubError` or `MissingBlockstoreError` if the node lacks a usable pubsub service or blockstore — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through.)
 
 ### Read a tally (no signer needed)
 
@@ -123,11 +125,11 @@ src/
   manifest/      derive one criteria document per contest         [implemented]
   signer/        VoteSigner identity seam                         [implemented]
   client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
-  errors.ts      NotImplementedError, ReadOnlyError               [implemented]
+  errors.ts      NotImplemented/ReadOnly/MissingPubsub/Blockstore [implemented]
   interpreters/  one file per `type` + registry/resolver           [leaves implemented]
   chain/         ChainClient = viem PublicClient (historical-block reads)
   crdt/          Merkle-CRDT interfaces                           [design only]
-  transport/     libp2p transport interfaces (pubsub + fetch)     [design only]
+  transport/     helia/libp2p transport (pubsub + blockstore)     [requireHeliaServices live; rest design]
   tally/         tally interfaces                                 [design only]
   index.ts       public entry: re-exports + facade + design types
 ```

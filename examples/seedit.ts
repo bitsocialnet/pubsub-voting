@@ -2,27 +2,28 @@
  * Example: how a non-pkc host (seedit / plebbit) would call this library.
  *
  * The core is host-agnostic, so seedit does not use the pkc convenience path. It
- * supplies the three injected seams directly: a `Libp2pHandle` adapting its own
- * libp2p/Helia node, a `ChainClientFactory` (viem), and a `VoteSigner` wrapping the
- * user's plebbit identity. The engine is identical to 5chan's; only the seams differ.
+ * supplies the three injected seams directly: its own running Helia node (with a
+ * gossipsub service at `libp2p.services.pubsub` and a `blockstore`), a
+ * `ChainClientFactory` (viem), and a `VoteSigner` wrapping the user's plebbit identity.
+ * The engine is identical to 5chan's; only the node and signer differ.
  */
 import {
     PubsubVoter,
     deriveCriteria,
-    type Libp2pHandle,
+    type HeliaInstance,
     type ChainClientFactory,
     type VoteSigner,
     type Criteria
 } from "@bitsocial/pubsub-votes";
 
-// Host-provided adapters. Each maps seedit's runtime onto the library's seam type.
+// Host-provided seams. seedit passes its own Helia node and wires chains + signer.
 // (Bodies omitted here; this is the shape a host implements.)
-declare function seeditLibp2p(): Libp2pHandle;
+declare function seeditHelia(): HeliaInstance;
 declare function viemChains(): ChainClientFactory;
 declare function seeditSigner(): VoteSigner;
 
 const voter = new PubsubVoter({
-    libp2p: seeditLibp2p(),
+    helia: seeditHelia(),
     chains: viemChains(),
     signer: seeditSigner()
 });
