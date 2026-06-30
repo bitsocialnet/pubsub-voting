@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: schema + design scaffold.** This repo currently contains only zod schemas, TypeScript design interfaces, and design docs. There is no runtime implementation yet. See [DESIGN.md](./DESIGN.md) for the architecture and [the open questions](./DESIGN.md#open-questions) before implementing.
+> **Status: foundation + facade implemented; engine still design.** Implemented and unit-tested today: the zod schemas, canonical dag-cbor encoding, topic derivation, manifest derivation, and the `PubsubVoter` facade (construction, per-contest caching, read-only enforcement). The live engine — CRDT, transport, verify, tally, chain reads — is still design-only, so `start`/`getTally`/`castVotes` throw `NotImplementedError` for now. See [DESIGN.md](./DESIGN.md) for the architecture, build order, and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -28,17 +28,82 @@ This library does not start its own node. It consumes the host's shared libp2p/H
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
 
+## Usage
+
+The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host adapts its own libp2p/Helia node to a `Libp2pHandle` and injects up to three seams into a single `PubsubVoter`:
+
+| Seam | Type | Required | Purpose |
+|---|---|---|---|
+| `libp2p` | `Libp2pHandle` | yes | the host's shared node (publish / subscribe / fetch) |
+| `chains` | `ChainClientFactory` | yes | historical-block ERC-20/721 reads for eligibility and weight |
+| `signer` | `VoteSigner` | no | author identity + ed25519 signing; omit for a read-only voter |
+
+### Construct a voter
+
+```ts
+import { PubsubVoter } from "@bitsocial/pubsub-votes";
+
+const voter = new PubsubVoter({
+  libp2p: hostLibp2pHandle(), // host adapts pkc / plebbit / raw Helia → Libp2pHandle
+  chains: viemChainFactory(), // ({ chain, config }) => ChainClient
+  signer: mySigner            // optional; omit → read-only voter
+});
+```
+
+### Read a tally (no signer needed)
+
+```ts
+const contest = await voter.contest(criteria); // criteria: one validated CriteriaSchema document
+await contest.start();
+const tally = await contest.getTally();
+const winner = tally.ranking[0]?.board;
+```
+
+### Cast or withdraw a vote (needs a signer)
+
+```ts
+await contest.castVotes([{ board: "12D3KooW...", vote: 1 }]); // v1: one upvote per topic
+await contest.castVotes([]);                                  // withdraw: empty bundle supersedes under LWW
+```
+
+`castVotes` on a voter built without a `signer` throws `ReadOnlyError`.
+
+### Many contests from one manifest
+
+A 5chan-style directory manifest derives one contest (one topic) per slot:
+
+```ts
+const contests = await voter.contestsFromManifest(manifest); // → VoteNetwork[]
+```
+
+### Pure helpers (no node, no network)
+
+```ts
+import { topicFor, deriveCriteria } from "@bitsocial/pubsub-votes";
+
+const topic = await topicFor(criteria);       // "bitsocial-votes/" + CID(dag-cbor(criteria))
+const allCriteria = deriveCriteria(manifest); // defaults ⊕ each entry, each validated
+```
+
+Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a read-only consumer are in [examples/](./examples/).
+
 ## Layout
 
 ```
 src/
   schema/        zod schemas (criteria, votes, author/wallet) + inferred types
+  encoding/      canonical dag-cbor encoding                      [implemented]
+  topic.ts       topic = "bitsocial-votes/" + CID(dag-cbor)       [implemented]
+  manifest/      derive one criteria document per contest         [implemented]
+  signer/        VoteSigner identity seam                         [implemented]
+  client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
+  errors.ts      NotImplementedError, ReadOnlyError               [implemented]
   interpreters/  interpreter interfaces + v1/combo option schemas
   chain/         ChainClient interface (historical-block reads)
-  crdt/          Merkle-CRDT interfaces
-  transport/     libp2p transport interfaces (pubsub + fetch)
-  tally/         tally interfaces
-  index.ts       public entry: re-exports + VoteNetwork interface
+  crdt/          Merkle-CRDT interfaces                           [design only]
+  transport/     libp2p transport interfaces (pubsub + fetch)     [design only]
+  tally/         tally interfaces                                 [design only]
+  index.ts       public entry: re-exports + facade + design types
 ```
 
 ## License

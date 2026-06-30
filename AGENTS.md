@@ -1,6 +1,6 @@
 # Agent Instructions for @bitsocial/pubsub-votes
 
-Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. Currently a **schema + design scaffold**: zod schemas, TypeScript interfaces, and design docs only, no runtime implementation. Read [DESIGN.md](./DESIGN.md) before changing anything.
+Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. The **foundation and public facade are implemented** (schemas, canonical encoding, topic derivation, manifest derivation, the `PubsubVoter` facade); the **live engine** (CRDT, transport, verify, tally, chain reads) is still **design only** and its facade methods throw `NotImplementedError`. Read [DESIGN.md](./DESIGN.md) before changing anything.
 
 ## Scope rules
 
@@ -8,6 +8,10 @@ Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. 
 - **MUST** keep this library out of pkc-js's protocol concerns. It consumes pkc-js, it does not modify it. Anything chain-related (balance reads, wallet binding, chainTicker-to-RPC) lives here, never upstream.
 - **MUST NOT** start a libp2p node. Accept an injected handle from the host (today `pkc.clients.libp2pJsClients[key]._helia`).
 - **MUST NOT** use `any` or cast to `any` without asking. This repo stays fully typed.
+
+## Documentation
+
+- **MUST** update [README.md](./README.md) (the "Usage" section) in the same change whenever the public API changes — anything exported from [src/index.ts](./src/index.ts): the `PubsubVoter` constructor/options, the injected seams (`Libp2pHandle`, `ChainClientFactory`, `VoteSigner`), the `VoteNetwork`/`VoteClient` methods, or the pure helpers (`topicFor`, `deriveCriteria`). README usage snippets must stay copy-pasteable and match the real types. Keep [examples/](./examples/) in sync too.
 
 ## Dependencies
 

@@ -1,9 +1,11 @@
 /**
- * Public entry, design only.
+ * Public entry.
  *
- * Re-exports the schemas and the design interfaces, and declares the top-level
- * VoteNetwork facade the implementation will provide. No runtime is implemented
- * yet; see DESIGN.md.
+ * Implemented today (pure, offline, unit-tested): the zod schemas, canonical dag-cbor
+ * encoding, topic derivation, manifest derivation, and the `PubsubVoter` facade
+ * (construction, contest caching, read-only enforcement). The live engine
+ * (CRDT/transport/verify/tally/chain) is still design-only; facade methods that need
+ * it throw `NotImplementedError`. See DESIGN.md for architecture and build order.
  */
 
 // Schemas (runtime values) and their inferred types.
@@ -12,53 +14,18 @@ export * from "./schema/votes.js";
 export * from "./schema/criteria.js";
 export * from "./interpreters/options.js";
 
-// Design interfaces (types only).
+// Implemented runtime: encoding, topic, manifest, errors, identity seam, facade.
+export * from "./encoding/canonical.js";
+export * from "./topic.js";
+export * from "./manifest/manifest.js";
+export * from "./errors.js";
+export * from "./client/voter.js";
+export type { VoteSigner } from "./signer/types.js";
+
+// Design interfaces (types only) for the engine that is not yet implemented.
 export type * from "./interpreters/types.js";
 export type * from "./chain/types.js";
 export type * from "./verify/types.js";
 export type * from "./crdt/types.js";
 export type * from "./transport/types.js";
 export type * from "./tally/types.js";
-
-import type { Criteria } from "./schema/criteria.js";
-import type { Vote, VotesBundle } from "./schema/votes.js";
-import type { InterpreterRegistry } from "./interpreters/types.js";
-import type { ChainClients } from "./chain/types.js";
-import type { Libp2pHandle } from "./transport/types.js";
-import type { ContestTally, TallyOptions } from "./tally/types.js";
-
-/** Construction options for a VoteNetwork. */
-export interface VoteNetworkOptions {
-    /** The static criteria document; also derives the topic. */
-    criteria: Criteria;
-    /** Injected host node handle (today: pkc.clients.libp2pJsClients[key]._helia). */
-    libp2p: Libp2pHandle;
-    /** chainTicker -> client, built from `criteria.requires.chains`. */
-    chains: ChainClients;
-    /** Optional interpreter overrides that shadow built-ins by `type`. */
-    interpreters?: Partial<InterpreterRegistry>;
-}
-
-/**
- * The top-level facade: join the topic, keep the CRDT in sync, cast votes, and
- * read tallies. This is the only object most consumers (for example 5chan) touch.
- */
-export interface VoteNetwork {
-    /** Join the topic, fetch and union heads from peers, subscribe to gossip. */
-    start(): Promise<void>;
-    /** Leave the topic and release the transport. Does not stop the host node. */
-    stop(): Promise<void>;
-
-    /**
-     * Sign the given votes into a bundle for the current bucket, add it to the
-     * CRDT, and broadcast the new heads. Returns the published bundle. Pass an empty
-     * array to withdraw: a newer empty bundle supersedes the prior one under LWW.
-     */
-    castVotes(votes: Vote[]): Promise<VotesBundle>;
-
-    /** Current contest ranking, verified lazily top-down. */
-    getTally(options?: TallyOptions): Promise<ContestTally>;
-
-    /** Fired when incoming votes change the state. */
-    on(event: "update", cb: () => void): void;
-}

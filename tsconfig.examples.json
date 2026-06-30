@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "resolveJsonModule": true,
+    "paths": {
+      "@bitsocial/pubsub-votes": ["./src/index.ts"]
+    }
+  },
+  "include": ["examples", "src"]
+}
