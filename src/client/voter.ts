@@ -3,6 +3,7 @@ import type { Vote, VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients } from "../chain/types.js";
 import type { Libp2pHandle } from "../transport/types.js";
 import type { InterpreterRegistry } from "../interpreters/types.js";
+import { resolveRegistry, validateCriteriaInterpreters } from "../interpreters/registry.js";
 import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { topicFor } from "../topic.js";
@@ -76,15 +77,16 @@ export interface PubsubVoterOptions {
     chains: ChainClientFactory;
     /** Identity. Omit for a read-only voter (renders tallies, cannot cast). */
     signer?: VoteSigner;
-    /** Interpreter overrides that shadow built-ins by `type`. */
-    interpreters?: Partial<InterpreterRegistry>;
+    /** Interpreter overrides that shadow built-ins by `type` (a flat `type -> interpreter` map). */
+    interpreters?: InterpreterRegistry;
 }
 
 interface ResolvedDeps {
     libp2p: Libp2pHandle;
     chains: ChainClientFactory;
     signer: VoteSigner | undefined;
-    interpreters: Partial<InterpreterRegistry> | undefined;
+    /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
+    registry: InterpreterRegistry;
 }
 
 /** One contest. The pure parts (criteria, topic, read-only) are live; the engine is pending. */
@@ -149,7 +151,7 @@ export class PubsubVoter implements VoteClient {
             libp2p: options.libp2p,
             chains: options.chains,
             signer: options.signer,
-            interpreters: options.interpreters
+            registry: resolveRegistry(options.interpreters)
         };
     }
 
@@ -159,6 +161,7 @@ export class PubsubVoter implements VoteClient {
 
     async contest(criteria: Criteria): Promise<VoteNetwork> {
         const validated = CriteriaSchema.parse(criteria);
+        validateCriteriaInterpreters(validated, this.#deps.registry);
         const topic = await topicFor(validated);
         const existing = this.#contests.get(topic);
         if (existing) return existing;

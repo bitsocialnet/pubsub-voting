@@ -59,7 +59,7 @@ A criteria change is a new interpreter `type` and/or new criteria bytes (includi
 
 ```
 schema/        the wire and the criteria document (zod)
-interpreters/  type -> verifier registry; eligibility + weight
+interpreters/  flat type -> interpreter registry (one kind; eligibility/weight slots)
 chain/         historical-block reads (ERC-721 / ERC-20), chainTicker -> RPC
 verify/        bundle signature, wallet binding, timestamp monotonicity   [interfaces only for now]
 crdt/          Merkle-clock + LWW reduction
@@ -145,12 +145,16 @@ Deterministic per-contest aggregation. Verify lazily top-down: only verify the v
 
 Mirror the pkc-js challenge registry ([src/runtime/node/community/challenges/index.ts:94](https://github.com/pkcprotocol/pkc-js/blob/master/src/runtime/node/community/challenges/index.ts#L94)): a `Record<string, interpreter>` where user entries shadow builtins. Each interpreter owns its option schema and is evaluated at the bundle's bucket block via a `ChainClient`.
 
-| Kind | type | v1 | Purpose |
+One flat registry, one file per `type` directly under `interpreters/`, each co-locating its option schema with its evaluation function — the pkc-js `{ type, options-validation, verify }` shape. `registry.ts` holds `builtinRegistry`, `resolveRegistry` (host overrides shadow built-ins by `type`), and `validateCriteriaInterpreters` (the `eligibility`/`weight` refs must resolve and their options must parse, and every `requires.interpreters` name must resolve — else `UnknownInterpreterError` and the client recuses itself). `CriteriaSchema` stays loose (`{ type, ...options }`); the registry is the single source of truth for which `type`s are valid and how their options parse. Leaf interpreters depend only on the `ChainClient` interface, so they are unit-testable against a mock with no network.
+
+**One kind, one return type: a non-negative `number`.** There is a single interpreter kind; `evaluate` returns a score where `0` means "does not qualify". The criteria keeps two *slots* that draw from the one registry: the **eligibility** slot treats the score as a gate (`> 0` admits, `0` rejects), the **weight** slot treats it as the vote's magnitude. Final vote value = `evaluate(eligibility) === 0 ? 0 : evaluate(weight)`. A separate boolean eligibility kind was considered and rejected for the simplicity of one kind/one registry: an interpreter that needs a threshold (min Passes, min balance) bakes it in by returning `0` below the threshold (`erc721-min-balance` returns the holding or 0; `erc20-balance` takes an optional `min`). The same interpreter can therefore serve either slot — e.g. `erc721-min-balance` is a Pass gate in eligibility and "1 vote per Pass" in weight.
+
+| type | typical slot | v1 | Purpose |
 |---|---|---|---|
-| eligibility | `erc721-min-balance` | yes | Hold at least N of an ERC-721 (5chan Pass) |
-| weight | `constant` | yes | Fixed weight per eligible voter (1 pass = 1 vote) |
-| weight | `erc20-balance` | reserved | Weight by ERC-20 balance (BSO) for the combo path |
-| weight | `sum` | reserved | Combine weight terms |
+| `erc721-min-balance` | eligibility | yes | Hold at least N of an ERC-721 (5chan Pass); scores the holding or 0 |
+| `constant` | weight | yes | Fixed score per wallet (1 pass = 1 vote) |
+| `erc20-balance` | weight (or eligibility with `min`) | reserved | Score by ERC-20 balance (BSO) for the combo path |
+| `sum` | weight | reserved | Combine interpreter terms |
 
 ## Dependencies
 
@@ -164,5 +168,7 @@ pkc-js exposes the node only as `pkc.clients.libp2pJsClients[key]._helia` ([src/
 
 - **Wallet-binding signed-message format.** Reuse the existing Bitsocial/plebbit author-wallet convention (likely `{ domainSeparator, authorAddress, timestamp }` signed EIP-191), do not invent. pkc-js defines no format today.
 - **Signer reuse vs direct crypto.** `@pkcprotocol/pkc-js` only exports `.`, `./challenges`, `./rpc`. If the signer utilities are not on the top-level entry, depend on `@noble/curves` + `cborg` directly (the same versions pkc-js uses).
+- **Combinator interpreter protocol (`sum`, and any future `product`/`min`/`and`/`or`).** A combinator must resolve and invoke *other* interpreters, and each nested term may name its own `chain`. The current `ChainReadContext` exposes a single `chain` and no registry handle, so a combinator cannot recurse. Options: thread the resolved registry + a per-term chain selector into the eval context, or expand combinators at validation time into a resolved tree. Until decided, `sum.evaluate` throws `NotImplementedError`; `erc20-balance` and `constant` are leaves and work today.
+- **ERC-20 weight precision.** `erc20-balance` divides raw units by `decimals` to a JS `number` so the tally sorts as plain numbers; balances above ~2^53 base units after scaling lose precision. If exact large-balance weighting is needed, switch to `bigint` end-to-end (interpreter return + tally sort).
 - **Snapshot/compaction format** for fast cold start. Can land after the live path works.
 - **Application-level peer reputation for layer-2 invalidity.** Gossipsub `reject` scoring only punishes layer-1 badness (malformed bytes / not a bounded CID list), because that is all the topic validator sees. A well-formed head CID that later resolves to an *invalid bundle* (bad signature, stale binding, vote out of range) was already accepted and re-forwarded at gossip time, so gossipsub cannot retroactively score the sender. Penalizing peers that repeatedly serve unverifiable bundles needs a separate reputation in the fetch/serve path. Open: whether v1 needs it, or whether the bounded-fetch policy + per-message caps suffice.

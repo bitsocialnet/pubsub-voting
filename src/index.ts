@@ -12,7 +12,17 @@
 export * from "./schema/author.js";
 export * from "./schema/votes.js";
 export * from "./schema/criteria.js";
-export * from "./interpreters/options.js";
+
+// Interpreters: a single kind, one file per `type`, each owning its option schema and a
+// numeric `evaluate` (the eligibility slot gates on `> 0`, the weight slot uses the
+// magnitude), plus the registry (built-ins, the host-shadowing resolver, and criteria
+// validation). The leaf interpreters are implemented against the injected `ChainClient`;
+// only the `sum` combinator is a stub.
+export * from "./interpreters/erc721-min-balance.js";
+export * from "./interpreters/constant.js";
+export * from "./interpreters/erc20-balance.js";
+export * from "./interpreters/sum.js";
+export * from "./interpreters/registry.js";
 
 // Implemented runtime: encoding, topic, manifest, errors, identity seam, facade.
 export * from "./encoding/canonical.js";

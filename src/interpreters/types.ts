@@ -2,12 +2,22 @@ import type { z } from "zod";
 import type { ChainClient } from "../chain/types.js";
 
 /**
- * Interpreter interfaces, design only.
+ * Interpreter interface, design + leaves implemented.
  *
- * An interpreter turns a criteria `{ type, ...options }` reference into a decision
- * about a voter, evaluated at the bundle's bucket block. The registry maps a `type`
- * string to an interpreter, exactly like the pkc-js challenge registry
- * (Record<string, factory>, user entries shadow builtins).
+ * An interpreter turns a criteria `{ type, ...options }` reference into a non-negative
+ * score for one wallet, evaluated at the bundle's bucket block. There is a SINGLE kind
+ * (mirroring the flat pkc-js challenge registry: `Record<string, interpreter>`, user
+ * entries shadow builtins). The criteria still has two slots that draw from this one
+ * registry:
+ *
+ *   - eligibility slot: the score is a GATE. `> 0` admits the wallet, `0` rejects it.
+ *   - weight slot:      the score is the vote's MAGNITUDE.
+ *
+ * Final vote value = `evaluate(eligibility) === 0 ? 0 : evaluate(weight)`.
+ *
+ * A single numeric return covers both roles: an interpreter that needs a threshold
+ * (min Passes, min balance) bakes it in by returning 0 when the wallet falls short.
+ * That is why eligibility does not need a separate boolean kind.
  */
 
 /** Everything an interpreter needs to read chain state for one evaluation. */
@@ -19,31 +29,19 @@ export interface ChainReadContext {
 }
 
 /**
- * Eligibility: is this wallet allowed to vote at all?
- * `O` is the interpreter's validated options type (from its `optionsSchema`).
+ * The one interpreter kind. `O` is the validated options type (from its `optionsSchema`).
+ * `evaluate` returns a non-negative number; `0` means "does not qualify" (rejected in the
+ * eligibility slot, no weight in the weight slot).
  */
-export interface EligibilityInterpreter<O = unknown> {
+export interface Interpreter<O = unknown> {
     readonly type: string;
     readonly optionsSchema: z.ZodType<O>;
-    isEligible(args: { options: O; walletAddress: string; ctx: ChainReadContext }): Promise<boolean>;
+    evaluate(args: { options: O; walletAddress: string; ctx: ChainReadContext }): Promise<number>;
 }
 
 /**
- * Weight: how much does an eligible wallet's vote count?
- * Returns a non-negative number; 0 is equivalent to ineligible.
- */
-export interface WeightInterpreter<O = unknown> {
-    readonly type: string;
-    readonly optionsSchema: z.ZodType<O>;
-    weightOf(args: { options: O; walletAddress: string; ctx: ChainReadContext }): Promise<number>;
-}
-
-/**
- * The registry. Built-ins are provided by this library; consumers may pass
- * overrides that shadow built-ins by `type`. Mirrors pkc-js
+ * The registry: a flat `type -> interpreter` map. Built-ins are provided by this
+ * library; hosts may pass overrides that shadow built-ins by `type`. Mirrors pkc-js
  * src/runtime/node/community/challenges/index.ts.
  */
-export interface InterpreterRegistry {
-    eligibility: Record<string, EligibilityInterpreter>;
-    weight: Record<string, WeightInterpreter>;
-}
+export type InterpreterRegistry = Record<string, Interpreter>;

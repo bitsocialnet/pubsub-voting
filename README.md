@@ -87,6 +87,32 @@ const allCriteria = deriveCriteria(manifest); // defaults ⊕ each entry, each v
 
 Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a read-only consumer are in [examples/](./examples/).
 
+### Custom interpreters
+
+Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block against the injected `ChainClient`. There is **one kind**: `evaluate → number`, a non-negative score where `0` means "does not qualify". The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility > 0 ? weight : 0`. An interpreter that needs a threshold returns `0` below it (so `erc721-min-balance` and `erc20-balance`'s optional `min` can gate), which lets the same interpreter serve either slot.
+
+Built-ins: `erc721-min-balance` (v1), `constant` (v1), `erc20-balance` and `sum` (reserved for the pass + BSO combo). A host adds or shadows interpreters by `type` via the `interpreters` option — this is how clients like 5chan or seedit register custom rules without forking the library:
+
+```ts
+import { PubsubVoter, type Interpreter } from "@bitsocial/pubsub-votes";
+import { z } from "zod";
+
+const seeditModAllowlist: Interpreter<{ type: "seedit-mod-allowlist"; allow: string[] }> = {
+  type: "seedit-mod-allowlist",
+  optionsSchema: z.object({ type: z.literal("seedit-mod-allowlist"), allow: z.array(z.string()) }),
+  async evaluate({ options, walletAddress }) {
+    return options.allow.includes(walletAddress) ? 1 : 0; // gate: 1 admits, 0 rejects
+  }
+};
+
+const voter = new PubsubVoter({
+  libp2p, chains,
+  interpreters: { "seedit-mod-allowlist": seeditModAllowlist } // flat map; shadows/extends built-ins by `type`
+});
+```
+
+A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned to the topic it runs on, and a client that does not implement a `type` named in `criteria.requires.interpreters` throws `UnknownInterpreterError` and recuses itself rather than miscounting.
+
 ## Layout
 
 ```
@@ -98,7 +124,7 @@ src/
   signer/        VoteSigner identity seam                         [implemented]
   client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
   errors.ts      NotImplementedError, ReadOnlyError               [implemented]
-  interpreters/  interpreter interfaces + v1/combo option schemas
+  interpreters/  one file per `type` + registry/resolver           [leaves implemented]
   chain/         ChainClient interface (historical-block reads)
   crdt/          Merkle-CRDT interfaces                           [design only]
   transport/     libp2p transport interfaces (pubsub + fetch)     [design only]
