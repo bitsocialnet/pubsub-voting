@@ -27,10 +27,10 @@ Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. 
 - Schemas are zod v4 (`z.looseObject`, `z.record(key, value)`, `z.strictObject`/`.strict()`, `z.discriminatedUnion`). Check `package.json` for the exact zod version before using version-sensitive APIs.
 - The criteria document must be canonically encodable with dag-cbor (no `undefined`, sorted keys), because `topic = CID(dag-cbor(criteria))`. A non-canonical criteria object is a bug: it changes the topic.
 - Each interpreter owns its own option schema. The top-level `CriteriaSchema` keeps `eligibility`/`weight` loose (`{ type, ...options }`) so custom interpreters can register without a schema change.
-- Reuse the pkc-js author/wallet wire shape (`{ address, timestamp, signature: { signature, type } }`); do not diverge from it.
+- A vote bundle carries **no pkc-js author**. The voting wallet signs each bundle directly as EIP-712 typed data; the bundle is `{ address, votes, blockNumber, signature }` where `address` MUST equal the address recovered from `signature`. You may reuse pkc-js's detached-signature shape (`{ signature, type }`) for the `signature` field, but do not carry a pkc-js author object or an author→wallet binding. See [DESIGN.md, Votes wire](./DESIGN.md).
 
 ## When implementing later (not now)
 
 - Reproduce any reported bug deterministically in a test first.
-- Wallet-binding format: confirm the Bitsocial/plebbit convention before coding (pkc-js defines none). See [DESIGN.md, Open questions](./DESIGN.md#open-questions).
+- Vote-signature format: EIP-712 typed data signed by the voting wallet (no pkc-js author, no author→wallet binding). The model is decided; only the concrete EIP-712 `types` layout is open — pin it with a fixed test vector. See [DESIGN.md, Votes wire](./DESIGN.md) and [Open questions](./DESIGN.md#open-questions).
 - Never include identifying information (absolute home paths, usernames, hostnames, personal emails) in issues, PRs, or commit messages.

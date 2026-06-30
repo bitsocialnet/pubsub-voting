@@ -14,7 +14,7 @@ The same engine generalizes to the original use case in [pkc-js issue #25](https
 
 [pkc-js](https://github.com/pkcprotocol/pkc-js) (Public Key Communities) is the protocol layer: communities, publications, the challenge exchange. Voting is application/governance layer. Keeping it separate means:
 
-- Chain-RPC and governance churn stay out of pkc-js core. pkc-js deliberately touches chains only for name resolution; it has no balance lookups, no chainTicker-to-RPC mapping, and no wallet-binding verification. This library owns all of that.
+- Chain-RPC and governance churn stay out of pkc-js core. pkc-js deliberately touches chains only for name resolution; it has no balance lookups, no chainTicker-to-RPC mapping, and no off-chain vote signing or verification. This library owns all of that.
 - The engine is reusable across clients and contests.
 - The core (`schema/`, `verify/`, `crdt/`, `tally/`) is transport-agnostic and unit-testable without a network. libp2p only appears in `transport/`.
 
@@ -36,7 +36,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`) and a `blockstore` (else `MissingBlockstoreError`) |
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; interpreters read through it for eligibility and weight |
-| `signer` | `VoteSigner` | no | author identity + ed25519 signing; omit for a read-only voter |
+| `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 
 ### Construct a voter
 
@@ -119,11 +119,11 @@ A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned t
 
 ```
 src/
-  schema/        zod schemas (criteria, votes, author/wallet) + inferred types
+  schema/        zod schemas (criteria, votes, shared wire primitives) + inferred types
   encoding/      canonical dag-cbor encoding                      [implemented]
   topic.ts       topic = "bitsocial-votes/" + CID(dag-cbor)       [implemented]
   manifest/      derive one criteria document per contest         [implemented]
-  signer/        VoteSigner identity seam                         [implemented]
+  signer/        VoteSigner seam + EIP-712 ballot typed data       [implemented]
   client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
   errors.ts      NotImplemented/ReadOnly/MissingPubsub/Blockstore [implemented]
   interpreters/  one file per `type` + registry/resolver           [leaves implemented]

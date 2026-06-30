@@ -3,34 +3,26 @@ import type { VotesBundle } from "../schema/votes.js";
 /**
  * Verification interfaces, design only.
  *
- * Verification has two cheap, offline stages (no chain reads) and one chain stage:
- *   1. bundle signature: ed25519 over cbor(VotesSignedPropertyNames), against author.address
- *   2. wallet binding: the eligibility-chain wallet's signature binds it to author.address
- *   3. eligibility + weight: interpreters read chain state at the bucket block
+ * Verification has one cheap, offline stage (no chain reads) and one chain stage:
+ *   1. ballot signature: recover the EIP-712 signer and check it equals bundle.address
+ *   2. eligibility + weight: interpreters read chain state at the bucket block
  *
- * The tally runs stage 3 lazily (only where it can change the visible ranking),
- * so these are split.
+ * The tally runs stage 2 lazily (only where it can change the visible ranking), so the
+ * cheap offline check is split out and runs first — a bad signature drops a vote for zero
+ * chain reads. There is no separate wallet-binding stage: the single wallet signature is
+ * the identity. See DESIGN.md "Identity: the voting wallet, nothing else" and "Tally".
  */
 
 export type VerifyOk = { valid: true };
 export type VerifyFail = { valid: false; reason: string };
 export type VerifyResult = VerifyOk | VerifyFail;
 
-/** Stage 1 + 2: signature and binding only. No chain access. */
+/** Stage 1: ballot signature only. No chain access. */
 export interface OfflineBundleVerifier {
-    /** ed25519 signature over the signed property names, against author.address. */
-    verifyBundleSignature(bundle: VotesBundle): Promise<VerifyResult>;
-
     /**
-     * The eligibility-chain wallet's `signature` binds wallet.address to
-     * author.address (EIP-191). The exact signed-message format is an open question
-     * (see DESIGN.md); confirm the Bitsocial convention before implementing.
+     * Rebuild the EIP-712 ballot typed data from the contest CID + chainId + the bundle's
+     * `votes` and `blockNumber` (see signer/eip712.ts), recover the signer with
+     * `viem.recoverTypedDataAddress`, and check it equals `bundle.address`. No chain read.
      */
-    verifyWalletBinding(args: { bundle: VotesBundle; chain: string }): Promise<VerifyResult>;
-
-    /**
-     * Reject a wallet binding whose timestamp is lower than the last seen for that
-     * wallet (the issue #25 revocation mitigation). Requires per-wallet state.
-     */
-    isBindingTimestampFresh(args: { walletAddress: string; timestamp: number }): boolean;
+    verifyBundleSignature(args: { bundle: VotesBundle; contestCid: string; chainId: number }): Promise<VerifyResult>;
 }

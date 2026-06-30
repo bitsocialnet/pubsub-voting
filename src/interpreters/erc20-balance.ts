@@ -1,6 +1,6 @@
 import { erc20Abi, getAddress } from "viem";
 import { z } from "zod";
-import { ChainTickerSchema } from "../schema/author.js";
+import { ChainTickerSchema } from "../schema/common.js";
 import type { Interpreter } from "./types.js";
 
 /**

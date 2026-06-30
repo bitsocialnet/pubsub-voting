@@ -1,15 +1,19 @@
 import { z } from "zod";
-import { SignatureSchema, VoteAuthorSchema } from "./author.js";
+import { SignatureSchema } from "./common.js";
 
 /**
  * The Votes wire format.
  *
- * One bundle per author per heartbeat, scoped to the topic's single contest. The
- * bundle is the unit of signing and the value stored at each Merkle-CRDT node. An
- * empty `votes` array is the withdrawal/abstention form: a newer bundle (higher
- * blockNumber) with no votes supersedes an earlier one under LWW, removing the vote
- * from the tally without breaking the monotonic union. See DESIGN.md "Votes wire",
- * "Cancelling a vote", and "CRDT".
+ * One bundle per voting wallet per heartbeat, scoped to the topic's single contest.
+ * The bundle is the value stored at each Merkle-CRDT node. An empty `votes` array is
+ * the withdrawal/abstention form: a newer bundle (higher blockNumber) with no votes
+ * supersedes an earlier one under LWW, removing the vote from the tally without
+ * breaking the monotonic union. See DESIGN.md "Votes wire", "Cancelling a vote", and
+ * "CRDT".
+ *
+ * The bundle is signed directly by the eligibility-chain wallet as EIP-712 typed data
+ * (see signer/eip712.ts); `address` is that wallet and MUST equal the address recovered
+ * from `signature`. There is no pkc-js author and no author->wallet binding.
  */
 
 /**
@@ -26,28 +30,19 @@ export const VoteSchema = z.object({
 });
 
 /**
- * The portion of a bundle that is covered by the signature. The property order
- * here is the canonical signing order (see VotesSignedPropertyNames). Mirrors the
- * pkc-js `_signJson` pattern: cbor-encode exactly these properties, then ed25519
- * sign the bytes.
+ * The full wire node: the voting wallet, its votes, the bucket block, and the wallet's
+ * EIP-712 signature over the ballot. `address` is carried so the LWW key and chain reads
+ * are available without re-recovering; it MUST equal `recoverTypedDataAddress(signature)`
+ * (a forged `address` fails the recovery check at verify time). The signed payload is
+ * the EIP-712 ballot built from the contest CID + chainId + `votes` + `blockNumber`
+ * (see signer/eip712.ts), not these wire bytes directly.
  */
-export const VotesBundleSignedSchema = z.object({
-    author: VoteAuthorSchema,
+export const VotesBundleSchema = z.object({
+    address: z.string().min(1),
     votes: z.array(VoteSchema),
-    blockNumber: z.number().int().nonnegative()
-});
-
-/** The full bundle: signed payload plus the author's ed25519 signature over it. */
-export const VotesBundleSchema = VotesBundleSignedSchema.extend({
+    blockNumber: z.number().int().nonnegative(),
     signature: SignatureSchema
 });
 
-/**
- * Exactly the properties covered by `VotesBundle.signature`, in canonical order.
- * The verifier and signer must agree on this list and its order.
- */
-export const VotesSignedPropertyNames = ["author", "votes", "blockNumber"] as const;
-
 export type Vote = z.infer<typeof VoteSchema>;
-export type VotesBundleSigned = z.infer<typeof VotesBundleSignedSchema>;
 export type VotesBundle = z.infer<typeof VotesBundleSchema>;

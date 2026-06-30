@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ChainTickerSchema } from "./author.js";
+import { ChainTickerSchema } from "./common.js";
 
 /**
  * The criteria document.

@@ -3,8 +3,8 @@
  *
  * One topic decides one contest, so the tally aggregates the current bundles into a
  * single contest ranking. Verification is lazy and top-down: only the votes that can
- * still change the visible order are verified (signature, wallet binding, chain
- * reads), stopping once the remaining unverified weight cannot flip the ranking. So a
+ * still change the visible order are verified (ballot signature, chain reads),
+ * stopping once the remaining unverified weight cannot flip the ranking. So a
  * leaderboard can render fast and refine. See DESIGN.md "Tally".
  */
 

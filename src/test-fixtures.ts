@@ -3,6 +3,7 @@ import type { Criteria } from "./schema/criteria.js";
 import type { BlockstoreLike, HeliaInstance, PubsubService } from "./transport/types.js";
 import type { ChainClientFactory } from "./chain/types.js";
 import type { VoteSigner } from "./signer/types.js";
+import { EIP712_SIGNATURE_TYPE } from "./signer/eip712.js";
 
 /**
  * Shared test fixtures. Not part of the public API; imported only by *.test.ts and
@@ -91,7 +92,7 @@ export function fakeChains(): ChainClientFactory {
 /** A minimal signer for write-path tests. */
 export function fakeSigner(): VoteSigner {
     return {
-        author: () => ({ address: "author-1", wallets: {} }),
-        sign: () => ({ signature: "deadbeef", type: "ed25519" })
+        address: () => "0x0000000000000000000000000000000000000001",
+        signBallot: () => ({ signature: "0xdeadbeef", type: EIP712_SIGNATURE_TYPE })
     };
 }

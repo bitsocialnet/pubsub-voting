@@ -6,17 +6,18 @@ This document is the design of record. The repo currently implements **schemas a
 
 - **Consumer:** [5chan](https://github.com/bitsocialnet/5chan) and its [competitive directory system](https://github.com/bitsocialnet/5chan/blob/master/README.md#competitive-directory-system). Many boards compete for each directory slot; only the highest-voted board appears on the homepage. Current curation is manual pull requests to [`5chan-directories.json`](https://github.com/bitsocialnet/lists/blob/master/5chan-directories.json). This library replaces that with holder-decided, censorship-resistant voting.
 - **Origin:** [pkc-js issue #25](https://github.com/pkcprotocol/pkc-js/issues/25), which sketched pubsub voting (settings in the topic, bucketized block numbers, per-bucket heartbeat republish). This design keeps the good parts and replaces the bare heartbeat with a Merkle-CRDT.
-- **Host:** [pkc-js](https://github.com/pkcprotocol/pkc-js) (Public Key Communities) provides the shared libp2p/Helia node, the author identity, and the ed25519 signing primitives. This library adds everything chain-related and the CRDT, none of which exist in pkc-js.
+- **Host:** [pkc-js](https://github.com/pkcprotocol/pkc-js) (Public Key Communities) provides the shared libp2p/Helia node. It is *only* the node host: it supplies no identity and no signing for voting. This library adds everything chain-related, the CRDT, and the vote-signing/verification, none of which exist in pkc-js.
 
 ## Decisions
 
 - **State model: Merkle-CRDT.** Votes form a last-write-wins element-set keyed by wallet, carried in a Merkle-DAG. Broadcast head CIDs over pubsub; fetch the diff by CID. Precedent: Merkle-CRDTs (Sanjuán et al., Protocol Labs 2020), `go-ds-crdt` (powers IPFS Cluster's shared pinset with no leader), OrbitDB, Secure Scuttlebutt.
 - **Weighting v1: 5chan Pass only.** ERC-721 ownership gates eligibility; weight is constant (1 pass = 1 vote). The interpreter design keeps a combo path open (pass eligibility + BSO ERC-20 weight) without a redesign.
 - **Voting is upvote-only in v1.** Downvotes turn a contest into a cheap weapon against competitors; approval-style upvotes (vote for as many boards as you like, capped by `maxVotesPerAddress`) avoid that. The wire keeps a numeric `vote` field so a future criteria could widen the range.
+- **Identity is the voting wallet, not a pkc-js author.** The eligibility-chain wallet (whose private key 5chan or its clients hold, never pkc-js) signs each vote directly as EIP-712 typed data; the address recovered from that signature is the only identity in the system. There is no pkc-js author and no author→wallet binding — the signature *is* the identity. This drops a whole verification layer (no binding to forge or keep monotonic) and the ed25519 author signer.
 
 ## Votes are off-chain
 
-A vote is never written to a blockchain. Casting a vote is: sign the bundle (ed25519), store it as a dag-cbor node in the host's Helia blockstore (IPFS content-addressing, not a chain), and broadcast the new head CIDs over gossipsub. There is no transaction and no gas.
+A vote is never written to a blockchain. Casting a vote is: sign the bundle with the eligibility-chain wallet (EIP-712 typed data — no gas, an off-chain signature), store it as a dag-cbor node in the host's Helia blockstore (IPFS content-addressing, not a chain), and broadcast the new head CIDs over gossipsub. There is no transaction and no gas.
 
 The chain is **read-only**, and only to decide *who may vote* and *how much*:
 
@@ -49,7 +50,7 @@ Anyone, trustlessly. A snapshot is a head CID plus compacted state that every cl
 
 ### How fast is cold start?
 
-For a topic with ~1000 votes, cold start is **fetch-bound, not compute-bound**. The state is ~1000 small dag-cbor nodes (each: author + wallet binding, one vote, blockNumber, ed25519 signature, parent CIDs ≈ 0.5–1.5 KB), so ~0.5–1.5 MB total. Walking that many small blocks over bitswap is round-trip-dominated: single-digit to low-tens of seconds against a healthy `bitsocial-seeder`, worse against flaky peers. The crypto is cheap (ed25519 verify is tens of µs each, so ~1000 signatures is well under a second), and chain reads are lazy (tally only, only for ranking-relevant votes), so neither gates the join. The two levers that shrink this number are the **snapshot/compaction** format (fetch one compacted blob instead of N nodes — see "Open questions") and **per-contest topics** (sync only the slot you care about).
+For a topic with ~1000 votes, cold start is **fetch-bound, not compute-bound**. The state is ~1000 small dag-cbor nodes (each: voting wallet address, one vote, blockNumber, one secp256k1 signature, parent CIDs ≈ 0.3–1 KB), so well under ~1 MB total. Walking that many small blocks over bitswap is round-trip-dominated: single-digit to low-tens of seconds against a healthy `bitsocial-seeder`, worse against flaky peers. The crypto is cheap (secp256k1 `ecrecover` is ~tens to low-hundreds of µs each, so recovering ~1000 vote signatures is still well under a second), and chain reads are lazy (tally only, only for ranking-relevant votes), so neither gates the join. The two levers that shrink this number are the **snapshot/compaction** format (fetch one compacted blob instead of N nodes — see "Open questions") and **per-contest topics** (sync only the slot you care about).
 
 ### What happens when criteria change on upgrade?
 
@@ -61,7 +62,7 @@ A criteria change is a new interpreter `type` and/or new criteria bytes (includi
 schema/        the wire and the criteria document (zod)
 interpreters/  flat type -> interpreter registry (one kind; eligibility/weight slots)
 chain/         historical-block reads (ERC-721 / ERC-20), chainTicker -> RPC
-verify/        bundle signature, wallet binding, timestamp monotonicity   [interfaces only for now]
+verify/        vote signature (recovers the voting wallet), blockNumber monotonicity   [interfaces only for now]
 crdt/          Merkle-clock + LWW reduction
 transport/     gossipsub topic (broadcast heads + topic validator) + libp2p fetch (cold-start sync)
 tally/         deterministic per-contest aggregation, lazy top-down verify
@@ -82,13 +83,19 @@ The point of the structure is that **rules are per-contest, not global**. `defau
 ### Votes wire
 
 ```
-VotesBundle { author, votes: Vote[], blockNumber, signature }
+VotesBundle { address, votes: Vote[], blockNumber, signature }
 Vote        { board, vote }
 ```
 
-The contest is not on the wire: one topic decides one contest, so the contest is implied by the topic the bundle was published to. A vote names the `board` and a numeric `vote`.
+The contest is not on the wire as a field: one topic decides one contest, so the contest is implied by the topic the bundle was published to (and bound into the signature — see below). A vote names the `board` and a numeric `vote`. `address` is the voting wallet (the holder of the Pass / ERC-20) and MUST equal the address recovered from `signature`; it is carried so the LWW key and chain reads are available without re-recovering, and a forged `address` simply fails the recovery check.
 
-The author signs the bundle with their ed25519 key over a cbor-encoded set of signed property names, mirroring pkc-js `_signJson` in [src/signer/signatures.ts:142](https://github.com/pkcprotocol/pkc-js/blob/master/src/signer/signatures.ts#L142). Constraints: `votes.length <= maxVotesPerAddress` (v1: 1, the one-vote-per-topic rule), and each `vote` within `voteSchema` (v1: exactly 1). An **empty `votes` array is always valid** — it is the withdrawal form (see "Cancelling a vote").
+The eligibility-chain wallet signs the bundle directly as **EIP-712 typed data** (`viem.signTypedData`; verification is `viem.verifyTypedData` / `recoverTypedDataAddress`). There is no separate author and no author→wallet binding — the recovered signer *is* the voter. The signed message binds:
+
+- **the contest** — the criteria CID (equivalently the topic), so a signature can never be replayed onto another contest or another app's topic;
+- **the `votes`** (each `board` + numeric `vote`);
+- **the `blockNumber`** — the LWW key and the bucketized block every verifier reads balances at.
+
+The EIP-712 `domain` is `{ name: "bitsocial-votes", version, chainId }` with `chainId` set to the eligibility chain, which gives cross-chain/cross-app domain separation for free. Constraints: `votes.length <= maxVotesPerAddress` (v1: 1, the one-vote-per-topic rule), and each `vote` within `voteSchema` (v1: exactly 1). An **empty `votes` array is always valid** — it is the withdrawal form (see "Cancelling a vote").
 
 ### Cancelling a vote
 
@@ -97,13 +104,15 @@ There is no delete; the union only grows. A vote is removed two ways, both consi
 - **Active withdrawal.** Publish a newer bundle (higher `blockNumber`) with `votes: []`. LWW keyed by wallet picks the newest bundle, which now expresses *no vote*, so the tally drops it. The old bundle bytes may still be served, but `current()` resolves the wallet to the empty one. This is supersession, not deletion — the union still only gains a node.
 - **Passive expiry.** Stop republishing. A bundle is valid for `voteExpiryBuckets` after its `blockNumber` (the issue #25 heartbeat), so a wallet that goes silent has its vote decay on its own. Keeping a vote alive means periodically re-signing with a fresh `blockNumber`. Changing a vote is the same mechanism: a newer bundle naming a different board supersedes the old one.
 
-### Wallet binding (net-new; pkc-js has the schema but no verifier)
+### Identity: the voting wallet, nothing else (net-new; pkc-js has no signer for this)
 
-`author.wallets[chain] = { address, timestamp, signature }`, shape from [pkc-js src/schema/schema.ts:35](https://github.com/pkcprotocol/pkc-js/blob/master/src/schema/schema.ts#L35). The eligibility-chain wallet signs an EIP-191 message binding it to `author.address`; verification will use `viem.verifyMessage`. A binding whose `timestamp` is lower than the last seen for that wallet is rejected (the issue #25 revocation mitigation). **The exact signed-message format is an open question** (see below); pkc-js defines none today, so do not invent one before confirming the Bitsocial convention.
+There is no pkc-js author and no author→wallet binding. The thing that holds the Pass is an eligibility-chain wallet, and that wallet signs each vote directly (see "Votes wire"), so the only identity is the address recovered from the bundle's EIP-712 signature. Collapsing the old two-key model (ed25519 author + a secp256k1 binding vouching for it) into one wallet signature removes an entire verification layer — there is no binding to forge, and no separate binding timestamp to keep monotonic.
+
+The old "sign once, delegate to a cheap key" rationale does not apply here: the client holds the wallet key and signs programmatically, so there is no per-vote human wallet prompt to avoid — paying one secp256k1 signature per bundle is free. Wallet-key compromise is a wallet-level concern outside the protocol (the same as for any on-chain asset); there is no protocol-level binding-revocation step because there is no binding. Supersession and replay are handled entirely by `blockNumber` LWW + bucket expiry (see "CRDT" and "Cancelling a vote").
 
 ### CRDT
 
-Last-write-wins element-set keyed by the eligibility-chain wallet address; value is the bundle; conflict resolution is highest `blockNumber`, tiebreak lowest bundle CID (for determinism across clients). Each bundle is a dag-cbor DAG node linking the heads known at signing, stored in the host's Helia blockstore. Only head CIDs go over pubsub; missing ancestors are fetched by CID. Prune bundles older than `voteExpiryBuckets` and those superseded per wallet.
+Last-write-wins element-set keyed by the voting wallet address (recovered from the bundle's EIP-712 signature); value is the bundle; conflict resolution is highest `blockNumber`, tiebreak lowest bundle CID (for determinism across clients). Each bundle is a dag-cbor DAG node linking the heads known at signing, stored in the host's Helia blockstore. Only head CIDs go over pubsub; missing ancestors are fetched by CID. Prune bundles older than `voteExpiryBuckets` and those superseded per wallet.
 
 ### Transport: gossipsub topic + validation
 
@@ -124,26 +133,26 @@ Nothing stops *publishing* them — and nothing needs to, because a head CID car
 |---|---|---|
 | Malformed bytes / not a bounded list of CIDs | topic validator (layer 1) | `reject` — not forwarded, sender scored down |
 | Well-formed CID that resolves to nothing (or the sender won't serve it) | fetch-on-demand | fetch fails → no-op; state never changes |
-| Resolves to a bundle that fails verification (bad signature, bad or stale wallet binding, vote out of range, expired bucket, over `maxVotesPerAddress`) | offline verify (layer 2) + chain (layer 3) | dropped — never stored, re-served, or counted |
+| Resolves to a bundle that fails verification (bad signature, `address` ≠ recovered signer, vote out of range, expired bucket, over `maxVotesPerAddress`) | offline verify (layer 2) + chain (layer 3) | dropped — never stored, re-served, or counted |
 | Resolves to a valid, eligible, signed bundle | — | a legitimate vote: counted once per Pass-gated wallet (the NFT gate bounds Sybils), LWW makes it deterministic, union makes it un-removable |
-| Replayed/old bundle, or two conflicting bundles from one signer (equivocation) | LWW (higher `blockNumber`, tiebreak lower CID) + binding-timestamp monotonicity + bucket expiry | resolves to one vote every client agrees on; a replayed older bundle is inert |
+| Replayed/old bundle, or two conflicting bundles from one signer (equivocation) | LWW (higher `blockNumber`, tiebreak lower CID) + bucket expiry; the signature binds `blockNumber` so an old bundle cannot be re-stamped | resolves to one vote every client agrees on; a replayed older bundle is inert |
 | Heads that omit known votes, or a peer that withholds | monotonic union + multi-peer cold-start fetch | cannot subtract a vote an honest peer serves (see "Can always-online peers drop votes?") |
 
 The validator cannot fully verify a vote at gossip time: the message is only head CIDs, the referenced bundle has not been fetched, and full verification needs async chain reads done lazily by the tally. So validation is **layered**:
 
 1. **Topic validator** (cheap, pre-flood): the message decodes to a bounded list of well-formed CIDs, within a size cap, within a per-peer rate. Pure and unit-testable; no network or chain.
-2. **CRDT merge** (after fetching a bundle by CID): run offline verification — bundle signature + wallet binding — before admitting the node to the set or re-serving it. Invalid → drop.
+2. **CRDT merge** (after fetching a bundle by CID): run offline verification — recover the EIP-712 vote signature and check it matches `address` — before admitting the node to the set or re-serving it. Invalid → drop.
 3. **Tally** (lazy, on-chain): eligibility and weight reads, only for the votes that can still change the visible ranking.
 
 The one residual is **resource exhaustion, not incorrectness**: a flood of plausible-looking but unresolvable CIDs costs wasted fetch attempts. It is bounded by the per-message CID cap and size cap, per-peer rate limiting, gossipsub peer scoring (which prunes persistently-bad senders), and a bounded fetch policy — fetch only unknown CIDs, cap concurrent and total fetches, and stop walking an ancestor chain the moment a node fails to verify.
 
 ### Tally
 
-Deterministic per-contest aggregation with **bound-based lazy verification**: only verify the votes (signature, wallet binding, chain reads) that can still change the visible ranking, stopping once the remaining unverified weight cannot flip the order. Render provisional immediately and refine.
+Deterministic per-contest aggregation with **bound-based lazy verification**: only verify the votes (signature, chain reads) that can still change the visible ranking, stopping once the remaining unverified weight cannot flip the order. Render provisional immediately and refine.
 
 The lever is that **verification only ever subtracts weight** — a vote is either valid (keeps its weight) or invalid/ineligible (drops to `0`), never more. So each board has a **ceiling** (sum of its unverified claimed weight) and a **floor** (sum of its verified-valid weight); verifying raises the floor toward the ceiling, or drops the ceiling when a vote is rejected. The winner is locked the moment the leader's floor ≥ every other board's ceiling — no outcome of the unverified remainder can catch it. A full ranking locks pairwise top-down (`floor_i ≥ ceiling_{i+1}` for each adjacent pair); since 5chan only seats #1 per slot, the common case stops as soon as the leader is locked and never ranks the also-rans.
 
-Order the work cheap-first: signature and wallet-binding checks are local and fast, the chain read is the costly part, so prune with the free checks before spending a read — a bad ed25519 signature or EIP-191 binding drops a vote for zero chain reads. This is also a DoS lever: a board whose ceiling is already below the leader's floor is never touched, so padding a losing board costs nothing. The residual is padding a board to *look* like a contender to force disproving reads — the resource-exhaustion residual from "What stops someone publishing invalid head CIDs?" — bounded by the per-message and per-peer fetch caps.
+Order the work cheap-first: the EIP-712 signature check is local and fast, the chain read is the costly part, so prune with the free check before spending a read — a bad signature (or `address` that does not match the recovered signer) drops a vote for zero chain reads. This is also a DoS lever: a board whose ceiling is already below the leader's floor is never touched, so padding a losing board costs nothing. The residual is padding a board to *look* like a contender to force disproving reads — the resource-exhaustion residual from "What stops someone publishing invalid head CIDs?" — bounded by the per-message and per-peer fetch caps.
 
 The clean wire-derived ceiling is a v1 (`constant` weight) property: every vote's ceiling is trivially `1`, so claimed count *is* the ceiling. The reserved `erc20-balance` path derives magnitude *from* the chain read, so it has no free upper bound; lazy tally there needs a separate bounding scheme (see "Open questions").
 
@@ -164,7 +173,7 @@ One flat registry, one file per `type` directly under `interpreters/`, each co-l
 
 ## Dependencies
 
-Match pkc-js exact versions so DAG nodes interop with the shared Helia 6 node: `zod 4.3.6`, `multiformats 13.4.2`, plus (added by the implementation later) `cborg 4.5.8`, `@ipld/dag-cbor`, `uint8arrays 5.1.0`, `@noble/curves 2.2.0`. `viem 2.54.0` is a direct dependency: it is the chain client interpreters read through (`ctx.chain` is a viem `PublicClient`) and provides `verifyMessage` (pkc-js has neither). `@pkcprotocol/pkc-js`, `helia`, and `@libp2p/interface` are peer dependencies so libp2p is not double-bundled.
+Match pkc-js exact versions so DAG nodes interop with the shared Helia 6 node: `zod 4.3.6`, `multiformats 13.4.2`, plus (added by the implementation later) `cborg 4.5.8`, `@ipld/dag-cbor`, `uint8arrays 5.1.0`. `viem 2.54.0` is a direct dependency: it is the chain client interpreters read through (`ctx.chain` is a viem `PublicClient`) and provides EIP-712 vote signing/verification (`signTypedData`, `verifyTypedData`, `recoverTypedDataAddress` — pkc-js has none of these). With the pkc-js author dropped, voting no longer needs ed25519 primitives. `@pkcprotocol/pkc-js`, `helia`, and `@libp2p/interface` are peer dependencies so libp2p is not double-bundled.
 
 ## Deferred pkc-js work
 
@@ -172,10 +181,9 @@ This library takes the host's Helia node directly and drives its gossipsub servi
 
 ## Open questions
 
-- **Wallet-binding signed-message format.** Reuse the existing Bitsocial/plebbit author-wallet convention (likely `{ domainSeparator, authorAddress, timestamp }` signed EIP-191), do not invent. pkc-js defines no format today.
-- **Signer reuse vs direct crypto.** `@pkcprotocol/pkc-js` only exports `.`, `./challenges`, `./rpc`. If the signer utilities are not on the top-level entry, depend on `@noble/curves` + `cborg` directly (the same versions pkc-js uses).
+- **Exact EIP-712 type layout.** The signed-message *model* is decided (EIP-712 typed data signed by the voting wallet, domain `{ name: "bitsocial-votes", version, chainId }`, message binding contest CID + `votes` + `blockNumber` — see "Votes wire"). What remains is pinning the concrete `types` struct: field names/order, the encoding of the contest CID (string vs `bytes32`), and the `vote` field type (`uint256`). Settle this with a fixed test vector so every client recovers identical signers.
 - **Combinator interpreter protocol (`sum`, and any future `product`/`min`/`and`/`or`).** A combinator must resolve and invoke *other* interpreters, and each nested term may name its own `chain`. The current `ChainReadContext` exposes a single `chain` and no registry handle, so a combinator cannot recurse. Options: thread the resolved registry + a per-term chain selector into the eval context, or expand combinators at validation time into a resolved tree. Until decided, `sum.evaluate` throws `NotImplementedError`; `erc20-balance` and `constant` are leaves and work today.
 - **ERC-20 weight precision.** `erc20-balance` divides raw units by `decimals` to a JS `number` so the tally sorts as plain numbers; balances above ~2^53 base units after scaling lose precision. If exact large-balance weighting is needed, switch to `bigint` end-to-end (interpreter return + tally sort).
 - **Lazy-tally upper bounds for non-constant weight.** The bound-based early stop in "Tally" assumes each unverified vote has a cheap ceiling — trivially `1` for `constant`. `erc20-balance` and `sum` derive weight from chain reads, so they carry no free wire-side bound; lazy tally there needs a self-declared, verify-down balance, or it degrades to verifying every ranking-relevant vote. Decide alongside the combinator protocol.
 - **Snapshot/compaction format** for fast cold start. Can land after the live path works.
-- **Application-level peer reputation for layer-2 invalidity.** Gossipsub `reject` scoring only punishes layer-1 badness (malformed bytes / not a bounded CID list), because that is all the topic validator sees. A well-formed head CID that later resolves to an *invalid bundle* (bad signature, stale binding, vote out of range) was already accepted and re-forwarded at gossip time, so gossipsub cannot retroactively score the sender. Penalizing peers that repeatedly serve unverifiable bundles needs a separate reputation in the fetch/serve path. Open: whether v1 needs it, or whether the bounded-fetch policy + per-message caps suffice.
+- **Application-level peer reputation for layer-2 invalidity.** Gossipsub `reject` scoring only punishes layer-1 badness (malformed bytes / not a bounded CID list), because that is all the topic validator sees. A well-formed head CID that later resolves to an *invalid bundle* (bad signature, `address` mismatch, vote out of range) was already accepted and re-forwarded at gossip time, so gossipsub cannot retroactively score the sender. Penalizing peers that repeatedly serve unverifiable bundles needs a separate reputation in the fetch/serve path. Open: whether v1 needs it, or whether the bounded-fetch policy + per-message caps suffice.

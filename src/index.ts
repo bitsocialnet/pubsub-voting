@@ -9,7 +9,7 @@
  */
 
 // Schemas (runtime values) and their inferred types.
-export * from "./schema/author.js";
+export * from "./schema/common.js";
 export * from "./schema/votes.js";
 export * from "./schema/criteria.js";
 
@@ -30,6 +30,9 @@ export * from "./topic.js";
 export * from "./manifest/manifest.js";
 export * from "./errors.js";
 export * from "./client/voter.js";
+// Identity seam: the EIP-712 ballot builder + constants a host needs to implement a
+// signer, plus the signer interface itself.
+export * from "./signer/eip712.js";
 export type { VoteSigner } from "./signer/types.js";
 
 // Design interfaces (types only) for the engine that is not yet implemented.
