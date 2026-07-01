@@ -15,7 +15,7 @@ import type { Vote } from "../schema/votes.js";
  *     every client hashes the same bytes. Different rules -> different CID -> a signature
  *     gathered for one contest does not validate on another. (This is the CID of the whole
  *     criteria document, distinct from the `criteria.contest` slot-code field inside it.)
- *   - `votes`: each board + numeric vote.
+ *   - `votes`: each board (`{ name, publicKey }`) + numeric vote.
  *   - `blockNumber`: the LWW key and the bucketized block every verifier reads at.
  *
  * The `domain.chainId` is the eligibility chain, giving cross-chain/cross-app domain
@@ -25,25 +25,33 @@ import type { Vote } from "../schema/votes.js";
 
 /** EIP-712 domain name shared by every contest. */
 export const EIP712_DOMAIN_NAME = "bitsocial-votes";
-/** EIP-712 domain version. Bump only on a breaking change to the ballot layout. */
-export const EIP712_DOMAIN_VERSION = "1";
 /** The `type` tag carried in a bundle's {@link Signature} for an EIP-712 ballot signature. */
 export const EIP712_SIGNATURE_TYPE = "eip712";
 
 /**
  * The EIP-712 `types` struct — frozen for v1 (see DESIGN.md "Wire freeze (v1)"). Field
  * names and order are part of the type hash, so any change here is a breaking wire change
- * that must bump {@link EIP712_DOMAIN_VERSION} and re-freeze the conformance vector in
- * eip712.test.ts.
+ * that must re-freeze the conformance vector in eip712.test.ts. The domain deliberately
+ * carries no `version` field — nothing ever version-negotiates the domain, so a layout
+ * change is just a new frozen vector, not a version bump.
  *   - `criteria` is `bytes` (the raw binary CID, `cid.bytes`), not a string: hashing the
  *     canonical bytes avoids the multibase/version ambiguity a stringified CID would bake
  *     in, so independent clients recover identical signers.
  *   - `vote` is `int256` (signed) so a future criteria can widen the range to downvotes
  *     without a layout change; v1 is upvote-only.
+ *   - `board` is a `Board` struct (`{ name, publicKey }`). EIP-712 has no optional
+ *     fields, so `name` is always signed as a string — the empty string when the wire
+ *     vote carries no name. Board identity is `publicKey`; `name` is a display label and
+ *     does not affect the tally, so signing `""` vs. a name for the same `publicKey` is
+ *     the same board.
  */
 export const BALLOT_TYPES = {
+    Board: [
+        { name: "name", type: "string" },
+        { name: "publicKey", type: "string" }
+    ],
     Vote: [
-        { name: "board", type: "string" },
+        { name: "board", type: "Board" },
         { name: "vote", type: "int256" }
     ],
     Ballot: [
@@ -55,12 +63,12 @@ export const BALLOT_TYPES = {
 
 /** The EIP-712 typed-data object handed to viem to sign or to recover a signer from. */
 export interface BallotTypedData {
-    domain: { name: string; version: string; chainId: number };
+    domain: { name: string; chainId: number };
     types: typeof BALLOT_TYPES;
     primaryType: "Ballot";
     message: {
         criteria: `0x${string}`;
-        votes: { board: string; vote: bigint }[];
+        votes: { board: { name: string; publicKey: string }; vote: bigint }[];
         blockNumber: bigint;
     };
 }
@@ -86,12 +94,15 @@ export function ballotTypedData(args: {
     blockNumber: number;
 }): BallotTypedData {
     return {
-        domain: { name: EIP712_DOMAIN_NAME, version: EIP712_DOMAIN_VERSION, chainId: args.chainId },
+        domain: { name: EIP712_DOMAIN_NAME, chainId: args.chainId },
         types: BALLOT_TYPES,
         primaryType: "Ballot",
         message: {
             criteria: bytesToHex(args.criteriaCid),
-            votes: args.votes.map((v) => ({ board: v.board, vote: BigInt(v.vote) })),
+            votes: args.votes.map((v) => ({
+                board: { name: v.board.name ?? "", publicKey: v.board.publicKey },
+                vote: BigInt(v.vote)
+            })),
             blockNumber: BigInt(args.blockNumber)
         }
     };

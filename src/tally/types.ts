@@ -10,7 +10,12 @@
 
 /** One board's standing within a contest. */
 export interface BoardTally {
-    board: string;
+    /**
+     * The board this row aggregates. Rows are keyed by `board.publicKey`; `name` is a
+     * display label carried through from the votes (or the criteria candidate list) and
+     * never affects which votes fold into this row. See DESIGN.md "Votes wire".
+     */
+    board: { name?: string; publicKey: string };
     /** Summed weight of upvotes counted so far. */
     weight: number;
     /** True once every vote contributing to this row has passed full verification. */

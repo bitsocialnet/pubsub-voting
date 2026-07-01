@@ -27,7 +27,7 @@ const tally = await contest.getTally(); // allowed
 console.log(tally.ranking[0]?.board);
 
 try {
-    await contest.castVotes([{ board: "0xabc", vote: 1 }]); // throws ReadOnlyError
+    await contest.castVotes([{ board: { publicKey: "12D3KooW..." }, vote: 1 }]); // throws ReadOnlyError
 } catch (err) {
     if (err instanceof ReadOnlyError) console.log("cannot vote without a signer, as expected");
     else throw err;

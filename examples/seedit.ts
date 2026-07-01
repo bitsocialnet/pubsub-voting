@@ -38,7 +38,7 @@ console.log(`contest ${contest.criteria.contest} on topic ${contest.topic}`);
 const tally = await contest.getTally();
 console.log("ranking:", tally.ranking);
 
-await contest.castVotes([{ board: "12D3KooW...board", vote: 1 }]);
+await contest.castVotes([{ board: { publicKey: "12D3KooW...board" }, vote: 1 }]);
 
 // A host can also derive criteria from a manifest without constructing a voter at all
 // — pure, no network — e.g. to precompute topics for a directory index.

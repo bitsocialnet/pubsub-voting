@@ -37,7 +37,7 @@ for (const contest of contests) {
 // Cast a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
 const biz = contests.find((c) => c.criteria.contest === "biz");
 if (biz && !biz.readOnly) {
-    await biz.castVotes([{ board: "12D3KooW...someBoardAddress", vote: 1 }]);
+    await biz.castVotes([{ board: { name: "Business & Finance", publicKey: "12D3KooW...someBoardKey" }, vote: 1 }]);
     // Withdraw later by publishing an empty bundle:
     await biz.castVotes([]);
 }

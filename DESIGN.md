@@ -84,30 +84,32 @@ The point of the structure is that **rules are per-contest, not global**. `defau
 
 ```
 VotesBundle { address, votes: Vote[], blockNumber, signature }
-Vote        { board, vote }
+Vote        { board: { name?, publicKey }, vote }
 ```
 
-The contest is not on the wire as a field: one topic decides one contest, so the contest is implied by the topic the bundle was published to (and bound into the signature — see below). A vote names the `board` and a numeric `vote`. `address` is the voting wallet (the holder of the Pass / ERC-20) and MUST equal the address recovered from `signature`; it is carried so the LWW key and chain reads are available without re-recovering, and a forged `address` simply fails the recovery check.
+The contest is not on the wire as a field: one topic decides one contest, so the contest is implied by the topic the bundle was published to (and bound into the signature — see below). A vote names the `board` and a numeric `vote`. A `board` is a pkc-js community identity — `{ name?, publicKey }`, where `publicKey` is the B58 IPNS name (e.g. `12D3KooW…`, the same shape pkc-js uses) and `name` is an optional human label (which may be a resolvable domain like `business.eth`). `publicKey` is validated strictly as a base58btc IPNS key (pkc-js's `isIpns` check) and a domain or non-decodable string is rejected — stricter than pkc-js's own loose `z.string().min(1)` field, because this is the vote-identity boundary. **Board identity is `publicKey` alone**: the tally aggregates on `publicKey`, so two votes for the same board that disagree on (or omit) `name` still fold into one row and cannot be split or spoofed apart. Note `board.publicKey` is the *community's* identity, not the voter's — the voter is the eligibility-chain wallet in `address`. `address` is the voting wallet (the holder of the Pass / ERC-20) and MUST equal the address recovered from `signature`; it is carried so the LWW key and chain reads are available without re-recovering, and a forged `address` simply fails the recovery check.
 
 The eligibility-chain wallet signs the bundle directly as **EIP-712 typed data** (`viem.signTypedData`; verification is `viem.verifyTypedData` / `recoverTypedDataAddress`). There is no separate author and no author→wallet binding — the recovered signer *is* the voter. The signed message binds:
 
 - **the contest** — the criteria CID (equivalently the topic), carried as the raw binary CID bytes (see "Wire freeze"), so a signature can never be replayed onto another contest or another app's topic;
-- **the `votes`** (each `board` + numeric `vote`);
+- **the `votes`** (each `board` `{ name, publicKey }` + numeric `vote`);
 - **the `blockNumber`** — the LWW key and the bucketized block every verifier reads balances at.
 
-The EIP-712 `domain` is `{ name: "bitsocial-votes", version, chainId }` with `chainId` set to the eligibility chain, which gives cross-chain/cross-app domain separation for free. Constraints: `votes.length <= maxVotesPerAddress` (v1: 1, the one-vote-per-topic rule), and each `vote` within `voteSchema` (v1: exactly 1). An **empty `votes` array is always valid** — it is the withdrawal form (see "Cancelling a vote").
+The EIP-712 `domain` is `{ name: "bitsocial-votes", chainId }` with `chainId` set to the eligibility chain, which gives cross-chain/cross-app domain separation for free. There is deliberately no `version` field — nothing version-negotiates the domain, so a layout change is a new frozen vector, not a version bump. Constraints: `votes.length <= maxVotesPerAddress` (v1: 1, the one-vote-per-topic rule), and each `vote` within `voteSchema` (v1: exactly 1). An **empty `votes` array is always valid** — it is the withdrawal form (see "Cancelling a vote").
 
 #### Wire freeze (v1)
 
-The concrete EIP-712 `types` struct is frozen (see `src/signer/eip712.ts`, `BALLOT_TYPES`). Field names and order are part of the type hash, so any change is a breaking wire change that bumps `domain.version` and re-freezes the conformance vector:
+The concrete EIP-712 `types` struct is frozen (see `src/signer/eip712.ts`, `BALLOT_TYPES`). Field names and order are part of the type hash, so any change is a breaking wire change that re-freezes the conformance vector:
 
 ```
 Ballot { criteria: bytes, votes: Vote[], blockNumber: uint256 }
-Vote   { board: string, vote: int256 }
+Vote   { board: Board, vote: int256 }
+Board  { name: string, publicKey: string }
 ```
 
 - **`criteria` is `bytes`, not a string.** It carries the raw binary CID (`cid.bytes`, 36 bytes for a CIDv1/dag-cbor/sha2-256 criteria — so `bytes32` cannot hold it). Hashing the canonical bytes avoids the multibase/version ambiguity a stringified CID would bake in, so independent clients recover identical signers. Note this is the CID of the whole criteria document, distinct from the `criteria.contest` slot-code field inside it — the ballot field is named `criteria` (not `contest`) to avoid that collision.
 - **`vote` is `int256` (signed).** v1 is upvote-only, but signed leaves room for a future criteria to widen the range to downvotes without a layout change.
+- **`board` is a `Board` struct `{ name, publicKey }`.** `publicKey` is the B58 IPNS community name; `name` is a display label. EIP-712 has no optional fields, so `name` is always signed as a string — the **empty string** when the wire vote carries no name. Since board identity is `publicKey` (not `name`), signing `""` versus a name for the same `publicKey` is the same board to the tally; the `name` in the signature is just the voter's display claim.
 - **`blockNumber` is `uint256`.**
 - The freeze is pinned by a fixed conformance vector (known key → known hash, signature, recovered signer) in `src/signer/eip712.test.ts`. Those literals are the cross-client spec: an independent implementation must reproduce them byte-for-byte.
 

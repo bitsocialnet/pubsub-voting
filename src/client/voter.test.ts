@@ -62,13 +62,13 @@ describe("write path gating", () => {
     it("castVotes throws ReadOnlyError without a signer", async () => {
         const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
         const contest = await voter.contest(bizCriteria());
-        await expect(contest.castVotes([{ board: "b", vote: 1 }])).rejects.toBeInstanceOf(ReadOnlyError);
+        await expect(contest.castVotes([{ board: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(ReadOnlyError);
     });
 
     it("castVotes reaches the (unbuilt) engine when a signer is present", async () => {
         const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
         const contest = await voter.contest(bizCriteria());
-        await expect(contest.castVotes([{ board: "b", vote: 1 }])).rejects.toBeInstanceOf(NotImplementedError);
+        await expect(contest.castVotes([{ board: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(NotImplementedError);
     });
 
     it("getTally reaches the (unbuilt) engine", async () => {

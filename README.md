@@ -58,13 +58,13 @@ Construction throws `MissingPubsubError` or `MissingBlockstoreError` if the node
 const contest = await voter.contest(criteria); // criteria: one validated CriteriaSchema document
 await contest.start();
 const tally = await contest.getTally();
-const winner = tally.ranking[0]?.board;
+const winner = tally.ranking[0]?.board; // { name?: string, publicKey: string } — identity is publicKey
 ```
 
 ### Cast or withdraw a vote (needs a signer)
 
 ```ts
-await contest.castVotes([{ board: "12D3KooW...", vote: 1 }]); // v1: one upvote per topic
+await contest.castVotes([{ board: { publicKey: "12D3KooW..." }, vote: 1 }]); // board: { name?, publicKey } (B58 IPNS name); v1: one upvote per topic
 await contest.castVotes([]);                                  // withdraw: empty bundle supersedes under LWW
 ```
 
