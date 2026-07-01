@@ -24,7 +24,7 @@ This library does not start its own node. It consumes the host's running Helia n
 
 - **Settings live in the topic.** `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. Two peers on the same topic provably ran identical rules, so the network validates itself with no intermediary.
 - **Votes are a Merkle-CRDT.** A signed `Votes` bundle is a DAG node; only head CIDs travel over pubsub; missing history is fetched by CID. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves.
-- **Eligibility and weight are data, not code.** A fixed interpreter registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships `erc721-min-balance` eligibility (5chan Pass) and `constant` weight (1 pass = 1 vote), with `erc20-balance` / `sum` reserved for a pass + BSO combo.
+- **Eligibility and weight are data, not code.** A fixed interpreter registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships `erc721-min-balance` eligibility (5chan Pass) and `constant` weight (1 pass = 1 vote), with `erc20-balance` reserved for a pass + BSO combo (see [Weighted voting](#weighted-voting)).
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
 
@@ -93,7 +93,7 @@ Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a
 
 Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block. Chain-reading interpreters get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → number`, a non-negative score where `0` means "does not qualify". The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility > 0 ? weight : 0`. An interpreter that needs a threshold returns `0` below it (so `erc721-min-balance` and `erc20-balance`'s optional `min` can gate), which lets the same interpreter serve either slot.
 
-Built-ins: `erc721-min-balance` (v1), `constant` (v1), `erc20-balance` and `sum` (reserved for the pass + BSO combo). A host adds or shadows interpreters by `type` via the `interpreters` option — this is how clients like 5chan or seedit register custom rules without forking the library:
+Built-ins: `erc721-min-balance` (v1), `constant` (v1), and `erc20-balance` (reserved for the pass + BSO combo — see [Weighted voting](#weighted-voting)). A host adds or shadows interpreters by `type` via the `interpreters` option — this is how clients like 5chan or seedit register custom rules without forking the library:
 
 ```ts
 import { PubsubVoter, type Interpreter } from "@bitsocial/pubsub-votes";
@@ -114,6 +114,22 @@ const voter = new PubsubVoter({
 ```
 
 A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned to the topic it runs on, and a client that does not implement a `type` named in `criteria.requires.interpreters` throws `UnknownInterpreterError` and recuses itself rather than miscounting.
+
+### Weighted voting
+
+v1 ships `constant` weight (one Pass, one vote) **on purpose** — it resists whale dominance and downvote weaponization. But weight is a *magnitude*: any interpreter that returns a holding or balance turns votes into holder-weighted power with no engine change. Keep the Pass gate in `eligibility` and swap the `weight` slot:
+
+```ts
+import type { InterpreterRef } from "@bitsocial/pubsub-votes";
+
+// Among Pass-holders, voting power = BSO balance: 1000 BSO ⇒ 1000 votes.
+const bsoWeight: InterpreterRef = { type: "erc20-balance", chain: "base", contract: "0x…BSO", decimals: 18 };
+
+// Or one vote per Pass held — 5 Passes ⇒ 5 votes (the gate interpreter, reused as weight).
+const passCountWeight: InterpreterRef = { type: "erc721-min-balance", chain: "base", contract: "0x…Pass", min: 1 };
+```
+
+List every interpreter used in `criteria.requires.interpreters`. This is a **capability, not 5chan's default**: token-weighting carries governance/abuse questions, and balance-derived weight drops the lazy-tally ceiling (see [DESIGN.md, Open questions](./DESIGN.md#open-questions)). A full, derivable document is in [examples/weighted.ts](./examples/weighted.ts).
 
 ## Layout
 

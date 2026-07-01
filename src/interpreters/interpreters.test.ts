@@ -5,9 +5,8 @@ import type { ChainReadContext, Interpreter } from "./types.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
 import { constant } from "./constant.js";
 import { erc20Balance } from "./erc20-balance.js";
-import { sum } from "./sum.js";
 import { resolveRegistry, validateCriteriaInterpreters, builtinRegistry } from "./registry.js";
-import { NotImplementedError, UnknownInterpreterError } from "../errors.js";
+import { UnknownInterpreterError } from "../errors.js";
 import { bizCriteria } from "../test-fixtures.js";
 
 /**
@@ -54,14 +53,6 @@ describe("erc20-balance (weight, and gate when min is set)", () => {
         const options = { type: "erc20-balance" as const, chain: "base", contract: "0x0000000000000000000000000000000000000b50", decimals: 6, min: 100 };
         const score = await erc20Balance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc20: 1_500_000n }) }); // 1.5 < 100
         expect(score).toBe(0);
-    });
-});
-
-describe("sum (reserved combinator)", () => {
-    it("throws until its term-resolution protocol lands", async () => {
-        await expect(
-            sum.evaluate({ options: { type: "sum", terms: [{ type: "constant" }] }, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({}) })
-        ).rejects.toBeInstanceOf(NotImplementedError);
     });
 });
 

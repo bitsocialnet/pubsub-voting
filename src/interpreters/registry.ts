@@ -4,7 +4,6 @@ import { UnknownInterpreterError } from "../errors.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
 import { constant } from "./constant.js";
 import { erc20Balance } from "./erc20-balance.js";
-import { sum } from "./sum.js";
 
 /**
  * The interpreter registry: builtins, the shadowing resolver, and criteria validation.
@@ -22,8 +21,7 @@ import { sum } from "./sum.js";
 export const builtinRegistry: InterpreterRegistry = {
     [erc721MinBalance.type]: erc721MinBalance,
     [constant.type]: constant,
-    [erc20Balance.type]: erc20Balance,
-    [sum.type]: sum
+    [erc20Balance.type]: erc20Balance
 };
 
 /** type ids the v1 implementation guarantees; checked against `requires.interpreters`. */

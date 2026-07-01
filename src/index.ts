@@ -17,11 +17,11 @@ export * from "./schema/criteria.js";
 // numeric `evaluate` (the eligibility slot gates on `> 0`, the weight slot uses the
 // magnitude), plus the registry (built-ins, the host-shadowing resolver, and criteria
 // validation). The leaf interpreters read through the injected viem `PublicClient`
-// (`ctx.chain`); only the `sum` combinator is a stub.
+// (`ctx.chain`). Interpreter composition (combining several into one slot) is a
+// documented future extension, not a built-in — see DESIGN.md "Future improvements".
 export * from "./interpreters/erc721-min-balance.js";
 export * from "./interpreters/constant.js";
 export * from "./interpreters/erc20-balance.js";
-export * from "./interpreters/sum.js";
 export * from "./interpreters/registry.js";
 
 // Implemented runtime: encoding, topic, manifest, errors, identity seam, facade.
