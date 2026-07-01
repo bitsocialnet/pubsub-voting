@@ -91,11 +91,25 @@ The contest is not on the wire as a field: one topic decides one contest, so the
 
 The eligibility-chain wallet signs the bundle directly as **EIP-712 typed data** (`viem.signTypedData`; verification is `viem.verifyTypedData` / `recoverTypedDataAddress`). There is no separate author and no author→wallet binding — the recovered signer *is* the voter. The signed message binds:
 
-- **the contest** — the criteria CID (equivalently the topic), so a signature can never be replayed onto another contest or another app's topic;
+- **the contest** — the criteria CID (equivalently the topic), carried as the raw binary CID bytes (see "Wire freeze"), so a signature can never be replayed onto another contest or another app's topic;
 - **the `votes`** (each `board` + numeric `vote`);
 - **the `blockNumber`** — the LWW key and the bucketized block every verifier reads balances at.
 
 The EIP-712 `domain` is `{ name: "bitsocial-votes", version, chainId }` with `chainId` set to the eligibility chain, which gives cross-chain/cross-app domain separation for free. Constraints: `votes.length <= maxVotesPerAddress` (v1: 1, the one-vote-per-topic rule), and each `vote` within `voteSchema` (v1: exactly 1). An **empty `votes` array is always valid** — it is the withdrawal form (see "Cancelling a vote").
+
+#### Wire freeze (v1)
+
+The concrete EIP-712 `types` struct is frozen (see `src/signer/eip712.ts`, `BALLOT_TYPES`). Field names and order are part of the type hash, so any change is a breaking wire change that bumps `domain.version` and re-freezes the conformance vector:
+
+```
+Ballot { criteria: bytes, votes: Vote[], blockNumber: uint256 }
+Vote   { board: string, vote: int256 }
+```
+
+- **`criteria` is `bytes`, not a string.** It carries the raw binary CID (`cid.bytes`, 36 bytes for a CIDv1/dag-cbor/sha2-256 criteria — so `bytes32` cannot hold it). Hashing the canonical bytes avoids the multibase/version ambiguity a stringified CID would bake in, so independent clients recover identical signers. Note this is the CID of the whole criteria document, distinct from the `criteria.contest` slot-code field inside it — the ballot field is named `criteria` (not `contest`) to avoid that collision.
+- **`vote` is `int256` (signed).** v1 is upvote-only, but signed leaves room for a future criteria to widen the range to downvotes without a layout change.
+- **`blockNumber` is `uint256`.**
+- The freeze is pinned by a fixed conformance vector (known key → known hash, signature, recovered signer) in `src/signer/eip712.test.ts`. Those literals are the cross-client spec: an independent implementation must reproduce them byte-for-byte.
 
 ### Cancelling a vote
 
@@ -181,7 +195,6 @@ This library takes the host's Helia node directly and drives its gossipsub servi
 
 ## Open questions
 
-- **Exact EIP-712 type layout.** The signed-message *model* is decided (EIP-712 typed data signed by the voting wallet, domain `{ name: "bitsocial-votes", version, chainId }`, message binding contest CID + `votes` + `blockNumber` — see "Votes wire"). What remains is pinning the concrete `types` struct: field names/order, the encoding of the contest CID (string vs `bytes32`), and the `vote` field type (`uint256`). Settle this with a fixed test vector so every client recovers identical signers.
 - **Combinator interpreter protocol (`sum`, and any future `product`/`min`/`and`/`or`).** A combinator must resolve and invoke *other* interpreters, and each nested term may name its own `chain`. The current `ChainReadContext` exposes a single `chain` and no registry handle, so a combinator cannot recurse. Options: thread the resolved registry + a per-term chain selector into the eval context, or expand combinators at validation time into a resolved tree. Until decided, `sum.evaluate` throws `NotImplementedError`; `erc20-balance` and `constant` are leaves and work today.
 - **ERC-20 weight precision.** `erc20-balance` divides raw units by `decimals` to a JS `number` so the tally sorts as plain numbers; balances above ~2^53 base units after scaling lose precision. If exact large-balance weighting is needed, switch to `bigint` end-to-end (interpreter return + tally sort).
 - **Lazy-tally upper bounds for non-constant weight.** The bound-based early stop in "Tally" assumes each unverified vote has a cheap ceiling — trivially `1` for `constant`. `erc20-balance` and `sum` derive weight from chain reads, so they carry no free wire-side bound; lazy tally there needs a self-declared, verify-down balance, or it degrades to verifying every ranking-relevant vote. Decide alongside the combinator protocol.

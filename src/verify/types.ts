@@ -20,9 +20,9 @@ export type VerifyResult = VerifyOk | VerifyFail;
 /** Stage 1: ballot signature only. No chain access. */
 export interface OfflineBundleVerifier {
     /**
-     * Rebuild the EIP-712 ballot typed data from the contest CID + chainId + the bundle's
-     * `votes` and `blockNumber` (see signer/eip712.ts), recover the signer with
+     * Rebuild the EIP-712 ballot typed data from the criteria CID bytes + chainId + the
+     * bundle's `votes` and `blockNumber` (see signer/eip712.ts), recover the signer with
      * `viem.recoverTypedDataAddress`, and check it equals `bundle.address`. No chain read.
      */
-    verifyBundleSignature(args: { bundle: VotesBundle; contestCid: string; chainId: number }): Promise<VerifyResult>;
+    verifyBundleSignature(args: { bundle: VotesBundle; criteriaCid: Uint8Array; chainId: number }): Promise<VerifyResult>;
 }

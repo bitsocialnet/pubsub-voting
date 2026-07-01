@@ -10,8 +10,11 @@ import type { Vote } from "../schema/votes.js";
  *
  * The signature binds three things so a vote cannot be replayed onto another contest or
  * app, and cannot be re-stamped to a different block:
- *   - `contest`: the criteria CID (equivalently the topic). Different rules -> different
- *     CID -> a signature gathered for one contest does not validate on another.
+ *   - `criteria`: the criteria CID (equivalently the topic), carried as the raw binary
+ *     CID bytes (`cid.bytes`) so there is no multibase/version representation ambiguity —
+ *     every client hashes the same bytes. Different rules -> different CID -> a signature
+ *     gathered for one contest does not validate on another. (This is the CID of the whole
+ *     criteria document, distinct from the `criteria.contest` slot-code field inside it.)
  *   - `votes`: each board + numeric vote.
  *   - `blockNumber`: the LWW key and the bucketized block every verifier reads at.
  *
@@ -28,10 +31,15 @@ export const EIP712_DOMAIN_VERSION = "1";
 export const EIP712_SIGNATURE_TYPE = "eip712";
 
 /**
- * The EIP-712 `types` struct. `vote` is `int256` (signed) so a future criteria can widen
- * the range to downvotes without a layout change; v1 is upvote-only. Pinned here so every
- * client hashes byte-identical typed data — settle any change with a fixed test vector
- * (see DESIGN.md "Open questions").
+ * The EIP-712 `types` struct — frozen for v1 (see DESIGN.md "Wire freeze (v1)"). Field
+ * names and order are part of the type hash, so any change here is a breaking wire change
+ * that must bump {@link EIP712_DOMAIN_VERSION} and re-freeze the conformance vector in
+ * eip712.test.ts.
+ *   - `criteria` is `bytes` (the raw binary CID, `cid.bytes`), not a string: hashing the
+ *     canonical bytes avoids the multibase/version ambiguity a stringified CID would bake
+ *     in, so independent clients recover identical signers.
+ *   - `vote` is `int256` (signed) so a future criteria can widen the range to downvotes
+ *     without a layout change; v1 is upvote-only.
  */
 export const BALLOT_TYPES = {
     Vote: [
@@ -39,7 +47,7 @@ export const BALLOT_TYPES = {
         { name: "vote", type: "int256" }
     ],
     Ballot: [
-        { name: "contest", type: "string" },
+        { name: "criteria", type: "bytes" },
         { name: "votes", type: "Vote[]" },
         { name: "blockNumber", type: "uint256" }
     ]
@@ -51,10 +59,17 @@ export interface BallotTypedData {
     types: typeof BALLOT_TYPES;
     primaryType: "Ballot";
     message: {
-        contest: string;
+        criteria: `0x${string}`;
         votes: { board: string; vote: bigint }[];
         blockNumber: bigint;
     };
+}
+
+/** Lowercase `0x`-hex encoding of raw bytes, for the EIP-712 `bytes` message field. */
+function bytesToHex(bytes: Uint8Array): `0x${string}` {
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return `0x${hex}`;
 }
 
 /**
@@ -63,8 +78,8 @@ export interface BallotTypedData {
  * Integer fields are emitted as `bigint` (EIP-712 256-bit ints).
  */
 export function ballotTypedData(args: {
-    /** The criteria CID string (e.g. `(await criteriaCid(criteria)).toString()`). */
-    contestCid: string;
+    /** The criteria CID's raw binary bytes (`(await criteriaCid(criteria)).bytes`). */
+    criteriaCid: Uint8Array;
     /** The eligibility chain's numeric chainId (`criteria.requires.chains[chain].chainId`). */
     chainId: number;
     votes: Vote[];
@@ -75,7 +90,7 @@ export function ballotTypedData(args: {
         types: BALLOT_TYPES,
         primaryType: "Ballot",
         message: {
-            contest: args.contestCid,
+            criteria: bytesToHex(args.criteriaCid),
             votes: args.votes.map((v) => ({ board: v.board, vote: BigInt(v.vote) })),
             blockNumber: BigInt(args.blockNumber)
         }
