@@ -65,7 +65,7 @@ describe("ballotTypedData", () => {
         expect(h({ votes: [vote({ board: { publicKey: KEY_B } })] })).not.toBe(ref);
         expect(h({ votes: [vote({ vote: 2 })] })).not.toBe(ref);
         // `name` is part of the signed Board struct, so it changes the hash too.
-        expect(h({ votes: [vote({ board: { name: "Biz", publicKey: KEY_A } })] })).not.toBe(ref);
+        expect(h({ votes: [vote({ board: { name: "biz.bso", publicKey: KEY_A } })] })).not.toBe(ref);
     });
 });
 

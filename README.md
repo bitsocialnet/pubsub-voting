@@ -30,13 +30,14 @@ See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists 
 
 ## Usage
 
-The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects up to three seams into a single `PubsubVoter`:
+The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects up to four seams into a single `PubsubVoter`:
 
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`) and a `blockstore` (else `MissingBlockstoreError`) |
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; interpreters read through it for eligibility and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
+| `nameResolvers` | `NameResolver[]` | no | board-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `board.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
 
 ### Construct a voter
 
@@ -44,9 +45,10 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 import { PubsubVoter } from "@bitsocial/pubsub-votes";
 
 const voter = new PubsubVoter({
-  helia,                      // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
-  chains: viemChainFactory(), // ({ chain, config }) => viem PublicClient
-  signer: mySigner            // optional; omit → read-only voter
+  helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
+  chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
+  signer: mySigner,             // optional; omit → read-only voter
+  nameResolvers: [bsoResolver]  // optional; verifies board-name claims (e.g. @bitsocial/bso-resolver)
 });
 ```
 
@@ -67,6 +69,8 @@ const winner = tally.ranking[0]?.board; // { name?: string, publicKey: string } 
 await contest.castVotes([{ board: { publicKey: "12D3KooW..." }, vote: 1 }]); // board: { name?, publicKey } (B58 IPNS name); v1: one upvote per topic
 await contest.castVotes([]);                                  // withdraw: empty bundle supersedes under LWW
 ```
+
+A board's identity is its `publicKey`. The optional `name` is the board's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `board.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
 
 `castVotes` on a voter built without a `signer` throws `ReadOnlyError`.
 

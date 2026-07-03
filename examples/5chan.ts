@@ -13,20 +13,30 @@
  */
 import { readFileSync } from "node:fs";
 import stripJsonComments from "strip-json-comments";
-import { PubsubVoter, type HeliaInstance, type ChainClientFactory, type VoteSigner } from "@bitsocial/pubsub-votes";
+import {
+    PubsubVoter,
+    type HeliaInstance,
+    type ChainClientFactory,
+    type VoteSigner,
+    type NameResolver
+} from "@bitsocial/pubsub-votes";
 
 // The manifest is JSONC (commented for human readers), so strip comments before parsing.
 const manifest: unknown = JSON.parse(
     stripJsonComments(readFileSync(new URL("../5chan-directory-criteria.jsonc", import.meta.url), "utf8"))
 );
 
-// Host-provided seams. 5chan wires these from pkc + viem in its own code.
+// Host-provided seams. 5chan wires these from pkc + viem in its own code. The name
+// resolvers are the same instances 5chan already gives pkc-js (e.g. @bitsocial/
+// bso-resolver's BsoResolver for name.bso) — needed because votes carry board names,
+// whose name→publicKey claim the tally verifies before counting.
 declare function pkcHelia(): HeliaInstance; // pkc.clients.libp2pJsClients[key]._helia
 declare function viemChains(): ChainClientFactory;
 declare const signer: VoteSigner;
+declare const bsoResolver: NameResolver; // e.g. new BsoResolver({ key: "bso-viem", provider: "viem" })
 
 // One voter for the whole app. The Helia node (gossipsub + blockstore) is the only mandatory seam.
-const voter = new PubsubVoter({ helia: pkcHelia(), chains: viemChains(), signer });
+const voter = new PubsubVoter({ helia: pkcHelia(), chains: viemChains(), signer, nameResolvers: [bsoResolver] });
 
 // Derive every directory slot from the manifest: 63 contests, one topic each.
 const contests = await voter.contestsFromManifest(manifest);
@@ -43,7 +53,9 @@ for (const contest of contests) {
 // Cast a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
 const biz = contests.find((c) => c.criteria.contest === "biz");
 if (biz && !biz.readOnly) {
-    await biz.castVotes([{ board: { name: "Business & Finance", publicKey: "12D3KooW...someBoardKey" }, vote: 1 }]);
+    // `name` must be the board's resolvable domain (unique per community); the tally
+    // drops any vote whose name does not resolve to the claimed publicKey.
+    await biz.castVotes([{ board: { name: "bizfinance.bso", publicKey: "12D3KooW...someBoardKey" }, vote: 1 }]);
     // Withdraw later by publishing an empty bundle:
     await biz.castVotes([]);
 }

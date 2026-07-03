@@ -1,6 +1,6 @@
 import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
 import type { Vote, VotesBundle } from "../schema/votes.js";
-import type { ChainClient, ChainClientFactory, ChainClients } from "../chain/types.js";
+import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
 import type { BlockstoreLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import { requireHeliaServices } from "../transport/helia.js";
 import type { InterpreterRegistry } from "../interpreters/types.js";
@@ -21,9 +21,9 @@ import { NotImplementedError, ReadOnlyError } from "../errors.js";
  *     should not wire dependencies 63 times.
  *   - `VoteNetwork`: one contest (one topic). Join, sync, cast, read the tally.
  *
- * The three injected seams (helia, chains, signer) are the ONLY host contact surface,
- * so the same core runs under pkc-js, plebbit, or a raw node. The host passes its
- * running Helia node directly — no adapter — and the library drives that node's
+ * The injected seams (helia, chains, signer, nameResolvers) are the ONLY host contact
+ * surface, so the same core runs under pkc-js, plebbit, or a raw node. The host passes
+ * its running Helia node directly — no adapter — and the library drives that node's
  * gossipsub service and blockstore itself. A voter built without a `signer` is read-only.
  */
 
@@ -88,6 +88,15 @@ export interface PubsubVoterOptions {
     signer?: VoteSigner;
     /** Interpreter overrides that shadow built-ins by `type` (a flat `type -> interpreter` map). */
     interpreters?: InterpreterRegistry;
+    /**
+     * Board-name resolvers, same instances a host gives pkc-js (e.g.
+     * `@bitsocial/bso-resolver` for `name.bso`). The tally resolves each vote's
+     * `board.name` claim through the first resolver whose `canResolve` matches and
+     * drops bundles whose name does not resolve to the claimed `publicKey`. Omit only
+     * if no contest's votes carry names — with no resolver for a carried name's TLD,
+     * the claim cannot be verified and the bundle is dropped (never counted unchecked).
+     */
+    nameResolvers?: NameResolver[];
 }
 
 interface ResolvedDeps {
@@ -100,6 +109,8 @@ interface ResolvedDeps {
     signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
     registry: InterpreterRegistry;
+    /** Board-name resolvers for verifying `board.name` claims at tally time. */
+    nameResolvers: NameResolver[];
 }
 
 /** One contest. The pure parts (criteria, topic, read-only) are live; the engine is pending. */
@@ -151,9 +162,10 @@ class ContestNetwork implements VoteNetwork {
 /**
  * The default `VoteClient`. Construct with the host-injected seams: a `helia` node
  * (the only mandatory one — the library never starts or assumes a particular node, but
- * the node must carry a gossipsub service and a blockstore), a `chains` factory, and an
- * optional `signer`. The library has no knowledge of pkc-js or any other host: a host
- * passes its own running Helia node in directly.
+ * the node must carry a gossipsub service and a blockstore), a `chains` factory, an
+ * optional `signer`, and optional `nameResolvers` (needed once votes carry board
+ * names). The library has no knowledge of pkc-js or any other host: a host passes its
+ * own running Helia node in directly.
  */
 export class PubsubVoter implements VoteClient {
     readonly #deps: ResolvedDeps;
@@ -171,7 +183,8 @@ export class PubsubVoter implements VoteClient {
             blockstore,
             chains: options.chains,
             signer: options.signer,
-            registry: resolveRegistry(options.interpreters)
+            registry: resolveRegistry(options.interpreters),
+            nameResolvers: options.nameResolvers ?? []
         };
     }
 

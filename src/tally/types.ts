@@ -11,9 +11,11 @@
 /** One board's standing within a contest. */
 export interface BoardTally {
     /**
-     * The board this row aggregates. Rows are keyed by `board.publicKey`; `name` is a
-     * display label carried through from the votes (or the criteria candidate list) and
-     * never affects which votes fold into this row. See DESIGN.md "Votes wire".
+     * The board this row aggregates. Rows are keyed by `board.publicKey`; `name` is the
+     * board's resolvable domain carried through from the votes. It never affects which
+     * votes fold into this row, but it is not unchecked either: bundles whose name did
+     * not resolve to the claimed `publicKey` were dropped before aggregation, so a name
+     * surfacing here matched the registry. See DESIGN.md "Votes wire" and "Tally".
      */
     board: { name?: string; publicKey: string };
     /** Summed weight of upvotes counted so far. */

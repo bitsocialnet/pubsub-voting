@@ -4,8 +4,13 @@ import type { VotesBundle } from "../schema/votes.js";
  * Verification interfaces, design only.
  *
  * Verification has one cheap, offline stage (no chain reads) and one chain stage:
- *   1. ballot signature: recover the EIP-712 signer and check it equals bundle.address
- *   2. eligibility + weight: interpreters read chain state at the bucket block
+ *   1. offline: recover the EIP-712 signer and check it equals bundle.address, and the
+ *      criteria-bound constraints (votes.length <= maxVotesPerAddress, vote in range).
+ *      Pairwise-distinct board.publicKeys is enforced even earlier, by
+ *      VotesBundleSchema at parse time (see DESIGN.md "Votes wire")
+ *   2. chain: eligibility + weight interpreters read state at the bucket block, and
+ *      each vote's board.name claim is resolved through the injected nameResolvers
+ *      (a name that does not resolve to the claimed publicKey drops the bundle)
  *
  * The tally runs stage 2 lazily (only where it can change the visible ranking), so the
  * cheap offline check is split out and runs first — a bad signature drops a vote for zero
