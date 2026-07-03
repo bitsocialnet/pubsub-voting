@@ -9,7 +9,19 @@ import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { topicFor } from "../topic.js";
 import { deriveCriteria } from "../manifest/manifest.js";
+import type { VoteStore } from "../store/types.js";
+import { selectVoteStore } from "../store/select.js";
 import { NotImplementedError, ReadOnlyError } from "../errors.js";
+
+/**
+ * How often to republish a live vote, in buckets: half its expiry window, rounded up. A
+ * bundle is valid for `voteExpiryBuckets` after its `blockNumber` (see DESIGN.md "Passive
+ * expiry"), so re-signing at the halfway point leaves one full missed cycle of slack before
+ * the vote decays. Derived per-contest from the criteria — there is no global interval.
+ */
+export function republishIntervalBuckets(criteria: Criteria): number {
+    return Math.ceil(criteria.voteExpiryBuckets / 2);
+}
 
 /**
  * Public facade.
@@ -63,8 +75,24 @@ export interface VoteClient {
     contest(criteria: Criteria): Promise<VoteNetwork>;
     /** Derive every contest from a 5chan-style manifest and return one network each. */
     contestsFromManifest(manifest: unknown): Promise<VoteNetwork[]>;
+    /**
+     * Join every contest from the constructor `manifest` (if one was given, else the
+     * already-cached contests), start each network, and arm the republish scheduler that
+     * keeps this wallet's own votes alive by re-signing them with a fresh `blockNumber` on
+     * the liveness cadence (`ceil(voteExpiryBuckets / 2)` buckets per contest). Idempotent
+     * to the extent contests cache by topic.
+     */
+    start(): Promise<void>;
+    /** Stop the republish scheduler and leave every topic. The client stays reusable. */
+    stop(): Promise<void>;
     /** Stop every contest this client started. */
     stopAll(): Promise<void>;
+    /**
+     * Full teardown: stop the republish scheduler, leave every topic, and dispose the vote
+     * store (release its DB/file handles). Use when discarding the voter; unlike `stop`,
+     * the store is closed, so the client is not meant to be reused after `destroy`.
+     */
+    destroy(): Promise<void>;
 }
 
 /** Construction options for {@link PubsubVoter}. */
@@ -86,6 +114,21 @@ export interface PubsubVoterOptions {
     chains: ChainClientFactory;
     /** Identity. Omit for a read-only voter (renders tallies, cannot cast). */
     signer?: VoteSigner;
+    /**
+     * A 5chan-style directory manifest this voter owns. When given, `start()` derives every
+     * contest from it (via `deriveCriteria`) and keeps them all republished under one
+     * lifecycle. Optional: a voter can instead mint contests ad hoc through `contest()` /
+     * `contestsFromManifest()` and never set this.
+     */
+    manifest?: unknown;
+    /**
+     * Directory for the voter's persistence, Node only — the same `dataPath` convention
+     * pkc-js and `@bitsocial/bso-resolver` use. When set, the Node backend keeps this
+     * wallet's vote intents in a SQLite file inside this directory, so republishing survives
+     * a restart (see DESIGN.md "Persistence"). Ignored in the browser, which uses IndexedDB.
+     * Optional: with no `dataPath` on Node, persistence is in-memory (lost on restart).
+     */
+    dataPath?: string;
     /** Interpreter overrides that shadow built-ins by `type` (a flat `type -> interpreter` map). */
     interpreters?: InterpreterRegistry;
     /**
@@ -111,6 +154,8 @@ interface ResolvedDeps {
     registry: InterpreterRegistry;
     /** Board-name resolvers for verifying `board.name` claims at tally time. */
     nameResolvers: NameResolver[];
+    /** Persistence for this voter's own vote intents (in-memory unless a host injects one). */
+    store: VoteStore;
 }
 
 /** One contest. The pure parts (criteria, topic, read-only) are live; the engine is pending. */
@@ -146,6 +191,9 @@ class ContestNetwork implements VoteNetwork {
 
     async castVotes(_votes: Vote[]): Promise<VotesBundle> {
         if (this.#deps.signer === undefined) throw new ReadOnlyError();
+        // When the engine lands this also writes the chosen boards to `this.#deps.store`
+        // (a VoteIntent keyed by this topic) so the republish scheduler can re-sign them
+        // with a fresh blockNumber after a restart. See DESIGN.md "Persistence".
         throw new NotImplementedError("VoteNetwork.castVotes (sign + CRDT add + broadcast)");
     }
 
@@ -171,6 +219,14 @@ export class PubsubVoter implements VoteClient {
     readonly #deps: ResolvedDeps;
     /** Cache of live contests, keyed by topic so identical criteria share one network. */
     readonly #contests = new Map<string, ContestNetwork>();
+    /** The directory manifest this voter owns, if any; `start()` derives its contests. */
+    readonly #manifest: unknown;
+    /**
+     * Live republish timers, one per contest, cleared by `stop()` / `destroy()`. The
+     * registry and its teardown are real now; arming it (the re-sign tick) lands with the
+     * engine — see `#armRepublishScheduler`.
+     */
+    readonly #republishTimers = new Set<ReturnType<typeof setInterval>>();
 
     constructor(options: PubsubVoterOptions) {
         // Fail fast: the node must expose a gossipsub service and a blockstore. Throws
@@ -184,8 +240,10 @@ export class PubsubVoter implements VoteClient {
             chains: options.chains,
             signer: options.signer,
             registry: resolveRegistry(options.interpreters),
-            nameResolvers: options.nameResolvers ?? []
+            nameResolvers: options.nameResolvers ?? [],
+            store: selectVoteStore(options.dataPath)
         };
+        this.#manifest = options.manifest;
     }
 
     get readOnly(): boolean {
@@ -207,7 +265,50 @@ export class PubsubVoter implements VoteClient {
         return Promise.all(deriveCriteria(manifest).map((criteria) => this.contest(criteria)));
     }
 
+    async start(): Promise<void> {
+        const networks =
+            this.#manifest !== undefined
+                ? await this.contestsFromManifest(this.#manifest)
+                : [...this.#contests.values()];
+        for (const network of networks) {
+            // Throws NotImplementedError today (transport + CRDT sync pending); once the
+            // engine lands this joins the topic and unions heads from peers.
+            await network.start();
+        }
+        this.#armRepublishScheduler(networks);
+    }
+
+    async stop(): Promise<void> {
+        this.#clearRepublishTimers();
+        await this.stopAll();
+    }
+
     async stopAll(): Promise<void> {
         await Promise.all([...this.#contests.values()].map((network) => network.stop()));
+    }
+
+    async destroy(): Promise<void> {
+        this.#clearRepublishTimers();
+        await this.stopAll();
+        await this.#deps.store.destroy?.();
+    }
+
+    /** Clear every armed republish timer. Safe when none are armed. */
+    #clearRepublishTimers(): void {
+        for (const timer of this.#republishTimers) clearInterval(timer);
+        this.#republishTimers.clear();
+    }
+
+    /**
+     * Arm the per-contest republish loop. Deferred with the engine: each contest's tick
+     * will reload its `VoteIntent` from `this.#deps.store`, re-sign it with a fresh
+     * `blockNumber` via `castVotes`, and `store.put` the bumped `lastBucket`, on the
+     * `republishIntervalBuckets(criteria)` cadence — populating `#republishTimers` so
+     * `stop()` / `destroy()` can tear it down. Throws until built.
+     */
+    #armRepublishScheduler(_networks: VoteNetwork[]): void {
+        throw new NotImplementedError(
+            "PubsubVoter republish scheduler (re-sign + rebroadcast on the liveness cadence)"
+        );
     }
 }

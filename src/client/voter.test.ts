@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { PubsubVoter } from "./voter.js";
+import { PubsubVoter, republishIntervalBuckets } from "./voter.js";
+import { MemoryVoteStore } from "../store/memory.js";
+import { selectVoteStore } from "../store/select.js";
 import { MissingBlockstoreError, MissingPubsubError, NotImplementedError, ReadOnlyError } from "../errors.js";
 import { topicFor } from "../topic.js";
 import {
@@ -10,6 +12,12 @@ import {
     fakeChains,
     fakeSigner
 } from "../test-fixtures.js";
+
+/** A minimal directory manifest deriving one contest (the /biz/ slot) from the shared fixture. */
+function bizManifest(): unknown {
+    const { name, contest, ...defaults } = bizCriteria();
+    return { name: "test-directory", defaults, contests: [{ contest, name }] };
+}
 
 describe("PubsubVoter construction + read-only", () => {
     it("is read-only without a signer", () => {
@@ -75,5 +83,71 @@ describe("write path gating", () => {
         const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
         const contest = await voter.contest(bizCriteria());
         await expect(contest.getTally()).rejects.toBeInstanceOf(NotImplementedError);
+    });
+});
+
+describe("republish cadence", () => {
+    it("republishes at half the expiry window, rounded up", () => {
+        expect(republishIntervalBuckets(bizCriteria())).toBe(15); // voteExpiryBuckets: 30
+        expect(republishIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 7 })).toBe(4);
+        expect(republishIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 1 })).toBe(1);
+    });
+});
+
+describe("selectVoteStore", () => {
+    it("returns an in-memory store until the Node/browser backends land", () => {
+        expect(selectVoteStore("./data")).toBeInstanceOf(MemoryVoteStore);
+        expect(selectVoteStore(undefined)).toBeInstanceOf(MemoryVoteStore);
+    });
+});
+
+describe("MemoryVoteStore", () => {
+    it("round-trips put / get / list / delete", async () => {
+        const store = new MemoryVoteStore();
+        expect(await store.list()).toEqual([]);
+        const intent = { topic: "bitsocial-votes/x", address: "0xabc", votes: [], lastBucket: 42 };
+        await store.put(intent);
+        expect(await store.get("bitsocial-votes/x")).toEqual(intent);
+        expect(await store.list()).toEqual([intent]);
+        // put replaces by topic (last write wins, mirroring the CRDT).
+        await store.put({ ...intent, lastBucket: 43 });
+        expect((await store.get("bitsocial-votes/x"))?.lastBucket).toBe(43);
+        await store.delete("bitsocial-votes/x");
+        expect(await store.get("bitsocial-votes/x")).toBeUndefined();
+        expect(await store.list()).toEqual([]);
+    });
+});
+
+describe("PubsubVoter lifecycle", () => {
+    it("accepts a manifest and a dataPath at construction (Node persistence)", () => {
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: fakeChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest(),
+            dataPath: "./.votes-test"
+        });
+        expect(voter.readOnly).toBe(false);
+    });
+
+    it("start() reaches the (unbuilt) engine", async () => {
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: fakeChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest()
+        });
+        await expect(voter.start()).rejects.toBeInstanceOf(NotImplementedError);
+    });
+
+    it("destroy() is a safe teardown, even before start()", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        await expect(voter.destroy()).resolves.toBeUndefined();
+    });
+
+    it("stop() leaves topics and stays reusable", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        await voter.contest(bizCriteria());
+        await expect(voter.stop()).resolves.toBeUndefined();
     });
 });

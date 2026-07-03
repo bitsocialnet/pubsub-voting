@@ -35,16 +35,31 @@ declare function viemChains(): ChainClientFactory;
 declare const signer: VoteSigner;
 declare const bsoResolver: NameResolver; // e.g. new BsoResolver({ key: "bso-viem", provider: "viem" })
 
-// One voter for the whole app. The Helia node (gossipsub + blockstore) is the only mandatory seam.
-const voter = new PubsubVoter({ helia: pkcHelia(), chains: viemChains(), signer, nameResolvers: [bsoResolver] });
+// One voter for the whole app. The manifest is owned by the voter, so a single
+// `voter.start()` joins all 63 directory contests and keeps this wallet's votes
+// republished (re-signed with a fresh blockNumber on each contest's liveness cadence).
+// The Helia node (gossipsub + blockstore) is the only mandatory seam. `dataPath` (Node,
+// same convention as pkc-js) keeps this wallet's vote intents in a SQLite file so
+// republishing resumes after a restart.
+const voter = new PubsubVoter({
+    helia: pkcHelia(),
+    chains: viemChains(),
+    signer,
+    nameResolvers: [bsoResolver],
+    manifest,
+    dataPath: "./.5chan-votes"
+});
 
-// Derive every directory slot from the manifest: 63 contests, one topic each.
+// Join every slot and arm republishing in one call.
+await voter.start();
+
+// Derive the same 63 contests to render the homepage (contestsFromManifest caches by topic,
+// so these are the very networks start() joined).
 const contests = await voter.contestsFromManifest(manifest);
 console.log(`joined ${contests.length} directory contests`);
 
 // Render the homepage: the winning board for each slot.
 for (const contest of contests) {
-    await contest.start();
     const tally = await contest.getTally();
     const winner = tally.ranking[0]?.board ?? "(no votes yet)";
     console.log(`${contest.criteria.contest}: ${winner}  [topic ${contest.topic}]`);
@@ -59,3 +74,6 @@ if (biz && !biz.readOnly) {
     // Withdraw later by publishing an empty bundle:
     await biz.castVotes([]);
 }
+
+// On shutdown: stop every republish loop, leave all topics, and dispose the vote store.
+await voter.destroy();

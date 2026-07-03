@@ -30,6 +30,10 @@ export * from "./topic.js";
 export * from "./manifest/manifest.js";
 export * from "./errors.js";
 export * from "./client/voter.js";
+// Vote-intent persistence is internal: the voter selects a backend by environment (SQLite
+// under `dataPath` on Node, IndexedDB in the browser) — there is no host-facing store seam,
+// only the `dataPath` option. The `VoteStore` contract and backends stay in `src/store/`.
+// See DESIGN.md "Persistence".
 // Identity seam: the EIP-712 ballot builder + constants a host needs to implement a
 // signer, plus the signer interface itself.
 export * from "./signer/eip712.js";

@@ -30,7 +30,7 @@ See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists 
 
 ## Usage
 
-The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects up to four seams into a single `PubsubVoter`:
+The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects its seams into a single `PubsubVoter`:
 
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
@@ -38,6 +38,8 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; interpreters read through it for eligibility and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | board-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `board.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
+| `manifest` | `unknown` | no | a directory manifest this voter owns; `voter.start()` derives every contest from it and keeps them republished under one lifecycle (see [Lifecycle](#lifecycle-start--stop--destroy)) |
+| `dataPath` | `string` | no | Node only: directory for the SQLite file that persists this voter's vote intents so republishing survives a restart (the same `dataPath` convention as pkc-js / `@bitsocial/bso-resolver`). In the browser the voter uses IndexedDB; with no `dataPath` on Node, persistence is in-memory (lost on restart) |
 
 ### Construct a voter
 
@@ -80,6 +82,23 @@ A 5chan-style directory manifest derives one contest (one topic) per slot:
 
 ```ts
 const contests = await voter.contestsFromManifest(manifest); // → VoteNetwork[]
+```
+
+### Lifecycle (`start` / `stop` / `destroy`)
+
+Pass the `manifest` at construction and let one lifecycle own every contest. `start()` joins them all and arms a republish loop that keeps this wallet's votes alive by re-signing them with a fresh `blockNumber` on a per-contest cadence — `ceil(voteExpiryBuckets / 2)` buckets, half the expiry window, so a missed cycle still has slack. `stop()` leaves the topics (reusable); `destroy()` also disposes the vote store.
+
+```ts
+const voter = new PubsubVoter({ helia, chains, signer, manifest }); // manifest owned by the voter
+await voter.start();     // join every contest + start republishing this wallet's votes
+// … app runs …
+await voter.destroy();   // stop the republish loops, leave all topics, dispose the store
+```
+
+Persistence is what lets republishing survive a restart: the voter stores its own re-signable *intent* per contest (which boards it picked), not the signed bundles. On Node, pass `dataPath` to keep those intents in a SQLite file under that directory; in the browser the voter uses IndexedDB automatically; with no `dataPath` on Node, persistence is in-memory and lost on restart.
+
+```ts
+const voter = new PubsubVoter({ helia, chains, signer, manifest, dataPath: "./.bitsocial-votes" }); // Node: SQLite under dataPath
 ```
 
 ### Pure helpers (no node, no network)
@@ -144,6 +163,7 @@ src/
   topic.ts       topic = "bitsocial-votes/" + CID(dag-cbor)       [implemented]
   manifest/      derive one criteria document per contest         [implemented]
   signer/        VoteSigner seam + EIP-712 ballot typed data       [implemented]
+  store/         vote-intent persistence (Node SQLite / browser IDB) [memory impl; backends design]
   client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
   errors.ts      NotImplemented/ReadOnly/MissingPubsub/Blockstore [implemented]
   interpreters/  one file per `type` + registry/resolver           [leaves implemented]
