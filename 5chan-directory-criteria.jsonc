@@ -1,24 +1,39 @@
+// JSONC: comments are for human readers only — strip them (e.g. with `strip-json-comments`)
+// before JSON.parse. Nothing in this file is ever encoded or published; see `description`.
 {
   "name": "5chan directory voting",
   "description": "Authoring manifest for every 5chan directory contest. This file is NOT a criteria document and is never encoded or published. Per the @bitsocial/pubsub-votes model the rules live INSIDE each criteria document, and there is one document (and one pubsub topic) per contest. There is no global rule at runtime. The client derives one complete, standalone criteria document per contest by shallow-merging each `contests` entry over `defaults`: criteria = { ...defaults, ...entry } (entry contributes `name`, `contest`, and any rule fields it overrides; an override replaces that whole top-level field, no deep merge). `defaults` is purely a DRY authoring convenience that is flattened away at derivation. Each derived document is canonically dag-cbor encoded and its CID is the topic: topic = \"bitsocial-votes/\" + CID(dag-cbor(criteria)); editing `defaults` re-forks every inheriting contest in lockstep, editing one entry forks only that contest. In 5chan v1 every slot is gated by the same 5chan Pass, so almost all contests just inherit `defaults`; the /q/ entry below carries an illustrative `eligibility` override to show that eligibility, weight, vote bounds, expiry, and `requires` are all per-contest, not global.",
+  // Rule fields inherited by every contest below unless its entry overrides them
+  // (shallow merge; an override replaces the whole top-level field, no deep merge).
   "defaults": {
+    // Allowed numeric range for each vote value; v1 is upvote-only, so exactly 1.
     "voteSchema": {
       "min": 1,
       "max": 1
     },
+    // Max boards one wallet may vote for in a single bundle (approval cap); v1: one per topic.
     "maxVotesPerAddress": 1,
+    // Block-bucket size: every verifier reads balances at one canonical block per bucket,
+    // making the tally deterministic; 43200 Base blocks (2s each) = 1 day per bucket.
+    // On Ethereum mainnet (12s blocks) the day-sized equivalent would be 7200.
     "blocksPerBucket": 43200,
+    // How many buckets a bundle stays valid after its blockNumber; 30 day-buckets ≈ 30 days,
+    // after which the vote expires unless the client re-signs it and publish again.
     "voteExpiryBuckets": 30,
+    // Who may vote: gate a wallet in or out (here: hold ≥ min of the 5chan Pass ERC-721 on Base).
     "eligibility": {
       "type": "erc721-min-balance",
       "chain": "base",
       "contract": "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
       "min": 1
     },
+    // How much an eligible vote counts (here: constant, one pass = one vote).
     "weight": {
       "type": "constant",
       "value": 1
     },
+    // Dependency manifest + version negotiation: the interpreters and chain RPC config
+    // a client must support to verify this contest.
     "requires": {
       "interpreters": [
         "erc721-min-balance",
@@ -34,6 +49,8 @@
       }
     }
   },
+  // One entry per directory slot; the derived criteria is { ...defaults, ...entry },
+  // giving each slot its own standalone document and pubsub topic.
   "contests": [
     {
       "contest": "3",
@@ -176,6 +193,7 @@
       "name": "/pw/ - Professional Wrestling"
     },
     {
+      // Illustrative per-contest override: /q/ raises the gate to two Passes.
       "contest": "q",
       "name": "/q/ - 5chan Feedback",
       "eligibility": {

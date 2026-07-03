@@ -11,8 +11,14 @@
  * Type-checks against the public API; the live engine methods throw `NotImplementedError`
  * until built.
  */
+import { readFileSync } from "node:fs";
+import stripJsonComments from "strip-json-comments";
 import { PubsubVoter, type HeliaInstance, type ChainClientFactory, type VoteSigner } from "@bitsocial/pubsub-votes";
-import manifest from "../5chan-directory-criteria.json" with { type: "json" };
+
+// The manifest is JSONC (commented for human readers), so strip comments before parsing.
+const manifest: unknown = JSON.parse(
+    stripJsonComments(readFileSync(new URL("../5chan-directory-criteria.jsonc", import.meta.url), "utf8"))
+);
 
 // Host-provided seams. 5chan wires these from pkc + viem in its own code.
 declare function pkcHelia(): HeliaInstance; // pkc.clients.libp2pJsClients[key]._helia

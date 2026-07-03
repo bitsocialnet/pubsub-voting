@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
+import stripJsonComments from "strip-json-comments";
 import { deriveCriteria, mergeCriteria, DirectoryManifestSchema } from "./manifest.js";
 import { topicFor } from "../topic.js";
 
-/** The real 5chan example manifest (illustration file at the repo root). */
+/** The real 5chan example manifest (illustration JSONC file at the repo root). */
 function fiveChanManifest(): unknown {
-    return JSON.parse(readFileSync(new URL("../../5chan-directory-criteria.json", import.meta.url), "utf8"));
+    return JSON.parse(stripJsonComments(readFileSync(new URL("../../5chan-directory-criteria.jsonc", import.meta.url), "utf8")));
 }
 
 const defaults = {
