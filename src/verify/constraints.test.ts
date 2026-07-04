@@ -14,27 +14,34 @@ const bundle = (votes: VotesBundle["votes"]): VotesBundle => ({
     signature: { signature: "0xsig", type: "eip712" }
 });
 
-describe("checkBundleConstraints — votes.length <= maxVotesPerAddress (runtime, criteria-bound)", () => {
-    // Reproduce-first pin (see AGENTS.md "When implementing later"): with the v1 cap of 1, a
-    // wallet voting for two *different* communities exceeds maxVotesPerAddress and must be
-    // rejected. Both boards are distinct and legal at the wire layer (VotesBundleSchema
-    // accepts the bundle), so this cannot be caught at parse time — it is a runtime check
-    // against the criteria, which is why it lives here in the verify layer.
-    //
-    // Marked `it.fails` because checkBundleConstraints is design-only and throws
-    // NotImplementedError today, so the suite stays green (AGENTS.md forbids committing
-    // failing/skipped tests). The assertion below is the *desired* end-state. When the
-    // offline verify stage lands and implements the cap, this test starts passing, which
-    // flips `it.fails` red — the signal to drop `.fails` and keep it as a real test.
-    it.fails("rejects a bundle with more votes than maxVotesPerAddress (v1 = 1)", () => {
-        const criteria = bizCriteria(); // maxVotesPerAddress = 1
+describe("checkBundleConstraints — criteria-bound offline checks", () => {
+    // With the v1 cap of 1, a wallet voting for two *different* communities exceeds
+    // maxVotesPerAddress and must be rejected. Both boards are distinct and legal at the
+    // wire layer (VotesBundleSchema accepts the bundle), so this cannot be caught at parse
+    // time — it is a runtime check against the criteria, which is why it lives here.
+    it("rejects a bundle with more votes than maxVotesPerAddress (v1 = 1)", () => {
         const result = checkBundleConstraints(
             bundle([
                 { board: { publicKey: KEY }, vote: 1 },
                 { board: { publicKey: KEY_B }, vote: 1 }
             ]),
-            criteria
+            bizCriteria()
         );
         expect(result.valid).toBe(false);
+    });
+
+    it("accepts a single-board bundle within the cap", () => {
+        const result = checkBundleConstraints(bundle([{ board: { publicKey: KEY }, vote: 1 }]), bizCriteria());
+        expect(result.valid).toBe(true);
+    });
+
+    it("rejects a vote outside voteSchema (v1 range is [1, 1])", () => {
+        const result = checkBundleConstraints(bundle([{ board: { publicKey: KEY }, vote: 2 }]), bizCriteria());
+        expect(result.valid).toBe(false);
+    });
+
+    it("accepts an empty votes array (withdrawal) regardless of the cap", () => {
+        const result = checkBundleConstraints(bundle([]), bizCriteria());
+        expect(result.valid).toBe(true);
     });
 });

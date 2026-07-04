@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: foundation + facade implemented; engine still design.** Implemented and unit-tested today: the zod schemas, canonical dag-cbor encoding, topic derivation, manifest derivation, and the `PubsubVoter` facade (construction, per-contest caching, read-only enforcement). The live engine — CRDT, transport, verify, tally, chain reads — is still design-only, so `start`/`getTally`/`castVotes` throw `NotImplementedError` for now. See [DESIGN.md](./DESIGN.md) for the architecture, build order, and [open questions](./DESIGN.md#open-questions).
+> **Status: engine implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain eligibility + board-name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's **validate-before-forward gossip gate** are all implemented — so `start`, `castVotes`, and `getTally` are live. The gate runs the full validity pipeline in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, ineligible wallet, squatted name) is never propagated and `reject` scores the sender. The remaining stub is the `PubsubVoter` client-level republish scheduler. See [DESIGN.md](./DESIGN.md) for the architecture, the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -164,13 +164,14 @@ src/
   manifest/      derive one criteria document per contest         [implemented]
   signer/        VoteSigner seam + EIP-712 ballot typed data       [implemented]
   store/         vote-intent persistence (Node SQLite / browser IDB) [memory impl; backends design]
-  client/        PubsubVoter facade + per-contest VoteNetwork     [implemented]
+  client/        PubsubVoter facade + per-contest VoteNetwork     [implemented; republish scheduler stub]
   errors.ts      NotImplemented/ReadOnly/MissingPubsub/Blockstore [implemented]
-  interpreters/  one file per `type` + registry/resolver           [leaves implemented]
-  chain/         ChainClient = viem PublicClient (historical-block reads)
-  crdt/          Merkle-CRDT interfaces                           [design only]
-  transport/     helia/libp2p transport (pubsub + blockstore)     [requireHeliaServices live; rest design]
-  tally/         tally interfaces                                 [design only]
+  interpreters/  one file per `type` + registry/resolver          [implemented]
+  chain/         ChainClient = viem PublicClient + bucket math     [implemented]
+  verify/        signature + constraints + full BundleVerifier + verdict cache [implemented]
+  crdt/          Merkle-CRDT: LWW union, codec, in-memory store    [implemented]
+  transport/     async validate-before-forward gossip gate + heads codec + transport [implemented]
+  tally/         deterministic aggregation over pre-validated bundles [implemented]
   index.ts       public entry: re-exports + facade + design types
 ```
 

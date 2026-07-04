@@ -1,11 +1,13 @@
 /**
  * Public entry.
  *
- * Implemented today (pure, offline, unit-tested): the zod schemas, canonical dag-cbor
- * encoding, topic derivation, manifest derivation, and the `PubsubVoter` facade
- * (construction, contest caching, read-only enforcement). The live engine
- * (CRDT/transport/verify/tally/chain) is still design-only; facade methods that need
- * it throw `NotImplementedError`. See DESIGN.md for architecture and build order.
+ * The engine is implemented and unit-tested: the zod schemas, canonical dag-cbor encoding,
+ * topic derivation, manifest derivation, the verify pipeline (signature + constraints +
+ * eligibility + name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's
+ * validate-before-forward gossip gate (`VoteNetwork.start`/`castVotes`/`getTally` are live).
+ * The `PubsubVoter` client-level republish scheduler is the remaining stub. See DESIGN.md for
+ * architecture, and "Transport" for the forward-gate that verifies a bundle (signature,
+ * on-chain eligibility, board-name resolution) before gossipsub re-forwards it.
  */
 
 // Schemas (runtime values) and their inferred types.

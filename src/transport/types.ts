@@ -52,7 +52,35 @@ export interface PubsubService {
     getSubscribers(topic: string): PeerId[];
     addEventListener(type: "message", listener: (evt: { detail: { topic: string; data: Uint8Array; from?: PeerId } }) => void): void;
     removeEventListener(type: "message", listener: (evt: { detail: { topic: string; data: Uint8Array; from?: PeerId } }) => void): void;
+    /**
+     * gossipsub's per-topic validator map. The transport installs the async forward-gate
+     * here (`topicValidators.set(topic, gate)`); gossipsub awaits the returned promise
+     * before re-forwarding the message to the mesh, which is what makes `reject` land on the
+     * sender for semantic invalidity. Optional because a non-gossipsub pubsub lacks it — the
+     * transport checks for it at `start()` and throws if absent. `@libp2p/gossipsub` exposes
+     * it as a mutable `Map`. See DESIGN.md "Transport".
+     */
+    topicValidators?: Map<string, GossipTopicValidator>;
 }
+
+/** A received pubsub message, as passed to a gossipsub topic validator. */
+export interface GossipMessage {
+    topic: string;
+    data: Uint8Array;
+    from?: PeerId;
+}
+
+/**
+ * A gossipsub topic validator: run on every received message BEFORE re-forwarding, returning
+ * (or resolving to) a {@link TopicValidatorResult}. Returning a promise makes the gate async —
+ * gossipsub awaits it, so the full fetch + verify pipeline can run before the message is
+ * forwarded (see DESIGN.md "Transport"). Declared structurally so the library imports no
+ * gossipsub package; `@libp2p/gossipsub`'s `TopicValidatorFn` satisfies it.
+ */
+export type GossipTopicValidator = (
+    peer: PeerId,
+    message: GossipMessage
+) => TopicValidatorResult | Promise<TopicValidatorResult>;
 
 /**
  * The subset of a Helia blockstore this library drives, declared structurally. Vote

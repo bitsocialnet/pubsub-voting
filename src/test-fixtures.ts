@@ -1,7 +1,7 @@
 import { createPublicClient, http } from "viem";
 import type { Criteria } from "./schema/criteria.js";
 import type { BlockstoreLike, HeliaInstance, PubsubService } from "./transport/types.js";
-import type { ChainClientFactory } from "./chain/types.js";
+import type { ChainClient, ChainClientFactory } from "./chain/types.js";
 import type { VoteSigner } from "./signer/types.js";
 import { EIP712_SIGNATURE_TYPE } from "./signer/eip712.js";
 
@@ -34,7 +34,7 @@ export function bizCriteria(): Criteria {
     };
 }
 
-/** A no-op gossipsub service: construction validates its shape but never calls it. */
+/** A no-op gossipsub service carrying an (empty) topic-validator map, as gossipsub exposes. */
 function fakePubsub(): PubsubService {
     return {
         publish: async () => undefined,
@@ -42,7 +42,8 @@ function fakePubsub(): PubsubService {
         unsubscribe: () => {},
         getSubscribers: () => [],
         addEventListener: () => {},
-        removeEventListener: () => {}
+        removeEventListener: () => {},
+        topicValidators: new Map()
     };
 }
 
@@ -95,4 +96,18 @@ export function fakeSigner(): VoteSigner {
         address: () => "0x0000000000000000000000000000000000000001",
         signBallot: () => ({ signature: "0xdeadbeef", type: EIP712_SIGNATURE_TYPE })
     };
+}
+
+/**
+ * A chain factory returning a stubbed viem client (no network): `getBlockNumber` for the
+ * current bucket, `getBlock` for the tie-break block hash, and `readContract` for balances.
+ * Lets write-path and tally tests run the engine end-to-end without an RPC.
+ */
+export function stubChains(over: { blockNumber?: bigint; balance?: bigint } = {}): ChainClientFactory {
+    const client = {
+        getBlockNumber: async () => over.blockNumber ?? 43200n,
+        getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+        readContract: async () => over.balance ?? 1n
+    };
+    return () => client as unknown as ChainClient;
 }

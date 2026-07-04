@@ -1,20 +1,20 @@
 /**
  * Library error types.
  *
- * The pure foundation (schema, canonical encoding, topic derivation, manifest
- * derivation) and the public facade construction are fully implemented. The live
- * engine (CRDT, transport, verify, tally, chain reads) is still design-only, so the
- * facade methods that depend on it throw `NotImplementedError` rather than pretending
- * to work. See DESIGN.md for the build order.
+ * The engine is implemented — schemas, encoding, topic/manifest derivation, the verify
+ * pipeline, the Merkle-CRDT, the tally, and the transport's validate-before-forward gossip
+ * gate — so `VoteNetwork.start`/`castVotes`/`getTally` are live. The remaining stub is the
+ * `PubsubVoter` client-level republish scheduler, which still throws `NotImplementedError`.
+ * See DESIGN.md.
  */
 
-/** Thrown by facade methods whose backing engine is not yet implemented. */
+/** Thrown by the facade paths that are not yet implemented (the client-level republish scheduler). */
 export class NotImplementedError extends Error {
     constructor(what: string) {
         super(
-            `${what} is not implemented yet: the live engine (CRDT/transport/verify/tally/chain) ` +
-                `is still in design. The schema, canonical encoding, topic derivation, and manifest ` +
-                `derivation are implemented. See DESIGN.md for the build order.`
+            `${what} is not implemented yet. The engine (verify, CRDT, tally, and the transport ` +
+                `forward-gate) is live; the client-level republish scheduler is the remaining stub. ` +
+                `See DESIGN.md.`
         );
         this.name = "NotImplementedError";
     }

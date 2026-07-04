@@ -1,7 +1,6 @@
 import type { VotesBundle } from "../schema/votes.js";
 import type { Criteria } from "../schema/criteria.js";
 import type { VerifyResult } from "./types.js";
-import { NotImplementedError } from "../errors.js";
 
 /**
  * Offline verify stage 1, constraints half: the criteria-bound checks that gate a bundle
@@ -14,10 +13,26 @@ import { NotImplementedError } from "../errors.js";
  * boards). This runtime check is where the cap belongs. See DESIGN.md "Votes wire".
  *
  * An empty `votes` array (withdrawal/abstention) is always valid regardless of the cap.
- *
- * Design only: throws NotImplementedError until the verify engine lands. The expected
- * behavior is pinned in `constraints.test.ts` (a reproduce-first `it.fails`).
  */
-export function checkBundleConstraints(_bundle: VotesBundle, _criteria: Criteria): VerifyResult {
-    throw new NotImplementedError("verify: checkBundleConstraints (criteria-bound offline constraints)");
+export function checkBundleConstraints(bundle: VotesBundle, criteria: Criteria): VerifyResult {
+    // Withdrawal/abstention: the empty bundle is always legal, cap and range notwithstanding.
+    if (bundle.votes.length === 0) return { valid: true };
+
+    if (bundle.votes.length > criteria.maxVotesPerAddress) {
+        return {
+            valid: false,
+            reason: `votes.length ${bundle.votes.length} exceeds maxVotesPerAddress ${criteria.maxVotesPerAddress}`
+        };
+    }
+
+    const { min, max } = criteria.voteSchema;
+    for (const v of bundle.votes) {
+        if (v.vote < min || v.vote > max) {
+            return {
+                valid: false,
+                reason: `vote ${v.vote} for board ${v.board.publicKey} is outside voteSchema [${min}, ${max}]`
+            };
+        }
+    }
+    return { valid: true };
 }

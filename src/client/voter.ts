@@ -1,17 +1,31 @@
+import pLimit from "p-limit";
 import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
-import type { Vote, VotesBundle } from "../schema/votes.js";
+import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
-import type { BlockstoreLike, HeliaInstance, PubsubService } from "../transport/types.js";
+import { makeBucketMath } from "../chain/bucket.js";
+import { tickerForRef } from "../chain/ticker.js";
+import type { BlockstoreLike, HeliaInstance, PubsubService, VoteTransport } from "../transport/types.js";
 import { requireHeliaServices } from "../transport/helia.js";
+import { makeBlockstoreDagNodeStore } from "../transport/dag-store.js";
+import { makeRateLimiter } from "../transport/rate-limit.js";
+import { makeGossipGate } from "../transport/gossip-validator.js";
+import { makeVoteTransport } from "../transport/transport.js";
+import { encodeHeads, decodeHeads } from "../transport/heads.js";
 import type { InterpreterRegistry } from "../interpreters/types.js";
 import { resolveRegistry, validateCriteriaInterpreters } from "../interpreters/registry.js";
+import { makeVoteCrdt } from "../crdt/crdt.js";
+import type { VoteCrdt } from "../crdt/types.js";
+import { makeBundleVerifier } from "../verify/bundle.js";
+import { makeVerdictCache } from "../verify/cache.js";
+import { makeTally } from "../tally/tally.js";
 import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
-import { topicFor } from "../topic.js";
+import { ballotTypedData } from "../signer/eip712.js";
+import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import { deriveCriteria } from "../manifest/manifest.js";
 import type { VoteStore } from "../store/types.js";
 import { selectVoteStore } from "../store/select.js";
-import { NotImplementedError, ReadOnlyError } from "../errors.js";
+import { NotImplementedError, ReadOnlyError, UnknownInterpreterError } from "../errors.js";
 
 /**
  * How often to republish a live vote, in buckets: half its expiry window, rounded up. A
@@ -158,7 +172,24 @@ interface ResolvedDeps {
     store: VoteStore;
 }
 
-/** One contest. The pure parts (criteria, topic, read-only) are live; the engine is pending. */
+/** Hard per-message validation deadline (ms): the 10s budget for fetch + verify in the gate. */
+const GATE_TIMEOUT_MS = 10_000;
+/** Forward-gate layer-1 / walk bounds (see DESIGN.md "Transport"). */
+const GATE_BOUNDS = { maxHeadsPerMessage: 64, maxMessageBytes: 1 << 20, maxClosureNodes: 1024 };
+/** Concurrent in-flight fetch/verify operations across the gate. */
+const GATE_CONCURRENCY = 8;
+/** Per-peer rate window: how many messages one peer may make us validate per interval. */
+const GATE_RATE = { limit: 256, intervalMs: 10_000 };
+
+/** Lowercase `0x`-hex to bytes (for the bucket boundary block hash). */
+function hexToBytes(hex: string): Uint8Array {
+    const body = hex.startsWith("0x") ? hex.slice(2) : hex;
+    const out = new Uint8Array(body.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(body.slice(i * 2, i * 2 + 2), 16);
+    return out;
+}
+
+/** One contest: joins the topic behind the validate-before-forward gate, reads the tally, casts votes. */
 class ContestNetwork implements VoteNetwork {
     readonly criteria: Criteria;
     readonly topic: string;
@@ -169,37 +200,142 @@ class ContestNetwork implements VoteNetwork {
     readonly #chainClients: ChainClients;
     readonly #updateListeners: Array<() => void> = [];
 
-    constructor(criteria: Criteria, topic: string, deps: ResolvedDeps) {
+    readonly #criteriaCid: Uint8Array;
+    /** The eligibility chain's numeric chainId, bound into every ballot signature. */
+    readonly #chainId: number;
+    /** The eligibility chain client, also the seed chain for the tally's tie-break block hash. */
+    readonly #eligibilityChain: ChainClient;
+    readonly #bucketMath: ReturnType<typeof makeBucketMath>;
+    readonly #crdt: VoteCrdt;
+    readonly #tally: ReturnType<typeof makeTally>;
+    /** Live once `start()` runs; the gate + gossip wiring for this topic. */
+    #transport: VoteTransport | undefined;
+
+    constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
         this.topic = topic;
         this.readOnly = deps.signer === undefined;
         this.#deps = deps;
+        this.#criteriaCid = criteriaCidBytes;
         this.#chainClients = Object.fromEntries(
             Object.entries(criteria.requires.chains).map(
                 ([chain, config]): [string, ChainClient] => [chain, deps.chains({ chain, config })]
             )
         );
+
+        // The eligibility chain fixes the ballot's chainId and the tie-break seed chain.
+        const eligibility = deps.registry[criteria.eligibility.type];
+        if (!eligibility) throw new UnknownInterpreterError("eligibility", criteria.eligibility.type);
+        const eligibilityTicker = tickerForRef(criteria, criteria.eligibility, eligibility.optionsSchema.parse(criteria.eligibility));
+        const eligibilityChain = this.#chainClients[eligibilityTicker];
+        if (!eligibilityChain) throw new Error(`no chain client for eligibility chain "${eligibilityTicker}"`);
+        this.#eligibilityChain = eligibilityChain;
+        this.#chainId = criteria.requires.chains[eligibilityTicker]!.chainId;
+
+        this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
+        const store = makeBlockstoreDagNodeStore(deps.blockstore);
+        this.#crdt = makeVoteCrdt({ store, bucketMath: this.#bucketMath, voteExpiryBuckets: criteria.voteExpiryBuckets });
+
+        const verifier = makeBundleVerifier({
+            criteria,
+            criteriaCid: criteriaCidBytes,
+            chainId: this.#chainId,
+            registry: deps.registry,
+            chainFor: (ticker) => this.#chainFor(ticker),
+            bucketMath: this.#bucketMath,
+            nameResolvers: deps.nameResolvers
+        });
+        // The gate/transport are (re)built in start(); the store, crdt, cache, and verifier are
+        // stable per contest, so a cache and verifier bound here survive restarts of the topic.
+        this.#store = store;
+        this.#cache = makeVerdictCache();
+        this.#verifier = verifier;
+
+        this.#tally = makeTally({
+            criteria,
+            registry: deps.registry,
+            chainFor: (ticker) => this.#chainFor(ticker),
+            bucketMath: this.#bucketMath,
+            current: () => this.#crdt.current(),
+            bucketBlockHash: () => this.#bucketBlockHash()
+        });
+    }
+
+    readonly #store: ReturnType<typeof makeBlockstoreDagNodeStore>;
+    readonly #cache: ReturnType<typeof makeVerdictCache>;
+    readonly #verifier: ReturnType<typeof makeBundleVerifier>;
+
+    #chainFor(ticker: string): ChainClient {
+        const client = this.#chainClients[ticker];
+        if (!client) throw new Error(`no chain client configured for chain "${ticker}"`);
+        return client;
+    }
+
+    /** Hash of the current bucket boundary block on the eligibility chain (rolling tie seed). */
+    async #bucketBlockHash(): Promise<Uint8Array> {
+        const head = await this.#eligibilityChain.getBlockNumber();
+        const boundary = this.#bucketMath.sampleBlockForBucket(this.#bucketMath.bucketForBlock(Number(head)));
+        const block = await this.#eligibilityChain.getBlock({ blockNumber: BigInt(boundary) });
+        if (!block.hash) throw new Error(`bucket boundary block ${boundary} has no hash`);
+        return hexToBytes(block.hash);
+    }
+
+    #notifyUpdate(): void {
+        for (const cb of this.#updateListeners) cb();
     }
 
     async start(): Promise<void> {
-        throw new NotImplementedError("VoteNetwork.start (transport + CRDT sync)");
+        const limit = pLimit(GATE_CONCURRENCY);
+        const gate = makeGossipGate({
+            decodeHeads,
+            fetchNode: (cid) => this.#store.get(cid),
+            verifier: this.#verifier,
+            cache: this.#cache,
+            merge: (heads) => this.#crdt.merge(heads),
+            limit: (fn) => limit(fn),
+            allowPeer: makeRateLimiter(GATE_RATE),
+            onAccept: () => this.#notifyUpdate(),
+            bounds: GATE_BOUNDS,
+            timeoutMs: GATE_TIMEOUT_MS
+        });
+        this.#transport = makeVoteTransport({
+            pubsub: this.#deps.pubsub,
+            topic: this.topic,
+            gate,
+            encodeHeads,
+            decodeHeads,
+            getHeads: () => this.#crdt.heads()
+        });
+        await this.#transport.start();
     }
 
     async stop(): Promise<void> {
-        // Nothing is started yet, so stopping is a no-op until the transport lands.
+        await this.#transport?.stop();
+        this.#transport = undefined;
     }
 
-    async castVotes(_votes: Vote[]): Promise<VotesBundle> {
-        if (this.#deps.signer === undefined) throw new ReadOnlyError();
-        // When the engine lands this also writes the chosen boards to `this.#deps.store`
-        // (a VoteIntent keyed by this topic) so the republish scheduler can re-sign them
-        // with a fresh blockNumber after a restart. See DESIGN.md "Persistence".
-        throw new NotImplementedError("VoteNetwork.castVotes (sign + CRDT add + broadcast)");
+    async castVotes(votes: Vote[]): Promise<VotesBundle> {
+        const signer = this.#deps.signer;
+        if (signer === undefined) throw new ReadOnlyError();
+
+        // Sign for the current bucket boundary block, the same block every verifier reads at.
+        const head = await this.#eligibilityChain.getBlockNumber();
+        const blockNumber = this.#bucketMath.sampleBlockForBucket(this.#bucketMath.bucketForBlock(Number(head)));
+        const typedData = ballotTypedData({ criteriaCid: this.#criteriaCid, chainId: this.#chainId, votes, blockNumber });
+        const signature = await signer.signBallot(typedData);
+        const address = await signer.address();
+        const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
+
+        await this.#crdt.add(bundle);
+        await this.#transport?.broadcastHeads(this.#crdt.heads());
+        // Persist the re-signable intent so the republish scheduler can revive it after restart.
+        await this.#deps.store.put({ topic: this.topic, address, votes, lastBucket: this.#bucketMath.bucketForBlock(blockNumber) });
+        this.#notifyUpdate();
+        return bundle;
     }
 
-    async getTally(_options?: TallyOptions): Promise<ContestTally> {
-        void this.#chainClients;
-        throw new NotImplementedError("VoteNetwork.getTally (lazy top-down verify)");
+    async getTally(options?: TallyOptions): Promise<ContestTally> {
+        return this.#tally.compute(options);
     }
 
     on(event: "update", cb: () => void): void {
@@ -253,10 +389,11 @@ export class PubsubVoter implements VoteClient {
     async contest(criteria: Criteria): Promise<VoteNetwork> {
         const validated = CriteriaSchema.parse(criteria);
         validateCriteriaInterpreters(validated, this.#deps.registry);
-        const topic = await topicFor(validated);
+        const cid = await criteriaCid(validated);
+        const topic = TOPIC_PREFIX + cid.toString();
         const existing = this.#contests.get(topic);
         if (existing) return existing;
-        const network = new ContestNetwork(validated, topic, this.#deps);
+        const network = new ContestNetwork(validated, topic, cid.bytes, this.#deps);
         this.#contests.set(topic, network);
         return network;
     }

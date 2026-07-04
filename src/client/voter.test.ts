@@ -10,8 +10,12 @@ import {
     fakeHeliaWithoutPubsub,
     fakeHeliaWithoutBlockstore,
     fakeChains,
+    stubChains,
     fakeSigner
 } from "../test-fixtures.js";
+
+/** A valid base58btc IPNS board key (VotesBundleSchema rejects non-keys, so castVotes needs a real one). */
+const VALID_KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
 /** A minimal directory manifest deriving one contest (the /biz/ slot) from the shared fixture. */
 function bizManifest(): unknown {
@@ -73,16 +77,42 @@ describe("write path gating", () => {
         await expect(contest.castVotes([{ board: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(ReadOnlyError);
     });
 
-    it("castVotes reaches the (unbuilt) engine when a signer is present", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
+    it("castVotes signs and returns a bundle when a signer is present", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
         const contest = await voter.contest(bizCriteria());
-        await expect(contest.castVotes([{ board: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(NotImplementedError);
+        const bundle = await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
+        expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
+        // blockNumber is the bucket boundary: bucketForBlock(43200)=1, sampleBlockForBucket(1)=43200.
+        expect(bundle.blockNumber).toBe(43200);
+        expect(bundle.votes[0].board.publicKey).toBe(VALID_KEY);
     });
+});
 
-    it("getTally reaches the (unbuilt) engine", async () => {
+describe("getTally", () => {
+    it("returns an empty ranking for a contest with no votes (no chain reads)", async () => {
         const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
         const contest = await voter.contest(bizCriteria());
-        await expect(contest.getTally()).rejects.toBeInstanceOf(NotImplementedError);
+        expect(await contest.getTally()).toEqual({ contest: "biz", ranking: [] });
+    });
+
+    it("reflects a cast vote end-to-end (cast -> CRDT -> tally)", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        const contest = await voter.contest(bizCriteria());
+        await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
+
+        const tally = await contest.getTally();
+        expect(tally.ranking).toHaveLength(1);
+        expect(tally.ranking[0].board.publicKey).toBe(VALID_KEY);
+        expect(tally.ranking[0].weight).toBe(1n); // constant weight, 1 pass = 1 vote
+    });
+});
+
+describe("network lifecycle", () => {
+    it("start and stop resolve, wiring the real forward-gate over the host node", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const contest = await voter.contest(bizCriteria());
+        await expect(contest.start()).resolves.toBeUndefined();
+        await expect(contest.stop()).resolves.toBeUndefined();
     });
 });
 

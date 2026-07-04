@@ -41,9 +41,12 @@ export type ChainClientFactory = (args: { chain: string; config: ChainConfig }) 
  * The tally uses it to verify a vote's `board.name` claim: resolve the name and drop
  * the bundle when it does not resolve or resolves to a different `publicKey` than the
  * vote claims (see DESIGN.md "Tally"). `resolve` returning `undefined` means the name
- * has no record. Known gap: there is no block parameter, so resolution is a fresh
- * head lookup rather than pinned to the bucket block like every other chain read —
- * see DESIGN.md "Open questions", "Pinned-block name resolution".
+ * has no record. `resolve` accepts an optional `blockNumber` to pin the read to a
+ * canonical historical block (bso-resolver#3, since resolved upstream); when omitted it
+ * resolves at head. v1 still resolves at head: the registry lives on its own chain, so
+ * pinning also needs a canonical per-bucket block *on the registry's chain* — that
+ * multi-chain block-selection half is still open. See DESIGN.md "Open questions",
+ * "Pinned-block name resolution".
  */
 export interface NameResolver {
     /** Identifies this resolver instance (e.g. "bso-viem"). */
@@ -53,6 +56,12 @@ export interface NameResolver {
     /** Resolve a name to its record; `undefined` when the name has no record. */
     resolve: (opts: {
         name: string;
+        /**
+         * Pin the text-record read to a canonical historical block; resolves at head
+         * when omitted. v1 leaves it unset (head) until per-bucket block selection on
+         * the registry's chain lands — see the interface note above.
+         */
+        blockNumber?: bigint;
         abortSignal?: AbortSignal;
     }) => Promise<{ publicKey: string; [key: string]: string } | undefined>;
     /** True when this resolver handles the name's TLD (e.g. ends with ".bso"). */
