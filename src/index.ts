@@ -13,9 +13,9 @@ export * from "./schema/common.js";
 export * from "./schema/votes.js";
 export * from "./schema/criteria.js";
 
-// Interpreters: a single kind, one file per `type`, each owning its option schema and a
-// numeric `evaluate` (the eligibility slot gates on `> 0`, the weight slot uses the
-// magnitude), plus the registry (built-ins, the host-shadowing resolver, and criteria
+// Interpreters: a single kind, one file per `type`, each owning its option schema and an
+// `evaluate` returning `{ score: bigint }` (the eligibility slot gates on `score > 0n`,
+// the weight slot uses the magnitude), plus the registry (built-ins, the host-shadowing resolver, and criteria
 // validation). The leaf interpreters read through the injected viem `PublicClient`
 // (`ctx.chain`). Interpreter composition (combining several into one slot) is a
 // documented future extension, not a built-in — see DESIGN.md "Future improvements".

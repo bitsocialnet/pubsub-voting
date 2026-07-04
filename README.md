@@ -114,7 +114,7 @@ Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a
 
 ### Custom interpreters
 
-Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block. Chain-reading interpreters get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → number`, a non-negative score where `0` means "does not qualify". The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility > 0 ? weight : 0`. An interpreter that needs a threshold returns `0` below it (so `erc721-min-balance` and `erc20-balance`'s optional `min` can gate), which lets the same interpreter serve either slot.
+Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block. Chain-reading interpreters get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → { score: bigint }`, a non-negative score where `0n` means "does not qualify" (a result object, not a bare `bigint`, so slot-specific fields can be added later). The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility.score > 0n ? weight.score : 0n`. An interpreter that needs a threshold returns `0n` below it (so `erc721-min-balance` and `erc20-balance`'s optional `min` can gate), which lets the same interpreter serve either slot.
 
 Built-ins: `erc721-min-balance` (v1), `constant` (v1), and `erc20-balance` (reserved for the pass + BSO combo — see [Weighted voting](#weighted-voting)). A host adds or shadows interpreters by `type` via the `interpreters` option — this is how clients like 5chan or seedit register custom rules without forking the library:
 
@@ -126,7 +126,7 @@ const seeditModAllowlist: Interpreter<{ type: "seedit-mod-allowlist"; allow: str
   type: "seedit-mod-allowlist",
   optionsSchema: z.object({ type: z.literal("seedit-mod-allowlist"), allow: z.array(z.string()) }),
   async evaluate({ options, walletAddress }) {
-    return options.allow.includes(walletAddress) ? 1 : 0; // gate: 1 admits, 0 rejects
+    return { score: options.allow.includes(walletAddress) ? 1n : 0n }; // gate: 1n admits, 0n rejects
   }
 };
 
@@ -140,15 +140,15 @@ A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned t
 
 ### Weighted voting
 
-v1 ships `constant` weight (one Pass, one vote) **on purpose** — it resists whale dominance and downvote weaponization. But weight is a *magnitude*: any interpreter that returns a holding or balance turns votes into holder-weighted power with no engine change. Keep the Pass gate in `eligibility` and swap the `weight` slot:
+v1 ships `constant` weight (one Pass, one vote) **on purpose** — it resists whale dominance and downvote weaponization. But weight is a *magnitude*: any interpreter that returns a holding or balance turns votes into holder-weighted power with no engine change. An interpreter's `evaluate` returns `{ score: bigint }`, so weights are exact and compared as `bigint`s; `erc20-balance` scores in **raw base units** (voting power proportional to balance — twice the balance, twice the weight), which you format to whole tokens for display with `viem.formatUnits(score, decimals)`. Keep the Pass gate in `eligibility` and swap the `weight` slot:
 
 ```ts
 import type { InterpreterRef } from "@bitsocial/pubsub-votes";
 
-// Among Pass-holders, voting power = BSO balance: 1000 BSO ⇒ 1000 votes.
+// Among Pass-holders, voting power is proportional to BSO balance (scored in base units).
 const bsoWeight: InterpreterRef = { type: "erc20-balance", chain: "base", contract: "0x…BSO", decimals: 18 };
 
-// Or one vote per Pass held — 5 Passes ⇒ 5 votes (the gate interpreter, reused as weight).
+// Or one vote per Pass held — 5 Passes ⇒ score 5n (the gate interpreter, reused as weight).
 const passCountWeight: InterpreterRef = { type: "erc721-min-balance", chain: "base", contract: "0x…Pass", min: 1 };
 ```
 

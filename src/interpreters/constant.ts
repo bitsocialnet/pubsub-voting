@@ -9,7 +9,7 @@ import type { Interpreter } from "./types.js";
  */
 export const ConstantOptionsSchema = z.object({
     type: z.literal("constant"),
-    value: z.number().positive().default(1)
+    value: z.number().int().positive().default(1)
 });
 
 export type ConstantOptions = z.infer<typeof ConstantOptionsSchema>;
@@ -18,6 +18,6 @@ export const constant: Interpreter<ConstantOptions> = {
     type: "constant",
     optionsSchema: ConstantOptionsSchema,
     async evaluate({ options }) {
-        return options.value;
+        return { score: BigInt(options.value) };
     }
 };

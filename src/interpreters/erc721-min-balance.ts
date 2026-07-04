@@ -32,6 +32,6 @@ export const erc721MinBalance: Interpreter<Erc721MinBalanceOptions> = {
             args: [getAddress(walletAddress)],
             blockNumber: BigInt(ctx.blockNumber)
         });
-        return balance >= BigInt(options.min) ? Number(balance) : 0;
+        return { score: balance >= BigInt(options.min) ? balance : 0n };
     }
 };

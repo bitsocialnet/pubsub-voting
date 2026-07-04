@@ -16,7 +16,7 @@ import { topicFor, type Criteria } from "@bitsocial/pubsub-votes";
 const PASS = "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9"; // 5chan Pass (example)
 const BSO = "0x1234567890abcdef1234567890abcdef12345678"; // placeholder BSO contract
 
-// Among Pass-holders, voting power = BSO balance: 1000 BSO ⇒ 1000 votes.
+// Among Pass-holders, voting power is proportional to BSO balance (scored in base units).
 const bsoWeighted: Criteria = {
     name: "/biz/ - Business & Finance (BSO-weighted)",
     contest: "biz",
@@ -32,7 +32,7 @@ const bsoWeighted: Criteria = {
     }
 };
 
-// Or: one vote per Pass held — 5 Passes ⇒ 5 votes (the gate interpreter, reused as weight).
+// Or: one vote per Pass held — 5 Passes ⇒ score 5n (the gate interpreter, reused as weight).
 const passCountWeighted: Criteria = {
     ...bsoWeighted,
     name: "/biz/ - Business & Finance (Pass-count-weighted)",
