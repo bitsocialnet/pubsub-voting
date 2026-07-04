@@ -20,7 +20,7 @@ export function bizCriteria(): Criteria {
         maxVotesPerAddress: 1,
         blocksPerBucket: 43200,
         voteExpiryBuckets: 30,
-        eligibility: {
+        rule: {
             type: "erc721-min-balance",
             chain: "base",
             contract: "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
@@ -28,7 +28,7 @@ export function bizCriteria(): Criteria {
         },
         weight: { type: "constant", value: 1 },
         requires: {
-            interpreters: ["erc721-min-balance", "constant"],
+            rules: ["erc721-min-balance", "constant"],
             chains: { base: { chainId: 8453, rpcUrls: ["https://mainnet.base.org"] } }
         }
     };

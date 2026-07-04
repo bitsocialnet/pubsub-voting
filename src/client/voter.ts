@@ -11,8 +11,8 @@ import { makeRateLimiter } from "../transport/rate-limit.js";
 import { makeGossipGate } from "../transport/gossip-validator.js";
 import { makeVoteTransport } from "../transport/transport.js";
 import { encodeHeads, decodeHeads } from "../transport/heads.js";
-import type { InterpreterRegistry } from "../interpreters/types.js";
-import { resolveRegistry, validateCriteriaInterpreters } from "../interpreters/registry.js";
+import type { RuleRegistry } from "../rules/types.js";
+import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
@@ -25,7 +25,7 @@ import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import { deriveCriteria } from "../manifest/manifest.js";
 import type { VoteStore } from "../store/types.js";
 import { selectVoteStore } from "../store/select.js";
-import { NotImplementedError, ReadOnlyError, UnknownInterpreterError } from "../errors.js";
+import { NotImplementedError, ReadOnlyError, UnknownRuleError } from "../errors.js";
 
 /**
  * How often to republish a live vote, in buckets: half its expiry window, rounded up. A
@@ -143,8 +143,8 @@ export interface PubsubVoterOptions {
      * Optional: with no `dataPath` on Node, persistence is in-memory (lost on restart).
      */
     dataPath?: string;
-    /** Interpreter overrides that shadow built-ins by `type` (a flat `type -> interpreter` map). */
-    interpreters?: InterpreterRegistry;
+    /** Rule overrides that shadow built-ins by `type` (a flat `type -> rule` map). */
+    rules?: RuleRegistry;
     /**
      * Board-name resolvers, same instances a host gives pkc-js (e.g.
      * `@bitsocial/bso-resolver` for `name.bso`). The tally resolves each vote's
@@ -165,7 +165,7 @@ interface ResolvedDeps {
     chains: ChainClientFactory;
     signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
-    registry: InterpreterRegistry;
+    registry: RuleRegistry;
     /** Board-name resolvers for verifying `board.name` claims at tally time. */
     nameResolvers: NameResolver[];
     /** Persistence for this voter's own vote intents (in-memory unless a host injects one). */
@@ -201,10 +201,10 @@ class ContestNetwork implements VoteNetwork {
     readonly #updateListeners: Array<() => void> = [];
 
     readonly #criteriaCid: Uint8Array;
-    /** The eligibility chain's numeric chainId, bound into every ballot signature. */
+    /** The gating (`rule`) chain's numeric chainId, bound into every ballot signature. */
     readonly #chainId: number;
-    /** The eligibility chain client, also the seed chain for the tally's tie-break block hash. */
-    readonly #eligibilityChain: ChainClient;
+    /** The gating (`rule`) chain client, also the seed chain for the tally's tie-break block hash. */
+    readonly #ruleChain: ChainClient;
     readonly #bucketMath: ReturnType<typeof makeBucketMath>;
     readonly #crdt: VoteCrdt;
     readonly #tally: ReturnType<typeof makeTally>;
@@ -223,14 +223,14 @@ class ContestNetwork implements VoteNetwork {
             )
         );
 
-        // The eligibility chain fixes the ballot's chainId and the tie-break seed chain.
-        const eligibility = deps.registry[criteria.eligibility.type];
-        if (!eligibility) throw new UnknownInterpreterError("eligibility", criteria.eligibility.type);
-        const eligibilityTicker = tickerForRef(criteria, criteria.eligibility, eligibility.optionsSchema.parse(criteria.eligibility));
-        const eligibilityChain = this.#chainClients[eligibilityTicker];
-        if (!eligibilityChain) throw new Error(`no chain client for eligibility chain "${eligibilityTicker}"`);
-        this.#eligibilityChain = eligibilityChain;
-        this.#chainId = criteria.requires.chains[eligibilityTicker]!.chainId;
+        // The gating (`rule`) chain fixes the ballot's chainId and the tie-break seed chain.
+        const rule = deps.registry[criteria.rule.type];
+        if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
+        const ruleTicker = tickerForRef(criteria, criteria.rule, rule.optionsSchema.parse(criteria.rule));
+        const ruleChain = this.#chainClients[ruleTicker];
+        if (!ruleChain) throw new Error(`no chain client for gating (\`rule\`) chain "${ruleTicker}"`);
+        this.#ruleChain = ruleChain;
+        this.#chainId = criteria.requires.chains[ruleTicker]!.chainId;
 
         this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
         const store = makeBlockstoreDagNodeStore(deps.blockstore);
@@ -271,11 +271,11 @@ class ContestNetwork implements VoteNetwork {
         return client;
     }
 
-    /** Hash of the current bucket boundary block on the eligibility chain (rolling tie seed). */
+    /** Hash of the current bucket boundary block on the gating (`rule`) chain (rolling tie seed). */
     async #bucketBlockHash(): Promise<Uint8Array> {
-        const head = await this.#eligibilityChain.getBlockNumber();
+        const head = await this.#ruleChain.getBlockNumber();
         const boundary = this.#bucketMath.sampleBlockForBucket(this.#bucketMath.bucketForBlock(Number(head)));
-        const block = await this.#eligibilityChain.getBlock({ blockNumber: BigInt(boundary) });
+        const block = await this.#ruleChain.getBlock({ blockNumber: BigInt(boundary) });
         if (!block.hash) throw new Error(`bucket boundary block ${boundary} has no hash`);
         return hexToBytes(block.hash);
     }
@@ -319,7 +319,7 @@ class ContestNetwork implements VoteNetwork {
         if (signer === undefined) throw new ReadOnlyError();
 
         // Sign for the current bucket boundary block, the same block every verifier reads at.
-        const head = await this.#eligibilityChain.getBlockNumber();
+        const head = await this.#ruleChain.getBlockNumber();
         const blockNumber = this.#bucketMath.sampleBlockForBucket(this.#bucketMath.bucketForBlock(Number(head)));
         const typedData = ballotTypedData({ criteriaCid: this.#criteriaCid, chainId: this.#chainId, votes, blockNumber });
         const signature = await signer.signBallot(typedData);
@@ -375,7 +375,7 @@ export class PubsubVoter implements VoteClient {
             blockstore,
             chains: options.chains,
             signer: options.signer,
-            registry: resolveRegistry(options.interpreters),
+            registry: resolveRegistry(options.rules),
             nameResolvers: options.nameResolvers ?? [],
             store: selectVoteStore(options.dataPath)
         };
@@ -388,7 +388,7 @@ export class PubsubVoter implements VoteClient {
 
     async contest(criteria: Criteria): Promise<VoteNetwork> {
         const validated = CriteriaSchema.parse(criteria);
-        validateCriteriaInterpreters(validated, this.#deps.registry);
+        validateCriteriaRules(validated, this.#deps.registry);
         const cid = await criteriaCid(validated);
         const topic = TOPIC_PREFIX + cid.toString();
         const existing = this.#contests.get(topic);

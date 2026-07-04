@@ -4,7 +4,7 @@ import type { VotesBundle } from "../schema/votes.js";
 /**
  * Merkle-CRDT interfaces, design only.
  *
- * State is a last-write-wins element-set keyed by the eligibility-chain wallet
+ * State is a last-write-wins element-set keyed by the gating-chain wallet
  * address. Each bundle is a dag-cbor DAG node linking the heads known at signing,
  * so the log is a Merkle-clock. Convergence is automatic (the join is commutative)
  * and missing history is detectable (a head commits to its ancestors).

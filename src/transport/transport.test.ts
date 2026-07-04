@@ -14,7 +14,7 @@ import type { VotesBundle } from "../schema/votes.js";
 
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const TOPIC = "bitsocial-votes/test";
-const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, eligibilityScore: 1n, resolvedNames: {} }) };
+const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
 
 function fakePeer(id: string): PeerId {
     return { toString: () => id } as unknown as PeerId;

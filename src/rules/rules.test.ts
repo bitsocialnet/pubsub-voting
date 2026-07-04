@@ -1,17 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { createPublicClient, http } from "viem";
 import type { ChainClient } from "../chain/types.js";
-import type { ChainReadContext, Interpreter } from "./types.js";
+import type { ChainReadContext, Rule } from "./types.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
 import { constant } from "./constant.js";
 import { erc20Balance } from "./erc20-balance.js";
-import { resolveRegistry, validateCriteriaInterpreters, builtinRegistry } from "./registry.js";
-import { UnknownInterpreterError } from "../errors.js";
+import { resolveRegistry, validateCriteriaRules, builtinRegistry } from "./registry.js";
+import { UnknownRuleError } from "../errors.js";
 import { bizCriteria } from "../test-fixtures.js";
 
 /**
  * A ChainReadContext whose viem client returns a fixed `balanceOf`, for offline
- * interpreter tests. Each interpreter under test does exactly one `readContract`
+ * rule tests. Each rule under test does exactly one `readContract`
  * (ERC-20 or ERC-721 `balanceOf`), so a single stubbed return covers both.
  */
 function ctxWith(balances: { erc20?: bigint; erc721?: bigint }): ChainReadContext {
@@ -64,37 +64,37 @@ describe("registry: shadowing resolver (one flat map)", () => {
     });
 
     it("lets a host override shadow a built-in by type", () => {
-        const custom: Interpreter = { ...erc721MinBalance, evaluate: async () => ({ score: 1n }) };
+        const custom: Rule = { ...erc721MinBalance, evaluate: async () => ({ score: 1n }) };
         const registry = resolveRegistry({ "erc721-min-balance": custom });
         expect(registry["erc721-min-balance"]).toBe(custom);
         expect(registry["constant"]).toBe(constant); // unrelated built-ins untouched
     });
 
-    it("lets a host add a brand-new interpreter type", () => {
-        const seeditGate: Interpreter = { ...erc721MinBalance, type: "seedit-mod-allowlist" };
+    it("lets a host add a brand-new rule type", () => {
+        const seeditGate: Rule = { ...erc721MinBalance, type: "seedit-mod-allowlist" };
         const registry = resolveRegistry({ "seedit-mod-allowlist": seeditGate });
         expect(registry["seedit-mod-allowlist"]).toBe(seeditGate);
     });
 });
 
-describe("registry: validateCriteriaInterpreters", () => {
+describe("registry: validateCriteriaRules", () => {
     it("accepts a valid v1 criteria", () => {
-        expect(() => validateCriteriaInterpreters(bizCriteria(), builtinRegistry)).not.toThrow();
+        expect(() => validateCriteriaRules(bizCriteria(), builtinRegistry)).not.toThrow();
     });
 
-    it("rejects an unknown eligibility type", () => {
-        const criteria = { ...bizCriteria(), eligibility: { type: "nope" } };
-        expect(() => validateCriteriaInterpreters(criteria, builtinRegistry)).toThrow(UnknownInterpreterError);
+    it("rejects an unknown rule type", () => {
+        const criteria = { ...bizCriteria(), rule: { type: "nope" } };
+        expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(UnknownRuleError);
     });
 
-    it("rejects an unknown name in requires.interpreters", () => {
+    it("rejects an unknown name in requires.rules", () => {
         const base = bizCriteria();
-        const criteria = { ...base, requires: { ...base.requires, interpreters: ["erc721-min-balance", "from-the-future"] as [string, ...string[]] } };
-        expect(() => validateCriteriaInterpreters(criteria, builtinRegistry)).toThrow(UnknownInterpreterError);
+        const criteria = { ...base, requires: { ...base.requires, rules: ["erc721-min-balance", "from-the-future"] as [string, ...string[]] } };
+        expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(UnknownRuleError);
     });
 
-    it("rejects malformed interpreter options", () => {
+    it("rejects malformed rule options", () => {
         const criteria = { ...bizCriteria(), weight: { type: "constant", value: -1 } };
-        expect(() => validateCriteriaInterpreters(criteria, builtinRegistry)).toThrow();
+        expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow();
     });
 });

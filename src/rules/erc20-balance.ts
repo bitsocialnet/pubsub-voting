@@ -1,15 +1,15 @@
 import { erc20Abi, getAddress, parseUnits } from "viem";
 import { z } from "zod";
 import { ChainTickerSchema } from "../schema/common.js";
-import type { Interpreter } from "./types.js";
+import type { Rule } from "./types.js";
 
 /**
  * Score by ERC-20 balance (for example BSO). Reserved for the pass + BSO combo path.
  *
  * Score = the wallet's raw balance (base units) at the bucket block if it meets `min`,
- * else 0n. `min` (in whole tokens, default 0) is what lets this single interpreter serve
+ * else 0n. `min` (in whole tokens, default 0) is what lets this single rule serve
  * BOTH slots: in the weight slot leave `min` at 0 and the score is the magnitude; in the
- * eligibility slot set `min` and a wallet below it scores 0n (rejected).
+ * rule slot set `min` and a wallet below it scores 0n (rejected).
  *
  * The score is the exact `bigint` viem returns — no `Number()` cast, no precision loss.
  * We deliberately do NOT divide by `decimals`: that divide is monotonic, so it never
@@ -17,7 +17,7 @@ import type { Interpreter } from "./types.js";
  * precision. `decimals` is retained only to convert `min` (whole tokens) to base units
  * via viem `parseUnits`, so the gate compares like-for-like. The score's absolute
  * magnitude is therefore base units; formatting to whole tokens for display is a caller
- * concern (`viem.formatUnits`). See DESIGN.md "Interpreters".
+ * concern (`viem.formatUnits`). See DESIGN.md "Rules".
  *
  * (Edge: `min` is a normal token threshold. A `min` large enough that `.toString()`
  * yields scientific notation would break `parseUnits` — out of scope for real thresholds.)
@@ -32,7 +32,7 @@ export const Erc20BalanceOptionsSchema = z.object({
 
 export type Erc20BalanceOptions = z.infer<typeof Erc20BalanceOptionsSchema>;
 
-export const erc20Balance: Interpreter<Erc20BalanceOptions> = {
+export const erc20Balance: Rule<Erc20BalanceOptions> = {
     type: "erc20-balance",
     optionsSchema: Erc20BalanceOptionsSchema,
     async evaluate({ options, walletAddress, ctx }) {

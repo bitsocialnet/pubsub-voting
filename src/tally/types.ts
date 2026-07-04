@@ -18,7 +18,7 @@ export interface BoardTally {
      * surfacing here matched the registry. See DESIGN.md "Votes wire" and "Tally".
      */
     board: { name?: string; publicKey: string };
-    /** Summed weight of upvotes counted so far, in interpreter score units (`bigint`). */
+    /** Summed weight of upvotes counted so far, in rule score units (`bigint`). */
     weight: bigint;
     /** True once every vote contributing to this row has passed full verification. */
     verified: boolean;

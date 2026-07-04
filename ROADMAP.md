@@ -8,12 +8,12 @@ v1 does exactly one thing: **holder-decided directory voting gated by an ERC-721
 
 Concretely, v1 is:
 
-- **Eligibility:** `erc721-min-balance` (hold ≥ N of the Pass).
+- **Gate (`rule`):** `erc721-min-balance` (hold ≥ N of the Pass).
 - **Weight:** `constant` (1 Pass = 1 vote) — no balance reads, so the tally does zero chain reads.
 - **Voting:** upvote-only, one vote per topic (`maxVotesPerAddress: 1`), approval-style across contests.
-- **Built-in interpreter registry:** exactly `erc721-min-balance` + `constant`. Nothing else is registered.
+- **Built-in rule registry:** exactly `erc721-min-balance` + `constant`. Nothing else is registered.
 
-Token-weighting, ERC-20 in either slot, interpreter combining, and multi-chain resolution are **out of v1** (see [Deferred](#deferred-designed-not-shipped)).
+Token-weighting, ERC-20 in either slot, rule combining, and multi-chain resolution are **out of v1** (see [Deferred](#deferred-designed-not-shipped)).
 
 ## Status
 
@@ -24,12 +24,12 @@ The engine is implemented and unit-tested; the client-level lifecycle is the rem
 - zod schemas (criteria, votes, wire primitives) and canonical dag-cbor encoding
 - topic derivation (`topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`) and manifest → per-contest criteria derivation
 - EIP-712 ballot signer + **frozen conformance vector** (the cross-client wire spec)
-- verify pipeline: signature + `address`-recovery + criteria constraints + on-chain eligibility + board-name resolution, with a per-bundle verdict cache
+- verify pipeline: signature + `address`-recovery + criteria constraints + on-chain gate (`rule`) + board-name resolution, with a per-bundle verdict cache
 - Merkle-CRDT: LWW union keyed by wallet, dag-cbor codec, in-memory node store
 - tally: deterministic per-contest aggregation over pre-validated bundles, rolling-seed tiebreak
 - transport **validate-before-forward gossip gate** (`src/transport/gossip-validator.ts`): the full pipeline runs in an async topic validator before `forwardMessage`
 - chain bucket math and chainTicker → RPC
-- interpreters: `erc721-min-balance` + `constant` (registered); `erc20-balance` present in-tree and unit-tested but **not registered** (see Deferred)
+- rules: `erc721-min-balance` + `constant` (registered); `erc20-balance` present in-tree and unit-tested but **not registered** (see Deferred)
 - facade: `VoteNetwork.start` / `castVotes` / `getTally`; in-memory vote-intent store
 
 ### Remaining for v1
@@ -50,9 +50,9 @@ Track these as pkc-js issues and reference them here once filed.
 
 These are decided in principle and the architecture leaves room for each without an engine rewrite, but none ships in v1. Kept here so v1 stays small and the intent is not lost.
 
-- **Balance-derived / token-weighted voting.** `erc20-balance` (Pass gate + BSO weight) stays in-tree and unit-tested but is **unregistered**, so a criteria naming it recuses via `UnknownInterpreterError` rather than silently enabling token-weighting. Re-registering it in `builtinRegistry` + re-exporting from `src/index.ts` is the whole re-ship, but it must land **with** the open question below resolved. See [DESIGN.md, Future improvements](./DESIGN.md#future-improvements).
+- **Balance-derived / token-weighted voting.** `erc20-balance` (Pass gate + BSO weight) stays in-tree and unit-tested but is **unregistered**, so a criteria naming it recuses via `UnknownRuleError` rather than silently enabling token-weighting. Re-registering it in `builtinRegistry` + re-exporting from `src/index.ts` is the whole re-ship, but it must land **with** the open question below resolved. See [DESIGN.md, Future improvements](./DESIGN.md#future-improvements).
   - **Open question — lazy-tally upper bounds for non-constant weight.** The bound-based early stop in ["Tally"](./DESIGN.md#tally) assumes each unverified vote has a cheap ceiling — trivially `1` for `constant`. A balance-derived weight like `erc20-balance` derives magnitude *from* the chain read, so it carries no free wire-side bound; lazy tally there needs a self-declared, verify-down balance, or it degrades to verifying every ranking-relevant vote. The `{ score }` result object exists precisely to grow a `ceiling` field for this without another signature break. Decide when the first weighted contest ships — and, if a weight reduction ever lands, alongside it.
-- **Eligibility combining — a `challenges`-style AND-array.** Make the eligibility slot `InterpreterRef[]`, every term required, iterated by the runtime exactly as pkc-js ANDs its challenges (e.g. "hold a Pass **and** ≥ N BSO"). Requires `ChainReadContext` to evolve from a single pre-resolved `chain` to a `chainFor(ticker)` resolver. See [DESIGN.md, Future improvements](./DESIGN.md#future-improvements).
+- **Gate combining — a `challenges`-style AND-array.** Make the `rule` slot `RuleRef[]`, every term required, iterated by the runtime exactly as pkc-js ANDs its challenges (e.g. "hold a Pass **and** ≥ N BSO"). Requires `ChainReadContext` to evolve from a single pre-resolved `chain` to a `chainFor(ticker)` resolver. See [DESIGN.md, Future improvements](./DESIGN.md#future-improvements).
 - **Weight combining — a weight-only, non-recursive reduction.** For multi-asset additive weight (e.g. `#Passes + BSO/1000`), a `sum` over weight-slot terms. Requires the lazy-tally upper-bound question above.
-- **Pinned-block name resolution across chains.** Board-name verification currently resolves at head. Pinning it to a canonical historical block needs a per-bucket block *on the registry's chain* (Ethereum for `.bso`), which differs from the criteria's chain (Base in the 5chan example) — the same multi-chain block-selection problem as the tie seed and the eligibility AND-array. The resolver API already accepts an optional `blockNumber`; v1 leaves it unset and accepts a transient disagreement window around a name re-point. See [DESIGN.md, Open questions](./DESIGN.md#open-questions).
+- **Pinned-block name resolution across chains.** Board-name verification currently resolves at head. Pinning it to a canonical historical block needs a per-bucket block *on the registry's chain* (Ethereum for `.bso`), which differs from the criteria's chain (Base in the 5chan example) — the same multi-chain block-selection problem as the tie seed and the gate AND-array. The resolver API already accepts an optional `blockNumber`; v1 leaves it unset and accepts a transient disagreement window around a name re-point. See [DESIGN.md, Open questions](./DESIGN.md#open-questions).
 - **Snapshot / compaction format** for fast cold start — fetch one compacted blob instead of N nodes. Can land after the live path works.

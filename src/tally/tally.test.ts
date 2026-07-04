@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { makeTally, type TallyDeps } from "./tally.js";
-import { builtinRegistry } from "../interpreters/registry.js";
+import { builtinRegistry } from "../rules/registry.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bizCriteria } from "../test-fixtures.js";
 import type { ChainClient } from "../chain/types.js";

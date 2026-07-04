@@ -14,10 +14,10 @@ const defaults = {
     maxVotesPerAddress: 1,
     blocksPerBucket: 43200,
     voteExpiryBuckets: 30,
-    eligibility: { type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 1 },
+    rule: { type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 1 },
     weight: { type: "constant", value: 1 },
     requires: {
-        interpreters: ["erc721-min-balance", "constant"],
+        rules: ["erc721-min-balance", "constant"],
         chains: { base: { chainId: 8453, rpcUrls: ["https://mainnet.base.org"] } }
     }
 };
@@ -34,9 +34,9 @@ describe("mergeCriteria", () => {
         const c = mergeCriteria(defaults, {
             contest: "q",
             name: "/q/",
-            eligibility: { type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 2 }
+            rule: { type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 2 }
         });
-        expect(c.eligibility).toEqual({ type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 2 });
+        expect(c.rule).toEqual({ type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 2 });
     });
 
     it("rejects a merged document that is not valid criteria", () => {
@@ -56,7 +56,7 @@ describe("deriveCriteria on the real 5chan manifest", () => {
         expect(criteria.length).toBe(63);
         expect(criteria.every((c) => c.contest.length > 0)).toBe(true);
         const q = criteria.find((c) => c.contest === "q");
-        expect(q?.eligibility).toMatchObject({ min: 2 });
+        expect(q?.rule).toMatchObject({ min: 2 });
     });
 
     it("gives every slot a distinct topic", async () => {

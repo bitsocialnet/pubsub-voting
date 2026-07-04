@@ -4,7 +4,7 @@
  * The core is host-agnostic, so seedit does not use the pkc convenience path. It
  * supplies the three injected seams directly: its own running Helia node (with a
  * gossipsub service at `libp2p.services.pubsub` and a `blockstore`), a
- * `ChainClientFactory` (viem), and a `VoteSigner` wrapping the user's eligibility-chain
+ * `ChainClientFactory` (viem), and a `VoteSigner` wrapping the user's gating-chain
  * wallet (the account that holds the Pass/ERC-20). The engine is identical to 5chan's;
  * only the node and signer differ.
  */

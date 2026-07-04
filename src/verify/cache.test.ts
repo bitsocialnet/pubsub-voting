@@ -25,7 +25,7 @@ function countingVerifier(): { verifier: BundleVerifier; calls: () => number } {
         verifier: {
             verify: async () => {
                 calls++;
-                return { valid: true, eligibilityScore: 1n, resolvedNames: {} };
+                return { valid: true, ruleScore: 1n, resolvedNames: {} };
             }
         },
         calls: () => calls

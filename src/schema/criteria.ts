@@ -25,13 +25,13 @@ export const VoteRangeSchema = z.object({
 });
 
 /**
- * A reference to an interpreter by `type`, plus interpreter-specific options.
- * Kept loose on purpose: each interpreter owns and validates its own option schema
- * (see interpreters/options.ts), so custom interpreters can be referenced without
+ * A reference to a rule by `type`, plus rule-specific options.
+ * Kept loose on purpose: each rule owns and validates its own option schema
+ * (see rules/types.ts), so custom rules can be referenced without
  * changing CriteriaSchema. This mirrors pkc-js challenge settings
  * ({ name, options }) where the named challenge validates its own options.
  */
-export const InterpreterRefSchema = z.looseObject({
+export const RuleRefSchema = z.looseObject({
     type: z.string().min(1)
 });
 
@@ -43,11 +43,11 @@ export const ChainConfigSchema = z.object({
 
 /**
  * The dependency manifest. A client reads this on join and checks that it
- * implements every named interpreter; if not, it is too old and must recuse
+ * implements every named rule; if not, it is too old and must recuse
  * itself rather than miscount. This is how criteria upgrades fork cleanly.
  */
 export const RequiresSchema = z.object({
-    interpreters: z.array(z.string().min(1)).nonempty(),
+    rules: z.array(z.string().min(1)).nonempty(),
     chains: z.record(ChainTickerSchema, ChainConfigSchema)
 });
 
@@ -70,16 +70,16 @@ export const CriteriaSchema = z
         /** How many buckets a bundle stays valid after its blockNumber. */
         voteExpiryBuckets: z.number().int().positive(),
         /** Who may vote (gates a wallet in or out). */
-        eligibility: InterpreterRefSchema,
+        rule: RuleRefSchema,
         /** How much an eligible vote counts. */
-        weight: InterpreterRefSchema,
+        weight: RuleRefSchema,
         /** Dependency manifest + version negotiation. */
         requires: RequiresSchema
     })
     .strict();
 
 export type VoteRange = z.infer<typeof VoteRangeSchema>;
-export type InterpreterRef = z.infer<typeof InterpreterRefSchema>;
+export type RuleRef = z.infer<typeof RuleRefSchema>;
 export type ChainConfig = z.infer<typeof ChainConfigSchema>;
 export type Requires = z.infer<typeof RequiresSchema>;
 export type Criteria = z.infer<typeof CriteriaSchema>;

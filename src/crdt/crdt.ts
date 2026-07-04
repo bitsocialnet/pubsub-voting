@@ -10,7 +10,7 @@ import type { DagNode, DagNodeStore, LwwResolve, VoteCrdt } from "./types.js";
  *
  * Conflict resolution per wallet: highest `blockNumber` wins, tie broken by lowest node CID,
  * for determinism across clients. Bundles admitted here are assumed already validity-gated
- * (signature, eligibility, name) by the transport before merge — the CRDT is trust-neutral
+ * (signature, gate, name) by the transport before merge — the CRDT is trust-neutral
  * storage, not a verifier.
  */
 

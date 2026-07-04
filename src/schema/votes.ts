@@ -29,7 +29,7 @@ function isB58IpnsKey(x: string): boolean {
  * breaking the monotonic union. See DESIGN.md "Votes wire", "Cancelling a vote", and
  * "CRDT".
  *
- * The bundle is signed directly by the eligibility-chain wallet as EIP-712 typed data
+ * The bundle is signed directly by the gating-chain wallet as EIP-712 typed data
  * (see signer/eip712.ts); `address` is that wallet and MUST equal the address recovered
  * from `signature`. There is no pkc-js author and no author->wallet binding.
  */
@@ -59,7 +59,7 @@ export const BoardSchema = z.object({
     // A pkc-js community identity: `name` is an optional resolvable domain (must be
     // dotted — carry a TLD — e.g. "memes.bso" via @bitsocial/bso-resolver), `publicKey`
     // is the B58 IPNS name (e.g. "12D3KooW..."): the self-certifying key the tally
-    // aggregates on. Not an EVM address; the eligibility-chain wallet lives on the
+    // aggregates on. Not an EVM address; the gating-chain wallet lives on the
     // enclosing bundle's `address`, not here. We validate the key strictly
     // (`isB58IpnsKey`) — stricter than pkc-js's loose `z.string().min(1)` field —
     // because this is the vote-identity boundary: a domain or garbage in the identity

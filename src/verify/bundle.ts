@@ -1,9 +1,9 @@
 import type { VotesBundle } from "../schema/votes.js";
 import type { Criteria } from "../schema/criteria.js";
-import type { InterpreterRegistry } from "../interpreters/types.js";
+import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
-import { UnknownInterpreterError } from "../errors.js";
+import { UnknownRuleError } from "../errors.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
 import type { BundleVerifier, BundleVerdict } from "./types.js";
@@ -15,8 +15,8 @@ import type { BundleVerifier, BundleVerdict } from "./types.js";
  *
  *   1. signature   (local, µs): recover the EIP-712 signer, must equal `bundle.address`.
  *   2. constraints (local, µs): `votes.length <= maxVotesPerAddress`, each vote in range.
- *   3. eligibility (chain):     the eligibility interpreter scores the wallet `> 0n` at the
- *                               bucket block. `0n` -> ineligible -> drop.
+ *   3. gate        (chain):     the `rule` scores the wallet `> 0n` at the bucket block.
+ *                               `0n` -> not admitted -> drop.
  *   4. name        (network):   each vote's `board.name` (if any) must resolve to the
  *                               claimed `publicKey`; a squatted/absent name drops the bundle.
  *
@@ -33,10 +33,10 @@ export interface BundleVerifierDeps {
     criteria: Criteria;
     /** The criteria document's CID bytes (`(await criteriaCid(criteria)).bytes`) — signature binding. */
     criteriaCid: Uint8Array;
-    /** The eligibility chain's numeric chainId (bound in the ballot domain). */
+    /** The rule chain's numeric chainId (bound in the ballot domain). */
     chainId: number;
-    /** Resolved interpreter registry (built-ins + host overrides). */
-    registry: InterpreterRegistry;
+    /** Resolved rule registry (built-ins + host overrides). */
+    registry: RuleRegistry;
     /** Resolve a chain ticker (e.g. "base") to its viem client. */
     chainFor: (ticker: string) => ChainClient;
     /** Bucket math for `criteria.blocksPerBucket`. */
@@ -48,13 +48,13 @@ export interface BundleVerifierDeps {
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
     const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers } = deps;
 
-    // Resolve the eligibility interpreter, its options, and its chain client once. The
-    // interpreter reads at the bundle's bucket block, but which interpreter/chain to use is
-    // fixed by the criteria, so it need not be recomputed per bundle.
-    const eligibility = registry[criteria.eligibility.type];
-    if (!eligibility) throw new UnknownInterpreterError("eligibility", criteria.eligibility.type);
-    const eligibilityOptions = eligibility.optionsSchema.parse(criteria.eligibility);
-    const eligibilityChain = chainFor(tickerForRef(criteria, criteria.eligibility, eligibilityOptions));
+    // Resolve the gate `rule`, its options, and its chain client once. The rule reads at the
+    // bundle's bucket block, but which rule/chain to use is fixed by the criteria, so it need
+    // not be recomputed per bundle.
+    const rule = registry[criteria.rule.type];
+    if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
+    const ruleOptions = rule.optionsSchema.parse(criteria.rule);
+    const ruleChain = chainFor(tickerForRef(criteria, criteria.rule, ruleOptions));
 
     return {
         async verify(bundle: VotesBundle): Promise<BundleVerdict> {
@@ -66,15 +66,15 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             const constraints = checkBundleConstraints(bundle, criteria);
             if (!constraints.valid) return constraints;
 
-            // 3. Eligibility (chain) — read the gate at the bucket's sample block.
+            // 3. Gate (chain) — read the `rule` at the bucket's sample block.
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
-            const { score } = await eligibility.evaluate({
-                options: eligibilityOptions,
+            const { score } = await rule.evaluate({
+                options: ruleOptions,
                 walletAddress: bundle.address,
-                ctx: { chain: eligibilityChain, blockNumber: sampleBlock }
+                ctx: { chain: ruleChain, blockNumber: sampleBlock }
             });
             if (score === 0n) {
-                return { valid: false, reason: `ineligible: eligibility score is 0n at block ${sampleBlock}` };
+                return { valid: false, reason: `not admitted: rule score is 0n at block ${sampleBlock}` };
             }
 
             // 4. Board-name resolution (network) — a carried name is a claim, verified against
@@ -97,7 +97,7 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
                 resolvedNames[name] = record.publicKey;
             }
 
-            return { valid: true, eligibilityScore: score, resolvedNames };
+            return { valid: true, ruleScore: score, resolvedNames };
         }
     };
 }

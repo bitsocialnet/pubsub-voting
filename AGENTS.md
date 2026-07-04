@@ -4,7 +4,7 @@ Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. 
 
 ## Scope rules
 
-- **MUST** keep the core (`src/schema/`, `src/interpreters/`, `src/chain/`, `src/crdt/`, `src/tally/`, `src/verify/`) free of any `libp2p` / `helia` import. Network code lives only under `src/transport/`. This is what keeps the engine unit-testable without a network.
+- **MUST** keep the core (`src/schema/`, `src/rules/`, `src/chain/`, `src/crdt/`, `src/tally/`, `src/verify/`) free of any `libp2p` / `helia` import. Network code lives only under `src/transport/`. This is what keeps the engine unit-testable without a network.
 - **MUST** keep this library out of pkc-js's protocol concerns. It consumes pkc-js, it does not modify it. Anything chain-related (balance reads, wallet binding, chainTicker-to-RPC) lives here, never upstream.
 - **MUST NOT** start a libp2p node. Accept an injected handle from the host (today `pkc.clients.libp2pJsClients[key]._helia`).
 - **MUST NOT** use `any` or cast to `any` without asking. This repo stays fully typed.
@@ -26,7 +26,7 @@ Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. 
 
 - Schemas are zod v4 (`z.looseObject`, `z.record(key, value)`, `z.strictObject`/`.strict()`, `z.discriminatedUnion`). Check `package.json` for the exact zod version before using version-sensitive APIs.
 - The criteria document must be canonically encodable with dag-cbor (no `undefined`, sorted keys), because `topic = CID(dag-cbor(criteria))`. A non-canonical criteria object is a bug: it changes the topic.
-- Each interpreter owns its own option schema. The top-level `CriteriaSchema` keeps `eligibility`/`weight` loose (`{ type, ...options }`) so custom interpreters can register without a schema change.
+- Each rule owns its own option schema. The top-level `CriteriaSchema` keeps `rule`/`weight` loose (`{ type, ...options }`) so custom rules can register without a schema change.
 - A vote bundle carries **no pkc-js author**. The voting wallet signs each bundle directly as EIP-712 typed data; the bundle is `{ address, votes, blockNumber, signature }` where `address` MUST equal the address recovered from `signature`. You may reuse pkc-js's detached-signature shape (`{ signature, type }`) for the `signature` field, but do not carry a pkc-js author object or an author→wallet binding. See [DESIGN.md, Votes wire](./DESIGN.md).
 
 ## When implementing later (not now)

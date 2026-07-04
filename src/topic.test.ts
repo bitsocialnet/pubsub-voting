@@ -23,7 +23,7 @@ describe("topicFor", () => {
         const reordered: Criteria = {
             requires: base.requires,
             weight: base.weight,
-            eligibility: base.eligibility,
+            rule: base.rule,
             voteExpiryBuckets: base.voteExpiryBuckets,
             blocksPerBucket: base.blocksPerBucket,
             maxVotesPerAddress: base.maxVotesPerAddress,
@@ -44,7 +44,7 @@ describe("topicFor", () => {
         const a = bizCriteria();
         const b: Criteria = {
             ...bizCriteria(),
-            eligibility: { ...bizCriteria().eligibility, min: 2 }
+            rule: { ...bizCriteria().rule, min: 2 }
         };
         expect(await topicFor(a)).not.toBe(await topicFor(b));
     });

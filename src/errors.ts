@@ -21,22 +21,22 @@ export class NotImplementedError extends Error {
 }
 
 /**
- * Thrown when a criteria document names an interpreter `type` this client does not
- * implement (in the `eligibility`/`weight` slot or in `requires.interpreters`). A
+ * Thrown when a criteria document names a rule `type` this client does not
+ * implement (in the `rule`/`weight` slot or in `requires.rules`). A
  * client that hits this is too old (or missing a host override) and must recuse
- * itself from the contest rather than miscount. See DESIGN.md "Interpreters".
+ * itself from the contest rather than miscount. See DESIGN.md "Rules".
  */
-export class UnknownInterpreterError extends Error {
+export class UnknownRuleError extends Error {
     constructor(
-        readonly slot: "eligibility" | "weight" | "requires",
+        readonly slot: "rule" | "weight" | "requires",
         readonly type: string
     ) {
         super(
-            `Unknown interpreter "${type}" referenced by the criteria ${slot}. This client does not ` +
-                `implement it; pass it via the \`interpreters\` option to shadow/extend the built-ins, ` +
+            `Unknown rule "${type}" referenced by the criteria ${slot}. This client does not ` +
+                `implement it; pass it via the \`rules\` option to shadow/extend the built-ins, ` +
                 `or recuse this contest. Built-ins: see registry.ts.`
         );
-        this.name = "UnknownInterpreterError";
+        this.name = "UnknownRuleError";
     }
 }
 

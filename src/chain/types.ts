@@ -5,14 +5,14 @@ import type { ChainConfig } from "../schema/criteria.js";
  * Chain access.
  *
  * A `ChainClient` is just a viem `PublicClient`. The library does not wrap it in a
- * curated read API (no `balanceOfErc20`/`balanceOfErc721` helpers): every interpreter
+ * curated read API (no `balanceOfErc20`/`balanceOfErc721` helpers): every rule
  * writes its own reads with the full viem surface (`readContract`, `getBalance`,
  * `call`, multicall, ...) against whatever ABI it needs. That keeps custom
- * interpreters unconstrained — a host can read any contract shape without waiting for
+ * rules unconstrained — a host can read any contract shape without waiting for
  * a helper to be added here.
  *
  * Reads must be pinned to an explicit historical block (the sampled block for a
- * bundle's bucket) so every verifier prices the same state — interpreters pass
+ * bundle's bucket) so every verifier prices the same state — rules pass
  * `blockNumber: BigInt(ctx.blockNumber)` to each viem call. viem is allowed in the
  * core (it carries no libp2p/helia import); only `src/transport/` touches the node.
  *

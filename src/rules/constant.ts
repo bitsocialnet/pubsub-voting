@@ -1,10 +1,10 @@
 import { z } from "zod";
-import type { Interpreter } from "./types.js";
+import type { Rule } from "./types.js";
 
 /**
  * A fixed score for every wallet. v1.
  *
- * In the weight slot this is "1 pass = 1 vote" (`value: 1`). In the eligibility slot a
+ * In the weight slot this is "1 pass = 1 vote" (`value: 1`). In the rule slot a
  * positive `value` admits everyone (a no-op gate). No chain read.
  */
 export const ConstantOptionsSchema = z.object({
@@ -14,7 +14,7 @@ export const ConstantOptionsSchema = z.object({
 
 export type ConstantOptions = z.infer<typeof ConstantOptionsSchema>;
 
-export const constant: Interpreter<ConstantOptions> = {
+export const constant: Rule<ConstantOptions> = {
     type: "constant",
     optionsSchema: ConstantOptionsSchema,
     async evaluate({ options }) {

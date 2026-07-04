@@ -9,7 +9,7 @@ import type { BallotTypedData } from "./eip712.js";
  * pkc-js, plebbit, or a raw key without the library ever holding key material: the
  * library builds the EIP-712 ballot typed data and asks the host to sign it.
  *
- * The signer wraps the eligibility-chain wallet — the account that holds the Pass/ERC-20.
+ * The signer wraps the gating-chain wallet — the account that holds the Pass/ERC-20.
  * There is no pkc-js author and no author->wallet binding: the address recovered from the
  * ballot signature IS the voter (see DESIGN.md "Identity: the voting wallet, nothing
  * else"). A voter constructed without a signer is read-only (renders tallies, cannot
@@ -17,7 +17,7 @@ import type { BallotTypedData } from "./eip712.js";
  */
 export interface VoteSigner {
     /**
-     * The voting wallet's address (the eligibility-chain account holding the Pass/ERC-20).
+     * The voting wallet's address (the gating-chain account holding the Pass/ERC-20).
      * Embedded as `bundle.address`; the verifier independently recovers it from the
      * signature, so a wrong value here fails verification rather than forging a vote.
      */

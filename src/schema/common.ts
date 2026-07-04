@@ -4,11 +4,11 @@ import { z } from "zod";
  * Shared wire primitives.
  *
  * There is no pkc-js author in this library: a vote is signed directly by the
- * eligibility-chain wallet that holds the Pass/ERC-20 (see DESIGN.md "Identity: the
+ * gating-chain wallet that holds the Pass/ERC-20 (see DESIGN.md "Identity: the
  * voting wallet, nothing else"). What survives from the old author/wallet schema is
  * two small, identity-agnostic primitives reused across the wire:
  *   - `ChainTickerSchema`: the chain identifier ("base", "eth", ...) used by criteria
- *     and chain-reading interpreters.
+ *     and chain-reading rules.
  *   - `SignatureSchema`: the detached `{ signature, type }` shape (kept from pkc-js),
  *     here carrying the wallet's EIP-712 ballot signature.
  */

@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: engine implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain eligibility + board-name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's **validate-before-forward gossip gate** are all implemented — so `start`, `castVotes`, and `getTally` are live. The gate runs the full validity pipeline in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, ineligible wallet, squatted name) is never propagated and `reject` scores the sender. The remaining stub is the `PubsubVoter` client-level republish scheduler. See [DESIGN.md](./DESIGN.md) for the architecture, the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
+> **Status: engine implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + board-name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's **validate-before-forward gossip gate** are all implemented — so `start`, `castVotes`, and `getTally` are live. The gate runs the full validity pipeline in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. The remaining stub is the `PubsubVoter` client-level republish scheduler. See [DESIGN.md](./DESIGN.md) for the architecture, the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -24,7 +24,7 @@ This library does not start its own node. It consumes the host's running Helia n
 
 - **Settings live in the topic.** `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. Two peers on the same topic provably ran identical rules, so the network validates itself with no intermediary.
 - **Votes are a Merkle-CRDT.** A signed `Votes` bundle is a DAG node; only head CIDs travel over pubsub; missing history is fetched by CID. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves.
-- **Eligibility and weight are data, not code.** A fixed interpreter registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the NFT path — `erc721-min-balance` eligibility (5chan Pass) and `constant` weight (1 pass = 1 vote). Balance-derived (token-weighted) voting is deferred; see [ROADMAP.md](./ROADMAP.md).
+- **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the NFT path — an `erc721-min-balance` gate `rule` (5chan Pass) and `constant` weight (1 pass = 1 vote). Balance-derived (token-weighted) voting is deferred; see [ROADMAP.md](./ROADMAP.md).
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
 
@@ -35,7 +35,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`) and a `blockstore` (else `MissingBlockstoreError`) |
-| `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; interpreters read through it for eligibility and weight |
+| `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | board-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `board.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
 | `manifest` | `unknown` | no | a directory manifest this voter owns; `voter.start()` derives every contest from it and keeps them republished under one lifecycle (see [Lifecycle](#lifecycle-start--stop--destroy)) |
@@ -112,17 +112,17 @@ const allCriteria = deriveCriteria(manifest); // defaults ⊕ each entry, each v
 
 Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a read-only consumer are in [examples/](./examples/).
 
-### Custom interpreters
+### Custom rules
 
-Eligibility and weight are a single flat registry of interpreters, one `type` per file, mirroring the pkc-js challenge registry. Each interpreter owns its option schema and is evaluated at the bundle's bucket block. Chain-reading interpreters get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → { score: bigint }`, a non-negative score where `0n` means "does not qualify" (a result object, not a bare `bigint`, so slot-specific fields can be added later). The criteria has two *slots* drawing from the one registry — the **eligibility** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `eligibility.score > 0n ? weight.score : 0n`. An interpreter that needs a threshold returns `0n` below it (so `erc721-min-balance`'s optional `min` gates), which lets the same interpreter serve either slot.
+The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema and is evaluated at the bundle's bucket block. Chain-reading rules get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → { score: bigint }`, a non-negative score where `0n` means "does not qualify" (a result object, not a bare `bigint`, so slot-specific fields can be added later). The criteria has two *slots* drawing from the one registry — the **rule** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `rule.score > 0n ? weight.score : 0n`. A rule that needs a threshold returns `0n` below it (so `erc721-min-balance`'s optional `min` gates), which lets the same rule serve either slot.
 
-Built-ins: `erc721-min-balance` (v1) and `constant` (v1). A host adds or shadows interpreters by `type` via the `interpreters` option — this is how clients like 5chan or seedit register custom rules without forking the library:
+Built-ins: `erc721-min-balance` (v1) and `constant` (v1). A host adds or shadows rules by `type` via the `rules` option — this is how clients like 5chan or seedit register custom rules without forking the library:
 
 ```ts
-import { PubsubVoter, type Interpreter } from "@bitsocial/pubsub-votes";
+import { PubsubVoter, type Rule } from "@bitsocial/pubsub-votes";
 import { z } from "zod";
 
-const seeditModAllowlist: Interpreter<{ type: "seedit-mod-allowlist"; allow: string[] }> = {
+const seeditModAllowlist: Rule<{ type: "seedit-mod-allowlist"; allow: string[] }> = {
   type: "seedit-mod-allowlist",
   optionsSchema: z.object({ type: z.literal("seedit-mod-allowlist"), allow: z.array(z.string()) }),
   async evaluate({ options, walletAddress }) {
@@ -132,15 +132,15 @@ const seeditModAllowlist: Interpreter<{ type: "seedit-mod-allowlist"; allow: str
 
 const voter = new PubsubVoter({
   libp2p, chains,
-  interpreters: { "seedit-mod-allowlist": seeditModAllowlist } // flat map; shadows/extends built-ins by `type`
+  rules: { "seedit-mod-allowlist": seeditModAllowlist } // flat map; shadows/extends built-ins by `type`
 });
 ```
 
-A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned to the topic it runs on, and a client that does not implement a `type` named in `criteria.requires.interpreters` throws `UnknownInterpreterError` and recuses itself rather than miscounting.
+A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned to the topic it runs on, and a client that does not implement a `type` named in `criteria.requires.rules` throws `UnknownRuleError` and recuses itself rather than miscounting.
 
 ### Weighted voting (deferred)
 
-v1 ships `constant` weight (one Pass, one vote) **on purpose** — it resists whale dominance and downvote weaponization. Balance-derived, token-weighted voting (Pass gate + BSO weight via `erc20-balance`) is a designed-but-unshipped capability: the interpreter path and result shape leave room for it with no engine change, but it is not in the v1 built-ins and carries open governance/abuse and lazy-tally questions. See [ROADMAP.md](./ROADMAP.md) and [DESIGN.md, Future improvements](./DESIGN.md#future-improvements).
+v1 ships `constant` weight (one Pass, one vote) **on purpose** — it resists whale dominance and downvote weaponization. Balance-derived, token-weighted voting (Pass gate + BSO weight via `erc20-balance`) is a designed-but-unshipped capability: the rule path and result shape leave room for it with no engine change, but it is not in the v1 built-ins and carries open governance/abuse and lazy-tally questions. See [ROADMAP.md](./ROADMAP.md) and [DESIGN.md, Future improvements](./DESIGN.md#future-improvements).
 
 ## Layout
 
@@ -154,7 +154,7 @@ src/
   store/         vote-intent persistence (Node SQLite / browser IDB) [memory impl; backends design]
   client/        PubsubVoter facade + per-contest VoteNetwork     [implemented; republish scheduler stub]
   errors.ts      NotImplemented/ReadOnly/MissingPubsub/Blockstore [implemented]
-  interpreters/  one file per `type` + registry/resolver          [implemented]
+  rules/         one file per `type` + registry/resolver          [implemented]
   chain/         ChainClient = viem PublicClient + bucket math     [implemented]
   verify/        signature + constraints + full BundleVerifier + verdict cache [implemented]
   crdt/          Merkle-CRDT: LWW union, codec, in-memory store    [implemented]

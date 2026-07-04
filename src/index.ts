@@ -3,11 +3,11 @@
  *
  * The engine is implemented and unit-tested: the zod schemas, canonical dag-cbor encoding,
  * topic derivation, manifest derivation, the verify pipeline (signature + constraints +
- * eligibility + name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's
+ * gate + name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's
  * validate-before-forward gossip gate (`VoteNetwork.start`/`castVotes`/`getTally` are live).
  * The `PubsubVoter` client-level republish scheduler is the remaining stub. See DESIGN.md for
  * architecture, and "Transport" for the forward-gate that verifies a bundle (signature,
- * on-chain eligibility, board-name resolution) before gossipsub re-forwards it.
+ * on-chain gate, board-name resolution) before gossipsub re-forwards it.
  */
 
 // Schemas (runtime values) and their inferred types.
@@ -15,17 +15,17 @@ export * from "./schema/common.js";
 export * from "./schema/votes.js";
 export * from "./schema/criteria.js";
 
-// Interpreters: a single kind, one file per `type`, each owning its option schema and an
-// `evaluate` returning `{ score: bigint }` (the eligibility slot gates on `score > 0n`,
+// Rules: a single kind, one file per `type`, each owning its option schema and an
+// `evaluate` returning `{ score: bigint }` (the `rule` slot gates on `score > 0n`,
 // the weight slot uses the magnitude), plus the registry (built-ins, the host-shadowing resolver, and criteria
-// validation). The leaf interpreters read through the injected viem `PublicClient`
-// (`ctx.chain`). Interpreter composition (combining several into one slot) is a
+// validation). The leaf rules read through the injected viem `PublicClient`
+// (`ctx.chain`). Rule composition (combining several into one slot) is a
 // documented future extension, not a built-in — see DESIGN.md "Future improvements".
 // v1 ships the NFT path only: `erc721-min-balance` + `constant`. `erc20-balance` stays in
 // the tree but is not registered or re-exported — see ROADMAP.md ("Deferred").
-export * from "./interpreters/erc721-min-balance.js";
-export * from "./interpreters/constant.js";
-export * from "./interpreters/registry.js";
+export * from "./rules/erc721-min-balance.js";
+export * from "./rules/constant.js";
+export * from "./rules/registry.js";
 
 // Implemented runtime: encoding, topic, manifest, errors, identity seam, facade.
 export * from "./encoding/canonical.js";
@@ -43,7 +43,7 @@ export * from "./signer/eip712.js";
 export type { VoteSigner } from "./signer/types.js";
 
 // Design interfaces (types only) for the engine that is not yet implemented.
-export type * from "./interpreters/types.js";
+export type * from "./rules/types.js";
 export type * from "./chain/types.js";
 export type * from "./verify/types.js";
 export type * from "./crdt/types.js";

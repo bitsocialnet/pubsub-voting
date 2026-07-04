@@ -19,7 +19,7 @@ async function makeNode(address: string, parents: CID[] = []): Promise<{ cid: CI
     return { cid: await dagNodeCid(node), node };
 }
 
-const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, eligibilityScore: 1n, resolvedNames: {} }) };
+const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
 const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, reason: "invalid" }) };
 
 const DEFAULT_BOUNDS = { maxHeadsPerMessage: 16, maxMessageBytes: 1 << 20, maxClosureNodes: 100 };
@@ -104,7 +104,7 @@ describe("makeGossipGate", () => {
     it("short-circuits to accept on a verdict-cache hit without fetching", async () => {
         const { cid } = await makeNode("0x1");
         const cache = makeVerdictCache();
-        cache.set(cid, { valid: true, eligibilityScore: 1n, resolvedNames: {} });
+        cache.set(cid, { valid: true, ruleScore: 1n, resolvedNames: {} });
         let fetches = 0;
         const g = gate({
             fetchNode: async () => {

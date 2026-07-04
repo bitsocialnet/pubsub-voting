@@ -3,7 +3,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { makeBundleVerifier } from "./bundle.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
-import { builtinRegistry } from "../interpreters/registry.js";
+import { builtinRegistry } from "../rules/registry.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bizCriteria } from "../test-fixtures.js";
 import type { ChainClient, NameResolver } from "../chain/types.js";
@@ -70,10 +70,10 @@ describe("makeBundleVerifier", () => {
         const bundle = await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n }).verify(bundle);
         expect(verdict.valid).toBe(true);
-        if (verdict.valid) expect(verdict.eligibilityScore).toBe(1n);
+        if (verdict.valid) expect(verdict.ruleScore).toBe(1n);
     });
 
-    it("rejects an ineligible wallet (eligibility score 0n)", async () => {
+    it("rejects a wallet the gate does not admit (rule score 0n)", async () => {
         const bundle = await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 0n }).verify(bundle);
         expect(verdict.valid).toBe(false);

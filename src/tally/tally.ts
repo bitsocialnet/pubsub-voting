@@ -2,17 +2,17 @@ import { base58btc } from "multiformats/bases/base58";
 import { sha256 } from "multiformats/hashes/sha2";
 import type { Criteria } from "../schema/criteria.js";
 import type { VotesBundle } from "../schema/votes.js";
-import type { InterpreterRegistry } from "../interpreters/types.js";
+import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
-import { UnknownInterpreterError } from "../errors.js";
+import { UnknownRuleError } from "../errors.js";
 import type { Tally, TallyOptions, ContestTally, BoardTally } from "./types.js";
 
 /**
  * Deterministic per-contest aggregation over the CRDT's current (already validity-gated)
- * bundles. Because the forward-gate verified signature + eligibility + name before any
+ * bundles. Because the forward-gate verified signature + gate (`rule`) + name before any
  * bundle was stored, the tally never re-does that work: it only sums *weight magnitude*
- * per board and orders the rows. In v1 the weight interpreter is `constant`, so this does
+ * per board and orders the rows. In v1 the weight rule is `constant`, so this does
  * ZERO chain reads (see DESIGN.md "Tally"). The reserved balance-derived weight path
  * (`erc20-balance`) is where the lazy ceiling/floor early-stop would live; v1 has a trivial
  * `1` ceiling per vote, so the common case simply sums.
@@ -25,7 +25,7 @@ import type { Tally, TallyOptions, ContestTally, BoardTally } from "./types.js";
 
 export interface TallyDeps {
     criteria: Criteria;
-    registry: InterpreterRegistry;
+    registry: RuleRegistry;
     chainFor: (ticker: string) => ChainClient;
     bucketMath: BucketMath;
     /** The CRDT's current bundles (one per wallet, LWW-resolved); empty-votes bundles are withdrawals. */
@@ -52,9 +52,9 @@ function compareBytes(x: Uint8Array, y: Uint8Array): number {
 export function makeTally(deps: TallyDeps): Tally {
     const { criteria, registry, chainFor, bucketMath, current, bucketBlockHash } = deps;
 
-    // Resolve the weight interpreter, its options, and its chain once (see verify/bundle.ts).
+    // Resolve the weight rule, its options, and its chain once (see verify/bundle.ts).
     const weight = registry[criteria.weight.type];
-    if (!weight) throw new UnknownInterpreterError("weight", criteria.weight.type);
+    if (!weight) throw new UnknownRuleError("weight", criteria.weight.type);
     const weightOptions = weight.optionsSchema.parse(criteria.weight);
     const weightChain = chainFor(tickerForRef(criteria, criteria.weight, weightOptions));
 
