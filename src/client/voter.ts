@@ -210,6 +210,13 @@ class ContestNetwork implements VoteNetwork {
     readonly #tally: ReturnType<typeof makeTally>;
     /** Live once `start()` runs; the gate + gossip wiring for this topic. */
     #transport: VoteTransport | undefined;
+    /**
+     * Last-known current bucket on the gating chain, refreshed by {@link #refreshBucket} on
+     * every chain read the network already does (start, cast, tally). The CRDT's read-time
+     * expiry filter (`current`/`heads`) reads it, so the sync transport `getHeads` closure
+     * stays sync while still dropping decayed votes. Coarse-stale is fine — buckets are large.
+     */
+    #currentBucketCache = 0;
 
     constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
@@ -256,7 +263,7 @@ class ContestNetwork implements VoteNetwork {
             registry: deps.registry,
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
-            current: () => this.#crdt.current(),
+            current: () => this.#crdt.current(this.#currentBucketCache),
             bucketBlockHash: () => this.#bucketBlockHash()
         });
     }
@@ -269,6 +276,13 @@ class ContestNetwork implements VoteNetwork {
         const client = this.#chainClients[ticker];
         if (!client) throw new Error(`no chain client configured for chain "${ticker}"`);
         return client;
+    }
+
+    /** Read the gating-chain head and update {@link #currentBucketCache}; returns the bucket. */
+    async #refreshBucket(): Promise<number> {
+        const head = await this.#ruleChain.getBlockNumber();
+        this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
+        return this.#currentBucketCache;
     }
 
     /** Hash of the current bucket boundary block on the gating (`rule`) chain (rolling tie seed). */
@@ -304,9 +318,17 @@ class ContestNetwork implements VoteNetwork {
             gate,
             encodeHeads,
             decodeHeads,
-            getHeads: () => this.#crdt.heads()
+            getHeads: () => this.#crdt.heads(this.#currentBucketCache)
         });
         await this.#transport.start();
+        // If cold start merged any heads, refresh the bucket and prune the decayed nodes it
+        // pulled in. Gated on non-empty state so an empty join stays network-free (no getBlockNumber
+        // read), preserving the "zero chain reads for a constant-weight tally" property. Periodic
+        // pruning should ride the republish scheduler tick once that lands.
+        if (this.#crdt.nodeCount() > 0) {
+            await this.#refreshBucket();
+            await this.#crdt.prune(this.#currentBucketCache);
+        }
     }
 
     async stop(): Promise<void> {
@@ -320,14 +342,16 @@ class ContestNetwork implements VoteNetwork {
 
         // Sign for the current bucket boundary block, the same block every verifier reads at.
         const head = await this.#ruleChain.getBlockNumber();
-        const blockNumber = this.#bucketMath.sampleBlockForBucket(this.#bucketMath.bucketForBlock(Number(head)));
+        const bucket = this.#bucketMath.bucketForBlock(Number(head));
+        this.#currentBucketCache = bucket;
+        const blockNumber = this.#bucketMath.sampleBlockForBucket(bucket);
         const typedData = ballotTypedData({ criteriaCid: this.#criteriaCid, chainId: this.#chainId, votes, blockNumber });
         const signature = await signer.signBallot(typedData);
         const address = await signer.address();
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
         await this.#crdt.add(bundle);
-        await this.#transport?.broadcastHeads(this.#crdt.heads());
+        await this.#transport?.broadcastHeads(this.#crdt.heads(bucket));
         // Persist the re-signable intent so the republish scheduler can revive it after restart.
         await this.#deps.store.put({ topic: this.topic, address, votes, lastBucket: this.#bucketMath.bucketForBlock(blockNumber) });
         this.#notifyUpdate();
@@ -335,6 +359,13 @@ class ContestNetwork implements VoteNetwork {
     }
 
     async getTally(options?: TallyOptions): Promise<ContestTally> {
+        // With state present, refresh the bucket so the tally's `current()` filters expiry against
+        // the live block, then prune the now-decayed nodes. Empty state needs neither, so an
+        // empty tally reads no chain (the constant-weight "zero chain reads" property).
+        if (this.#crdt.nodeCount() > 0) {
+            await this.#refreshBucket();
+            await this.#crdt.prune(this.#currentBucketCache);
+        }
         return this.#tally.compute(options);
     }
 

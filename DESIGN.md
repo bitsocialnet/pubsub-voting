@@ -138,7 +138,9 @@ The old "sign once, delegate to a cheap key" rationale does not apply here: the 
 
 ### CRDT
 
-Last-write-wins element-set keyed by the voting wallet address (recovered from the bundle's EIP-712 signature); value is the bundle; conflict resolution is highest `blockNumber`, tiebreak lowest bundle CID (for determinism across clients). Each bundle is a dag-cbor DAG node linking the heads known at signing, stored in the host's Helia blockstore. Only head CIDs go over pubsub; missing ancestors are fetched by CID. Prune bundles older than `voteExpiryBuckets` and those superseded per wallet.
+Last-write-wins element-set keyed by the voting wallet address (recovered from the bundle's EIP-712 signature); value is the bundle; conflict resolution is highest `blockNumber`, tiebreak lowest bundle CID (for determinism across clients). Each bundle is a dag-cbor DAG node linking the heads known at signing, stored in the host's Helia blockstore. Only head CIDs go over pubsub; missing ancestors are fetched by CID.
+
+Expiry is a **read-time filter, not a delete**: `current()` and `heads()` take the current bucket and drop any bundle past `voteExpiryBuckets` after its `blockNumber`'s bucket, so a decayed vote never enters the tally nor the broadcast heads — *even when a `merge` re-materializes it as a DAG ancestor* (integrating a live head walks its parents back through the store, so an expired ancestor cannot simply be deleted without breaking that walk). `prune` then drops expired and superseded-per-wallet nodes from the in-memory working set to bound memory; it is housekeeping, not the correctness guarantee, since the read-time filter already excludes anything it would remove.
 
 ### Transport: gossipsub topic + validation
 

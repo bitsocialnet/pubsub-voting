@@ -16,6 +16,8 @@ function bundle(address: string, votes: Vote[], blockNumber: number): VotesBundl
 }
 
 const BLOCKS_PER_BUCKET = 43200;
+// Any bucket where nothing added below has expired (all test bundles sit in buckets 0..1).
+const LIVE = 0;
 function crdt() {
     return makeVoteCrdt({
         store: makeMemoryDagNodeStore(),
@@ -30,7 +32,7 @@ describe("makeVoteCrdt — LWW reduction", () => {
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 100));
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], 200));
 
-        const current = c.current();
+        const current = c.current(LIVE);
         expect(current).toHaveLength(1);
         expect(current[0].blockNumber).toBe(200);
         expect(current[0].votes[0].board.publicKey).toBe(KEY_B);
@@ -48,7 +50,7 @@ describe("makeVoteCrdt — LWW reduction", () => {
         const c = makeVoteCrdt({ store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 });
         await c.merge([cidA, cidB]);
 
-        const current = c.current();
+        const current = c.current(LIVE);
         expect(current).toHaveLength(1);
         // The winner is the one whose node CID the resolver picks as lowest.
         const winnerCid = lwwResolve({ bundle: nodeA.value, cid: cidA }, { bundle: nodeB.value, cid: cidB });
@@ -61,7 +63,7 @@ describe("makeVoteCrdt — LWW reduction", () => {
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 100));
         await c.add(bundle(WALLET, [], 200)); // withdrawal: newer, empty
 
-        const current = c.current();
+        const current = c.current(LIVE);
         expect(current).toHaveLength(1);
         expect(current[0].votes).toHaveLength(0); // resolves to the withdrawal
     });
@@ -73,7 +75,7 @@ describe("makeVoteCrdt — heads and monotonic union", () => {
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 100));
         const second = await c.add(bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], 200));
 
-        const heads = c.heads();
+        const heads = c.heads(LIVE);
         expect(heads).toHaveLength(1);
         expect(heads[0].equals(second)).toBe(true);
     });
@@ -88,34 +90,99 @@ describe("makeVoteCrdt — heads and monotonic union", () => {
         await a.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 100));
         await b.add(bundle(OTHER, [{ board: { publicKey: KEY_B }, vote: 1 }], 100));
 
-        await a.merge(b.heads());
-        await a.merge(b.heads()); // idempotent: re-merging the same heads changes nothing
+        await a.merge(b.heads(LIVE));
+        await a.merge(b.heads(LIVE)); // idempotent: re-merging the same heads changes nothing
 
-        const wallets = new Set(a.current().map((v) => v.address));
+        const wallets = new Set(a.current(LIVE).map((v) => v.address));
         expect(wallets).toEqual(new Set([WALLET, OTHER]));
         // Union only adds: a still has its own vote after merging b's.
-        expect(a.current()).toHaveLength(2);
+        expect(a.current(LIVE)).toHaveLength(2);
     });
 });
 
-describe("makeVoteCrdt — prune", () => {
-    it("drops a bundle past its expiry window", async () => {
-        const c = crdt();
-        await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0
-        expect(c.current()).toHaveLength(1);
+describe("makeVoteCrdt — read-time expiry filter", () => {
+    it("current() drops an expired winner but keeps a still-live one", async () => {
+        const c = crdt(); // voteExpiryBuckets = 2
+        await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0, expires past 2
+        await c.add(bundle(OTHER, [{ board: { publicKey: KEY_B }, vote: 1 }], 3 * BLOCKS_PER_BUCKET)); // bucket 3
 
-        // voteExpiryBuckets = 2, so bucket 0 expires once currentBucket > 2.
-        await c.prune(3);
-        expect(c.current()).toHaveLength(0);
+        // At bucket 4: WALLET (bucket 0) is expired (4 > 0 + 2), OTHER (bucket 3) is live (4 <= 3 + 2).
+        const current = c.current(4);
+        expect(current).toHaveLength(1);
+        expect(current[0].address).toBe(OTHER);
     });
 
-    it("keeps a still-live bundle and drops the superseded older one", async () => {
+    it("heads() drops an expired standalone tip (nothing broadcast for a decayed vote)", async () => {
+        const c = crdt();
+        await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0
+
+        expect(c.heads(LIVE)).toHaveLength(1); // live: still a broadcastable tip
+        expect(c.heads(3)).toHaveLength(0); // expired: dropped from the broadcast heads
+        expect(c.current(3)).toHaveLength(0); // and from the tally view
+    });
+
+    it("does not resurrect an expired ancestor a merge re-materializes (no head-CID pollution)", async () => {
+        // Shared store = the blockstore both peers read/write. Peer C cold-starts from B's heads.
+        const store = makeMemoryDagNodeStore();
+        const deps = { store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 };
+        const producer = makeVoteCrdt(deps);
+
+        await producer.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // A, bucket 0
+        const bCid = await producer.add(bundle(OTHER, [{ board: { publicKey: KEY_B }, vote: 1 }], 3 * BLOCKS_PER_BUCKET)); // B, bucket 3, links A
+
+        const c = makeVoteCrdt(deps);
+        await c.merge([bCid]); // integrate walks B -> A, re-materializing the expired A into C's working set
+
+        // At bucket 4: A (bucket 0) is expired, B (bucket 3) is live. A must not pollute either view.
+        const current = c.current(4);
+        expect(current).toHaveLength(1);
+        expect(current[0].address).toBe(OTHER);
+
+        const heads = c.heads(4);
+        expect(heads).toHaveLength(1);
+        expect(heads[0].equals(bCid)).toBe(true); // A is an ancestor, not a live tip
+    });
+
+    it("filters an expired tip a stale peer re-injects (gate does not check expiry)", async () => {
+        const store = makeMemoryDagNodeStore();
+        const deps = { store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 };
+        const producer = makeVoteCrdt(deps);
+        const aCid = await producer.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0
+
+        const c = makeVoteCrdt(deps);
+        await c.merge([aCid]); // a stale peer re-broadcasts the long-decayed head; merge admits it
+
+        expect(c.heads(4)).toHaveLength(0); // we neither re-broadcast it...
+        expect(c.current(4)).toHaveLength(0); // ...nor count it
+    });
+});
+
+describe("makeVoteCrdt — prune bounds the working set", () => {
+    it("drops expired and superseded nodes from memory while the tally view is unchanged", async () => {
+        const c = crdt();
+        await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // superseded below
+        await c.add(bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], BLOCKS_PER_BUCKET)); // bucket 1, winner
+        await c.add(bundle(OTHER, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0, expires past 2
+        expect(c.nodeCount()).toBe(3);
+
+        // At bucket 3: OTHER's node is expired; WALLET's bucket-0 node is superseded (not a winner).
+        await c.prune(3);
+        expect(c.nodeCount()).toBe(1); // only WALLET's winning bucket-1 node survives in memory
+
+        // The read-time view at a live bucket is unaffected by prune — prune is memory-only.
+        const current = c.current(1);
+        expect(current).toHaveLength(1);
+        expect(current[0].blockNumber).toBe(BLOCKS_PER_BUCKET);
+    });
+
+    it("keeps a still-live winner and drops the superseded older one", async () => {
         const c = crdt();
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0));
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], BLOCKS_PER_BUCKET)); // bucket 1
 
         await c.prune(1); // bucket 1 still live (1 <= 1 + 2); bucket 0 superseded (not winner)
-        const current = c.current();
+        expect(c.nodeCount()).toBe(1);
+        const current = c.current(1);
         expect(current).toHaveLength(1);
         expect(current[0].blockNumber).toBe(BLOCKS_PER_BUCKET);
     });

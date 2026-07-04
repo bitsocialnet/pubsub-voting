@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { PubsubVoter, republishIntervalBuckets } from "./voter.js";
+import type { ChainClient, ChainClientFactory } from "../chain/types.js";
 import { MemoryVoteStore } from "../store/memory.js";
 import { selectVoteStore } from "../store/select.js";
 import { MissingBlockstoreError, MissingPubsubError, NotImplementedError, ReadOnlyError } from "../errors.js";
@@ -16,6 +17,19 @@ import {
 
 /** A valid base58btc IPNS board key (VotesBundleSchema rejects non-keys, so castVotes needs a real one). */
 const VALID_KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
+
+/**
+ * A chain factory whose current block advances between calls, so a vote cast at one bucket can
+ * be observed decaying at a later one. `readContract` returns 1 (constant weight ignores it).
+ */
+function advancingChains(currentBlock: () => bigint): ChainClientFactory {
+    const client = {
+        getBlockNumber: async () => currentBlock(),
+        getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+        readContract: async () => 1n
+    };
+    return () => client as unknown as ChainClient;
+}
 
 /** A minimal directory manifest deriving one contest (the /biz/ slot) from the shared fixture. */
 function bizManifest(): unknown {
@@ -104,6 +118,26 @@ describe("getTally", () => {
         expect(tally.ranking).toHaveLength(1);
         expect(tally.ranking[0].board.publicKey).toBe(VALID_KEY);
         expect(tally.ranking[0].weight).toBe(1n); // constant weight, 1 pass = 1 vote
+    });
+
+    it("drops a vote from the tally once it decays past its expiry window", async () => {
+        // bizCriteria: voteExpiryBuckets 30, blocksPerBucket 43200. Cast at bucket 1; a vote
+        // there expires once the current bucket exceeds 1 + 30 = 31.
+        let block = 43200n; // bucket 1
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: advancingChains(() => block),
+            signer: fakeSigner()
+        });
+        const contest = await voter.contest(bizCriteria());
+        await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
+
+        // Still live at bucket 1: the vote counts.
+        expect((await contest.getTally()).ranking).toHaveLength(1);
+
+        // Advance well past the expiry window (bucket 32 > 31): the decayed vote is gone.
+        block = 32n * 43200n;
+        expect((await contest.getTally()).ranking).toEqual([]);
     });
 });
 

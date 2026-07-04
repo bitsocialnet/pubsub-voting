@@ -38,17 +38,30 @@ export interface VoteCrdt {
      */
     merge(heads: CID[]): Promise<void>;
 
-    /** Current heads (the only thing broadcast over pubsub). */
-    heads(): CID[];
-
-    /** LWW reduction: at most one current bundle per wallet. */
-    current(): VotesBundle[];
+    /**
+     * Current heads (the only thing broadcast over pubsub), filtered to the given bucket:
+     * an expired tip is dropped so a decayed vote is never broadcast or re-linked. Ancestors
+     * below a live tip stay reachable. `currentBucket` is `bucketForBlock(currentBlock)`.
+     */
+    heads(currentBucket: number): CID[];
 
     /**
-     * Drop bundles older than `voteExpiryBuckets` and those superseded per wallet.
-     * Keeps the DAG and blockstore bounded.
+     * LWW reduction (at most one bundle per wallet), filtered to the given bucket: a wallet
+     * whose winning bundle has expired drops out entirely, so the tally never counts a decayed
+     * vote — even one a `merge` re-materialized as a DAG ancestor. `currentBucket` is
+     * `bucketForBlock(currentBlock)`.
+     */
+    current(currentBucket: number): VotesBundle[];
+
+    /**
+     * Drop bundles older than `voteExpiryBuckets` and those superseded per wallet from the
+     * in-memory working set, bounding memory. Correctness does not depend on it — `current`
+     * and `heads` filter expiry at read time — so this is housekeeping, not the guarantee.
      */
     prune(currentBucket: number): Promise<void>;
+
+    /** Size of the in-memory working set — lets callers/tests observe that `prune` shrinks it. */
+    nodeCount(): number;
 }
 
 /**

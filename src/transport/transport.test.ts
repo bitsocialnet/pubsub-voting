@@ -64,7 +64,7 @@ async function harness() {
         gate,
         encodeHeads,
         decodeHeads,
-        getHeads: () => crdt.heads()
+        getHeads: () => crdt.heads(0)
     });
     const bundle: VotesBundle = { address: "0x1", votes: [{ board: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
     const cid = await store.put({ value: bundle, parents: [] });
@@ -89,7 +89,7 @@ describe("makeVoteTransport", () => {
         const verdict = await validator(fakePeer("peer1"), { topic: TOPIC, data: encodeHeads([h.cid]), from: fakePeer("peer1") });
 
         expect(verdict).toBe("accept");
-        expect(h.crdt.current()).toHaveLength(1);
+        expect(h.crdt.current(0)).toHaveLength(1);
         expect(heardHeads[0].equals(h.cid)).toBe(true);
     });
 

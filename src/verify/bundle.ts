@@ -25,7 +25,8 @@ import type { BundleVerifier, BundleVerdict } from "./types.js";
  * concern the tally derives lazily, not a validity concern (see DESIGN.md "Tally").
  *
  * Expiry is deliberately out of scope here: it depends on the current bucket (a clock), so it
- * is layered in by the transport gate / CRDT prune, not by this time-independent verifier.
+ * is enforced by the CRDT's read-time filter (`current`/`heads` drop decayed votes given the
+ * current bucket; `prune` bounds memory), not by this time-independent verifier.
  */
 
 /** Everything the verifier needs, resolved once per contest. */

@@ -1,5 +1,6 @@
 import type { CID } from "multiformats/cid";
 import type { BucketMath } from "../chain/types.js";
+import type { VotesBundle } from "../schema/votes.js";
 import type { DagNode, DagNodeStore, LwwResolve, VoteCrdt } from "./types.js";
 
 /**
@@ -52,7 +53,22 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
     // The working set of integrated nodes, mirrored from the store for fast reduction.
     const nodes = new Map<string, { cid: CID; node: DagNode }>();
 
-    /** The current DAG tips: integrated nodes no other integrated node links as a parent. */
+    /**
+     * A bundle has decayed once the current bucket is past its `blockNumber`'s bucket plus the
+     * expiry window (see DESIGN.md "Passive expiry"). This is the read-time filter that keeps an
+     * expired vote out of the tally and the broadcast heads *even when a merge re-materializes it
+     * as a DAG ancestor* — the same predicate `prune` uses to bound memory. Identical to the check
+     * in {@link prune}.
+     */
+    function isExpired(bundle: VotesBundle, currentBucket: number): boolean {
+        return currentBucket > bucketMath.bucketForBlock(bundle.blockNumber) + voteExpiryBuckets;
+    }
+
+    /**
+     * The current DAG tips: integrated nodes no other integrated node links as a parent.
+     * Unfiltered — used for `add`'s parent links so the Merkle history stays walkable; the public
+     * {@link VoteCrdt.heads} filters expired tips on top of this.
+     */
     function computeHeads(): CID[] {
         const parents = new Set<string>();
         for (const { node } of nodes.values()) {
@@ -108,14 +124,27 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
             for (const h of heads) await integrate(h);
         },
 
-        heads() {
-            return computeHeads();
+        heads(currentBucket) {
+            // Drop expired tips so an expired standalone (or re-injected) tip is never
+            // broadcast or linked; ancestors below a live tip stay walkable.
+            return computeHeads().filter((cid) => {
+                const entry = nodes.get(cid.toString())!;
+                return !isExpired(entry.node.value, currentBucket);
+            });
         },
 
-        current() {
+        current(currentBucket) {
             // One bundle per wallet (LWW). A winning empty-votes bundle is the withdrawal
-            // form and is returned as-is; the tally treats it as "no vote".
-            return [...winnersByWallet().values()].map((e) => e.node.value);
+            // form and is returned as-is; the tally treats it as "no vote". A winner past its
+            // expiry window drops the wallet entirely — the read-time filter that keeps a
+            // decayed vote (even one a merge re-materialized) out of the tally.
+            return [...winnersByWallet().values()]
+                .filter((e) => !isExpired(e.node.value, currentBucket))
+                .map((e) => e.node.value);
+        },
+
+        nodeCount() {
+            return nodes.size;
         },
 
         async prune(currentBucket: number) {
