@@ -21,9 +21,10 @@ export * from "./schema/criteria.js";
 // validation). The leaf interpreters read through the injected viem `PublicClient`
 // (`ctx.chain`). Interpreter composition (combining several into one slot) is a
 // documented future extension, not a built-in — see DESIGN.md "Future improvements".
+// v1 ships the NFT path only: `erc721-min-balance` + `constant`. `erc20-balance` stays in
+// the tree but is not registered or re-exported — see ROADMAP.md ("Deferred").
 export * from "./interpreters/erc721-min-balance.js";
 export * from "./interpreters/constant.js";
-export * from "./interpreters/erc20-balance.js";
 export * from "./interpreters/registry.js";
 
 // Implemented runtime: encoding, topic, manifest, errors, identity seam, facade.

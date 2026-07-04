@@ -3,7 +3,6 @@ import type { InterpreterRegistry } from "./types.js";
 import { UnknownInterpreterError } from "../errors.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
 import { constant } from "./constant.js";
-import { erc20Balance } from "./erc20-balance.js";
 
 /**
  * The interpreter registry: builtins, the shadowing resolver, and criteria validation.
@@ -17,11 +16,18 @@ import { erc20Balance } from "./erc20-balance.js";
  * from this single registry.
  */
 
-/** The library's built-in interpreters, before any host override. */
+/**
+ * The library's built-in interpreters, before any host override.
+ *
+ * v1 ships exactly the NFT path: `erc721-min-balance` (Pass gate) + `constant` weight.
+ * `erc20-balance` is intentionally NOT registered — it stays in the tree (`erc20-balance.ts`,
+ * unit-tested) as the design-open weight path, but is unshipped so a criteria naming it
+ * recuses via `UnknownInterpreterError` rather than silently enabling token-weighting. See
+ * ROADMAP.md ("Deferred") for when it re-ships.
+ */
 export const builtinRegistry: InterpreterRegistry = {
     [erc721MinBalance.type]: erc721MinBalance,
-    [constant.type]: constant,
-    [erc20Balance.type]: erc20Balance
+    [constant.type]: constant
 };
 
 /** type ids the v1 implementation guarantees; checked against `requires.interpreters`. */

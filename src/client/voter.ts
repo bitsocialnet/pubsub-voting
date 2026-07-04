@@ -408,10 +408,13 @@ export class PubsubVoter implements VoteClient {
                 ? await this.contestsFromManifest(this.#manifest)
                 : [...this.#contests.values()];
         for (const network of networks) {
-            // Throws NotImplementedError today (transport + CRDT sync pending); once the
-            // engine lands this joins the topic and unions heads from peers.
+            // Joins the topic and installs the forward gate; cold-start head sync over the
+            // libp2p fetch protocol (`fetchHeadsFromPeer`) is still unset, so this returns
+            // local heads and relies on live gossip to converge. See ROADMAP.md.
             await network.start();
         }
+        // NOTE: still throws NotImplementedError — the client-level republish scheduler is
+        // the one remaining stub, so `PubsubVoter.start()` is not yet usable end-to-end.
         this.#armRepublishScheduler(networks);
     }
 
