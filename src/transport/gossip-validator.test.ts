@@ -19,7 +19,9 @@ async function makeNode(address: string): Promise<{ cid: CID; node: VotesBundle 
 }
 
 const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
-const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, reason: "invalid" }) };
+const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
+/** A verifier whose failure is transient (view-/clock-dependent), e.g. a name resolved at head. */
+const ignoreVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "ignore", reason: "name at head" }) };
 
 const DEFAULT_BOUNDS = { maxWinnerCidsPerMessage: 16, maxMessageBytes: 1 << 20 };
 
@@ -119,7 +121,7 @@ describe("makeGossipGate", () => {
     it("rejects on a cached-invalid CID without fetching", async () => {
         const { cid } = await makeNode("0x1");
         const cache = makeVerdictCache();
-        cache.set(cid, { valid: false, reason: "known bad" });
+        cache.set(cid, { valid: false, disposition: "reject", reason: "known bad" });
         let fetches = 0;
         const g = gate({
             fetchNode: async () => {
@@ -160,6 +162,76 @@ describe("makeGossipGate", () => {
         });
         expect(await g.validate(encodeWinnerCids([a.cid, b.cid]), "p")).toBe("accept");
         expect(limited).toBe(2); // one per fetched bundle in the message
+    });
+
+    it("ignores (no penalty) a transient-invalid bundle and does NOT cache the verdict", async () => {
+        const { cid, node } = await makeNode("0x1");
+        const cache = makeVerdictCache();
+        let verifies = 0;
+        const g = gate({
+            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: false, disposition: "ignore", reason: "name at head" };
+                }
+            },
+            cache
+        });
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+        // A re-announce re-verifies (verdict not pinned) — the condition can resolve later.
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+        expect(verifies).toBe(2);
+        expect(cache.has(cid)).toBe(false);
+    });
+
+    it("caches a provable reject so a re-announce is not re-verified", async () => {
+        const { cid, node } = await makeNode("0xbad");
+        const cache = makeVerdictCache();
+        let verifies = 0;
+        const g = gate({
+            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: false, disposition: "reject", reason: "bad sig" };
+                }
+            },
+            cache
+        });
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
+        expect(verifies).toBe(1); // second announce short-circuits on the cached reject
+        expect(cache.has(cid)).toBe(true);
+    });
+
+    it("ignores a bundle bucketed ahead of head (future-head guard) without verifying or caching", async () => {
+        const { cid, node } = await makeNode("0x1");
+        const cache = makeVerdictCache();
+        let verifies = 0;
+        const g = gate({
+            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            isEvaluableNow: async () => false, // its sample block is ahead of our head
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                }
+            },
+            cache
+        });
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+        expect(verifies).toBe(0); // dropped before the (chain-touching) verifier runs
+        expect(cache.has(cid)).toBe(false);
+    });
+
+    it("verifies normally once the bundle is evaluable (future-head guard passes)", async () => {
+        const { cid, node } = await makeNode("0x1");
+        const g = gate({
+            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            isEvaluableNow: async () => true
+        });
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("accept");
     });
 
     it("ignores (does not hang) when a fetch exceeds the timeout", async () => {

@@ -21,6 +21,7 @@ export function checkBundleConstraints(bundle: VotesBundle, criteria: Criteria):
     if (bundle.votes.length > criteria.maxVotesPerAddress) {
         return {
             valid: false,
+            disposition: "reject",
             reason: `votes.length ${bundle.votes.length} exceeds maxVotesPerAddress ${criteria.maxVotesPerAddress}`
         };
     }
@@ -30,6 +31,7 @@ export function checkBundleConstraints(bundle: VotesBundle, criteria: Criteria):
         if (v.vote < min || v.vote > max) {
             return {
                 valid: false,
+                disposition: "reject",
                 reason: `vote ${v.vote} for board ${v.board.publicKey} is outside voteSchema [${min}, ${max}]`
             };
         }

@@ -1,6 +1,6 @@
 import type { CID } from "multiformats/cid";
 import type { VotesBundle } from "../schema/votes.js";
-import type { VerdictCache } from "../verify/cache.js";
+import { isCacheableVerdict, type VerdictCache } from "../verify/cache.js";
 import type { BundleVerifier } from "../verify/types.js";
 
 /**
@@ -17,10 +17,13 @@ import type { BundleVerifier } from "../verify/types.js";
  *   - "accept": every referenced bundle verified — deliver, merge, forward.
  *   - "reject": something is PROVABLY invalid (malformed message, a bundle that fails
  *     verification, a known-bad referenced CID) — drop, do not forward, penalize the sender.
- *   - "ignore": no verdict reachable through no provable fault of the sender (unfetchable
- *     within the timeout, over the per-peer rate, too many CIDs, internal error) — drop,
- *     do not forward, do NOT penalize. Using `reject` here would punish honest relayers for
- *     transient conditions and hand attackers a grief vector.
+ *   - "ignore": no verdict reachable through no provable fault of the sender — either a
+ *     transient/local condition (unfetchable within the timeout, over the per-peer rate,
+ *     internal error) or a view-/clock-dependent verdict two honest peers can disagree on
+ *     right now: a bundle bucketed ahead of our chain head (`isEvaluableNow`), or a
+ *     `board.name` resolved at head during a re-point window. Drop, do not forward, do NOT
+ *     penalize, and do NOT cache (it can change) — using `reject` here would punish honest
+ *     relayers for transient conditions and hand attackers a grief vector.
  *
  * Cheap-to-expensive with early exit: size/rate/decode first, then per-bundle fetch + verify,
  * de-duplicated through the verdict cache so a re-announced known bundle costs zero network.
@@ -42,6 +45,15 @@ export interface GossipGateDeps {
     fetchNode: (cid: CID) => Promise<VotesBundle | undefined>;
     /** The full validity pipeline for one bundle (see verify/bundle.ts). */
     verifier: BundleVerifier;
+    /**
+     * Clock-aware freshness guard, kept OUT of the pure (cacheable) verifier: is this bundle's
+     * bucket sample block already reachable from our chain head? A bundle dated to a future
+     * bucket (the voter's head ahead of ours, clock skew, or an absurd `blockNumber`) is not
+     * yet evaluable — transient, so the gate `ignore`s it (no penalty, uncached) until our head
+     * catches up. Omitted ⇒ no freshness check (prior behaviour). Steady-state votes resolve
+     * `true` with no chain read; only a look-ahead bundle costs a (memoized) head read.
+     */
+    isEvaluableNow?: (bundle: VotesBundle) => Promise<boolean>;
     /** Per-CID verdict cache — dedups re-announced bundles and known-bad CIDs. */
     cache: VerdictCache;
     /** Admit a validated bundle-CID set into the CRDT (idempotent; reads fetched bundles from the store). */
@@ -95,7 +107,8 @@ function withDeadline<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
 type BundleResult = "ok" | "reject" | "ignore";
 
 export function makeGossipGate(deps: GossipGateDeps): GossipGate {
-    const { decodeWinnerCids, fetchNode, verifier, cache, merge, limit, allowPeer, onAccept, bounds, timeoutMs } = deps;
+    const { decodeWinnerCids, fetchNode, verifier, isEvaluableNow, cache, merge, limit, allowPeer, onAccept, bounds, timeoutMs } =
+        deps;
 
     async function doValidate(data: Uint8Array, from: string): Promise<MessageVerdict> {
         // Layer 1: size, rate, decode — all pre-fetch.
@@ -120,14 +133,20 @@ export function makeGossipGate(deps: GossipGateDeps): GossipGate {
             seen.add(key);
 
             const cached = cache.get(cid);
-            if (cached) return cached.valid ? "ok" : "reject";
+            if (cached) return cached.valid ? "ok" : cached.disposition;
 
             const bundle = await limit(() => fetchNode(cid));
             if (!bundle) return "ignore"; // unfetchable/timeout — not provably the sender's fault
 
+            // Freshness guard (transient, so it runs here — not in the cacheable verifier — and
+            // its verdict is never cached): a bundle bucketed ahead of our head is not yet
+            // evaluable, so `ignore` it without penalty until our head advances. Also defuses an
+            // absurd-future `blockNumber` (e.g. uint256.max) — it never merges into the set.
+            if (isEvaluableNow && !(await isEvaluableNow(bundle))) return "ignore";
+
             const verdict = await verifier.verify(bundle);
-            cache.set(cid, verdict);
-            return verdict.valid ? "ok" : "reject";
+            if (isCacheableVerdict(verdict)) cache.set(cid, verdict); // only terminal verdicts (accept / provable reject)
+            return verdict.valid ? "ok" : verdict.disposition;
         };
 
         let sawIgnore = false;

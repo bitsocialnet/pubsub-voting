@@ -15,6 +15,18 @@ export interface VerdictCache {
     has(cid: CID): boolean;
 }
 
+/**
+ * Only *terminal* verdicts may be cached: an `accept`, or a `reject` that is a pure function
+ * of the bundle bytes + pinned historical chain state (bad signature, gate miss, ...). A
+ * transient `ignore` (name resolved at head during a re-point window, a `blockNumber` bucket
+ * ahead of this verifier's head) is view-/clock-dependent and can change as heads/records
+ * converge, so caching it would wrongly pin a stale verdict. See DESIGN.md "Transport"
+ * ("verdict cache") and verify/types.ts `VerdictDisposition`.
+ */
+export function isCacheableVerdict(verdict: BundleVerdict): boolean {
+    return verdict.valid || verdict.disposition === "reject";
+}
+
 /** An in-memory verdict cache keyed by the CID's canonical string. */
 export function makeVerdictCache(): VerdictCache {
     const byCid = new Map<string, BundleVerdict>();
@@ -35,8 +47,10 @@ export interface CachingBundleVerifier {
 /**
  * Wrap a {@link BundleVerifier} with a {@link VerdictCache}: a CID already seen returns its
  * cached verdict without touching the chain or the network; a new CID runs the full pipeline
- * once and stores the result (valid or invalid — a known-bad bundle is not re-fetched or
- * re-checked either).
+ * once and stores the result — but only if it is terminal ({@link isCacheableVerdict}): a
+ * valid bundle or a provable `reject` is remembered (a known-bad bundle is not re-fetched or
+ * re-checked), while a transient `ignore` is re-evaluated next time so a stale head/record
+ * cannot pin it.
  */
 export function makeCachingVerifier(verifier: BundleVerifier, cache: VerdictCache): CachingBundleVerifier {
     return {
@@ -44,7 +58,7 @@ export function makeCachingVerifier(verifier: BundleVerifier, cache: VerdictCach
             const cached = cache.get(cid);
             if (cached) return cached;
             const verdict = await verifier.verify(bundle);
-            cache.set(cid, verdict);
+            if (isCacheableVerdict(verdict)) cache.set(cid, verdict);
             return verdict;
         }
     };

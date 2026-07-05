@@ -30,11 +30,12 @@ export async function verifyBundleSignature(args: {
     if (bundle.signature.type !== EIP712_SIGNATURE_TYPE) {
         return {
             valid: false,
+            disposition: "reject",
             reason: `unsupported signature type "${bundle.signature.type}" (expected "${EIP712_SIGNATURE_TYPE}")`
         };
     }
     if (!isHex(bundle.signature.signature)) {
-        return { valid: false, reason: "signature is not 0x-hex" };
+        return { valid: false, disposition: "reject", reason: "signature is not 0x-hex" };
     }
 
     const typedData = ballotTypedData({
@@ -48,13 +49,17 @@ export async function verifyBundleSignature(args: {
     try {
         recovered = await recoverTypedDataAddress({ ...typedData, signature: bundle.signature.signature });
     } catch (err) {
-        return { valid: false, reason: `signature does not recover: ${(err as Error).message}` };
+        return { valid: false, disposition: "reject", reason: `signature does not recover: ${(err as Error).message}` };
     }
 
     // The recovered address is EIP-55 checksummed; `bundle.address` may be lowercase or
     // differently cased. Compare case-insensitively.
     if (recovered.toLowerCase() !== bundle.address.toLowerCase()) {
-        return { valid: false, reason: `recovered signer ${recovered} does not match bundle.address ${bundle.address}` };
+        return {
+            valid: false,
+            disposition: "reject",
+            reason: `recovered signer ${recovered} does not match bundle.address ${bundle.address}`
+        };
     }
     return { valid: true };
 }

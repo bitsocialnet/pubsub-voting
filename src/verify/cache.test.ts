@@ -55,12 +55,12 @@ describe("verdict cache", () => {
         expect(calls()).toBe(2);
     });
 
-    it("caches an invalid verdict too (a known-bad CID is not re-checked)", async () => {
+    it("caches a provable reject too (a known-bad CID is not re-checked)", async () => {
         let calls = 0;
         const verifier: BundleVerifier = {
             verify: async () => {
                 calls++;
-                return { valid: false, reason: "nope" };
+                return { valid: false, disposition: "reject", reason: "nope" };
             }
         };
         const caching = makeCachingVerifier(verifier, makeVerdictCache());
@@ -72,5 +72,22 @@ describe("verdict cache", () => {
         expect(first.valid).toBe(false);
         expect(second.valid).toBe(false);
         expect(calls).toBe(1);
+    });
+
+    it("does NOT cache a transient ignore verdict (it is re-checked as heads/records converge)", async () => {
+        let calls = 0;
+        const verifier: BundleVerifier = {
+            verify: async () => {
+                calls++;
+                return { valid: false, disposition: "ignore", reason: "name at head" };
+            }
+        };
+        const caching = makeCachingVerifier(verifier, makeVerdictCache());
+        const cid = await cidOf("transient");
+
+        await caching.verify(cid, dummyBundle);
+        await caching.verify(cid, dummyBundle);
+
+        expect(calls).toBe(2); // re-evaluated each time — the verdict can change
     });
 });

@@ -18,8 +18,20 @@ import type { VotesBundle } from "../schema/votes.js";
  * the identity. See DESIGN.md "Identity: the voting wallet, nothing else" and "Tally".
  */
 
+/**
+ * How a failing verdict should be blamed, mirroring the gossip gate's `reject`/`ignore`
+ * split (see DESIGN.md "Transport"):
+ *   - "reject": PROVABLY invalid — a pure function of the bundle bytes and pinned historical
+ *     chain state (bad signature, out-of-range vote, wallet the gate rejects at the bucket
+ *     block). Deterministic and stable, so it is safe to penalize the sender AND to cache.
+ *   - "ignore": not provably the sender's fault because the check is view- or clock-dependent
+ *     and two honest peers can legitimately disagree right now (a `board.name` resolved *at
+ *     head* during a re-point window; a `blockNumber` bucket ahead of this verifier's chain
+ *     head). No penalty, and NOT cached — the verdict can change as heads/records converge.
+ */
+export type VerdictDisposition = "reject" | "ignore";
 export type VerifyOk = { valid: true };
-export type VerifyFail = { valid: false; reason: string };
+export type VerifyFail = { valid: false; disposition: VerdictDisposition; reason: string };
 export type VerifyResult = VerifyOk | VerifyFail;
 
 /** Stage 1: ballot signature only. No chain access. */

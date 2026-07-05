@@ -6,6 +6,7 @@ import { tickerForRef } from "../chain/ticker.js";
 import { UnknownRuleError } from "../errors.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
+import type { GateNegativeCache } from "./negative-cache.js";
 import type { BundleVerifier, BundleVerdict } from "./types.js";
 
 /**
@@ -44,10 +45,17 @@ export interface BundleVerifierDeps {
     bucketMath: BucketMath;
     /** Host-injected board-name resolvers (`PubsubVoterOptions.nameResolvers`). */
     nameResolvers: NameResolver[];
+    /**
+     * Optional negative cache for gate misses, keyed by `(wallet, sampleBlock)`. When present,
+     * a wallet already known to score `0n` at a bucket's sample block is rejected without
+     * repeating the (deterministic, historical) chain read — bounds the per-unique-bundle RPC
+     * amplifier. Omitted ⇒ every novel bundle pays its own gate read (prior behaviour).
+     */
+    gateNegativeCache?: GateNegativeCache;
 }
 
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
-    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers } = deps;
+    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, gateNegativeCache } = deps;
 
     // Resolve the gate `rule`, its options, and its chain client once. The rule reads at the
     // bundle's bucket block, but which rule/chain to use is fixed by the criteria, so it need
@@ -67,31 +75,45 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             const constraints = checkBundleConstraints(bundle, criteria);
             if (!constraints.valid) return constraints;
 
-            // 3. Gate (chain) — read the `rule` at the bucket's sample block.
+            // 3. Gate (chain) — read the `rule` at the bucket's sample block. A gate miss is a
+            //    pure function of a pinned historical block, so it is `reject` (provable, stable)
+            //    and safe to remember: a `(wallet, sampleBlock)` negative-cache hit short-circuits
+            //    the chain read for a flood of fresh-signed bundles from the same ineligible wallet.
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
+            if (gateNegativeCache?.has(bundle.address, sampleBlock)) {
+                return { valid: false, disposition: "reject", reason: `not admitted: rule score is 0n at block ${sampleBlock} (cached)` };
+            }
             const { score } = await rule.evaluate({
                 options: ruleOptions,
                 walletAddress: bundle.address,
                 ctx: { chain: ruleChain, blockNumber: sampleBlock }
             });
             if (score === 0n) {
-                return { valid: false, reason: `not admitted: rule score is 0n at block ${sampleBlock}` };
+                gateNegativeCache?.add(bundle.address, sampleBlock);
+                return { valid: false, disposition: "reject", reason: `not admitted: rule score is 0n at block ${sampleBlock}` };
             }
 
             // 4. Board-name resolution (network) — a carried name is a claim, verified against
             //    the registry. A name that has no resolver, does not resolve, or resolves to a
-            //    different publicKey than the vote claims drops the whole bundle.
+            //    different publicKey than the vote claims drops the whole bundle. These failures
+            //    are `ignore`, not `reject`: v1 resolves at head, so they are view-/clock-dependent
+            //    (a missing resolver differs per verifier; a re-point produces a transient window
+            //    where honest peers disagree — see DESIGN.md "Tally"/"Open questions"). Penalizing
+            //    the sender for that would punish honest relayers; the drop still stops propagation.
+            //    (Once pinned-block resolution lands, a steady-state mismatch becomes provable
+            //    `reject`.) The gossip gate therefore does NOT cache these verdicts.
             const resolvedNames: Record<string, string> = {};
             for (const v of bundle.votes) {
                 const name = v.board.name;
                 if (!name) continue;
                 const resolver = nameResolvers.find((r) => r.canResolve({ name }));
-                if (!resolver) return { valid: false, reason: `no resolver handles board name "${name}"` };
+                if (!resolver) return { valid: false, disposition: "ignore", reason: `no resolver handles board name "${name}"` };
                 const record = await resolver.resolve({ name });
-                if (!record) return { valid: false, reason: `board name "${name}" does not resolve` };
+                if (!record) return { valid: false, disposition: "ignore", reason: `board name "${name}" does not resolve` };
                 if (record.publicKey !== v.board.publicKey) {
                     return {
                         valid: false,
+                        disposition: "ignore",
                         reason: `board name "${name}" resolves to ${record.publicKey}, not the claimed ${v.board.publicKey}`
                     };
                 }

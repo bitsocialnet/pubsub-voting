@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { makeBundleVerifier } from "./bundle.js";
+import { makeGateNegativeCache, type GateNegativeCache } from "./negative-cache.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import { builtinRegistry } from "../rules/registry.js";
@@ -53,7 +54,9 @@ function resolver(map: Record<string, string>): NameResolver {
     };
 }
 
-function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<string, string> } = {}) {
+function verifier(
+    over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; gateNegativeCache?: GateNegativeCache } = {}
+) {
     return makeBundleVerifier({
         criteria: bizCriteria(),
         criteriaCid: CRITERIA_CID,
@@ -61,7 +64,8 @@ function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<
         registry: builtinRegistry,
         chainFor: () => fakeChain(over.balance ?? 1n, over.onRead),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
-        nameResolvers: [resolver(over.names ?? {})]
+        nameResolvers: [resolver(over.names ?? {})],
+        gateNegativeCache: over.gateNegativeCache
     });
 }
 
@@ -77,6 +81,20 @@ describe("makeBundleVerifier", () => {
         const bundle = await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 0n }).verify(bundle);
         expect(verdict.valid).toBe(false);
+        if (!verdict.valid) expect(verdict.disposition).toBe("reject"); // gate miss is provable
+    });
+
+    it("caches a gate miss by (wallet, sampleBlock) so a second bundle skips the chain read", async () => {
+        let reads = 0;
+        const gateNegativeCache = makeGateNegativeCache();
+        const v = verifier({ balance: 0n, onRead: () => reads++, gateNegativeCache });
+        // Two DISTINCT bundles (different board) from the same wallet at the same block: the
+        // first pays the gate read, the second short-circuits on the negative cache.
+        const first = await v.verify(await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]));
+        const second = await v.verify(await signedBundle([{ board: { publicKey: KEY_B }, vote: 1 }]));
+        expect(first.valid).toBe(false);
+        expect(second.valid).toBe(false);
+        expect(reads).toBe(1); // only the first bundle hit the chain
     });
 
     it("rejects a bad signature BEFORE any chain read (cheap-first ordering)", async () => {
@@ -96,17 +114,19 @@ describe("makeBundleVerifier", () => {
         if (verdict.valid) expect(verdict.resolvedNames).toEqual({ "memes.bso": KEY_A });
     });
 
-    it("drops a squatted name that resolves to a different key", async () => {
+    it("drops a squatted name that resolves to a different key (ignore, not reject — resolved at head)", async () => {
         // memes.bso genuinely belongs to KEY_A, but this bundle claims it for KEY_B.
         const bundle = await signedBundle([{ board: { name: "memes.bso", publicKey: KEY_B }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n, names: { "memes.bso": KEY_A } }).verify(bundle);
         expect(verdict.valid).toBe(false);
+        if (!verdict.valid) expect(verdict.disposition).toBe("ignore");
     });
 
-    it("drops a name that does not resolve", async () => {
+    it("drops a name that does not resolve (ignore, not reject)", async () => {
         const bundle = await signedBundle([{ board: { name: "ghost.bso", publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n, names: {} }).verify(bundle);
         expect(verdict.valid).toBe(false);
+        if (!verdict.valid) expect(verdict.disposition).toBe("ignore");
     });
 
     it("accepts an empty withdrawal bundle from an eligible wallet", async () => {

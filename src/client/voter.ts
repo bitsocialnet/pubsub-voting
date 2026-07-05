@@ -17,6 +17,7 @@ import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
+import { makeGateNegativeCache } from "../verify/negative-cache.js";
 import { makeTally } from "../tally/tally.js";
 import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
@@ -191,6 +192,13 @@ const GATE_BOUNDS = { maxWinnerCidsPerMessage: 64, maxMessageBytes: 1 << 20 };
 const GATE_CONCURRENCY = 8;
 /** Per-peer rate window: how many messages one peer may make us validate per interval. */
 const GATE_RATE = { limit: 256, intervalMs: 10_000 };
+/**
+ * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
+ * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
+ * consults the head, and this TTL caps that to ≤1 `getBlockNumber` per window under a flood of
+ * future-dated bundles.
+ */
+const HEAD_BUCKET_TTL_MS = 1_000;
 
 /** Lowercase `0x`-hex to bytes (for the bucket boundary block hash). */
 function hexToBytes(hex: string): Uint8Array {
@@ -261,7 +269,8 @@ class ContestNetwork implements VoteNetwork {
             registry: deps.registry,
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
-            nameResolvers: deps.nameResolvers
+            nameResolvers: deps.nameResolvers,
+            gateNegativeCache: makeGateNegativeCache()
         });
         // The gate/transport are (re)built in start(); the store, crdt, cache, and verifier are
         // stable per contest, so a cache and verifier bound here survive restarts of the topic.
@@ -293,7 +302,33 @@ class ContestNetwork implements VoteNetwork {
     async #refreshBucket(): Promise<number> {
         const head = await this.#ruleChain.getBlockNumber();
         this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
+        this.#headReadMs = Date.now();
         return this.#currentBucketCache;
+    }
+
+    /** `Date.now()` of the last gating-chain head read, memoizing {@link #nowBucket}. */
+    #headReadMs = 0;
+
+    /** The current gating-chain head bucket, memoized for {@link HEAD_BUCKET_TTL_MS}. */
+    async #nowBucket(): Promise<number> {
+        if (this.#headReadMs !== 0 && Date.now() - this.#headReadMs < HEAD_BUCKET_TTL_MS) {
+            return this.#currentBucketCache;
+        }
+        return this.#refreshBucket();
+    }
+
+    /**
+     * Is this bundle's bucket sample block already reachable from our gating-chain head? A
+     * bundle dated to a future bucket (the voter's head ahead of ours, clock skew, or an absurd
+     * `blockNumber`) is transiently not-yet-evaluable, so the gate `ignore`s it (no penalty,
+     * uncached) until our head advances. Steady-state votes (bucket at/behind the current one)
+     * take the pure comparison and cost no chain read; only a look-ahead bundle — including the
+     * first vote seen on an otherwise-idle join — pays a (TTL-memoized) head read.
+     */
+    async #isEvaluableNow(bundle: VotesBundle): Promise<boolean> {
+        const sampleBucket = this.#bucketMath.bucketForBlock(bundle.blockNumber);
+        if (sampleBucket <= this.#currentBucketCache) return true;
+        return sampleBucket <= (await this.#nowBucket());
     }
 
     /** Hash of the current bucket boundary block on the gating (`rule`) chain (rolling tie seed). */
@@ -315,6 +350,7 @@ class ContestNetwork implements VoteNetwork {
             decodeWinnerCids,
             fetchNode: (cid) => this.#store.get(cid),
             verifier: this.#verifier,
+            isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
             cache: this.#cache,
             merge: (cids) => this.#crdt.merge(cids),
             limit: (fn) => limit(fn),
