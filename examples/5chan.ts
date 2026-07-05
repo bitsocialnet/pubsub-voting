@@ -53,21 +53,21 @@ const voter = new PubsubVoter({
 // Join every slot and arm republishing in one call.
 await voter.start();
 
-// Derive the same 63 contests to render the homepage (contestsFromManifest caches by topic,
-// so these are the very networks start() joined).
-const contests = await voter.contestsFromManifest(manifest);
+// Render the homepage: the winning board for each slot. The voter owns the manifest, so it
+// already knows every contest — reach each by its `contestId` (networks cache by topic, so
+// these are the very networks start() joined).
+const contests = await Promise.all(voter.contestIds.map((contestId) => voter.getContest({ contestId })));
 console.log(`joined ${contests.length} directory contests`);
 
-// Render the homepage: the winning board for each slot.
 for (const contest of contests) {
     const tally = await contest.getTally();
     const winner = tally.ranking[0]?.board ?? "(no votes yet)";
-    console.log(`${contest.criteria.contest}: ${winner}  [topic ${contest.topic}]`);
+    console.log(`${contest.criteria.contestId}: ${winner}  [topic ${contest.topic}]`);
 }
 
 // Cast a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
-const biz = contests.find((c) => c.criteria.contest === "biz");
-if (biz && !biz.readOnly) {
+const biz = await voter.getContest({ contestId: "biz" });
+if (!biz.readOnly) {
     // `name` must be the board's resolvable domain (unique per community); the tally
     // drops any vote whose name does not resolve to the claimed publicKey.
     await biz.castVotes([{ board: { name: "bizfinance.bso", publicKey: "12D3KooW...someBoardKey" }, vote: 1 }]);

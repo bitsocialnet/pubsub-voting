@@ -23,18 +23,21 @@ declare function seeditHelia(): HeliaInstance;
 declare function viemChains(): ChainClientFactory;
 declare function seeditSigner(): VoteSigner;
 
+// seedit votes on a single contest it cares about rather than a whole directory, but v1
+// still owns its contests through a manifest. A one-entry manifest wraps that single
+// criteria (empty `defaults`, so the entry IS the whole document).
+declare const criteria: Criteria;
 const voter = new PubsubVoter({
     helia: seeditHelia(),
     chains: viemChains(),
-    signer: seeditSigner()
+    signer: seeditSigner(),
+    manifest: { name: criteria.name, defaults: {}, contests: [criteria] }
 });
 
-// seedit votes on a single contest it cares about rather than a whole directory.
-declare const criteria: Criteria;
-const contest = await voter.contest(criteria);
+const contest = await voter.getContest({ contestId: criteria.contestId });
 await contest.start();
 
-console.log(`contest ${contest.criteria.contest} on topic ${contest.topic}`);
+console.log(`contest ${contest.criteria.contestId} on topic ${contest.topic}`);
 const tally = await contest.getTally();
 console.log("ranking:", tally.ranking);
 

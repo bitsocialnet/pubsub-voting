@@ -15,7 +15,7 @@ import { EIP712_SIGNATURE_TYPE } from "./signer/eip712.js";
 export function bizCriteria(): Criteria {
     return {
         name: "/biz/ - Business & Finance",
-        contest: "biz",
+        contestId: "biz",
         voteSchema: { min: 1, max: 1 },
         maxVotesPerAddress: 1,
         blocksPerBucket: 43200,

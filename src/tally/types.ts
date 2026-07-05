@@ -26,7 +26,8 @@ export interface BoardTally {
 
 /** A contest's ranking, highest weight first. Ordering is deterministic. */
 export interface ContestTally {
-    contest: string;
+    /** The `contestId` of the criteria this ranking is for. */
+    contestId: string;
     ranking: BoardTally[];
 }
 

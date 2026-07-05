@@ -48,7 +48,7 @@ describe("makeTally", () => {
         ];
         const tally = await makeTally(makeDeps(bundles)).compute();
 
-        expect(tally.contest).toBe("biz");
+        expect(tally.contestId).toBe("biz");
         expect(tally.ranking).toHaveLength(1);
         expect(tally.ranking[0].board.publicKey).toBe(KEY_A);
         expect(tally.ranking[0].weight).toBe(2n);

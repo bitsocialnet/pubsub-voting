@@ -14,7 +14,7 @@ import type { Vote } from "../schema/votes.js";
  *     CID bytes (`cid.bytes`) so there is no multibase/version representation ambiguity —
  *     every client hashes the same bytes. Different rules -> different CID -> a signature
  *     gathered for one contest does not validate on another. (This is the CID of the whole
- *     criteria document, distinct from the `criteria.contest` slot-code field inside it.)
+ *     criteria document, distinct from the `criteria.contestId` slot-code field inside it.)
  *   - `votes`: each board (`{ name, publicKey }`) + numeric vote.
  *   - `blockNumber`: the LWW key and the bucketized block every verifier reads at.
  *

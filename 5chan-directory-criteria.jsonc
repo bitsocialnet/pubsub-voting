@@ -2,7 +2,7 @@
 // before JSON.parse. Nothing in this file is ever encoded or published; see `description`.
 {
   "name": "5chan directory voting",
-  "description": "Authoring manifest for every 5chan directory contest. This file is NOT a criteria document and is never encoded or published. Per the @bitsocial/pubsub-votes model the rules live INSIDE each criteria document, and there is one document (and one pubsub topic) per contest. There is no global rule at runtime. The client derives one complete, standalone criteria document per contest by shallow-merging each `contests` entry over `defaults`: criteria = { ...defaults, ...entry } (entry contributes `name`, `contest`, and any rule fields it overrides; an override replaces that whole top-level field, no deep merge). `defaults` is purely a DRY authoring convenience that is flattened away at derivation. Each derived document is canonically dag-cbor encoded and its CID is the topic: topic = \"bitsocial-votes/\" + CID(dag-cbor(criteria)); editing `defaults` re-forks every inheriting contest in lockstep, editing one entry forks only that contest. In 5chan v1 every slot is gated by the same 5chan Pass, so almost all contests just inherit `defaults`; the /q/ entry below carries an illustrative `rule` override to show that the gate `rule`, weight, vote bounds, expiry, and `requires` are all per-contest, not global.",
+  "description": "Authoring manifest for every 5chan directory contest. This file is NOT a criteria document and is never encoded or published. Per the @bitsocial/pubsub-votes model the rules live INSIDE each criteria document, and there is one document (and one pubsub topic) per contest. There is no global rule at runtime. The client derives one complete, standalone criteria document per contest by shallow-merging each `contests` entry over `defaults`: criteria = { ...defaults, ...entry } (entry contributes `name`, `contestId`, and any rule fields it overrides; an override replaces that whole top-level field, no deep merge). `defaults` is purely a DRY authoring convenience that is flattened away at derivation. Each derived document is canonically dag-cbor encoded and its CID is the topic: topic = \"bitsocial-votes/\" + CID(dag-cbor(criteria)); editing `defaults` re-forks every inheriting contest in lockstep, editing one entry forks only that contest. In 5chan v1 every slot is gated by the same 5chan Pass, so almost all contests just inherit `defaults`; the /q/ entry below carries an illustrative `rule` override to show that the gate `rule`, weight, vote bounds, expiry, and `requires` are all per-contest, not global.",
   // Rule fields inherited by every contest below unless its entry overrides them
   // (shallow merge; an override replaces the whole top-level field, no deep merge).
   "defaults": {
@@ -53,148 +53,148 @@
   // giving each slot its own standalone document and pubsub topic.
   "contests": [
     {
-      "contest": "3",
+      "contestId": "3",
       "name": "/3/ - 3DCG"
     },
     {
-      "contest": "a",
+      "contestId": "a",
       "name": "/a/ - Anime & Manga"
     },
     {
-      "contest": "f",
+      "contestId": "f",
       "name": "/f/ - Flash"
     },
     {
-      "contest": "adv",
+      "contestId": "adv",
       "name": "/adv/ - Advice"
     },
     {
-      "contest": "an",
+      "contestId": "an",
       "name": "/an/ - Animals & Nature"
     },
     {
-      "contest": "b",
+      "contestId": "b",
       "name": "/b/ - Random"
     },
     {
-      "contest": "bant",
+      "contestId": "bant",
       "name": "/bant/ - International/Random"
     },
     {
-      "contest": "biz",
+      "contestId": "biz",
       "name": "/biz/ - Business & Finance"
     },
     {
-      "contest": "c",
+      "contestId": "c",
       "name": "/c/ - Anime/Cute"
     },
     {
-      "contest": "ck",
+      "contestId": "ck",
       "name": "/ck/ - Food & Cooking"
     },
     {
-      "contest": "co",
+      "contestId": "co",
       "name": "/co/ - Comics & Cartoons"
     },
     {
-      "contest": "diy",
+      "contestId": "diy",
       "name": "/diy/ - Do It Yourself"
     },
     {
-      "contest": "fa",
+      "contestId": "fa",
       "name": "/fa/ - Fashion"
     },
     {
-      "contest": "fit",
+      "contestId": "fit",
       "name": "/fit/ - Fitness"
     },
     {
-      "contest": "g",
+      "contestId": "g",
       "name": "/g/ - Technology"
     },
     {
-      "contest": "gd",
+      "contestId": "gd",
       "name": "/gd/ - Graphic Design"
     },
     {
-      "contest": "gif",
+      "contestId": "gif",
       "name": "/gif/ - Adult GIF"
     },
     {
-      "contest": "his",
+      "contestId": "his",
       "name": "/his/ - History & Humanities"
     },
     {
-      "contest": "i",
+      "contestId": "i",
       "name": "/i/ - Oekaki"
     },
     {
-      "contest": "ic",
+      "contestId": "ic",
       "name": "/ic/ - Artwork/Critique"
     },
     {
-      "contest": "int",
+      "contestId": "int",
       "name": "/int/ - International"
     },
     {
-      "contest": "jp",
+      "contestId": "jp",
       "name": "/jp/ - Otaku Culture"
     },
     {
-      "contest": "k",
+      "contestId": "k",
       "name": "/k/ - Weapons"
     },
     {
-      "contest": "lit",
+      "contestId": "lit",
       "name": "/lit/ - Literature"
     },
     {
-      "contest": "m",
+      "contestId": "m",
       "name": "/m/ - Mecha"
     },
     {
-      "contest": "mlp",
+      "contestId": "mlp",
       "name": "/mlp/ - Pony"
     },
     {
-      "contest": "mu",
+      "contestId": "mu",
       "name": "/mu/ - Music"
     },
     {
-      "contest": "n",
+      "contestId": "n",
       "name": "/n/ - Transportation"
     },
     {
-      "contest": "news",
+      "contestId": "news",
       "name": "/news/ - Current News"
     },
     {
-      "contest": "o",
+      "contestId": "o",
       "name": "/o/ - Auto"
     },
     {
-      "contest": "out",
+      "contestId": "out",
       "name": "/out/ - Outdoors"
     },
     {
-      "contest": "p",
+      "contestId": "p",
       "name": "/p/ - Photography"
     },
     {
-      "contest": "po",
+      "contestId": "po",
       "name": "/po/ - Papercraft & Origami"
     },
     {
-      "contest": "pol",
+      "contestId": "pol",
       "name": "/pol/ - Politically Incorrect"
     },
     {
-      "contest": "pw",
+      "contestId": "pw",
       "name": "/pw/ - Professional Wrestling"
     },
     {
       // Illustrative per-contest override: /q/ raises the gate to two Passes.
-      "contest": "q",
+      "contestId": "q",
       "name": "/q/ - 5chan Feedback",
       "rule": {
         "type": "erc721-min-balance",
@@ -204,111 +204,111 @@
       }
     },
     {
-      "contest": "qst",
+      "contestId": "qst",
       "name": "/qst/ - Quests"
     },
     {
-      "contest": "r9k",
+      "contestId": "r9k",
       "name": "/r9k/ - ROBOT9002"
     },
     {
-      "contest": "s5s",
+      "contestId": "s5s",
       "name": "/s5s/ - Shit 5chan Says"
     },
     {
-      "contest": "sci",
+      "contestId": "sci",
       "name": "/sci/ - Science & Math"
     },
     {
-      "contest": "soc",
+      "contestId": "soc",
       "name": "/soc/ - Cams & Meetups"
     },
     {
-      "contest": "sp",
+      "contestId": "sp",
       "name": "/sp/ - Sports"
     },
     {
-      "contest": "t",
+      "contestId": "t",
       "name": "/t/ - Torrents"
     },
     {
-      "contest": "tg",
+      "contestId": "tg",
       "name": "/tg/ - Traditional Games"
     },
     {
-      "contest": "toy",
+      "contestId": "toy",
       "name": "/toy/ - Toys"
     },
     {
-      "contest": "trv",
+      "contestId": "trv",
       "name": "/trv/ - Travel"
     },
     {
-      "contest": "tv",
+      "contestId": "tv",
       "name": "/tv/ - Television & Film"
     },
     {
-      "contest": "v",
+      "contestId": "v",
       "name": "/v/ - Video Games"
     },
     {
-      "contest": "vg",
+      "contestId": "vg",
       "name": "/vg/ - Video Game Generals"
     },
     {
-      "contest": "vip",
+      "contestId": "vip",
       "name": "/vip/ - Very Important Posts"
     },
     {
-      "contest": "vm",
+      "contestId": "vm",
       "name": "/vm/ - Video Games/Multiplayer"
     },
     {
-      "contest": "vmg",
+      "contestId": "vmg",
       "name": "/vmg/ - Video Games/Mobile"
     },
     {
-      "contest": "vp",
+      "contestId": "vp",
       "name": "/vp/ - Pokémon"
     },
     {
-      "contest": "vr",
+      "contestId": "vr",
       "name": "/vr/ - Retro Games"
     },
     {
-      "contest": "vrpg",
+      "contestId": "vrpg",
       "name": "/vrpg/ - Video Games/RPG"
     },
     {
-      "contest": "vst",
+      "contestId": "vst",
       "name": "/vst/ - Video Games/Strategy"
     },
     {
-      "contest": "vt",
+      "contestId": "vt",
       "name": "/vt/ - Virtual YouTubers"
     },
     {
-      "contest": "w",
+      "contestId": "w",
       "name": "/w/ - Anime/Wallpapers"
     },
     {
-      "contest": "wg",
+      "contestId": "wg",
       "name": "/wg/ - Wallpapers/General"
     },
     {
-      "contest": "wsg",
+      "contestId": "wsg",
       "name": "/wsg/ - Worksafe GIF"
     },
     {
-      "contest": "wsr",
+      "contestId": "wsr",
       "name": "/wsr/ - Worksafe Requests"
     },
     {
-      "contest": "x",
+      "contestId": "x",
       "name": "/x/ - Paranormal"
     },
     {
-      "contest": "xs",
+      "contestId": "xs",
       "name": "/xs/ - Extreme Sports"
     }
   ]

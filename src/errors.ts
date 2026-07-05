@@ -83,6 +83,53 @@ export class MissingBlockstoreError extends Error {
     }
 }
 
+/**
+ * Thrown at construction when no `manifest` is given. v1 requires a `PubsubVoter` to own a
+ * directory manifest: every contest is derived from it (`deriveCriteria`) and addressed by
+ * its `contestId` (`getContest`). There is no ad-hoc, manifest-free contest path in v1.
+ */
+export class MissingManifestError extends Error {
+    constructor() {
+        super(
+            "PubsubVoter requires a `manifest` at construction. v1 derives every contest from the " +
+                "directory manifest the voter owns and addresses each by its `contestId` " +
+                "(`getContest({ contestId })`); there is no ad-hoc contest path. Pass a directory " +
+                "manifest (see `deriveCriteria` / DESIGN.md \"Lifecycle\")."
+        );
+        this.name = "MissingManifestError";
+    }
+}
+
+/**
+ * Thrown at construction when a manifest declares the same `contestId` on more than one
+ * `contests` entry. `contestId` is how a host addresses a single contest
+ * (`getContest({ contestId })`), so it MUST be unique within a manifest.
+ */
+export class DuplicateContestIdError extends Error {
+    constructor(readonly contestId: string) {
+        super(
+            `Duplicate contestId "${contestId}" in the manifest. Each contest's \`contestId\` must be ` +
+                `unique — it is how a host addresses one contest (\`getContest({ contestId })\`). ` +
+                `Rename or remove the duplicate \`contests\` entry.`
+        );
+        this.name = "DuplicateContestIdError";
+    }
+}
+
+/** Thrown by `getContest` when no contest in this voter's manifest carries the requested `contestId`. */
+export class UnknownContestError extends Error {
+    constructor(
+        readonly contestId: string,
+        readonly known: readonly string[]
+    ) {
+        super(
+            `No contest with contestId "${contestId}" in this voter's manifest. ` +
+                `Known contestIds: ${known.length ? known.join(", ") : "(none)"}.`
+        );
+        this.name = "UnknownContestError";
+    }
+}
+
 /** Thrown when a write (cast/withdraw) is attempted on a voter constructed without a signer. */
 export class ReadOnlyError extends Error {
     constructor() {

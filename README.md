@@ -38,7 +38,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | board-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `board.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
-| `manifest` | `unknown` | no | a directory manifest this voter owns; `voter.start()` derives every contest from it and keeps them republished under one lifecycle (see [Lifecycle](#lifecycle-start--stop--destroy)) |
+| `manifest` | `unknown` | yes | the directory manifest this voter owns; the voter derives every contest from it at construction, addresses each by its unique `contestId` (`getContest`), and keeps them republished under one lifecycle (see [Lifecycle](#lifecycle-start--stop--destroy)). A duplicate `contestId` throws `DuplicateContestIdError`; a missing/invalid manifest throws `MissingManifestError` |
 | `dataPath` | `string` | no | Node only: directory for the SQLite file that persists this voter's vote intents so republishing survives a restart (the same `dataPath` convention as pkc-js / `@bitsocial/bso-resolver`). In the browser the voter uses IndexedDB; with no `dataPath` on Node, persistence is in-memory (lost on restart) |
 
 ### Construct a voter
@@ -49,17 +49,20 @@ import { PubsubVoter } from "@bitsocial/pubsub-votes";
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
   chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
+  manifest,                     // required: the directory manifest this voter owns (one contest per entry, unique contestId)
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver]  // optional; verifies board-name claims (e.g. @bitsocial/bso-resolver)
 });
 ```
+
+The `manifest` is mandatory: the voter derives every contest from it at construction and addresses each by its unique `contestId`. If you only care about one contest, pass a one-entry manifest (empty `defaults`, the criteria as the single `contests` entry).
 
 Construction throws `MissingPubsubError` or `MissingBlockstoreError` if the node lacks a usable pubsub service or blockstore — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through.)
 
 ### Read a tally (no signer needed)
 
 ```ts
-const contest = await voter.contest(criteria); // criteria: one validated CriteriaSchema document
+const contest = await voter.getContest({ contestId }); // contestId: a slot in the voter's manifest
 await contest.start();
 const tally = await contest.getTally();
 const winner = tally.ranking[0]?.board; // { name?: string, publicKey: string } — identity is publicKey
@@ -78,10 +81,10 @@ A board's identity is its `publicKey`. The optional `name` is the board's resolv
 
 ### Many contests from one manifest
 
-A 5chan-style directory manifest derives one contest (one topic) per slot:
+A 5chan-style directory manifest derives one contest (one topic) per slot. The voter owns the manifest, so it already knows every contest — enumerate them by `contestId` and reach each with `getContest`:
 
 ```ts
-const contests = await voter.contestsFromManifest(manifest); // → VoteNetwork[]
+const contests = await Promise.all(voter.contestIds.map((contestId) => voter.getContest({ contestId }))); // → VoteNetwork[]
 ```
 
 ### Lifecycle (`start` / `stop` / `destroy`)

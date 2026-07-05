@@ -28,7 +28,7 @@ describe("topicFor", () => {
             blocksPerBucket: base.blocksPerBucket,
             maxVotesPerAddress: base.maxVotesPerAddress,
             voteSchema: base.voteSchema,
-            contest: base.contest,
+            contestId: base.contestId,
             name: base.name
         };
         expect(await topicFor(reordered)).toBe(await topicFor(base));
@@ -36,7 +36,7 @@ describe("topicFor", () => {
 
     it("forks when a consensus field changes", async () => {
         const a = bizCriteria();
-        const b: Criteria = { ...bizCriteria(), contest: "g" };
+        const b: Criteria = { ...bizCriteria(), contestId: "g" };
         expect(await topicFor(a)).not.toBe(await topicFor(b));
     });
 

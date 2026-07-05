@@ -3,7 +3,15 @@ import { PubsubVoter, republishIntervalBuckets } from "./voter.js";
 import type { ChainClient, ChainClientFactory } from "../chain/types.js";
 import { MemoryVoteStore } from "../store/memory.js";
 import { selectVoteStore } from "../store/select.js";
-import { MissingBlockstoreError, MissingPubsubError, NotImplementedError, ReadOnlyError } from "../errors.js";
+import {
+    DuplicateContestIdError,
+    MissingBlockstoreError,
+    MissingManifestError,
+    MissingPubsubError,
+    NotImplementedError,
+    ReadOnlyError,
+    UnknownContestError
+} from "../errors.js";
 import { topicFor } from "../topic.js";
 import {
     bizCriteria,
@@ -33,67 +41,103 @@ function advancingChains(currentBlock: () => bigint): ChainClientFactory {
 
 /** A minimal directory manifest deriving one contest (the /biz/ slot) from the shared fixture. */
 function bizManifest(): unknown {
-    const { name, contest, ...defaults } = bizCriteria();
-    return { name: "test-directory", defaults, contests: [{ contest, name }] };
+    const { name, contestId, ...defaults } = bizCriteria();
+    return { name: "test-directory", defaults, contests: [{ contestId, name }] };
+}
+
+/** A manifest that repeats one `contestId`, to exercise the constructor uniqueness guard. */
+function dupContestIdManifest(): unknown {
+    const { name, contestId, ...defaults } = bizCriteria();
+    return { name: "dup", defaults, contests: [{ contestId, name }, { contestId, name: `${name} (again)` }] };
 }
 
 describe("PubsubVoter construction + read-only", () => {
     it("is read-only without a signer", () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
         expect(voter.readOnly).toBe(true);
     });
 
     it("throws MissingPubsubError when the node's libp2p has no gossipsub service", () => {
-        expect(() => new PubsubVoter({ helia: fakeHeliaWithoutPubsub(), chains: fakeChains() })).toThrow(
-            MissingPubsubError
-        );
+        expect(
+            () => new PubsubVoter({ helia: fakeHeliaWithoutPubsub(), chains: fakeChains(), manifest: bizManifest() })
+        ).toThrow(MissingPubsubError);
     });
 
     it("throws MissingBlockstoreError when the node has no blockstore", () => {
-        expect(() => new PubsubVoter({ helia: fakeHeliaWithoutBlockstore(), chains: fakeChains() })).toThrow(
-            MissingBlockstoreError
-        );
+        expect(
+            () => new PubsubVoter({ helia: fakeHeliaWithoutBlockstore(), chains: fakeChains(), manifest: bizManifest() })
+        ).toThrow(MissingBlockstoreError);
+    });
+
+    it("throws MissingManifestError when no manifest is given", () => {
+        // @ts-expect-error manifest is required in v1
+        expect(() => new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() })).toThrow(MissingManifestError);
+    });
+
+    it("throws DuplicateContestIdError when a manifest repeats a contestId", () => {
+        expect(
+            () => new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: dupContestIdManifest() })
+        ).toThrow(DuplicateContestIdError);
     });
 
     it("is writable with a signer", () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: fakeChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest()
+        });
         expect(voter.readOnly).toBe(false);
     });
 });
 
-describe("PubsubVoter.contest", () => {
+describe("PubsubVoter.getContest", () => {
+    it("exposes contestIds in manifest order", () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        expect(voter.contestIds).toEqual(["biz"]);
+    });
+
     it("derives the correct topic and propagates read-only", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        const contest = await voter.contest(bizCriteria());
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const contest = await voter.getContest({ contestId: "biz" });
         expect(contest.topic).toBe(await topicFor(bizCriteria()));
-        expect(contest.criteria.contest).toBe("biz");
+        expect(contest.criteria.contestId).toBe("biz");
         expect(contest.readOnly).toBe(true);
     });
 
-    it("caches one network per topic", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        const a = await voter.contest(bizCriteria());
-        const b = await voter.contest(bizCriteria());
+    it("caches one network per contest", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const a = await voter.getContest({ contestId: "biz" });
+        const b = await voter.getContest({ contestId: "biz" });
         expect(a).toBe(b);
     });
 
-    it("rejects an invalid criteria document", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        // @ts-expect-error intentionally invalid for the test
-        await expect(voter.contest({ contest: "x" })).rejects.toThrow();
+    it("throws UnknownContestError for a contestId not in the manifest", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        await expect(voter.getContest({ contestId: "nope" })).rejects.toBeInstanceOf(UnknownContestError);
+    });
+
+    it("rejects a manifest whose derived criteria is invalid", () => {
+        const bad = { name: "m", defaults: {}, contests: [{ contestId: "x", name: "/x/" }] };
+        expect(() => new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bad })).toThrow();
     });
 });
 
 describe("write path gating", () => {
     it("castVotes throws ReadOnlyError without a signer", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        const contest = await voter.contest(bizCriteria());
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const contest = await voter.getContest({ contestId: "biz" });
         await expect(contest.castVotes([{ board: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(ReadOnlyError);
     });
 
     it("castVotes signs and returns a bundle when a signer is present", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
-        const contest = await voter.contest(bizCriteria());
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: stubChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest()
+        });
+        const contest = await voter.getContest({ contestId: "biz" });
         const bundle = await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
         expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
         // blockNumber is the bucket boundary: bucketForBlock(43200)=1, sampleBlockForBucket(1)=43200.
@@ -104,14 +148,19 @@ describe("write path gating", () => {
 
 describe("getTally", () => {
     it("returns an empty ranking for a contest with no votes (no chain reads)", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        const contest = await voter.contest(bizCriteria());
-        expect(await contest.getTally()).toEqual({ contest: "biz", ranking: [] });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const contest = await voter.getContest({ contestId: "biz" });
+        expect(await contest.getTally()).toEqual({ contestId: "biz", ranking: [] });
     });
 
     it("reflects a cast vote end-to-end (cast -> CRDT -> tally)", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
-        const contest = await voter.contest(bizCriteria());
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: stubChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest()
+        });
+        const contest = await voter.getContest({ contestId: "biz" });
         await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
 
         const tally = await contest.getTally();
@@ -127,9 +176,10 @@ describe("getTally", () => {
         const voter = new PubsubVoter({
             helia: fakeHelia(),
             chains: advancingChains(() => block),
-            signer: fakeSigner()
+            signer: fakeSigner(),
+            manifest: bizManifest()
         });
-        const contest = await voter.contest(bizCriteria());
+        const contest = await voter.getContest({ contestId: "biz" });
         await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
 
         // Still live at bucket 1: the vote counts.
@@ -143,8 +193,8 @@ describe("getTally", () => {
 
 describe("network lifecycle", () => {
     it("start and stop resolve, wiring the real forward-gate over the host node", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        const contest = await voter.contest(bizCriteria());
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const contest = await voter.getContest({ contestId: "biz" });
         await expect(contest.start()).resolves.toBeUndefined();
         await expect(contest.stop()).resolves.toBeUndefined();
     });
@@ -205,13 +255,13 @@ describe("PubsubVoter lifecycle", () => {
     });
 
     it("destroy() is a safe teardown, even before start()", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
         await expect(voter.destroy()).resolves.toBeUndefined();
     });
 
     it("stop() leaves topics and stays reusable", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
-        await voter.contest(bizCriteria());
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        await voter.getContest({ contestId: "biz" });
         await expect(voter.stop()).resolves.toBeUndefined();
     });
 });

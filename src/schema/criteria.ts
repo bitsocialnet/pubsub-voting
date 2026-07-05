@@ -8,7 +8,7 @@ import { ChainTickerSchema } from "./common.js";
  *   topic = "bitsocial-votes/" + CID(dag-cbor(criteria))
  *
  * One criteria document describes exactly one contest (one directory slot), so there
- * is one topic per contest. The differing `contest` value makes each contest's bytes
+ * is one topic per contest. The differing `contestId` value makes each contest's bytes
  * distinct, which forks the topic automatically. A client joins only the contests it
  * cares about, which is what keeps cold start cheap. See DESIGN.md "Criteria document".
  *
@@ -55,8 +55,11 @@ export const CriteriaSchema = z
     .object({
         /** Human-readable label, not consensus-critical beyond changing the CID. */
         name: z.string().min(1),
-        /** The directory-slot code this topic decides. One contest per topic. */
-        contest: z.string().min(1),
+        /**
+         * The directory-slot code this topic decides. One contest per topic; it is how a host
+         * addresses a contest (`PubsubVoter.getContest`), so it MUST be unique within a manifest.
+         */
+        contestId: z.string().min(1),
         /** Allowed range for each `vote` value. v1: { min: 1, max: 1 }. */
         voteSchema: VoteRangeSchema,
         /**

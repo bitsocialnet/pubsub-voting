@@ -14,13 +14,16 @@ import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
  * document". Pure and offline.
  *
  * The manifest schema is intentionally permissive — it only pins the structural fields
- * (`name`, `defaults`, `contests[].contest`, `contests[].name`). `CriteriaSchema` is
+ * (`name`, `defaults`, `contests[].contestId`, `contests[].name`). `CriteriaSchema` is
  * the real gate: each derived document must be a valid, canonically-encodable criteria.
+ * Uniqueness of `contestId` across a manifest is enforced where the manifest is owned —
+ * the `PubsubVoter` constructor (see `DuplicateContestIdError`) — not here, so that
+ * `deriveCriteria` stays a pure, order-preserving transform.
  */
 
-/** One contest entry: identity plus any per-contest rule overrides. */
+/** One contest entry: its unique `contestId` plus any per-contest rule overrides. */
 export const ManifestContestSchema = z.looseObject({
-    contest: z.string().min(1),
+    contestId: z.string().min(1),
     name: z.string().min(1)
 });
 

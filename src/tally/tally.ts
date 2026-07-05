@@ -104,7 +104,7 @@ export function makeTally(deps: TallyDeps): Tally {
             const hasTie = new Set(list.map((r) => r.weight)).size !== list.length;
             if (!hasTie) {
                 list.sort((a, b) => (a.weight < b.weight ? 1 : a.weight > b.weight ? -1 : 0));
-                return { contest: criteria.contest, ranking: list };
+                return { contestId: criteria.contestId, ranking: list };
             }
 
             const blockHash = await bucketBlockHash();
@@ -114,7 +114,7 @@ export function makeTally(deps: TallyDeps): Tally {
                 if (a.weight !== b.weight) return a.weight < b.weight ? 1 : -1;
                 return compareBytes(seeds.get(a.board.publicKey)!, seeds.get(b.board.publicKey)!);
             });
-            return { contest: criteria.contest, ranking: list };
+            return { contestId: criteria.contestId, ranking: list };
         }
     };
 }

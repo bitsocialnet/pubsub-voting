@@ -24,15 +24,15 @@ const defaults = {
 
 describe("mergeCriteria", () => {
     it("flattens defaults and entry into one valid criteria document", () => {
-        const c = mergeCriteria(defaults, { contest: "biz", name: "/biz/" });
-        expect(c.contest).toBe("biz");
+        const c = mergeCriteria(defaults, { contestId: "biz", name: "/biz/" });
+        expect(c.contestId).toBe("biz");
         expect(c.name).toBe("/biz/");
         expect(c.maxVotesPerAddress).toBe(1);
     });
 
     it("lets an entry override a whole top-level field (no deep merge)", () => {
         const c = mergeCriteria(defaults, {
-            contest: "q",
+            contestId: "q",
             name: "/q/",
             rule: { type: "erc721-min-balance", chain: "base", contract: "0xabc", min: 2 }
         });
@@ -40,7 +40,7 @@ describe("mergeCriteria", () => {
     });
 
     it("rejects a merged document that is not valid criteria", () => {
-        expect(() => mergeCriteria({}, { contest: "x", name: "/x/" })).toThrow();
+        expect(() => mergeCriteria({}, { contestId: "x", name: "/x/" })).toThrow();
     });
 });
 
@@ -54,8 +54,8 @@ describe("deriveCriteria on the real 5chan manifest", () => {
     it("derives one valid criteria per directory slot", () => {
         const criteria = deriveCriteria(fiveChanManifest());
         expect(criteria.length).toBe(63);
-        expect(criteria.every((c) => c.contest.length > 0)).toBe(true);
-        const q = criteria.find((c) => c.contest === "q");
+        expect(criteria.every((c) => c.contestId.length > 0)).toBe(true);
+        const q = criteria.find((c) => c.contestId === "q");
         expect(q?.rule).toMatchObject({ min: 2 });
     });
 

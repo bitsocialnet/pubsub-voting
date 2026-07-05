@@ -1,5 +1,5 @@
 import pLimit from "p-limit";
-import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
+import type { Criteria } from "../schema/criteria.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
 import { makeBucketMath } from "../chain/bucket.js";
@@ -25,7 +25,14 @@ import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import { deriveCriteria } from "../manifest/manifest.js";
 import type { VoteStore } from "../store/types.js";
 import { selectVoteStore } from "../store/select.js";
-import { NotImplementedError, ReadOnlyError, UnknownRuleError } from "../errors.js";
+import {
+    DuplicateContestIdError,
+    MissingManifestError,
+    NotImplementedError,
+    ReadOnlyError,
+    UnknownContestError,
+    UnknownRuleError
+} from "../errors.js";
 
 /**
  * How often to republish a live vote, in buckets: half its expiry window, rounded up. A
@@ -85,16 +92,19 @@ export interface VoteNetwork {
 export interface VoteClient {
     /** True when constructed without a signer: every contest is read-only. */
     readonly readOnly: boolean;
-    /** Get (or create and cache) the network for one contest, keyed by its topic. */
-    contest(criteria: Criteria): Promise<VoteNetwork>;
-    /** Derive every contest from a 5chan-style manifest and return one network each. */
-    contestsFromManifest(manifest: unknown): Promise<VoteNetwork[]>;
+    /** The `contestId`s of every contest in this voter's manifest, in manifest order. */
+    readonly contestIds: readonly string[];
     /**
-     * Join every contest from the constructor `manifest` (if one was given, else the
-     * already-cached contests), start each network, and arm the republish scheduler that
-     * keeps this wallet's own votes alive by re-signing them with a fresh `blockNumber` on
-     * the liveness cadence (`ceil(voteExpiryBuckets / 2)` buckets per contest). Idempotent
-     * to the extent contests cache by topic.
+     * Get (or create and cache) the network for one contest by its `contestId`. The id must
+     * name a contest in this voter's manifest, else `UnknownContestError`. Networks cache by
+     * topic, so repeated calls for the same contest return the same object.
+     */
+    getContest(args: { contestId: string }): Promise<VoteNetwork>;
+    /**
+     * Join every contest in the constructor `manifest`, start each network, and arm the
+     * republish scheduler that keeps this wallet's own votes alive by re-signing them with a
+     * fresh `blockNumber` on the liveness cadence (`ceil(voteExpiryBuckets / 2)` buckets per
+     * contest). Idempotent to the extent contests cache by topic.
      */
     start(): Promise<void>;
     /** Stop the republish scheduler and leave every topic. The client stays reusable. */
@@ -129,12 +139,13 @@ export interface PubsubVoterOptions {
     /** Identity. Omit for a read-only voter (renders tallies, cannot cast). */
     signer?: VoteSigner;
     /**
-     * A 5chan-style directory manifest this voter owns. When given, `start()` derives every
-     * contest from it (via `deriveCriteria`) and keeps them all republished under one
-     * lifecycle. Optional: a voter can instead mint contests ad hoc through `contest()` /
-     * `contestsFromManifest()` and never set this.
+     * The 5chan-style directory manifest this voter owns. Required in v1: the voter derives
+     * every contest from it (via `deriveCriteria`) at construction, addresses each by its
+     * unique `contestId` (`getContest`), and keeps them all republished under one lifecycle.
+     * Its `contestId`s MUST be unique — a duplicate throws `DuplicateContestIdError` at
+     * construction — and a missing/invalid manifest throws `MissingManifestError`.
      */
-    manifest?: unknown;
+    manifest: unknown;
     /**
      * Directory for the voter's persistence, Node only — the same `dataPath` convention
      * pkc-js and `@bitsocial/bso-resolver` use. When set, the Node backend keeps this
@@ -375,19 +386,23 @@ class ContestNetwork implements VoteNetwork {
 }
 
 /**
- * The default `VoteClient`. Construct with the host-injected seams: a `helia` node
- * (the only mandatory one — the library never starts or assumes a particular node, but
- * the node must carry a gossipsub service and a blockstore), a `chains` factory, an
- * optional `signer`, and optional `nameResolvers` (needed once votes carry board
- * names). The library has no knowledge of pkc-js or any other host: a host passes its
- * own running Helia node in directly.
+ * The default `VoteClient`. Construct with the host-injected seams: a `helia` node (the
+ * library never starts or assumes a particular node, but it must carry a gossipsub service
+ * and a blockstore), a `chains` factory, the `manifest` this voter owns (required — every
+ * contest is derived from it and addressed by `contestId`), an optional `signer`, and
+ * optional `nameResolvers` (needed once votes carry board names). The library has no
+ * knowledge of pkc-js or any other host: a host passes its own running Helia node in directly.
  */
 export class PubsubVoter implements VoteClient {
     readonly #deps: ResolvedDeps;
     /** Cache of live contests, keyed by topic so identical criteria share one network. */
     readonly #contests = new Map<string, ContestNetwork>();
-    /** The directory manifest this voter owns, if any; `start()` derives its contests. */
-    readonly #manifest: unknown;
+    /**
+     * Every contest this voter owns, derived from the constructor manifest and keyed by its
+     * unique `contestId` (validated at construction). This is the single source of contests;
+     * `getContest` and `start()` both read from it, and it fixes `contestIds` order.
+     */
+    readonly #criteriaById: Map<string, Criteria>;
     /**
      * Live republish timers, one per contest, cleared by `stop()` / `destroy()`. The
      * registry and its teardown are real now; arming it (the re-sign tick) lands with the
@@ -410,34 +425,46 @@ export class PubsubVoter implements VoteClient {
             nameResolvers: options.nameResolvers ?? [],
             store: selectVoteStore(options.dataPath)
         };
-        this.#manifest = options.manifest;
+
+        // The manifest is mandatory in v1: derive every contest up front, validate each
+        // against the rule registry, and reject a duplicate `contestId` — the id is how a
+        // host addresses one contest (`getContest`), so it must be unique.
+        if (options.manifest === undefined || options.manifest === null) throw new MissingManifestError();
+        this.#criteriaById = new Map();
+        for (const criteria of deriveCriteria(options.manifest)) {
+            validateCriteriaRules(criteria, this.#deps.registry);
+            if (this.#criteriaById.has(criteria.contestId)) throw new DuplicateContestIdError(criteria.contestId);
+            this.#criteriaById.set(criteria.contestId, criteria);
+        }
     }
 
     get readOnly(): boolean {
         return this.#deps.signer === undefined;
     }
 
-    async contest(criteria: Criteria): Promise<VoteNetwork> {
-        const validated = CriteriaSchema.parse(criteria);
-        validateCriteriaRules(validated, this.#deps.registry);
-        const cid = await criteriaCid(validated);
+    get contestIds(): readonly string[] {
+        return [...this.#criteriaById.keys()];
+    }
+
+    async getContest(args: { contestId: string }): Promise<VoteNetwork> {
+        const criteria = this.#criteriaById.get(args.contestId);
+        if (!criteria) throw new UnknownContestError(args.contestId, [...this.#criteriaById.keys()]);
+        return this.#network(criteria);
+    }
+
+    /** Build (or return the cached) network for one already-validated criteria, keyed by topic. */
+    async #network(criteria: Criteria): Promise<ContestNetwork> {
+        const cid = await criteriaCid(criteria);
         const topic = TOPIC_PREFIX + cid.toString();
         const existing = this.#contests.get(topic);
         if (existing) return existing;
-        const network = new ContestNetwork(validated, topic, cid.bytes, this.#deps);
+        const network = new ContestNetwork(criteria, topic, cid.bytes, this.#deps);
         this.#contests.set(topic, network);
         return network;
     }
 
-    async contestsFromManifest(manifest: unknown): Promise<VoteNetwork[]> {
-        return Promise.all(deriveCriteria(manifest).map((criteria) => this.contest(criteria)));
-    }
-
     async start(): Promise<void> {
-        const networks =
-            this.#manifest !== undefined
-                ? await this.contestsFromManifest(this.#manifest)
-                : [...this.#contests.values()];
+        const networks = await Promise.all([...this.#criteriaById.values()].map((criteria) => this.#network(criteria)));
         for (const network of networks) {
             // Joins the topic and installs the forward gate; cold-start head sync over the
             // libp2p fetch protocol (`fetchHeadsFromPeer`) is still unset, so this returns
