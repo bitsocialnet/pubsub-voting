@@ -6,7 +6,7 @@ import type { BundleVerifier, BundleVerdict } from "./types.js";
  * Per-CID verdict cache. A bundle is immutable and content-addressed, and its verdict
  * (signature + constraints + gate-at-bucket-block + name resolution) is deterministic,
  * so it is computed once and reused. This is the lever that keeps the forward-gate cheap:
- * steady-state gossip re-announces already-known heads, so the same bundle CID would
+ * steady-state gossip re-announces already-known bundle CIDs, so the same bundle CID would
  * otherwise be re-verified once per gossiping peer. See DESIGN.md "Transport" ("verdict cache").
  */
 export interface VerdictCache {

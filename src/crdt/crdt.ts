@@ -1,15 +1,16 @@
 import type { CID } from "multiformats/cid";
 import type { BucketMath } from "../chain/types.js";
 import type { VotesBundle } from "../schema/votes.js";
-import type { DagNode, DagNodeStore, LwwResolve, VoteCrdt } from "./types.js";
+import type { BundleStore, LwwResolve, VoteCrdt } from "./types.js";
 
 /**
- * The Merkle-CRDT: a last-write-wins element-set keyed by the voting wallet, carried in a
- * Merkle-DAG. Aggregation is a monotonic union (a CRDT join) — combining two peers' sets can
- * only add nodes, never remove one — so a liar can omit a vote but cannot subtract one an
- * honest peer serves (see DESIGN.md "CRDT", "Can always-online peers drop votes?").
+ * The state-based grow-only CRDT: a last-write-wins element-set keyed by the voting wallet.
+ * Each bundle is a standalone dag-cbor block; there are no parent links and no DAG to walk.
+ * Aggregation is a monotonic union (a CRDT join) — combining two peers' sets can only add
+ * bundles, never remove one — so a liar can omit a vote but cannot subtract one an honest
+ * peer serves (see DESIGN.md "CRDT", "Can always-online peers drop votes?").
  *
- * Conflict resolution per wallet: highest `blockNumber` wins, tie broken by lowest node CID,
+ * Conflict resolution per wallet: highest `blockNumber` wins, tie broken by lowest bundle CID,
  * for determinism across clients. Bundles admitted here are assumed already validity-gated
  * (signature, gate, name) by the transport before merge — the CRDT is trust-neutral
  * storage, not a verifier.
@@ -28,7 +29,7 @@ function compareCid(a: CID, b: CID): number {
     return x.length - y.length;
 }
 
-/** Highest `blockNumber` wins; tie broken by lowest node CID. */
+/** Highest `blockNumber` wins; tie broken by lowest bundle CID. */
 export const lwwResolve: LwwResolve = (a, b) => {
     if (a.bundle.blockNumber !== b.bundle.blockNumber) {
         return a.bundle.blockNumber > b.bundle.blockNumber ? a.cid : b.cid;
@@ -37,7 +38,7 @@ export const lwwResolve: LwwResolve = (a, b) => {
 };
 
 export interface VoteCrdtDeps {
-    store: DagNodeStore;
+    store: BundleStore;
     /** Bucket math for `criteria.blocksPerBucket`, used by `prune` to age out expired bundles. */
     bucketMath: BucketMath;
     /** How many buckets a bundle stays valid after its blockNumber's bucket (`criteria.voteExpiryBuckets`). */
@@ -50,62 +51,44 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
     const { store, bucketMath, voteExpiryBuckets } = deps;
     const resolve = deps.resolve ?? lwwResolve;
 
-    // The working set of integrated nodes, mirrored from the store for fast reduction.
-    const nodes = new Map<string, { cid: CID; node: DagNode }>();
+    // The working set of integrated bundles, keyed by CID string, mirrored from the store for
+    // fast reduction.
+    const bundles = new Map<string, { cid: CID; bundle: VotesBundle }>();
 
     /**
      * A bundle has decayed once the current bucket is past its `blockNumber`'s bucket plus the
      * expiry window (see DESIGN.md "Passive expiry"). This is the read-time filter that keeps an
-     * expired vote out of the tally and the broadcast heads *even when a merge re-materializes it
-     * as a DAG ancestor* — the same predicate `prune` uses to bound memory. Identical to the check
-     * in {@link prune}.
+     * expired vote out of the tally and the broadcast winner CIDs — the same predicate `prune`
+     * uses to bound memory.
      */
     function isExpired(bundle: VotesBundle, currentBucket: number): boolean {
         return currentBucket > bucketMath.bucketForBlock(bundle.blockNumber) + voteExpiryBuckets;
     }
 
-    /**
-     * The current DAG tips: integrated nodes no other integrated node links as a parent.
-     * Unfiltered — used for `add`'s parent links so the Merkle history stays walkable; the public
-     * {@link VoteCrdt.heads} filters expired tips on top of this.
-     */
-    function computeHeads(): CID[] {
-        const parents = new Set<string>();
-        for (const { node } of nodes.values()) {
-            for (const p of node.parents) parents.add(p.toString());
-        }
-        const heads: CID[] = [];
-        for (const { cid } of nodes.values()) {
-            if (!parents.has(cid.toString())) heads.push(cid);
-        }
-        return heads;
-    }
-
-    /** Depth-first integrate a CID and all its ancestors from the store into the working set. */
+    /** Integrate one bundle CID from the store into the working set (idempotent). */
     async function integrate(cid: CID): Promise<void> {
         const key = cid.toString();
-        if (nodes.has(key)) return;
-        const node = await store.get(cid);
-        if (!node) {
-            throw new Error(`missing DAG node ${key} during merge; fetch it into the store before merging`);
+        if (bundles.has(key)) return;
+        const bundle = await store.get(cid);
+        if (!bundle) {
+            throw new Error(`missing bundle ${key} during merge; fetch it into the store before merging`);
         }
-        nodes.set(key, { cid, node });
-        for (const p of node.parents) await integrate(p);
+        bundles.set(key, { cid, bundle });
     }
 
     /** LWW winner per wallet across the working set. */
-    function winnersByWallet(): Map<string, { cid: CID; node: DagNode }> {
-        const winners = new Map<string, { cid: CID; node: DagNode }>();
-        for (const entry of nodes.values()) {
-            const wallet = entry.node.value.address.toLowerCase();
+    function winnersByWallet(): Map<string, { cid: CID; bundle: VotesBundle }> {
+        const winners = new Map<string, { cid: CID; bundle: VotesBundle }>();
+        for (const entry of bundles.values()) {
+            const wallet = entry.bundle.address.toLowerCase();
             const prev = winners.get(wallet);
             if (!prev) {
                 winners.set(wallet, entry);
                 continue;
             }
             const winnerCid = resolve(
-                { bundle: prev.node.value, cid: prev.cid },
-                { bundle: entry.node.value, cid: entry.cid }
+                { bundle: prev.bundle, cid: prev.cid },
+                { bundle: entry.bundle, cid: entry.cid }
             );
             winners.set(wallet, winnerCid.equals(prev.cid) ? prev : entry);
         }
@@ -114,48 +97,48 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
 
     return {
         async add(bundle) {
-            const node: DagNode = { value: bundle, parents: computeHeads() };
-            const cid = await store.put(node);
-            nodes.set(cid.toString(), { cid, node });
+            const cid = await store.put(bundle);
+            bundles.set(cid.toString(), { cid, bundle });
             return cid;
         },
 
-        async merge(heads: CID[]) {
-            for (const h of heads) await integrate(h);
+        async merge(cids: CID[]) {
+            for (const cid of cids) await integrate(cid);
         },
 
-        heads(currentBucket) {
-            // Drop expired tips so an expired standalone (or re-injected) tip is never
-            // broadcast or linked; ancestors below a live tip stay walkable.
-            return computeHeads().filter((cid) => {
-                const entry = nodes.get(cid.toString())!;
-                return !isExpired(entry.node.value, currentBucket);
-            });
+        winnerCids(currentBucket) {
+            // The current winner CIDs, expiry-filtered: a wallet whose winning bundle has
+            // decayed contributes nothing, so an expired vote is never broadcast.
+            const winners: CID[] = [];
+            for (const entry of winnersByWallet().values()) {
+                if (!isExpired(entry.bundle, currentBucket)) winners.push(entry.cid);
+            }
+            return winners;
         },
 
         current(currentBucket) {
             // One bundle per wallet (LWW). A winning empty-votes bundle is the withdrawal
             // form and is returned as-is; the tally treats it as "no vote". A winner past its
             // expiry window drops the wallet entirely — the read-time filter that keeps a
-            // decayed vote (even one a merge re-materialized) out of the tally.
+            // decayed vote out of the tally.
             return [...winnersByWallet().values()]
-                .filter((e) => !isExpired(e.node.value, currentBucket))
-                .map((e) => e.node.value);
+                .filter((e) => !isExpired(e.bundle, currentBucket))
+                .map((e) => e.bundle);
         },
 
         nodeCount() {
-            return nodes.size;
+            return bundles.size;
         },
 
         async prune(currentBucket: number) {
             const winners = winnersByWallet();
-            for (const [key, entry] of nodes) {
-                const wallet = entry.node.value.address.toLowerCase();
+            for (const [key, entry] of bundles) {
+                const wallet = entry.bundle.address.toLowerCase();
                 const isWinner = winners.get(wallet) === entry;
-                const bundleBucket = bucketMath.bucketForBlock(entry.node.value.blockNumber);
+                const bundleBucket = bucketMath.bucketForBlock(entry.bundle.blockNumber);
                 const expired = currentBucket > bundleBucket + voteExpiryBuckets;
-                // Drop superseded (non-winning) nodes and any node past its expiry window.
-                if (!isWinner || expired) nodes.delete(key);
+                // Drop superseded (non-winning) bundles and any bundle past its expiry window.
+                if (!isWinner || expired) bundles.delete(key);
             }
         }
     };

@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { makeVoteCrdt, lwwResolve } from "./crdt.js";
-import { makeMemoryDagNodeStore } from "./store.js";
-import type { DagNode } from "./types.js";
+import { makeMemoryBundleStore } from "./store.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import type { Vote, VotesBundle } from "../schema/votes.js";
 
@@ -20,7 +19,7 @@ const BLOCKS_PER_BUCKET = 43200;
 const LIVE = 0;
 function crdt() {
     return makeVoteCrdt({
-        store: makeMemoryDagNodeStore(),
+        store: makeMemoryBundleStore(),
         bucketMath: makeBucketMath(BLOCKS_PER_BUCKET),
         voteExpiryBuckets: 2
     });
@@ -39,21 +38,21 @@ describe("makeVoteCrdt — LWW reduction", () => {
     });
 
     it("collapses same-wallet equivocation (same blockNumber) to one, tie-broken by lowest CID", async () => {
-        const store = makeMemoryDagNodeStore();
-        // Two conflicting bundles from one wallet at the same block, both linking no parents,
-        // so this is a pure LWW tiebreak, not a DAG supersession.
-        const nodeA: DagNode = { value: bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 300), parents: [] };
-        const nodeB: DagNode = { value: bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], 300), parents: [] };
-        const cidA = await store.put(nodeA);
-        const cidB = await store.put(nodeB);
+        const store = makeMemoryBundleStore();
+        // Two conflicting bundles from one wallet at the same block, so this is a pure LWW
+        // tiebreak on bundle CID.
+        const bundleA = bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 300);
+        const bundleB = bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], 300);
+        const cidA = await store.put(bundleA);
+        const cidB = await store.put(bundleB);
 
         const c = makeVoteCrdt({ store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 });
         await c.merge([cidA, cidB]);
 
         const current = c.current(LIVE);
         expect(current).toHaveLength(1);
-        // The winner is the one whose node CID the resolver picks as lowest.
-        const winnerCid = lwwResolve({ bundle: nodeA.value, cid: cidA }, { bundle: nodeB.value, cid: cidB });
+        // The winner is the one whose bundle CID the resolver picks as lowest.
+        const winnerCid = lwwResolve({ bundle: bundleA, cid: cidA }, { bundle: bundleB, cid: cidB });
         const winnerKey = winnerCid.equals(cidA) ? KEY_A : KEY_B;
         expect(current[0].votes[0].board.publicKey).toBe(winnerKey);
     });
@@ -69,20 +68,21 @@ describe("makeVoteCrdt — LWW reduction", () => {
     });
 });
 
-describe("makeVoteCrdt — heads and monotonic union", () => {
-    it("advances heads to the latest node on a linear chain", async () => {
+describe("makeVoteCrdt — winner CIDs and monotonic union", () => {
+    it("winnerCids() returns the LWW winner CID per wallet (the newer supersedes the older)", async () => {
         const c = crdt();
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 100));
         const second = await c.add(bundle(WALLET, [{ board: { publicKey: KEY_B }, vote: 1 }], 200));
 
-        const heads = c.heads(LIVE);
-        expect(heads).toHaveLength(1);
-        expect(heads[0].equals(second)).toBe(true);
+        // One wallet -> one winner CID (the higher-blockNumber bundle), not both bundles.
+        const winners = c.winnerCids(LIVE);
+        expect(winners).toHaveLength(1);
+        expect(winners[0].equals(second)).toBe(true);
     });
 
     it("unions two peers' state without subtracting, and merge is idempotent", async () => {
         // A shared content-addressed store stands in for the blockstore both peers put into.
-        const store = makeMemoryDagNodeStore();
+        const store = makeMemoryBundleStore();
         const deps = { store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 };
         const a = makeVoteCrdt(deps);
         const b = makeVoteCrdt(deps);
@@ -90,8 +90,8 @@ describe("makeVoteCrdt — heads and monotonic union", () => {
         await a.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 100));
         await b.add(bundle(OTHER, [{ board: { publicKey: KEY_B }, vote: 1 }], 100));
 
-        await a.merge(b.heads(LIVE));
-        await a.merge(b.heads(LIVE)); // idempotent: re-merging the same heads changes nothing
+        await a.merge(b.winnerCids(LIVE));
+        await a.merge(b.winnerCids(LIVE)); // idempotent: re-merging the same CIDs changes nothing
 
         const wallets = new Set(a.current(LIVE).map((v) => v.address));
         expect(wallets).toEqual(new Set([WALLET, OTHER]));
@@ -112,47 +112,48 @@ describe("makeVoteCrdt — read-time expiry filter", () => {
         expect(current[0].address).toBe(OTHER);
     });
 
-    it("heads() drops an expired standalone tip (nothing broadcast for a decayed vote)", async () => {
+    it("winnerCids() drops an expired winner CID (nothing broadcast for a decayed vote)", async () => {
         const c = crdt();
         await c.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0
 
-        expect(c.heads(LIVE)).toHaveLength(1); // live: still a broadcastable tip
-        expect(c.heads(3)).toHaveLength(0); // expired: dropped from the broadcast heads
+        expect(c.winnerCids(LIVE)).toHaveLength(1); // live: still a broadcastable winner
+        expect(c.winnerCids(3)).toHaveLength(0); // expired: dropped from the broadcast winner CIDs
         expect(c.current(3)).toHaveLength(0); // and from the tally view
     });
 
-    it("does not resurrect an expired ancestor a merge re-materializes (no head-CID pollution)", async () => {
-        // Shared store = the blockstore both peers read/write. Peer C cold-starts from B's heads.
-        const store = makeMemoryDagNodeStore();
+    it("filters an expired bundle out of a merged set, keeping the live one", async () => {
+        // Shared store = the blockstore both peers read/write. Peer C cold-starts by merging
+        // the winner CIDs a peer serves — each an independent, standalone bundle CID.
+        const store = makeMemoryBundleStore();
         const deps = { store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 };
         const producer = makeVoteCrdt(deps);
 
-        await producer.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // A, bucket 0
-        const bCid = await producer.add(bundle(OTHER, [{ board: { publicKey: KEY_B }, vote: 1 }], 3 * BLOCKS_PER_BUCKET)); // B, bucket 3, links A
+        const aCid = await producer.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // A, bucket 0
+        const bCid = await producer.add(bundle(OTHER, [{ board: { publicKey: KEY_B }, vote: 1 }], 3 * BLOCKS_PER_BUCKET)); // B, bucket 3
 
         const c = makeVoteCrdt(deps);
-        await c.merge([bCid]); // integrate walks B -> A, re-materializing the expired A into C's working set
+        await c.merge([aCid, bCid]); // integrate both standalone bundles
 
         // At bucket 4: A (bucket 0) is expired, B (bucket 3) is live. A must not pollute either view.
         const current = c.current(4);
         expect(current).toHaveLength(1);
         expect(current[0].address).toBe(OTHER);
 
-        const heads = c.heads(4);
-        expect(heads).toHaveLength(1);
-        expect(heads[0].equals(bCid)).toBe(true); // A is an ancestor, not a live tip
+        const winners = c.winnerCids(4);
+        expect(winners).toHaveLength(1);
+        expect(winners[0].equals(bCid)).toBe(true); // only the live winner is broadcast
     });
 
-    it("filters an expired tip a stale peer re-injects (gate does not check expiry)", async () => {
-        const store = makeMemoryDagNodeStore();
+    it("filters an expired bundle a stale peer re-injects (gate does not check expiry)", async () => {
+        const store = makeMemoryBundleStore();
         const deps = { store, bucketMath: makeBucketMath(BLOCKS_PER_BUCKET), voteExpiryBuckets: 2 };
         const producer = makeVoteCrdt(deps);
         const aCid = await producer.add(bundle(WALLET, [{ board: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0
 
         const c = makeVoteCrdt(deps);
-        await c.merge([aCid]); // a stale peer re-broadcasts the long-decayed head; merge admits it
+        await c.merge([aCid]); // a stale peer re-broadcasts the long-decayed bundle; merge admits it
 
-        expect(c.heads(4)).toHaveLength(0); // we neither re-broadcast it...
+        expect(c.winnerCids(4)).toHaveLength(0); // we neither re-broadcast it...
         expect(c.current(4)).toHaveLength(0); // ...nor count it
     });
 });

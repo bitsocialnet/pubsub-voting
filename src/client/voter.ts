@@ -6,11 +6,11 @@ import { makeBucketMath } from "../chain/bucket.js";
 import { tickerForRef } from "../chain/ticker.js";
 import type { BlockstoreLike, HeliaInstance, PubsubService, VoteTransport } from "../transport/types.js";
 import { requireHeliaServices } from "../transport/helia.js";
-import { makeBlockstoreDagNodeStore } from "../transport/dag-store.js";
+import { makeBlockstoreBundleStore } from "../transport/bundle-store.js";
 import { makeRateLimiter } from "../transport/rate-limit.js";
 import { makeGossipGate } from "../transport/gossip-validator.js";
 import { makeVoteTransport } from "../transport/transport.js";
-import { encodeHeads, decodeHeads } from "../transport/heads.js";
+import { encodeWinnerCids, decodeWinnerCids } from "../transport/winner-cids.js";
 import type { RuleRegistry } from "../rules/types.js";
 import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
@@ -69,14 +69,14 @@ export interface VoteNetwork {
     /** True when no signer was provided: tallies readable, voting disabled. */
     readonly readOnly: boolean;
 
-    /** Join the topic, fetch and union heads from peers, subscribe to gossip. */
+    /** Join the topic, fetch and union winner CIDs from peers, subscribe to gossip. */
     start(): Promise<void>;
     /** Leave the topic and release the transport. Does not stop the host node. */
     stop(): Promise<void>;
 
     /**
      * Sign the given votes into a bundle for the current bucket, add it to the CRDT,
-     * and broadcast the new heads. Pass an empty array to withdraw (a newer empty
+     * and broadcast the new winner CIDs. Pass an empty array to withdraw (a newer empty
      * bundle supersedes the prior one under LWW). Throws `ReadOnlyError` with no signer.
      */
     castVotes(votes: Vote[]): Promise<VotesBundle>;
@@ -185,8 +185,8 @@ interface ResolvedDeps {
 
 /** Hard per-message validation deadline (ms): the 10s budget for fetch + verify in the gate. */
 const GATE_TIMEOUT_MS = 10_000;
-/** Forward-gate layer-1 / walk bounds (see DESIGN.md "Transport"). */
-const GATE_BOUNDS = { maxHeadsPerMessage: 64, maxMessageBytes: 1 << 20, maxClosureNodes: 1024 };
+/** Forward-gate layer-1 bounds (see DESIGN.md "Transport"). */
+const GATE_BOUNDS = { maxWinnerCidsPerMessage: 64, maxMessageBytes: 1 << 20 };
 /** Concurrent in-flight fetch/verify operations across the gate. */
 const GATE_CONCURRENCY = 8;
 /** Per-peer rate window: how many messages one peer may make us validate per interval. */
@@ -224,8 +224,8 @@ class ContestNetwork implements VoteNetwork {
     /**
      * Last-known current bucket on the gating chain, refreshed by {@link #refreshBucket} on
      * every chain read the network already does (start, cast, tally). The CRDT's read-time
-     * expiry filter (`current`/`heads`) reads it, so the sync transport `getHeads` closure
-     * stays sync while still dropping decayed votes. Coarse-stale is fine — buckets are large.
+     * expiry filter (`current`/`winnerCids`) reads it, so the sync transport `getWinnerCids`
+     * closure stays sync while still dropping decayed votes. Coarse-stale is fine — buckets are large.
      */
     #currentBucketCache = 0;
 
@@ -251,7 +251,7 @@ class ContestNetwork implements VoteNetwork {
         this.#chainId = criteria.requires.chains[ruleTicker]!.chainId;
 
         this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
-        const store = makeBlockstoreDagNodeStore(deps.blockstore);
+        const store = makeBlockstoreBundleStore(deps.blockstore);
         this.#crdt = makeVoteCrdt({ store, bucketMath: this.#bucketMath, voteExpiryBuckets: criteria.voteExpiryBuckets });
 
         const verifier = makeBundleVerifier({
@@ -279,7 +279,7 @@ class ContestNetwork implements VoteNetwork {
         });
     }
 
-    readonly #store: ReturnType<typeof makeBlockstoreDagNodeStore>;
+    readonly #store: ReturnType<typeof makeBlockstoreBundleStore>;
     readonly #cache: ReturnType<typeof makeVerdictCache>;
     readonly #verifier: ReturnType<typeof makeBundleVerifier>;
 
@@ -312,11 +312,11 @@ class ContestNetwork implements VoteNetwork {
     async start(): Promise<void> {
         const limit = pLimit(GATE_CONCURRENCY);
         const gate = makeGossipGate({
-            decodeHeads,
+            decodeWinnerCids,
             fetchNode: (cid) => this.#store.get(cid),
             verifier: this.#verifier,
             cache: this.#cache,
-            merge: (heads) => this.#crdt.merge(heads),
+            merge: (cids) => this.#crdt.merge(cids),
             limit: (fn) => limit(fn),
             allowPeer: makeRateLimiter(GATE_RATE),
             onAccept: () => this.#notifyUpdate(),
@@ -327,12 +327,12 @@ class ContestNetwork implements VoteNetwork {
             pubsub: this.#deps.pubsub,
             topic: this.topic,
             gate,
-            encodeHeads,
-            decodeHeads,
-            getHeads: () => this.#crdt.heads(this.#currentBucketCache)
+            encodeWinnerCids,
+            decodeWinnerCids,
+            getWinnerCids: () => this.#crdt.winnerCids(this.#currentBucketCache)
         });
         await this.#transport.start();
-        // If cold start merged any heads, refresh the bucket and prune the decayed nodes it
+        // If cold start merged any winner CIDs, refresh the bucket and prune the decayed nodes it
         // pulled in. Gated on non-empty state so an empty join stays network-free (no getBlockNumber
         // read), preserving the "zero chain reads for a constant-weight tally" property. Periodic
         // pruning should ride the republish scheduler tick once that lands.
@@ -362,7 +362,7 @@ class ContestNetwork implements VoteNetwork {
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
         await this.#crdt.add(bundle);
-        await this.#transport?.broadcastHeads(this.#crdt.heads(bucket));
+        await this.#transport?.broadcastWinnerCids(this.#crdt.winnerCids(bucket));
         // Persist the re-signable intent so the republish scheduler can revive it after restart.
         await this.#deps.store.put({ topic: this.topic, address, votes, lastBucket: this.#bucketMath.bucketForBlock(blockNumber) });
         this.#notifyUpdate();
@@ -466,9 +466,9 @@ export class PubsubVoter implements VoteClient {
     async start(): Promise<void> {
         const networks = await Promise.all([...this.#criteriaById.values()].map((criteria) => this.#network(criteria)));
         for (const network of networks) {
-            // Joins the topic and installs the forward gate; cold-start head sync over the
-            // libp2p fetch protocol (`fetchHeadsFromPeer`) is still unset, so this returns
-            // local heads and relies on live gossip to converge. See ROADMAP.md.
+            // Joins the topic and installs the forward gate; cold-start winner-CID sync over
+            // the libp2p fetch protocol (`fetchWinnerCidsFromPeer`) is still unset, so this
+            // returns local winner CIDs and relies on live gossip to converge. See ROADMAP.md.
             await network.start();
         }
         // NOTE: still throws NotImplementedError — the client-level republish scheduler is

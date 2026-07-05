@@ -3,9 +3,9 @@ import type { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
 import { makeVoteTransport } from "./transport.js";
 import { makeGossipGate } from "./gossip-validator.js";
-import { encodeHeads, decodeHeads } from "./heads.js";
+import { encodeWinnerCids, decodeWinnerCids } from "./winner-cids.js";
 import type { PubsubService, GossipTopicValidator } from "./types.js";
-import { makeMemoryDagNodeStore } from "../crdt/store.js";
+import { makeMemoryBundleStore } from "../crdt/store.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
 import { makeVerdictCache } from "../verify/cache.js";
 import { makeBucketMath } from "../chain/bucket.js";
@@ -45,29 +45,29 @@ function fakePubsub() {
 
 async function harness() {
     const { pubsub, topicValidators, published, subscribed } = fakePubsub();
-    const store = makeMemoryDagNodeStore();
+    const store = makeMemoryBundleStore();
     const crdt = makeVoteCrdt({ store, bucketMath: makeBucketMath(43200), voteExpiryBuckets: 30 });
     const gate = makeGossipGate({
-        decodeHeads,
+        decodeWinnerCids,
         fetchNode: (cid) => store.get(cid),
         verifier: okVerifier,
         cache: makeVerdictCache(),
         merge: (h) => crdt.merge(h),
         limit: (fn) => fn(),
         allowPeer: () => true,
-        bounds: { maxHeadsPerMessage: 16, maxMessageBytes: 1 << 20, maxClosureNodes: 100 },
+        bounds: { maxWinnerCidsPerMessage: 16, maxMessageBytes: 1 << 20 },
         timeoutMs: 5000
     });
     const transport = makeVoteTransport({
         pubsub,
         topic: TOPIC,
         gate,
-        encodeHeads,
-        decodeHeads,
-        getHeads: () => crdt.heads(0)
+        encodeWinnerCids,
+        decodeWinnerCids,
+        getWinnerCids: () => crdt.winnerCids(0)
     });
     const bundle: VotesBundle = { address: "0x1", votes: [{ board: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
-    const cid = await store.put({ value: bundle, parents: [] });
+    const cid = await store.put(bundle);
     return { transport, topicValidators, published, subscribed, crdt, cid };
 }
 
@@ -81,32 +81,32 @@ describe("makeVoteTransport", () => {
 
     it("accepts a valid message through the installed validator and merges it", async () => {
         const h = await harness();
-        const heardHeads: CID[] = [];
-        h.transport.onHeads((heads) => heardHeads.push(...heads));
+        const heardCids: CID[] = [];
+        h.transport.onWinnerCids((cids) => heardCids.push(...cids));
         await h.transport.start();
 
         const validator = h.topicValidators.get(TOPIC)!;
-        const verdict = await validator(fakePeer("peer1"), { topic: TOPIC, data: encodeHeads([h.cid]), from: fakePeer("peer1") });
+        const verdict = await validator(fakePeer("peer1"), { topic: TOPIC, data: encodeWinnerCids([h.cid]), from: fakePeer("peer1") });
 
         expect(verdict).toBe("accept");
         expect(h.crdt.current(0)).toHaveLength(1);
-        expect(heardHeads[0].equals(h.cid)).toBe(true);
+        expect(heardCids[0].equals(h.cid)).toBe(true);
     });
 
     it("ignores a message on a different topic", async () => {
         const h = await harness();
         await h.transport.start();
         const validator = h.topicValidators.get(TOPIC)!;
-        const verdict = await validator(fakePeer("peer1"), { topic: "other-topic", data: encodeHeads([h.cid]), from: fakePeer("peer1") });
+        const verdict = await validator(fakePeer("peer1"), { topic: "other-topic", data: encodeWinnerCids([h.cid]), from: fakePeer("peer1") });
         expect(verdict).toBe("ignore");
     });
 
-    it("broadcasts encoded heads to the topic", async () => {
+    it("broadcasts encoded winner CIDs to the topic", async () => {
         const h = await harness();
-        await h.transport.broadcastHeads([h.cid]);
+        await h.transport.broadcastWinnerCids([h.cid]);
         expect(h.published).toHaveLength(1);
         expect(h.published[0].topic).toBe(TOPIC);
-        expect(decodeHeads(h.published[0].data)[0].equals(h.cid)).toBe(true);
+        expect(decodeWinnerCids(h.published[0].data)[0].equals(h.cid)).toBe(true);
     });
 
     it("removes the validator and unsubscribes on stop", async () => {

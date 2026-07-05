@@ -3,8 +3,9 @@
  *
  * The engine is implemented and unit-tested: the zod schemas, canonical dag-cbor encoding,
  * topic derivation, manifest derivation, the verify pipeline (signature + constraints +
- * gate + name resolution), the Merkle-CRDT (LWW union), the tally, and the transport's
- * validate-before-forward gossip gate (`VoteNetwork.start`/`castVotes`/`getTally` are live).
+ * gate + name resolution), the state-based grow-only LWW winner-set CRDT, the tally, and the
+ * transport's validate-before-forward gossip gate (`VoteNetwork.start`/`castVotes`/`getTally`
+ * are live).
  * The `PubsubVoter` client-level republish scheduler is the remaining stub. See DESIGN.md for
  * architecture, and "Transport" for the forward-gate that verifies a bundle (signature,
  * on-chain gate, board-name resolution) before gossipsub re-forwards it.
@@ -42,7 +43,8 @@ export * from "./client/voter.js";
 export * from "./signer/eip712.js";
 export type { VoteSigner } from "./signer/types.js";
 
-// Design interfaces (types only) for the engine that is not yet implemented.
+// The engine's type seams (types only): the interfaces the implemented rules, chain reads,
+// verify pipeline, CRDT, transport, and tally are written against.
 export type * from "./rules/types.js";
 export type * from "./chain/types.js";
 export type * from "./verify/types.js";

@@ -9,10 +9,10 @@ import type { GossipGate } from "./gossip-validator.js";
  * in the pure {@link GossipGate} (gossip-validator.ts), so this module is thin glue.
  *
  * On `start` it installs the gate as the topic validator (gossipsub awaits it before
- * re-forwarding — see DESIGN.md "Transport"), subscribes, and cold-starts by unioning heads
- * from up to `k` peers through the SAME gate (so cold-start heads are validated too, not
- * trusted). Cold-start reuses `gate.validate(encodeHeads(heads), …)` rather than a second
- * verification path.
+ * re-forwarding — see DESIGN.md "Transport"), subscribes, and cold-starts by unioning the
+ * current winner CIDs from up to `k` peers through the SAME gate (so cold-start CIDs are
+ * validated too, not trusted). Cold-start reuses `gate.validate(encodeWinnerCids(cids), …)`
+ * rather than a second verification path.
  */
 
 export interface VoteTransportDeps {
@@ -20,28 +20,28 @@ export interface VoteTransportDeps {
     topic: string;
     /** The forward-gate; validates + merges accepted messages. */
     gate: GossipGate;
-    encodeHeads: (heads: CID[]) => Uint8Array;
-    decodeHeads: (data: Uint8Array) => CID[];
-    /** Our current DAG heads (crdt.heads), for broadcasting and cold-start return. */
-    getHeads: () => CID[];
-    /** Cold start: fetch a peer's current heads via the libp2p fetch protocol. Omit to skip. */
-    fetchHeadsFromPeer?: (peer: PeerId) => Promise<CID[]>;
+    encodeWinnerCids: (cids: CID[]) => Uint8Array;
+    decodeWinnerCids: (data: Uint8Array) => CID[];
+    /** Our current winner CIDs (crdt.winnerCids), for broadcasting and cold-start return. */
+    getWinnerCids: () => CID[];
+    /** Cold start: fetch a peer's current winner CIDs via the libp2p fetch protocol. Omit to skip. */
+    fetchWinnerCidsFromPeer?: (peer: PeerId) => Promise<CID[]>;
 }
 
 export function makeVoteTransport(deps: VoteTransportDeps): VoteTransport {
-    const { pubsub, topic, gate, encodeHeads, decodeHeads, getHeads, fetchHeadsFromPeer } = deps;
-    const headsListeners = new Set<(heads: CID[], from: PeerId) => void>();
+    const { pubsub, topic, gate, encodeWinnerCids, decodeWinnerCids, getWinnerCids, fetchWinnerCidsFromPeer } = deps;
+    const winnerCidsListeners = new Set<(cids: CID[], from: PeerId) => void>();
 
     // The installed gossipsub validator: filter to our topic, run the gate, and on accept
-    // notify head listeners (the gate has already merged into the CRDT). Returning a promise
-    // makes gossipsub await the full pipeline before forwarding.
+    // notify winner-CID listeners (the gate has already merged into the CRDT). Returning a
+    // promise makes gossipsub await the full pipeline before forwarding.
     const validator: GossipTopicValidator = async (peer, message) => {
         if (message.topic !== topic) return "ignore";
         const verdict = await gate.validate(message.data, peer.toString());
         if (verdict === "accept") {
             try {
-                const heads = decodeHeads(message.data);
-                for (const cb of headsListeners) cb(heads, peer);
+                const cids = decodeWinnerCids(message.data);
+                for (const cb of winnerCidsListeners) cb(cids, peer);
             } catch {
                 // Accepted messages always decode; guard defensively without failing the verdict.
             }
@@ -59,7 +59,7 @@ export function makeVoteTransport(deps: VoteTransportDeps): VoteTransport {
             }
             pubsub.topicValidators.set(topic, validator);
             pubsub.subscribe(topic);
-            await this.fetchHeadsFromPeers(4);
+            await this.fetchWinnerCidsFromPeers(4);
         },
 
         async stop() {
@@ -67,31 +67,31 @@ export function makeVoteTransport(deps: VoteTransportDeps): VoteTransport {
             pubsub.unsubscribe(topic);
         },
 
-        async broadcastHeads(heads: CID[]) {
-            await pubsub.publish(topic, encodeHeads(heads));
+        async broadcastWinnerCids(cids: CID[]) {
+            await pubsub.publish(topic, encodeWinnerCids(cids));
         },
 
-        onHeads(cb: (heads: CID[], from: PeerId) => void) {
-            headsListeners.add(cb);
+        onWinnerCids(cb: (cids: CID[], from: PeerId) => void) {
+            winnerCidsListeners.add(cb);
         },
 
-        async fetchHeadsFromPeers(k: number): Promise<CID[]> {
-            if (fetchHeadsFromPeer) {
+        async fetchWinnerCidsFromPeers(k: number): Promise<CID[]> {
+            if (fetchWinnerCidsFromPeer) {
                 const peers = pubsub.getSubscribers(topic).slice(0, k);
                 for (const peer of peers) {
                     try {
-                        const heads = await fetchHeadsFromPeer(peer);
-                        if (heads.length > 0) {
+                        const cids = await fetchWinnerCidsFromPeer(peer);
+                        if (cids.length > 0) {
                             // Validate + merge through the gate; a single liar cannot inject a
                             // bad vote, and union-only means it cannot hide an honest one.
-                            await gate.validate(encodeHeads(heads), peer.toString());
+                            await gate.validate(encodeWinnerCids(cids), peer.toString());
                         }
                     } catch {
                         // A flaky peer just contributes nothing; other peers still union in.
                     }
                 }
             }
-            return getHeads();
+            return getWinnerCids();
         }
     };
 }

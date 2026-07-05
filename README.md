@@ -23,7 +23,7 @@ This library does not start its own node. It consumes the host's running Helia n
 ## Design at a glance
 
 - **Settings live in the topic.** `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. Two peers on the same topic provably ran identical rules, so the network validates itself with no intermediary.
-- **Votes are a Merkle-CRDT.** A signed `Votes` bundle is a DAG node; only head CIDs travel over pubsub; missing history is fetched by CID. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves.
+- **Votes are a state-based grow-only CRDT.** A signed `Votes` bundle is a standalone dag-cbor block (no parent links); only winner bundle CIDs travel over pubsub; each unknown bundle is fetched by CID. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves.
 - **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the NFT path — an `erc721-min-balance` gate `rule` (5chan Pass) and `constant` weight (1 pass = 1 vote). Balance-derived (token-weighted) voting is deferred; see [ROADMAP.md](./ROADMAP.md).
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
@@ -160,8 +160,8 @@ src/
   rules/         one file per `type` + registry/resolver          [implemented]
   chain/         ChainClient = viem PublicClient + bucket math     [implemented]
   verify/        signature + constraints + full BundleVerifier + verdict cache [implemented]
-  crdt/          Merkle-CRDT: LWW union, codec, in-memory store    [implemented]
-  transport/     async validate-before-forward gossip gate + heads codec + transport [implemented]
+  crdt/          state-based LWW winner-set: union, codec, in-memory store [implemented]
+  transport/     async validate-before-forward gossip gate + winner-CID codec + transport [implemented]
   tally/         deterministic aggregation over pre-validated bundles [implemented]
   index.ts       public entry: re-exports + facade + design types
 ```

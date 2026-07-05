@@ -16,7 +16,7 @@ import type { Vote } from "../schema/votes.js";
  * This is a plain key-value contract, keyed by `topic` (one intent per contest per wallet).
  * It is internal: the library picks the backend by environment — IndexedDB in the browser,
  * a SQLite file under the constructor's `dataPath` on Node — with no host-facing store seam.
- * Declared as its own interface (like `DagNodeStore` in crdt/types.ts) so the voter can be
+ * Declared as its own interface (like `BundleStore` in crdt/types.ts) so the voter can be
  * tested against an in-memory store with no I/O.
  */
 

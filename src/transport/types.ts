@@ -3,15 +3,15 @@ import type { PeerId } from "@libp2p/interface";
 import type { Helia } from "helia";
 
 /**
- * Transport interfaces, design only. This is the ONLY part of the library that
+ * Transport interfaces. This is the ONLY part of the library that
  * touches libp2p/helia. The core (schema/verify/crdt/tally) does not import it, so the
  * engine is testable without a network.
  *
  * Two transports:
- *   - pubsub: broadcast and receive head CIDs (gossipsub), with a topic validator
+ *   - pubsub: broadcast and receive winner bundle CIDs (gossipsub), with a topic validator
  *     that drops invalid messages before the mesh re-forwards them.
  *   - fetch: resolve vote bundles by CID through the host's blockstore, and pull a
- *     peer's current heads on cold start, then union across peers so a single liar
+ *     peer's current winner CIDs on cold start, then union across peers so a single liar
  *     cannot hide a vote.
  *
  * The library does not start a node and does not take a host SDK. It receives the
@@ -102,26 +102,26 @@ export interface BlockstoreLike {
  */
 export type HeliaInstance = Helia;
 
-/** Live head propagation over pubsub. */
+/** Live winner-CID propagation over pubsub. */
 export interface VoteTransport {
     /**
      * Subscribe to the topic and install the cheap topic validator, built from the
      * criteria (max CIDs per message, size cap, per-peer rate), then fetch and union
-     * heads from peers. See DESIGN.md "Transport: gossipsub topic + validation".
+     * winner CIDs from peers. See DESIGN.md "Transport: gossipsub topic + validation".
      */
     start(): Promise<void>;
     stop(): Promise<void>;
 
-    /** Announce our current heads to the topic. */
-    broadcastHeads(heads: CID[]): Promise<void>;
+    /** Announce our current winner CIDs to the topic. */
+    broadcastWinnerCids(cids: CID[]): Promise<void>;
 
-    /** Called when a peer announces heads. */
-    onHeads(cb: (heads: CID[], from: PeerId) => void): void;
+    /** Called when a peer announces winner CIDs. */
+    onWinnerCids(cb: (cids: CID[], from: PeerId) => void): void;
 
     /**
-     * Cold-start sync: fetch current heads from up to `k` peers and union them.
+     * Cold-start sync: fetch current winner CIDs from up to `k` peers and union them.
      * Union is safe because more sources can only add knowledge; this is the
      * anti-censorship guarantee. See DESIGN.md "Can always-online peers drop votes?".
      */
-    fetchHeadsFromPeers(k: number): Promise<CID[]>;
+    fetchWinnerCidsFromPeers(k: number): Promise<CID[]>;
 }

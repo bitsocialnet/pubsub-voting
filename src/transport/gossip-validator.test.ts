@@ -1,10 +1,9 @@
 import { describe, it, expect } from "vitest";
 import type { CID } from "multiformats/cid";
 import { makeGossipGate, type GossipGateDeps } from "./gossip-validator.js";
-import { encodeHeads, decodeHeads } from "./heads.js";
+import { encodeWinnerCids, decodeWinnerCids } from "./winner-cids.js";
 import { makeVerdictCache } from "../verify/cache.js";
-import { dagNodeCid } from "../crdt/codec.js";
-import type { DagNode } from "../crdt/types.js";
+import { bundleCid } from "../crdt/codec.js";
 import type { BundleVerifier } from "../verify/types.js";
 import type { VotesBundle } from "../schema/votes.js";
 
@@ -14,19 +13,19 @@ function bundle(address: string): VotesBundle {
     return { address, votes: [{ board: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
 }
 
-async function makeNode(address: string, parents: CID[] = []): Promise<{ cid: CID; node: DagNode }> {
-    const node: DagNode = { value: bundle(address), parents };
-    return { cid: await dagNodeCid(node), node };
+async function makeNode(address: string): Promise<{ cid: CID; node: VotesBundle }> {
+    const node = bundle(address);
+    return { cid: await bundleCid(node), node };
 }
 
 const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
 const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, reason: "invalid" }) };
 
-const DEFAULT_BOUNDS = { maxHeadsPerMessage: 16, maxMessageBytes: 1 << 20, maxClosureNodes: 100 };
+const DEFAULT_BOUNDS = { maxWinnerCidsPerMessage: 16, maxMessageBytes: 1 << 20 };
 
 function gate(over: Partial<GossipGateDeps> & { fetchNode: GossipGateDeps["fetchNode"] }) {
     return makeGossipGate({
-        decodeHeads,
+        decodeWinnerCids,
         verifier: okVerifier,
         cache: makeVerdictCache(),
         merge: async () => {},
@@ -39,12 +38,12 @@ function gate(over: Partial<GossipGateDeps> & { fetchNode: GossipGateDeps["fetch
 }
 
 const fetcher =
-    (nodes: Map<string, DagNode>) =>
-    async (cid: CID): Promise<DagNode | undefined> =>
+    (nodes: Map<string, VotesBundle>) =>
+    async (cid: CID): Promise<VotesBundle | undefined> =>
         nodes.get(cid.toString());
 
 describe("makeGossipGate", () => {
-    it("accepts a valid single-head message and merges it", async () => {
+    it("accepts a valid single-CID message and merges it", async () => {
         const { cid, node } = await makeNode("0x1");
         let merged: CID[] | undefined;
         const accepted: Array<[CID[], string]> = [];
@@ -56,7 +55,7 @@ describe("makeGossipGate", () => {
             onAccept: (h, from) => accepted.push([h, from])
         });
 
-        expect(await g.validate(encodeHeads([cid]), "peer1")).toBe("accept");
+        expect(await g.validate(encodeWinnerCids([cid]), "peer1")).toBe("accept");
         expect(merged?.[0].equals(cid)).toBe(true);
         expect(accepted[0][1]).toBe("peer1");
     });
@@ -69,36 +68,36 @@ describe("makeGossipGate", () => {
     it("rejects an oversized message", async () => {
         const { cid, node } = await makeNode("0x1");
         const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), bounds: { ...DEFAULT_BOUNDS, maxMessageBytes: 5 } });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("reject");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
     });
 
-    it("rejects too many heads", async () => {
+    it("rejects too many CIDs", async () => {
         const { cid, node } = await makeNode("0x1");
-        const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), bounds: { ...DEFAULT_BOUNDS, maxHeadsPerMessage: 0 } });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("reject");
+        const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), bounds: { ...DEFAULT_BOUNDS, maxWinnerCidsPerMessage: 0 } });
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
     });
 
     it("ignores a peer over its rate limit (no penalty)", async () => {
         const { cid, node } = await makeNode("0x1");
         const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), allowPeer: () => false });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("ignore");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
     });
 
-    it("ignores an empty head announcement", async () => {
+    it("ignores an empty CID announcement", async () => {
         const g = gate({ fetchNode: async () => undefined });
-        expect(await g.validate(encodeHeads([]), "p")).toBe("ignore");
+        expect(await g.validate(encodeWinnerCids([]), "p")).toBe("ignore");
     });
 
-    it("ignores an unfetchable head (not the sender's provable fault)", async () => {
+    it("ignores an unfetchable CID (not the sender's provable fault)", async () => {
         const { cid } = await makeNode("0x1");
         const g = gate({ fetchNode: async () => undefined }); // never resolves to a node
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("ignore");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
     });
 
     it("rejects a bundle that fails verification", async () => {
         const { cid, node } = await makeNode("0xbad");
         const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), verifier: badVerifier });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("reject");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
     });
 
     it("short-circuits to accept on a verdict-cache hit without fetching", async () => {
@@ -113,7 +112,7 @@ describe("makeGossipGate", () => {
             },
             cache
         });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("accept");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("accept");
         expect(fetches).toBe(0);
     });
 
@@ -129,27 +128,27 @@ describe("makeGossipGate", () => {
             },
             cache
         });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("reject");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
         expect(fetches).toBe(0);
     });
 
-    it("ignores when the closure exceeds maxClosureNodes", async () => {
-        const parent = await makeNode("0x2");
-        const child = await makeNode("0x1", [parent.cid]);
+    it("rejects when more CIDs than maxWinnerCidsPerMessage are announced", async () => {
+        const a = await makeNode("0x1");
+        const b = await makeNode("0x2");
         const nodes = new Map([
-            [child.cid.toString(), child.node],
-            [parent.cid.toString(), parent.node]
+            [a.cid.toString(), a.node],
+            [b.cid.toString(), b.node]
         ]);
-        const g = gate({ fetchNode: fetcher(nodes), bounds: { ...DEFAULT_BOUNDS, maxClosureNodes: 1 } });
-        expect(await g.validate(encodeHeads([child.cid]), "p")).toBe("ignore");
+        const g = gate({ fetchNode: fetcher(nodes), bounds: { ...DEFAULT_BOUNDS, maxWinnerCidsPerMessage: 1 } });
+        expect(await g.validate(encodeWinnerCids([a.cid, b.cid]), "p")).toBe("reject");
     });
 
     it("wraps every fetch through the concurrency limiter", async () => {
-        const parent = await makeNode("0x2");
-        const child = await makeNode("0x1", [parent.cid]);
+        const a = await makeNode("0x1");
+        const b = await makeNode("0x2");
         const nodes = new Map([
-            [child.cid.toString(), child.node],
-            [parent.cid.toString(), parent.node]
+            [a.cid.toString(), a.node],
+            [b.cid.toString(), b.node]
         ]);
         let limited = 0;
         const g = gate({
@@ -159,13 +158,13 @@ describe("makeGossipGate", () => {
                 return fn();
             }
         });
-        expect(await g.validate(encodeHeads([child.cid]), "p")).toBe("accept");
-        expect(limited).toBe(2); // one per fetched node in the closure
+        expect(await g.validate(encodeWinnerCids([a.cid, b.cid]), "p")).toBe("accept");
+        expect(limited).toBe(2); // one per fetched bundle in the message
     });
 
     it("ignores (does not hang) when a fetch exceeds the timeout", async () => {
         const { cid } = await makeNode("0x1");
         const g = gate({ fetchNode: () => new Promise<undefined>(() => {}), timeoutMs: 50 });
-        expect(await g.validate(encodeHeads([cid]), "p")).toBe("ignore");
+        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
     });
 });

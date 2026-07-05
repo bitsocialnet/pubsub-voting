@@ -2,20 +2,16 @@ import type { CID } from "multiformats/cid";
 import type { VotesBundle } from "../schema/votes.js";
 
 /**
- * Merkle-CRDT interfaces, design only.
+ * State-based grow-only LWW winner-set interfaces.
  *
- * State is a last-write-wins element-set keyed by the gating-chain wallet
- * address. Each bundle is a dag-cbor DAG node linking the heads known at signing,
- * so the log is a Merkle-clock. Convergence is automatic (the join is commutative)
- * and missing history is detectable (a head commits to its ancestors).
+ * State is a last-write-wins element-set keyed by the gating-chain wallet address. Each
+ * bundle is a standalone dag-cbor block addressed by its CID — it carries no parent links.
+ * The live path gossips individual bundle CIDs; a peer fetches each unknown bundle by CID,
+ * verifies it (at the transport gate), and LWW-merges it into its per-wallet winner-set.
+ * There is no DAG to walk and no notion of history "heads" — convergence comes from
+ * gossipsub flood, the heartbeat re-gossip, and checkpoint reconciliation.
  * See DESIGN.md "CRDT".
  */
-
-/** One node in the Merkle-clock: a bundle plus the heads it linked at signing. */
-export interface DagNode {
-    value: VotesBundle;
-    parents: CID[];
-}
 
 /**
  * The conflict-resolution rule for two bundles claiming the same wallet:
@@ -29,34 +25,35 @@ export type LwwResolve = (a: { bundle: VotesBundle; cid: CID }, b: { bundle: Vot
  * LWW reduction (one bundle per wallet) that the tally consumes.
  */
 export interface VoteCrdt {
-    /** Store a locally produced bundle as a new node, updating heads. Returns its CID. */
+    /** Store a locally produced bundle as a standalone dag-cbor block. Returns its CID. */
     add(bundle: VotesBundle): Promise<CID>;
 
     /**
-     * Integrate remote heads: fetch any unknown nodes by CID, walk to known
-     * ancestors, update heads. Idempotent and order-independent.
+     * Integrate remote bundle CIDs: fetch any unknown bundle by CID and LWW-merge it into the
+     * winner-set. There is no ancestor recursion — each CID is a standalone bundle. Idempotent
+     * and order-independent.
      */
-    merge(heads: CID[]): Promise<void>;
+    merge(cids: CID[]): Promise<void>;
 
     /**
-     * Current heads (the only thing broadcast over pubsub), filtered to the given bucket:
-     * an expired tip is dropped so a decayed vote is never broadcast or re-linked. Ancestors
-     * below a live tip stay reachable. `currentBucket` is `bucketForBlock(currentBlock)`.
+     * The current winner CIDs (the LWW winner per wallet — the only thing broadcast over
+     * pubsub), filtered to the given bucket: a wallet whose winning bundle has expired is
+     * dropped, so a decayed vote is never broadcast. `currentBucket` is
+     * `bucketForBlock(currentBlock)`.
      */
-    heads(currentBucket: number): CID[];
+    winnerCids(currentBucket: number): CID[];
 
     /**
      * LWW reduction (at most one bundle per wallet), filtered to the given bucket: a wallet
      * whose winning bundle has expired drops out entirely, so the tally never counts a decayed
-     * vote — even one a `merge` re-materialized as a DAG ancestor. `currentBucket` is
-     * `bucketForBlock(currentBlock)`.
+     * vote. `currentBucket` is `bucketForBlock(currentBlock)`.
      */
     current(currentBucket: number): VotesBundle[];
 
     /**
      * Drop bundles older than `voteExpiryBuckets` and those superseded per wallet from the
      * in-memory working set, bounding memory. Correctness does not depend on it — `current`
-     * and `heads` filter expiry at read time — so this is housekeeping, not the guarantee.
+     * and `winnerCids` filter expiry at read time — so this is housekeeping, not the guarantee.
      */
     prune(currentBucket: number): Promise<void>;
 
@@ -65,11 +62,11 @@ export interface VoteCrdt {
 }
 
 /**
- * Persistence for DAG nodes, backed by the host's Helia blockstore (dag-cbor).
+ * Persistence for vote bundles, backed by the host's Helia blockstore (dag-cbor).
  * Declared as its own seam so the CRDT can be tested against an in-memory store.
  */
-export interface DagNodeStore {
-    put(node: DagNode): Promise<CID>;
-    get(cid: CID): Promise<DagNode | undefined>;
+export interface BundleStore {
+    put(bundle: VotesBundle): Promise<CID>;
+    get(cid: CID): Promise<VotesBundle | undefined>;
     has(cid: CID): Promise<boolean>;
 }
