@@ -67,6 +67,7 @@ export interface VoteCrdt {
  */
 export interface BundleStore {
     put(bundle: VotesBundle): Promise<CID>;
-    get(cid: CID): Promise<VotesBundle | undefined>;
+    /** `options.signal` cancels an in-flight bitswap fetch (the gate's per-fetch timeout aborts it). */
+    get(cid: CID, options?: { signal?: AbortSignal }): Promise<VotesBundle | undefined>;
     has(cid: CID): Promise<boolean>;
 }

@@ -56,7 +56,8 @@ async function harness() {
         limit: (fn) => fn(),
         allowPeer: () => true,
         bounds: { maxWinnerCidsPerMessage: 16, maxMessageBytes: 1 << 20 },
-        timeoutMs: 5000
+        timeoutMs: 5000,
+        fetchTimeoutMs: 5000
     });
     const transport = makeVoteTransport({
         pubsub,

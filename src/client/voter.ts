@@ -236,6 +236,12 @@ interface ResolvedDeps {
 
 /** Hard per-message validation deadline (ms): the 10s budget for fetch + verify in the gate. */
 const GATE_TIMEOUT_MS = 10_000;
+/**
+ * Per-fetch deadline (ms), shorter than {@link GATE_TIMEOUT_MS}. Caps how long one unfetchable CID
+ * can hold a shared p-limit fetch slot before it is aborted and released, so a flood of unfetchable
+ * CIDs cannot starve the fetch pool (see DESIGN.md "Transport", resource-exhaustion residual).
+ */
+const GATE_FETCH_TIMEOUT_MS = 3_000;
 /** Forward-gate layer-1 bounds (see DESIGN.md "Transport"). */
 const GATE_BOUNDS = { maxWinnerCidsPerMessage: 64, maxMessageBytes: 1 << 20 };
 /** Concurrent in-flight fetch/verify operations across the gate. */
@@ -417,7 +423,7 @@ class ContestNetwork implements VoteNetwork {
         const limit = pLimit(GATE_CONCURRENCY);
         const gate = makeGossipGate({
             decodeWinnerCids,
-            fetchNode: (cid) => this.#store.get(cid),
+            fetchNode: (cid, signal) => this.#store.get(cid, signal ? { signal } : undefined),
             verifier: this.#verifier,
             isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
             cache: this.#cache,
@@ -427,7 +433,8 @@ class ContestNetwork implements VoteNetwork {
             allowPeer: makeRateLimiter(GATE_RATE),
             onAccept: () => this.#notifyUpdate(),
             bounds: GATE_BOUNDS,
-            timeoutMs: GATE_TIMEOUT_MS
+            timeoutMs: GATE_TIMEOUT_MS,
+            fetchTimeoutMs: GATE_FETCH_TIMEOUT_MS
         });
         this.#transport = makeVoteTransport({
             pubsub: this.#deps.pubsub,

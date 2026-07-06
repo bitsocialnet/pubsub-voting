@@ -18,11 +18,11 @@ export function makeBlockstoreBundleStore(blockstore: BlockstoreLike): BundleSto
             await blockstore.put(cid, encodeBundle(bundle));
             return cid;
         },
-        async get(cid) {
+        async get(cid, options) {
             try {
-                return decodeBundle(await blockstore.get(cid));
+                return decodeBundle(await blockstore.get(cid, options));
             } catch {
-                return undefined; // unfetchable / undecodable — gate treats as ignore
+                return undefined; // unfetchable / undecodable / aborted — gate treats as ignore
             }
         },
         async has(cid) {

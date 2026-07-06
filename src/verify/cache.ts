@@ -27,13 +27,30 @@ export function isCacheableVerdict(verdict: BundleVerdict): boolean {
     return verdict.valid || verdict.disposition === "reject";
 }
 
-/** An in-memory verdict cache keyed by the CID's canonical string. */
-export function makeVerdictCache(): VerdictCache {
+/**
+ * An in-memory verdict cache keyed by the CID's canonical string, bounded to `maxEntries` with
+ * FIFO eviction (same pattern as `makeGateResultCache` / `makeAcceptedDedup`). Without a bound the
+ * `Map` grows one entry per novel CID forever: an ineligible wallet (or a flood of fresh wallets)
+ * minting fresh-signed bundles yields a distinct provable-`reject` per CID, so an unbounded cache is
+ * a memory-exhaustion vector (see DESIGN.md "Can valid votes clog the topic?"). Eviction is safe
+ * because a cached verdict is *terminal* and deterministic — an evicted entry only costs a re-fetch
+ * + re-verify on the next re-announce, never a wrong answer, and the `(wallet, sampleBlock)`
+ * gate-result cache still short-circuits the chain read so that recomputation stays cheap.
+ */
+export function makeVerdictCache(maxEntries = 4096): VerdictCache {
     const byCid = new Map<string, BundleVerdict>();
+    const order: string[] = [];
     return {
         get: (cid) => byCid.get(cid.toString()),
         set: (cid, verdict) => {
-            byCid.set(cid.toString(), verdict);
+            const k = cid.toString();
+            if (byCid.has(k)) return; // idempotent: a terminal verdict never changes, so keep FIFO position
+            byCid.set(k, verdict);
+            order.push(k);
+            if (order.length > maxEntries) {
+                const evicted = order.shift();
+                if (evicted !== undefined) byCid.delete(evicted);
+            }
         },
         has: (cid) => byCid.has(cid.toString())
     };

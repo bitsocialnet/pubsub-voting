@@ -89,7 +89,8 @@ export type GossipTopicValidator = (
  * generics we do not need here.
  */
 export interface BlockstoreLike {
-    get(cid: CID): Promise<Uint8Array>;
+    /** `options.signal` cancels an in-flight bitswap fetch — see the gate's per-fetch timeout. */
+    get(cid: CID, options?: { signal?: AbortSignal }): Promise<Uint8Array>;
     put(cid: CID, block: Uint8Array): Promise<CID>;
     has(cid: CID): Promise<boolean>;
 }

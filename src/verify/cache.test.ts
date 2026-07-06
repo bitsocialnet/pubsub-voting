@@ -74,6 +74,22 @@ describe("verdict cache", () => {
         expect(calls).toBe(1);
     });
 
+    it("evicts oldest entries past the cap (FIFO), bounding memory under a fresh-CID flood", async () => {
+        const cache = makeVerdictCache(2); // tiny cap for the test
+        const a = await cidOf("a");
+        const b = await cidOf("b");
+        const c = await cidOf("c");
+        const reject = { valid: false as const, disposition: "reject" as const, reason: "x" };
+
+        cache.set(a, reject);
+        cache.set(b, reject);
+        cache.set(c, reject); // over the cap of 2 -> evicts `a` (oldest)
+
+        expect(cache.has(a)).toBe(false);
+        expect(cache.has(b)).toBe(true);
+        expect(cache.has(c)).toBe(true);
+    });
+
     it("does NOT cache a transient ignore verdict (it is re-checked as heads/records converge)", async () => {
         let calls = 0;
         const verifier: BundleVerifier = {

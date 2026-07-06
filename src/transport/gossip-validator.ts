@@ -42,8 +42,11 @@ export interface GossipGateBounds {
 export interface GossipGateDeps {
     /** Decode a payload to bundle CIDs; throws on malformed (see transport/winner-cids.ts). */
     decodeWinnerCids: (data: Uint8Array) => CID[];
-    /** Fetch a bundle by CID (blockstore + bitswap); `undefined` if unfetchable. */
-    fetchNode: (cid: CID) => Promise<VotesBundle | undefined>;
+    /**
+     * Fetch a bundle by CID (blockstore + bitswap); `undefined` if unfetchable. `signal` aborts
+     * an in-flight fetch when the gate's per-fetch timeout fires (see `fetchTimeoutMs`).
+     */
+    fetchNode: (cid: CID, signal?: AbortSignal) => Promise<VotesBundle | undefined>;
     /** The full validity pipeline for one bundle (see verify/bundle.ts). */
     verifier: BundleVerifier;
     /**
@@ -75,6 +78,13 @@ export interface GossipGateDeps {
     bounds: GossipGateBounds;
     /** Hard per-message validation deadline; on expiry the verdict is `ignore`. */
     timeoutMs: number;
+    /**
+     * Per-fetch deadline (ms), shorter than `timeoutMs`. A single unfetchable CID cannot hold its
+     * `limit` (p-limit) slot for the whole message budget: at this deadline the fetch is aborted (its
+     * bitswap want cancelled) and the slot released, so a flood of unfetchable CIDs cannot starve the
+     * shared fetch pool. See DESIGN.md "Transport", resource-exhaustion residual.
+     */
+    fetchTimeoutMs: number;
 }
 
 export interface GossipGate {
@@ -121,8 +131,23 @@ function withDeadline<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
 type BundleResult = "ok" | "redundant" | "reject" | "ignore";
 
 export function makeGossipGate(deps: GossipGateDeps): GossipGate {
-    const { decodeWinnerCids, fetchNode, verifier, isEvaluableNow, cache, acceptedDedup, merge, limit, allowPeer, onAccept, bounds, timeoutMs } =
+    const { decodeWinnerCids, fetchNode, verifier, isEvaluableNow, cache, acceptedDedup, merge, limit, allowPeer, onAccept, bounds, timeoutMs, fetchTimeoutMs } =
         deps;
+
+    /**
+     * Fetch one bundle under a per-fetch deadline. On timeout the `AbortSignal` cancels the bitswap
+     * want AND `withDeadline` resolves `undefined` regardless of whether the underlying fetch honours
+     * the abort — so the `limit` slot is always freed at `fetchTimeoutMs`, never leaked to a hung fetch.
+     */
+    async function fetchWithTimeout(cid: CID): Promise<VotesBundle | undefined> {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
+        try {
+            return await withDeadline(fetchNode(cid, controller.signal), fetchTimeoutMs, undefined);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
 
     async function doValidate(data: Uint8Array, from: string): Promise<MessageVerdict> {
         // Layer 1: size, rate, decode — all pre-fetch.
@@ -149,7 +174,7 @@ export function makeGossipGate(deps: GossipGateDeps): GossipGate {
             const cached = cache.get(cid);
             if (cached) return { result: cached.valid ? "ok" : cached.disposition };
 
-            const bundle = await limit(() => fetchNode(cid));
+            const bundle = await limit(() => fetchWithTimeout(cid));
             if (!bundle) return { result: "ignore" }; // unfetchable/timeout — not provably the sender's fault
 
             // Freshness guard (transient, so it runs here — not in the cacheable verifier — and

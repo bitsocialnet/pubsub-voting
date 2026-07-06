@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import pLimit from "p-limit";
 import type { CID } from "multiformats/cid";
 import { makeGossipGate, type GossipGateDeps } from "./gossip-validator.js";
 import { encodeWinnerCids, decodeWinnerCids } from "./winner-cids.js";
@@ -37,6 +38,7 @@ function gate(over: Partial<GossipGateDeps> & { fetchNode: GossipGateDeps["fetch
         allowPeer: () => true,
         bounds: DEFAULT_BOUNDS,
         timeoutMs: 5000,
+        fetchTimeoutMs: 5000,
         ...over
     });
 }
@@ -240,6 +242,38 @@ describe("makeGossipGate", () => {
         const { cid } = await makeNode("0x1");
         const g = gate({ fetchNode: () => new Promise<undefined>(() => {}), timeoutMs: 50 });
         expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+    });
+
+    it("aborts a hung fetch at fetchTimeoutMs and frees the p-limit slot for later fetches", async () => {
+        const hung = await makeNode("0x1");
+        const good = await makeNode("0x2");
+        const goodNodes = new Map([[good.cid.toString(), good.node]]);
+        let aborted = false;
+        const limit = pLimit(1); // one slot: a leak here would starve the second fetch
+        const g = gate({
+            fetchNode: (cid, signal) => {
+                if (cid.toString() === hung.cid.toString()) {
+                    // Never settles on its own; the gate's per-fetch deadline must abort + free the slot.
+                    return new Promise<VotesBundle | undefined>((resolve) => {
+                        signal?.addEventListener("abort", () => {
+                            aborted = true;
+                            resolve(undefined);
+                        });
+                    });
+                }
+                return Promise.resolve(goodNodes.get(cid.toString()));
+            },
+            limit: (fn) => limit(fn),
+            fetchTimeoutMs: 20,
+            timeoutMs: 10_000 // message budget far exceeds the per-fetch deadline
+        });
+
+        const start = Date.now();
+        expect(await g.validate(encodeWinnerCids([hung.cid]), "p")).toBe("ignore");
+        expect(aborted).toBe(true); // the hung fetch was aborted, not left dangling
+        expect(Date.now() - start).toBeLessThan(2000); // resolved at the per-fetch deadline, not the 10s message budget
+        // The single slot was released, so a subsequent fetchable CID still validates.
+        expect(await g.validate(encodeWinnerCids([good.cid]), "p")).toBe("accept");
     });
 
     // blocksPerBucket large enough that blockNumbers 1 and 2 share bucket 0 — a same-bucket re-sign.
