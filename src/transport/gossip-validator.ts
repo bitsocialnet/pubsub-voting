@@ -2,6 +2,7 @@ import type { CID } from "multiformats/cid";
 import type { VotesBundle } from "../schema/votes.js";
 import { isCacheableVerdict, type VerdictCache } from "../verify/cache.js";
 import type { BundleVerifier } from "../verify/types.js";
+import type { AcceptedDedup } from "./accepted-dedup.js";
 
 /**
  * The forward-gate: the async gossipsub topic validator's decision core, written as a pure
@@ -56,6 +57,13 @@ export interface GossipGateDeps {
     isEvaluableNow?: (bundle: VotesBundle) => Promise<boolean>;
     /** Per-CID verdict cache — dedups re-announced bundles and known-bad CIDs. */
     cache: VerdictCache;
+    /**
+     * Optional dedup of already-accepted votes by `(wallet, bucket, votes)`. A same-bucket,
+     * same-choice re-sign under a fresh CID is dropped as "redundant" — not verified, not merged,
+     * and never the reason a message is forwarded — so a re-sign flood costs no gate read and is
+     * not re-broadcast. Omitted ⇒ every fresh CID is verified on its own (prior behaviour).
+     */
+    acceptedDedup?: AcceptedDedup;
     /** Admit a validated bundle-CID set into the CRDT (idempotent; reads fetched bundles from the store). */
     merge: (cids: CID[]) => Promise<void>;
     /** Concurrency limiter (p-limit) shared across in-flight validations. */
@@ -103,11 +111,17 @@ function withDeadline<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
     });
 }
 
-/** One bundle-verify outcome: "ok" (verified), or a terminal message verdict. */
-type BundleResult = "ok" | "reject" | "ignore";
+/**
+ * One referenced-CID outcome:
+ *   - "ok":        a fresh-verified valid bundle, or a re-announced known winner — forward + merge.
+ *   - "redundant": a same-bucket, same-choice re-sign of an already-accepted vote — inert, dropped
+ *                  without verifying or merging; never the reason a message is forwarded.
+ *   - "reject" / "ignore": terminal message verdicts (see `MessageVerdict`).
+ */
+type BundleResult = "ok" | "redundant" | "reject" | "ignore";
 
 export function makeGossipGate(deps: GossipGateDeps): GossipGate {
-    const { decodeWinnerCids, fetchNode, verifier, isEvaluableNow, cache, merge, limit, allowPeer, onAccept, bounds, timeoutMs } =
+    const { decodeWinnerCids, fetchNode, verifier, isEvaluableNow, cache, acceptedDedup, merge, limit, allowPeer, onAccept, bounds, timeoutMs } =
         deps;
 
     async function doValidate(data: Uint8Array, from: string): Promise<MessageVerdict> {
@@ -127,38 +141,58 @@ export function makeGossipGate(deps: GossipGateDeps): GossipGate {
         // Verify each referenced bundle independently, de-duplicated through the verdict cache.
         const seen = new Set<string>();
 
-        const check = async (cid: CID): Promise<BundleResult> => {
+        const check = async (cid: CID): Promise<{ result: BundleResult; bundle?: VotesBundle }> => {
             const key = cid.toString();
-            if (seen.has(key)) return "ok";
+            if (seen.has(key)) return { result: "ok" }; // already handled earlier in this message
             seen.add(key);
 
             const cached = cache.get(cid);
-            if (cached) return cached.valid ? "ok" : cached.disposition;
+            if (cached) return { result: cached.valid ? "ok" : cached.disposition };
 
             const bundle = await limit(() => fetchNode(cid));
-            if (!bundle) return "ignore"; // unfetchable/timeout — not provably the sender's fault
+            if (!bundle) return { result: "ignore" }; // unfetchable/timeout — not provably the sender's fault
 
             // Freshness guard (transient, so it runs here — not in the cacheable verifier — and
             // its verdict is never cached): a bundle bucketed ahead of our head is not yet
             // evaluable, so `ignore` it without penalty until our head advances. Also defuses an
             // absurd-future `blockNumber` (e.g. uint256.max) — it never merges into the set.
-            if (isEvaluableNow && !(await isEvaluableNow(bundle))) return "ignore";
+            if (isEvaluableNow && !(await isEvaluableNow(bundle))) return { result: "ignore" };
+
+            // Re-sign flood guard: a same-bucket, same-choice re-sign of a vote we already accepted
+            // is inert under LWW, so drop it WITHOUT verifying (no gate read) or merging (it is
+            // unverified — merging would bypass the gate). Safe on the untrusted `address` because a
+            // hit only ever suppresses forwarding of something an honest peer already has.
+            if (acceptedDedup?.isResignDuplicate(bundle)) return { result: "redundant" };
 
             const verdict = await verifier.verify(bundle);
             if (isCacheableVerdict(verdict)) cache.set(cid, verdict); // only terminal verdicts (accept / provable reject)
-            return verdict.valid ? "ok" : verdict.disposition;
+            return { result: verdict.valid ? "ok" : verdict.disposition, bundle };
         };
 
         let sawIgnore = false;
+        let sawForward = false; // at least one CID worth forwarding (fresh-valid or known winner)
+        const toMerge: CID[] = [];
+        const toRecord: VotesBundle[] = [];
         for (const cid of cids) {
-            const result = await check(cid);
+            const { result, bundle } = await check(cid);
             if (result === "reject") return "reject"; // reject takes precedence (penalize)
-            if (result === "ignore") sawIgnore = true;
+            if (result === "ignore") {
+                sawIgnore = true;
+                continue;
+            }
+            if (result === "redundant") continue; // inert; never merged, never a reason to forward
+            sawForward = true;
+            toMerge.push(cid);
+            if (bundle) toRecord.push(bundle); // only fresh-verified valid bundles carry a bundle
         }
         if (sawIgnore) return "ignore";
+        // A message whose only fresh content was re-sign duplicates carries nothing new, so it is
+        // not re-flooded (drop, no penalty) — the anti-amplification win.
+        if (!sawForward) return "ignore";
 
-        await merge(cids);
-        onAccept?.(cids, from);
+        await merge(toMerge);
+        for (const b of toRecord) acceptedDedup?.record(b);
+        onAccept?.(toMerge, from);
         return "accept";
     }
 

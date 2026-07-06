@@ -6,7 +6,7 @@ import { tickerForRef } from "../chain/ticker.js";
 import { UnknownRuleError } from "../errors.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
-import type { GateNegativeCache } from "./negative-cache.js";
+import type { GateResultCache } from "./gate-result-cache.js";
 import type { BundleVerifier, BundleVerdict } from "./types.js";
 
 /**
@@ -46,16 +46,17 @@ export interface BundleVerifierDeps {
     /** Host-injected community-name resolvers (`PubsubVoterOptions.nameResolvers`). */
     nameResolvers: NameResolver[];
     /**
-     * Optional negative cache for gate misses, keyed by `(wallet, sampleBlock)`. When present,
-     * a wallet already known to score `0n` at a bucket's sample block is rejected without
-     * repeating the (deterministic, historical) chain read — bounds the per-unique-bundle RPC
-     * amplifier. Omitted ⇒ every novel bundle pays its own gate read (prior behaviour).
+     * Optional cache of gate results, keyed by `(wallet, sampleBlock)`. When present, a wallet's
+     * score at a bucket's sample block is read from chain at most once — a `0n` miss short-circuits
+     * a flood of fresh-signed bundles from an ineligible wallet, and a `> 0n` hit short-circuits an
+     * *eligible* wallet re-signing or cycling choices within a bucket. Both are deterministic,
+     * historical reads. Omitted ⇒ every novel bundle pays its own gate read (prior behaviour).
      */
-    gateNegativeCache?: GateNegativeCache;
+    gateResultCache?: GateResultCache;
 }
 
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
-    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, gateNegativeCache } = deps;
+    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, gateResultCache } = deps;
 
     // Resolve the gate `rule`, its options, and its chain client once. The rule reads at the
     // bundle's bucket block, but which rule/chain to use is fixed by the criteria, so it need
@@ -75,21 +76,22 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             const constraints = checkBundleConstraints(bundle, criteria);
             if (!constraints.valid) return constraints;
 
-            // 3. Gate (chain) — read the `rule` at the bucket's sample block. A gate miss is a
-            //    pure function of a pinned historical block, so it is `reject` (provable, stable)
-            //    and safe to remember: a `(wallet, sampleBlock)` negative-cache hit short-circuits
-            //    the chain read for a flood of fresh-signed bundles from the same ineligible wallet.
+            // 3. Gate (chain) — read the `rule` at the bucket's sample block. The score is a pure
+            //    function of a pinned historical block, so it is memoized per `(wallet, sampleBlock)`:
+            //    a cache hit short-circuits the chain read for a flood of fresh-signed bundles from
+            //    the same wallet, whether it is ineligible (`0n`, a `reject`) or eligible (`> 0n`,
+            //    re-signing / cycling choices within one bucket).
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
-            if (gateNegativeCache?.has(bundle.address, sampleBlock)) {
-                return { valid: false, disposition: "reject", reason: `not admitted: rule score is 0n at block ${sampleBlock} (cached)` };
+            let score = gateResultCache?.get(bundle.address, sampleBlock);
+            if (score === undefined) {
+                ({ score } = await rule.evaluate({
+                    options: ruleOptions,
+                    walletAddress: bundle.address,
+                    ctx: { chain: ruleChain, blockNumber: sampleBlock }
+                }));
+                gateResultCache?.set(bundle.address, sampleBlock, score);
             }
-            const { score } = await rule.evaluate({
-                options: ruleOptions,
-                walletAddress: bundle.address,
-                ctx: { chain: ruleChain, blockNumber: sampleBlock }
-            });
             if (score === 0n) {
-                gateNegativeCache?.add(bundle.address, sampleBlock);
                 return { valid: false, disposition: "reject", reason: `not admitted: rule score is 0n at block ${sampleBlock}` };
             }
 

@@ -3,18 +3,20 @@ import type { CID } from "multiformats/cid";
 import { makeGossipGate, type GossipGateDeps } from "./gossip-validator.js";
 import { encodeWinnerCids, decodeWinnerCids } from "./winner-cids.js";
 import { makeVerdictCache } from "../verify/cache.js";
+import { makeAcceptedDedup } from "./accepted-dedup.js";
+import { makeBucketMath } from "../chain/bucket.js";
 import { bundleCid } from "../crdt/codec.js";
 import type { BundleVerifier } from "../verify/types.js";
 import type { VotesBundle } from "../schema/votes.js";
 
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
-function bundle(address: string): VotesBundle {
-    return { address, votes: [{ community: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
+function bundle(address: string, blockNumber = 1, sig = "0x"): VotesBundle {
+    return { address, votes: [{ community: { publicKey: KEY_A }, vote: 1 }], blockNumber, signature: { signature: sig, type: "eip712" } };
 }
 
-async function makeNode(address: string): Promise<{ cid: CID; node: VotesBundle }> {
-    const node = bundle(address);
+async function makeNode(address: string, blockNumber = 1, sig = "0x"): Promise<{ cid: CID; node: VotesBundle }> {
+    const node = bundle(address, blockNumber, sig);
     return { cid: await bundleCid(node), node };
 }
 
@@ -238,5 +240,92 @@ describe("makeGossipGate", () => {
         const { cid } = await makeNode("0x1");
         const g = gate({ fetchNode: () => new Promise<undefined>(() => {}), timeoutMs: 50 });
         expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+    });
+
+    // blocksPerBucket large enough that blockNumbers 1 and 2 share bucket 0 — a same-bucket re-sign.
+    const bucketMath = () => makeBucketMath(1000);
+
+    it("ignores a lone same-bucket, same-choice re-sign without a second verify (no re-flood)", async () => {
+        const first = await makeNode("0x1", 1, "0xaa");
+        const resign = await makeNode("0x1", 2, "0xbb"); // same wallet+votes+bucket, fresh CID
+        expect(first.cid.equals(resign.cid)).toBe(false);
+        const acceptedDedup = makeAcceptedDedup(bucketMath());
+        let verifies = 0;
+        const g = gate({
+            fetchNode: fetcher(
+                new Map([
+                    [first.cid.toString(), first.node],
+                    [resign.cid.toString(), resign.node]
+                ])
+            ),
+            acceptedDedup,
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                }
+            }
+        });
+        expect(await g.validate(encodeWinnerCids([first.cid]), "p")).toBe("accept"); // records the vote
+        expect(await g.validate(encodeWinnerCids([resign.cid]), "p")).toBe("ignore"); // re-sign dropped
+        expect(verifies).toBe(1); // the re-sign never reached the (chain-touching) verifier
+    });
+
+    it("still accepts a message carrying a genuinely-new vote alongside a re-sign duplicate", async () => {
+        const first = await makeNode("0x1", 1, "0xaa");
+        const resign = await makeNode("0x1", 2, "0xbb"); // dup of first
+        const fresh = await makeNode("0x2", 1, "0xcc"); // a different wallet's genuinely-new vote
+        const acceptedDedup = makeAcceptedDedup(bucketMath());
+        let merged: CID[] | undefined;
+        const g = gate({
+            fetchNode: fetcher(
+                new Map([
+                    [first.cid.toString(), first.node],
+                    [resign.cid.toString(), resign.node],
+                    [fresh.cid.toString(), fresh.node]
+                ])
+            ),
+            acceptedDedup,
+            merge: async (h) => {
+                merged = h;
+            }
+        });
+        expect(await g.validate(encodeWinnerCids([first.cid]), "p")).toBe("accept");
+        expect(await g.validate(encodeWinnerCids([resign.cid, fresh.cid]), "p")).toBe("accept");
+        // Only the genuinely-new CID is merged/forwarded; the re-sign duplicate is excluded.
+        expect(merged?.length).toBe(1);
+        expect(merged?.[0].equals(fresh.cid)).toBe(true);
+    });
+
+    it("cannot be poisoned: a matching-key bundle is dropped (ignore) even if it would 'verify'", async () => {
+        const real = await makeNode("0x1", 1, "0xaa");
+        // Attacker reuses the victim's (wallet, votes) at another same-bucket block with garbage —
+        // a matching dedup key. It must never be accepted or merged, regardless of the verifier.
+        const forged = await makeNode("0x1", 2, "0xdeadbeef");
+        const acceptedDedup = makeAcceptedDedup(bucketMath());
+        let mergedForged = false;
+        let verifies = 0;
+        const g = gate({
+            fetchNode: fetcher(
+                new Map([
+                    [real.cid.toString(), real.node],
+                    [forged.cid.toString(), forged.node]
+                ])
+            ),
+            acceptedDedup,
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, ruleScore: 1n, resolvedNames: {} }; // would "pass" if ever run
+                }
+            },
+            merge: async (h) => {
+                if (h.some((c) => c.equals(forged.cid))) mergedForged = true;
+            }
+        });
+        expect(await g.validate(encodeWinnerCids([real.cid]), "p")).toBe("accept");
+        expect(await g.validate(encodeWinnerCids([forged.cid]), "p")).toBe("ignore");
+        expect(verifies).toBe(1); // forged bundle never verified (short-circuited as redundant)
+        expect(mergedForged).toBe(false); // and never merged/stored
     });
 });

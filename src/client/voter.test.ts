@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { PubsubVoter, republishIntervalBuckets } from "./voter.js";
+import type { CID } from "multiformats/cid";
+import { PubsubVoter, republishIntervalBuckets, checkpointIntervalBuckets } from "./voter.js";
 import type { ChainClient, ChainClientFactory } from "../chain/types.js";
 import type { HeliaInstance, PubsubService } from "../transport/types.js";
 import { MemoryVoteStore } from "../store/memory.js";
@@ -226,6 +227,11 @@ describe("republish cadence", () => {
         expect(republishIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 7 })).toBe(4);
         expect(republishIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 1 })).toBe(1);
     });
+
+    it("cuts checkpoints once per full expiry window (coarser than republish)", () => {
+        expect(checkpointIntervalBuckets(bizCriteria())).toBe(30); // one whole voteExpiryBuckets
+        expect(checkpointIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 7 })).toBe(7);
+    });
 });
 
 describe("selectVoteStore", () => {
@@ -357,6 +363,45 @@ describe("republish scheduler", () => {
         block = bucketBlock(20);
         await vi.advanceTimersByTimeAsync(1000);
         expect(publish).toHaveBeenCalledTimes(2);
+        await voter.stop();
+    });
+
+    it("cuts a checkpoint on the coarse cadence (not every tick), storing blocks and exposing the root", async () => {
+        vi.useFakeTimers();
+        let block = bucketBlock(1);
+        const puts = new Set<string>();
+        const { helia } = spyableHelia();
+        const bs = (helia as unknown as { blockstore: { put(cid: CID, bytes: Uint8Array): Promise<CID> } }).blockstore;
+        const origPut = bs.put.bind(bs);
+        bs.put = async (cid, bytes) => {
+            puts.add(cid.toString());
+            return origPut(cid, bytes);
+        };
+        const voter = new PubsubVoter({
+            helia,
+            chains: advancingChains(() => block),
+            signer: fakeSigner(),
+            manifest: bizManifest(),
+            republishPollIntervalMs: 1000
+        });
+        await voter.start();
+        const contest = await voter.getContest({ contestId: "biz" });
+        // `latestCheckpointRoot` is exposed for the (host-blocked) fetch responder, not on the public
+        // VoteNetwork interface, so reach it structurally in the test.
+        const ck = contest as unknown as { latestCheckpointRoot(): CID | undefined };
+        expect(ck.latestCheckpointRoot()).toBeUndefined(); // no state ⇒ nothing to snapshot
+
+        await contest.castVotes(VOTE); // state at bucket 1
+        block = bucketBlock(40); // past the republish (15) and checkpoint (30) cadences
+        await vi.advanceTimersByTimeAsync(1000); // one poll tick: re-sign + prune + checkpoint cut
+        const root = ck.latestCheckpointRoot();
+        expect(root).toBeDefined();
+        expect(puts.has(root!.toString())).toBe(true); // the root block was written to the blockstore
+
+        // A further tick within the cadence must NOT re-cut — the cut is bucket-coarse, not per-tick.
+        block = bucketBlock(41);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(ck.latestCheckpointRoot()).toBe(root);
         await voter.stop();
     });
 

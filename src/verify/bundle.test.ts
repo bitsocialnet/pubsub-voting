@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { makeBundleVerifier } from "./bundle.js";
-import { makeGateNegativeCache, type GateNegativeCache } from "./negative-cache.js";
+import { makeGateResultCache, type GateResultCache } from "./gate-result-cache.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import { builtinRegistry } from "../rules/registry.js";
@@ -55,7 +55,7 @@ function resolver(map: Record<string, string>): NameResolver {
 }
 
 function verifier(
-    over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; gateNegativeCache?: GateNegativeCache } = {}
+    over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; gateResultCache?: GateResultCache } = {}
 ) {
     return makeBundleVerifier({
         criteria: bizCriteria(),
@@ -65,7 +65,7 @@ function verifier(
         chainFor: () => fakeChain(over.balance ?? 1n, over.onRead),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [resolver(over.names ?? {})],
-        gateNegativeCache: over.gateNegativeCache
+        gateResultCache: over.gateResultCache
     });
 }
 
@@ -86,15 +86,28 @@ describe("makeBundleVerifier", () => {
 
     it("caches a gate miss by (wallet, sampleBlock) so a second bundle skips the chain read", async () => {
         let reads = 0;
-        const gateNegativeCache = makeGateNegativeCache();
-        const v = verifier({ balance: 0n, onRead: () => reads++, gateNegativeCache });
+        const gateResultCache = makeGateResultCache();
+        const v = verifier({ balance: 0n, onRead: () => reads++, gateResultCache });
         // Two DISTINCT bundles (different community) from the same wallet at the same block: the
-        // first pays the gate read, the second short-circuits on the negative cache.
+        // first pays the gate read, the second short-circuits on the cached `0n` result.
         const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
         const second = await v.verify(await signedBundle([{ community: { publicKey: KEY_B }, vote: 1 }]));
         expect(first.valid).toBe(false);
         expect(second.valid).toBe(false);
         expect(reads).toBe(1); // only the first bundle hit the chain
+    });
+
+    it("caches a gate HIT by (wallet, sampleBlock) so an eligible wallet's re-vote skips the read", async () => {
+        let reads = 0;
+        const gateResultCache = makeGateResultCache();
+        const v = verifier({ balance: 1n, onRead: () => reads++, gateResultCache });
+        // An eligible wallet cycling choices in the same bucket must not re-read the chain per
+        // fresh bundle — the `> 0n` score is memoized just like the `0n` miss.
+        const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
+        const second = await v.verify(await signedBundle([{ community: { publicKey: KEY_B }, vote: 1 }]));
+        expect(first.valid).toBe(true);
+        expect(second.valid).toBe(true);
+        expect(reads).toBe(1); // the eligible score was read once and reused
     });
 
     it("rejects a bad signature BEFORE any chain read (cheap-first ordering)", async () => {

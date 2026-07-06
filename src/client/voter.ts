@@ -17,7 +17,10 @@ import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
-import { makeGateNegativeCache } from "../verify/negative-cache.js";
+import { makeGateResultCache } from "../verify/gate-result-cache.js";
+import { makeAcceptedDedup } from "../transport/accepted-dedup.js";
+import { encodeCheckpoint } from "../checkpoint/codec.js";
+import type { CID } from "multiformats/cid";
 import { makeTally } from "../tally/tally.js";
 import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
@@ -42,6 +45,19 @@ import {
  */
 export function republishIntervalBuckets(criteria: Criteria): number {
     return Math.ceil(criteria.voteExpiryBuckets / 2);
+}
+
+/**
+ * How often to cut a checkpoint, in buckets: one full expiry window. Checkpoints are compaction +
+ * cold-start (see DESIGN.md "Checkpoints"), not liveness, so the cadence is deliberately coarser
+ * than {@link republishIntervalBuckets} — a fresh cut per expiry window keeps the snapshot current
+ * enough for a cold joiner while the CRDT's read-time expiry filter already bounds the live set.
+ * This is a *bucket* cadence rolled onto the republish poll tick — never a per-block trigger, which
+ * would re-encode the whole winner set every block and churn the root CID, defeating seeder
+ * byte-identity.
+ */
+export function checkpointIntervalBuckets(criteria: Criteria): number {
+    return criteria.voteExpiryBuckets;
 }
 
 /**
@@ -279,6 +295,14 @@ class ContestNetwork implements VoteNetwork {
      * {@link republishIfDue}). See DESIGN.md "Cancelling a vote".
      */
     #lastTombstoneAnnounceBucket: number | undefined = undefined;
+    /** Bucket of the last checkpoint cut, so the cut rides the coarse cadence, not every poll tick. */
+    #lastCheckpointBucket: number | undefined = undefined;
+    /**
+     * Root CID of the most recent checkpoint this contest cut (blocks are in the blockstore). Held
+     * for the future cold-start fetch responder to serve; the responder wiring is host-blocked on
+     * the pkc-js fetch service (see ROADMAP / DESIGN.md "Deferred pkc-js work").
+     */
+    #latestCheckpointRoot: CID | undefined = undefined;
 
     constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
@@ -313,12 +337,13 @@ class ContestNetwork implements VoteNetwork {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            gateNegativeCache: makeGateNegativeCache()
+            gateResultCache: makeGateResultCache()
         });
-        // The gate/transport are (re)built in start(); the store, crdt, cache, and verifier are
-        // stable per contest, so a cache and verifier bound here survive restarts of the topic.
+        // The gate/transport are (re)built in start(); the store, crdt, caches, and verifier are
+        // stable per contest, so they survive restarts of the topic.
         this.#store = store;
         this.#cache = makeVerdictCache();
+        this.#acceptedDedup = makeAcceptedDedup(this.#bucketMath);
         this.#verifier = verifier;
 
         this.#tally = makeTally({
@@ -333,6 +358,7 @@ class ContestNetwork implements VoteNetwork {
 
     readonly #store: ReturnType<typeof makeBlockstoreBundleStore>;
     readonly #cache: ReturnType<typeof makeVerdictCache>;
+    readonly #acceptedDedup: ReturnType<typeof makeAcceptedDedup>;
     readonly #verifier: ReturnType<typeof makeBundleVerifier>;
 
     #chainFor(ticker: string): ChainClient {
@@ -395,6 +421,7 @@ class ContestNetwork implements VoteNetwork {
             verifier: this.#verifier,
             isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
             cache: this.#cache,
+            acceptedDedup: this.#acceptedDedup,
             merge: (cids) => this.#crdt.merge(cids),
             limit: (fn) => limit(fn),
             allowPeer: makeRateLimiter(GATE_RATE),
@@ -486,7 +513,36 @@ class ContestNetwork implements VoteNetwork {
                 await this.castVotes(intent.votes);
             }
         }
-        if (hasState) await this.#crdt.prune(bucket);
+        if (hasState) {
+            await this.#crdt.prune(bucket);
+            await this.#cutCheckpointIfDue(bucket);
+        }
+    }
+
+    /**
+     * Cut a checkpoint if the coarse cadence ({@link checkpointIntervalBuckets}) is due: snapshot the
+     * current non-expired LWW winners, store the resulting blocks in the blockstore, and remember the
+     * root CID. Rides the republish poll tick — never a per-block trigger — so it re-encodes the
+     * winner set at most once per expiry window, not once per block. No-op until the cadence elapses.
+     */
+    async #cutCheckpointIfDue(bucket: number): Promise<void> {
+        const due =
+            this.#lastCheckpointBucket === undefined ||
+            bucket >= this.#lastCheckpointBucket + checkpointIntervalBuckets(this.criteria);
+        if (!due) return;
+        const { root, blocks } = await encodeCheckpoint(this.#crdt.current(bucket));
+        for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
+        this.#latestCheckpointRoot = root;
+        this.#lastCheckpointBucket = bucket;
+    }
+
+    /**
+     * The root CID of the most recent checkpoint cut for this contest, or `undefined` if none has
+     * been cut yet. Exposed for the cold-start fetch responder (host-blocked on the pkc-js fetch
+     * service); the blocks it references are in the blockstore.
+     */
+    latestCheckpointRoot(): CID | undefined {
+        return this.#latestCheckpointRoot;
     }
 
     /**
