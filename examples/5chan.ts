@@ -7,7 +7,7 @@
  * service at `libp2p.services.pubsub` and a `blockstore`, or construction throws
  * `MissingPubsubError` / `MissingBlockstoreError`. This is the same shape every host uses
  * (see seedit.ts). 5chan has one directory manifest with 63 slots; the client derives one
- * criteria document (one topic) per slot and renders the winning board for each.
+ * criteria document (one topic) per slot and renders the winning community for each.
  * Type-checks against the public API, and every method used here — `start`, `castVotes`,
  * `forget`, `getTally`, `stop`/`destroy`, and the republish scheduler — is live.
  */
@@ -28,7 +28,7 @@ const manifest: unknown = JSON.parse(
 
 // Host-provided seams. 5chan wires these from pkc + viem in its own code. The name
 // resolvers are the same instances 5chan already gives pkc-js (e.g. @bitsocial/
-// bso-resolver's BsoResolver for name.bso) — needed because votes carry board names,
+// bso-resolver's BsoResolver for name.bso) — needed because votes carry community names,
 // whose name→publicKey claim the tally verifies before counting.
 declare function pkcHelia(): HeliaInstance; // pkc.clients.libp2pJsClients[key]._helia
 declare function viemChains(): ChainClientFactory;
@@ -53,7 +53,7 @@ const voter = new PubsubVoter({
 // Join every slot and arm republishing in one call.
 await voter.start();
 
-// Render the homepage: the winning board for each slot. The voter owns the manifest, so it
+// Render the homepage: the winning community for each slot. The voter owns the manifest, so it
 // already knows every contest — reach each by its `contestId` (networks cache by topic, so
 // these are the very networks start() joined).
 const contests = await Promise.all(voter.contestIds.map((contestId) => voter.getContest({ contestId })));
@@ -61,16 +61,16 @@ console.log(`joined ${contests.length} directory contests`);
 
 for (const contest of contests) {
     const tally = await contest.getTally();
-    const winner = tally.ranking[0]?.board ?? "(no votes yet)";
+    const winner = tally.ranking[0]?.community ?? "(no votes yet)";
     console.log(`${contest.criteria.contestId}: ${winner}  [topic ${contest.topic}]`);
 }
 
 // Cast a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
 const biz = await voter.getContest({ contestId: "biz" });
 if (!biz.readOnly) {
-    // `name` must be the board's resolvable domain (unique per community); the tally
+    // `name` must be the community's resolvable domain (unique per community); the tally
     // drops any vote whose name does not resolve to the claimed publicKey.
-    await biz.castVotes([{ board: { name: "bizfinance.bso", publicKey: "12D3KooW...someBoardKey" }, vote: 1 }]);
+    await biz.castVotes([{ community: { name: "bizfinance.bso", publicKey: "12D3KooW...someCommunityKey" }, vote: 1 }]);
     // Withdraw later, two ways:
     await biz.castVotes([]);                    // active: broadcast an empty bundle that supersedes under LWW; the scheduler re-announces the tombstone (no re-sign) until it expires, then drops it
     await voter.forget({ contestId: "biz" });   // passive: drop the stored intent, publish nothing, and let the vote decay at its own expiry

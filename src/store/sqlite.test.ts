@@ -5,11 +5,11 @@ import { join } from "node:path";
 import { SqliteVoteStore } from "./sqlite.js";
 import type { VoteIntent } from "./types.js";
 
-/** A valid base58btc IPNS board key — `VoteSchema` rejects non-keys on read, so intents need a real one. */
+/** A valid base58btc IPNS community key — `VoteSchema` rejects non-keys on read, so intents need a real one. */
 const KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
 function intent(over: Partial<VoteIntent> = {}): VoteIntent {
-    return { topic: "bitsocial-votes/x", address: "0xabc", votes: [{ board: { publicKey: KEY }, vote: 1 }], lastBucket: 7, ...over };
+    return { topic: "bitsocial-votes/x", address: "0xabc", votes: [{ community: { publicKey: KEY }, vote: 1 }], lastBucket: 7, ...over };
 }
 
 describe("SqliteVoteStore", () => {
@@ -57,6 +57,6 @@ describe("SqliteVoteStore", () => {
         store = new SqliteVoteStore(dir!);
         const got = await store.get("bitsocial-votes/keep");
         expect(got?.lastBucket).toBe(3);
-        expect(got?.votes).toEqual([{ board: { publicKey: KEY }, vote: 1 }]);
+        expect(got?.votes).toEqual([{ community: { publicKey: KEY }, vote: 1 }]);
     });
 });

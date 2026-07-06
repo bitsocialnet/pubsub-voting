@@ -8,7 +8,7 @@
  * are live), plus the `PubsubVoter` client-level republish scheduler and durable vote-intent
  * persistence (Node SQLite / browser IndexedDB), so the full `start`/`stop`/`destroy` lifecycle
  * works. See DESIGN.md for architecture, and "Transport" for the forward-gate that verifies a
- * bundle (signature, on-chain gate, board-name resolution) before gossipsub re-forwards it.
+ * bundle (signature, on-chain gate, community-name resolution) before gossipsub re-forwards it.
  */
 
 // Schemas (runtime values) and their inferred types.

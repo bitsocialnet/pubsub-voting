@@ -4,15 +4,15 @@ import { privateKeyToAccount } from "viem/accounts";
 import { ballotTypedData, BALLOT_TYPES, EIP712_DOMAIN_NAME } from "./eip712.js";
 import { VoteSchema, type Vote } from "../schema/votes.js";
 
-// Two distinct, schema-valid B58 IPNS board keys. Building test votes through VoteSchema
+// Two distinct, schema-valid B58 IPNS community keys. Building test votes through VoteSchema
 // (rather than raw literals) keeps this suite honest: the exact bytes that flow through
 // the ballot are the bytes the wire schema actually accepts.
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const KEY_B = "12Czge2qhmFg7TPsvfRDyZiWbwho51g5fgqc6LoVD6nTUWbodZXw";
 
 /** A schema-validated vote for KEY_A, with optional overrides, for feeding ballotTypedData. */
-function vote(over: { board?: { name?: string; publicKey: string }; vote?: number } = {}): Vote {
-    return VoteSchema.parse({ board: { publicKey: KEY_A }, vote: 1, ...over });
+function vote(over: { community?: { name?: string; publicKey: string }; vote?: number } = {}): Vote {
+    return VoteSchema.parse({ community: { publicKey: KEY_A }, vote: 1, ...over });
 }
 
 /** Decode a lowercase `0x`-hex string to bytes (test helper for building CID inputs). */
@@ -40,7 +40,7 @@ describe("ballotTypedData", () => {
         const td = ballotTypedData({ ...base, votes: [vote()] });
         expect(td.message.criteria).toBe("0x0171122069ed193edc1ad0d931d7c6ceafeb8ba40ff1ca1a65cb0a6493e04c96483320c1");
         expect(td.message.blockNumber).toBe(1000n);
-        expect(td.message.votes).toEqual([{ board: { name: "", publicKey: KEY_A }, vote: 1n }]);
+        expect(td.message.votes).toEqual([{ community: { name: "", publicKey: KEY_A }, vote: 1n }]);
     });
 
     it("carries an empty votes array (the withdrawal form)", () => {
@@ -62,10 +62,10 @@ describe("ballotTypedData", () => {
         expect(h({ criteriaCid: hexToBytes("0xdeadbeef") })).not.toBe(ref);
         expect(h({ chainId: 1 })).not.toBe(ref);
         expect(h({ blockNumber: 1001 })).not.toBe(ref);
-        expect(h({ votes: [vote({ board: { publicKey: KEY_B } })] })).not.toBe(ref);
+        expect(h({ votes: [vote({ community: { publicKey: KEY_B } })] })).not.toBe(ref);
         expect(h({ votes: [vote({ vote: 2 })] })).not.toBe(ref);
-        // `name` is part of the signed Board struct, so it changes the hash too.
-        expect(h({ votes: [vote({ board: { name: "biz.bso", publicKey: KEY_A } })] })).not.toBe(ref);
+        // `name` is part of the signed Community struct, so it changes the hash too.
+        expect(h({ votes: [vote({ community: { name: "biz.bso", publicKey: KEY_A } })] })).not.toBe(ref);
     });
 });
 
@@ -83,15 +83,15 @@ describe("ballotTypedData", () => {
 describe("EIP-712 ballot v1 frozen vector", () => {
     const PRIVATE_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
     const SIGNER_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
-    const EXPECTED_HASH = "0x401d8bcbc11009b3a9258413f49f6a895f2027280cd306c3dd006a363558d28c";
+    const EXPECTED_HASH = "0x1b0c3e29a0bffb1305d7dc278707165ea5bbf8004b65b24738256a5544facc7a";
     const EXPECTED_SIGNATURE =
-        "0x64341ee6217d7832a58504119f62028247ac101afab771427a4ef80488dc1353" +
-        "64eae2e994c87dc51d7b6da84e7730b79c1265857d4080eda44faa6fbc87f2a71b";
+        "0x67813a39ba6e600b0370934a6cc8958c5d54b2f1bdbaa5c64457262133d41e16" +
+        "3d045c635cc1ce1648421452b7a6075c4c3329205b79988c472a2e28a0bc7b5b1c";
 
     const vector = ballotTypedData({
         criteriaCid: CRITERIA_CID,
         chainId: 8453,
-        votes: [VoteSchema.parse({ board: { publicKey: KEY_A }, vote: 1 })],
+        votes: [VoteSchema.parse({ community: { publicKey: KEY_A }, vote: 1 })],
         blockNumber: 1000
     });
 

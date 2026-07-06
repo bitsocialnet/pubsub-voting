@@ -2,11 +2,11 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: engine and client lifecycle implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + board-name resolution), the Merkle-CRDT (LWW union), the tally, the transport's **validate-before-forward gossip gate**, the `PubsubVoter` client-level republish scheduler, and durable vote-intent persistence (Node SQLite / browser IndexedDB) are all implemented — so `start`, `castVotes`, `getTally`, and the full `PubsubVoter.start`/`stop`/`destroy` lifecycle are live. The gate runs the full validity pipeline in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. What remains is deferred, host-blocked work: cold-start winner-CID sync over the libp2p fetch protocol (needs a pkc-js-side fetch service) and checkpoint compaction. See [DESIGN.md](./DESIGN.md) for the architecture, the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
+> **Status: engine and client lifecycle implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the Merkle-CRDT (LWW union), the tally, the transport's **validate-before-forward gossip gate**, the `PubsubVoter` client-level republish scheduler, and durable vote-intent persistence (Node SQLite / browser IndexedDB) are all implemented — so `start`, `castVotes`, `getTally`, and the full `PubsubVoter.start`/`stop`/`destroy` lifecycle are live. The gate runs the full validity pipeline in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. What remains is deferred, host-blocked work: cold-start winner-CID sync over the libp2p fetch protocol (needs a pkc-js-side fetch service) and checkpoint compaction. See [DESIGN.md](./DESIGN.md) for the architecture, the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
-The first consumer is [5chan](https://github.com/bitsocialnet/5chan), a serverless, adminless imageboard on the Bitsocial protocol. 5chan has a [competitive directory system](https://github.com/bitsocialnet/5chan/blob/master/README.md#competitive-directory-system): many boards compete for each directory slot (for example, multiple "Business & Finance" boards), but only the highest-voted one appears on the homepage. Today those assignments are curated by hand through pull requests to [`5chan-directories.json`](https://github.com/bitsocialnet/lists/blob/master/5chan-directories.json). This library is the planned replacement: directory voting that is decided by holders rather than by maintainers, with no server to trust.
+The first consumer is [5chan](https://github.com/bitsocialnet/5chan), a serverless, adminless imageboard on the Bitsocial protocol. 5chan has a [competitive directory system](https://github.com/bitsocialnet/5chan/blob/master/README.md#competitive-directory-system): many communities compete for each directory slot (for example, multiple "Business & Finance" communities), but only the highest-voted one appears on the homepage. Today those assignments are curated by hand through pull requests to [`5chan-directories.json`](https://github.com/bitsocialnet/lists/blob/master/5chan-directories.json). This library is the planned replacement: directory voting that is decided by holders rather than by maintainers, with no server to trust.
 
 The same engine generalizes to the original use case in [pkc-js issue #25](https://github.com/pkcprotocol/pkc-js/issues/25) (a default-communities list voted on over pubsub) and to any future Bitsocial client that needs holder-weighted, censorship-resistant curation.
 
@@ -37,7 +37,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`) and a `blockstore` (else `MissingBlockstoreError`) |
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
-| `nameResolvers` | `NameResolver[]` | no | board-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `board.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
+| `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `community.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
 | `manifest` | `unknown` | yes | the directory manifest this voter owns; the voter derives every contest from it at construction, addresses each by its unique `contestId` (`getContest`), and keeps them republished under one lifecycle (see [Lifecycle](#lifecycle-start--stop--destroy)). A duplicate `contestId` throws `DuplicateContestIdError`; a missing/invalid manifest throws `MissingManifestError` |
 | `dataPath` | `string` | no | Node only: directory for the SQLite file that persists this voter's vote intents so republishing survives a restart (the same `dataPath` convention as pkc-js / `@bitsocial/bso-resolver`). In the browser the voter uses IndexedDB; with no `dataPath` on Node, persistence is in-memory (lost on restart) |
 | `republishPollIntervalMs` | `number` | no | how often (wall-clock ms) the republish scheduler checks each contest for a due re-sign; defaults to 10 minutes. The cadence itself is bucket-based per contest (`ceil(voteExpiryBuckets / 2)`); this only sets the poll granularity. Lower it to react faster at the cost of more RPC head reads |
@@ -52,7 +52,7 @@ const voter = new PubsubVoter({
   chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
   manifest,                     // required: the directory manifest this voter owns (one contest per entry, unique contestId)
   signer: mySigner,             // optional; omit → read-only voter
-  nameResolvers: [bsoResolver]  // optional; verifies board-name claims (e.g. @bitsocial/bso-resolver)
+  nameResolvers: [bsoResolver]  // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
 });
 ```
 
@@ -66,18 +66,18 @@ Construction throws `MissingPubsubError` or `MissingBlockstoreError` if the node
 const contest = await voter.getContest({ contestId }); // contestId: a slot in the voter's manifest
 await contest.start();
 const tally = await contest.getTally();
-const winner = tally.ranking[0]?.board; // { name?: string, publicKey: string } — identity is publicKey
+const winner = tally.ranking[0]?.community; // { name?: string, publicKey: string } — identity is publicKey
 ```
 
 ### Cast or withdraw a vote (needs a signer)
 
 ```ts
-await contest.castVotes([{ board: { publicKey: "12D3KooW..." }, vote: 1 }]); // board: { name?, publicKey } (B58 IPNS name); v1: one upvote per topic
+await contest.castVotes([{ community: { publicKey: "12D3KooW..." }, vote: 1 }]); // community: { name?, publicKey } (B58 IPNS name); v1: one upvote per topic
 await contest.castVotes([]);                                  // active withdrawal: broadcast an empty bundle that supersedes under LWW; the scheduler re-announces that tombstone (without re-signing it) until it expires, then drops it
 await voter.forget({ contestId: "biz" });                     // passive withdrawal: drop the stored intent, publish nothing, and let the vote decay at its own expiry
 ```
 
-A board's identity is its `publicKey`. The optional `name` is the board's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `board.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
+A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
 
 There are two ways to stop voting. `castVotes([])` is the **active** path: it broadcasts an empty bundle that immediately supersedes the prior vote under LWW. The scheduler then **re-announces that tombstone** — re-broadcasting its existing CID on the liveness cadence, *without* re-signing it, so its expiry clock is untouched — so peers that missed the one-shot flood converge within a cycle; once the tombstone expires the scheduler drops the intent and the bundle decays via expiry + prune (never an immortal heartbeat). `forget({ contestId })` is the **passive** path: it drops the stored intent and publishes nothing, so the vote simply decays once its last bundle expires. Both are idempotent; `forget` on an unknown `contestId` throws `UnknownContestError`.
 
@@ -102,7 +102,7 @@ await voter.start();     // join every contest + start republishing this wallet'
 await voter.destroy();   // stop the republish loops, leave all topics, dispose the store
 ```
 
-Persistence is what lets republishing survive a restart: the voter stores its own re-signable *intent* per contest (which boards it picked), not the signed bundles. On Node, pass `dataPath` to keep those intents in a SQLite file under that directory; in the browser the voter uses IndexedDB automatically; with no `dataPath` on Node, persistence is in-memory and lost on restart.
+Persistence is what lets republishing survive a restart: the voter stores its own re-signable *intent* per contest (which communities it picked), not the signed bundles. On Node, pass `dataPath` to keep those intents in a SQLite file under that directory; in the browser the voter uses IndexedDB automatically; with no `dataPath` on Node, persistence is in-memory and lost on restart.
 
 ```ts
 const voter = new PubsubVoter({ helia, chains, signer, manifest, dataPath: "./.bitsocial-votes" }); // Node: SQLite under dataPath

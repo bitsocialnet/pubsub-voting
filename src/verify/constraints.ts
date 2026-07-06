@@ -10,7 +10,7 @@ import type { VerifyResult } from "./types.js";
  * Pure and synchronous: no signature recovery, no chain. These bounds live in the
  * *criteria*, not in the wire type, which is exactly why `VotesBundleSchema` does NOT
  * enforce them — the schema owns only criteria-independent wire shape (pairwise-distinct
- * boards). This runtime check is where the cap belongs. See DESIGN.md "Votes wire".
+ * communities). This runtime check is where the cap belongs. See DESIGN.md "Votes wire".
  *
  * An empty `votes` array (withdrawal/abstention) is always valid regardless of the cap.
  */
@@ -32,7 +32,7 @@ export function checkBundleConstraints(bundle: VotesBundle, criteria: Criteria):
             return {
                 valid: false,
                 disposition: "reject",
-                reason: `vote ${v.vote} for board ${v.board.publicKey} is outside voteSchema [${min}, ${max}]`
+                reason: `vote ${v.vote} for community ${v.community.publicKey} is outside voteSchema [${min}, ${max}]`
             };
         }
     }

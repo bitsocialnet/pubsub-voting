@@ -6,10 +6,10 @@ import type { VotesBundle } from "../schema/votes.js";
  * Verification has one cheap, offline stage (no chain reads) and one chain stage:
  *   1. offline: recover the EIP-712 signer and check it equals bundle.address, and the
  *      criteria-bound constraints (votes.length <= maxVotesPerAddress, vote in range).
- *      Pairwise-distinct board.publicKeys is enforced even earlier, by
+ *      Pairwise-distinct community.publicKeys is enforced even earlier, by
  *      VotesBundleSchema at parse time (see DESIGN.md "Votes wire")
  *   2. chain: the `rule` (gate) + weight rules read state at the bucket block, and
- *      each vote's board.name claim is resolved through the injected nameResolvers
+ *      each vote's community.name claim is resolved through the injected nameResolvers
  *      (a name that does not resolve to the claimed publicKey drops the bundle)
  *
  * The tally runs stage 2 lazily (only where it can change the visible ranking), so the
@@ -25,7 +25,7 @@ import type { VotesBundle } from "../schema/votes.js";
  *     chain state (bad signature, out-of-range vote, wallet the gate rejects at the bucket
  *     block). Deterministic and stable, so it is safe to penalize the sender AND to cache.
  *   - "ignore": not provably the sender's fault because the check is view- or clock-dependent
- *     and two honest peers can legitimately disagree right now (a `board.name` resolved *at
+ *     and two honest peers can legitimately disagree right now (a `community.name` resolved *at
  *     head* during a re-point window; a `blockNumber` bucket ahead of this verifier's chain
  *     head). No penalty, and NOT cached — the verdict can change as heads/records converge.
  */
@@ -49,7 +49,7 @@ export interface OfflineBundleVerifier {
  * did so downstream stages need not redo it:
  *   - `ruleScore`: the gate `rule`'s score for the voting wallet at the bucket block
  *     (always `> 0n` here — `0n` would have failed the gate).
- *   - `resolvedNames`: for each vote that carried a `board.name`, the `publicKey` the name
+ *   - `resolvedNames`: for each vote that carried a `community.name`, the `publicKey` the name
  *     resolved to (equal to the claimed key, since a mismatch fails the gate). Votes with no
  *     name are absent. Lets a UI show a verified name without re-resolving.
  */
@@ -61,7 +61,7 @@ export interface BundleVerdictValid {
 
 /**
  * The full validity verdict for one bundle: signature + criteria constraints + on-chain
- * gate (`rule`) + board-name resolution, in cheap-to-expensive order with early exit. This is
+ * gate (`rule`) + community-name resolution, in cheap-to-expensive order with early exit. This is
  * what the gossip forward-gate runs *before* re-forwarding (see DESIGN.md "Transport"): a
  * failing verdict is dropped and never forwarded, stored, or counted. Weight *magnitude*
  * (ranking, not validity) is deliberately NOT computed here — the tally derives it lazily.

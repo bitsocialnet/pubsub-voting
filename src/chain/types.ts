@@ -32,13 +32,13 @@ export type ChainClients = Record<string, ChainClient>;
 export type ChainClientFactory = (args: { chain: string; config: ChainConfig }) => ChainClient;
 
 /**
- * A board-name resolver the host injects (`PubsubVoterOptions.nameResolvers`). The
+ * A community-name resolver the host injects (`PubsubVoterOptions.nameResolvers`). The
  * shape is structurally identical to pkc-js's `NameResolverInterface`, so a host passes
  * the very same instances it already gives pkc-js (e.g. `@bitsocial/bso-resolver`'s
  * `BsoResolver`, which resolves `name.bso` through the `bitsocial` text record) —
  * declared here rather than imported so this library depends on no resolver package.
  *
- * The tally uses it to verify a vote's `board.name` claim: resolve the name and drop
+ * The tally uses it to verify a vote's `community.name` claim: resolve the name and drop
  * the bundle when it does not resolve or resolves to a different `publicKey` than the
  * vote claims (see DESIGN.md "Tally"). `resolve` returning `undefined` means the name
  * has no record. `resolve` accepts an optional `blockNumber` to pin the read to a

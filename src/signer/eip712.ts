@@ -15,7 +15,7 @@ import type { Vote } from "../schema/votes.js";
  *     every client hashes the same bytes. Different rules -> different CID -> a signature
  *     gathered for one contest does not validate on another. (This is the CID of the whole
  *     criteria document, distinct from the `criteria.contestId` slot-code field inside it.)
- *   - `votes`: each board (`{ name, publicKey }`) + numeric vote.
+ *   - `votes`: each community (`{ name, publicKey }`) + numeric vote.
  *   - `blockNumber`: the LWW key and the bucketized block every verifier reads at.
  *
  * The `domain.chainId` is the gating (`rule`) chain, giving cross-chain/cross-app domain
@@ -39,19 +39,19 @@ export const EIP712_SIGNATURE_TYPE = "eip712";
  *     in, so independent clients recover identical signers.
  *   - `vote` is `int256` (signed) so a future criteria can widen the range to downvotes
  *     without a layout change; v1 is upvote-only.
- *   - `board` is a `Board` struct (`{ name, publicKey }`). EIP-712 has no optional
+ *   - `community` is a `Community` struct (`{ name, publicKey }`). EIP-712 has no optional
  *     fields, so `name` is always signed as a string — the empty string when the wire
- *     vote carries no name. Board identity is `publicKey`; `name` is a display label and
+ *     vote carries no name. Community identity is `publicKey`; `name` is a display label and
  *     does not affect the tally, so signing `""` vs. a name for the same `publicKey` is
- *     the same board.
+ *     the same community.
  */
 export const BALLOT_TYPES = {
-    Board: [
+    Community: [
         { name: "name", type: "string" },
         { name: "publicKey", type: "string" }
     ],
     Vote: [
-        { name: "board", type: "Board" },
+        { name: "community", type: "Community" },
         { name: "vote", type: "int256" }
     ],
     Ballot: [
@@ -68,7 +68,7 @@ export interface BallotTypedData {
     primaryType: "Ballot";
     message: {
         criteria: `0x${string}`;
-        votes: { board: { name: string; publicKey: string }; vote: bigint }[];
+        votes: { community: { name: string; publicKey: string }; vote: bigint }[];
         blockNumber: bigint;
     };
 }
@@ -100,7 +100,7 @@ export function ballotTypedData(args: {
         message: {
             criteria: bytesToHex(args.criteriaCid),
             votes: args.votes.map((v) => ({
-                board: { name: v.board.name ?? "", publicKey: v.board.publicKey },
+                community: { name: v.community.name ?? "", publicKey: v.community.publicKey },
                 vote: BigInt(v.vote)
             })),
             blockNumber: BigInt(args.blockNumber)

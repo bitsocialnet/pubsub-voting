@@ -8,16 +8,16 @@
  * leaderboard can render fast and refine. See DESIGN.md "Tally".
  */
 
-/** One board's standing within a contest. */
-export interface BoardTally {
+/** One community's standing within a contest. */
+export interface CommunityTally {
     /**
-     * The board this row aggregates. Rows are keyed by `board.publicKey`; `name` is the
-     * board's resolvable domain carried through from the votes. It never affects which
+     * The community this row aggregates. Rows are keyed by `community.publicKey`; `name` is the
+     * community's resolvable domain carried through from the votes. It never affects which
      * votes fold into this row, but it is not unchecked either: bundles whose name did
      * not resolve to the claimed `publicKey` were dropped before aggregation, so a name
      * surfacing here matched the registry. See DESIGN.md "Votes wire" and "Tally".
      */
-    board: { name?: string; publicKey: string };
+    community: { name?: string; publicKey: string };
     /** Summed weight of upvotes counted so far, in rule score units (`bigint`). */
     weight: bigint;
     /** True once every vote contributing to this row has passed full verification. */
@@ -28,7 +28,7 @@ export interface BoardTally {
 export interface ContestTally {
     /** The `contestId` of the criteria this ranking is for. */
     contestId: string;
-    ranking: BoardTally[];
+    ranking: CommunityTally[];
 }
 
 export interface TallyOptions {

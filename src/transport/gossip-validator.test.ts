@@ -10,7 +10,7 @@ import type { VotesBundle } from "../schema/votes.js";
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
 function bundle(address: string): VotesBundle {
-    return { address, votes: [{ board: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
+    return { address, votes: [{ community: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
 }
 
 async function makeNode(address: string): Promise<{ cid: CID; node: VotesBundle }> {

@@ -29,10 +29,10 @@ console.log("read-only:", voter.readOnly); // true
 
 const contest = await voter.getContest({ contestId: criteria.contestId });
 const tally = await contest.getTally(); // allowed
-console.log(tally.ranking[0]?.board);
+console.log(tally.ranking[0]?.community);
 
 try {
-    await contest.castVotes([{ board: { publicKey: "12D3KooW..." }, vote: 1 }]); // throws ReadOnlyError
+    await contest.castVotes([{ community: { publicKey: "12D3KooW..." }, vote: 1 }]); // throws ReadOnlyError
 } catch (err) {
     if (err instanceof ReadOnlyError) console.log("cannot vote without a signer, as expected");
     else throw err;

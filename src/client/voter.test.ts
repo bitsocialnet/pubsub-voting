@@ -23,7 +23,7 @@ import {
     fakeSigner
 } from "../test-fixtures.js";
 
-/** A valid base58btc IPNS board key (VotesBundleSchema rejects non-keys, so castVotes needs a real one). */
+/** A valid base58btc IPNS community key (VotesBundleSchema rejects non-keys, so castVotes needs a real one). */
 const VALID_KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
 /**
@@ -147,7 +147,7 @@ describe("write path gating", () => {
     it("castVotes throws ReadOnlyError without a signer", async () => {
         const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
         const contest = await voter.getContest({ contestId: "biz" });
-        await expect(contest.castVotes([{ board: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(ReadOnlyError);
+        await expect(contest.castVotes([{ community: { publicKey: "b" }, vote: 1 }])).rejects.toBeInstanceOf(ReadOnlyError);
     });
 
     it("castVotes signs and returns a bundle when a signer is present", async () => {
@@ -158,11 +158,11 @@ describe("write path gating", () => {
             manifest: bizManifest()
         });
         const contest = await voter.getContest({ contestId: "biz" });
-        const bundle = await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
+        const bundle = await contest.castVotes([{ community: { publicKey: VALID_KEY }, vote: 1 }]);
         expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
         // blockNumber is the bucket boundary: bucketForBlock(43200)=1, sampleBlockForBucket(1)=43200.
         expect(bundle.blockNumber).toBe(43200);
-        expect(bundle.votes[0].board.publicKey).toBe(VALID_KEY);
+        expect(bundle.votes[0].community.publicKey).toBe(VALID_KEY);
     });
 });
 
@@ -181,11 +181,11 @@ describe("getTally", () => {
             manifest: bizManifest()
         });
         const contest = await voter.getContest({ contestId: "biz" });
-        await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
+        await contest.castVotes([{ community: { publicKey: VALID_KEY }, vote: 1 }]);
 
         const tally = await contest.getTally();
         expect(tally.ranking).toHaveLength(1);
-        expect(tally.ranking[0].board.publicKey).toBe(VALID_KEY);
+        expect(tally.ranking[0].community.publicKey).toBe(VALID_KEY);
         expect(tally.ranking[0].weight).toBe(1n); // constant weight, 1 pass = 1 vote
     });
 
@@ -200,7 +200,7 @@ describe("getTally", () => {
             manifest: bizManifest()
         });
         const contest = await voter.getContest({ contestId: "biz" });
-        await contest.castVotes([{ board: { publicKey: VALID_KEY }, vote: 1 }]);
+        await contest.castVotes([{ community: { publicKey: VALID_KEY }, vote: 1 }]);
 
         // Still live at bucket 1: the vote counts.
         expect((await contest.getTally()).ranking).toHaveLength(1);
@@ -309,7 +309,7 @@ describe("republish scheduler", () => {
 
     const BUCKET = 43200; // bizCriteria blocksPerBucket; voteExpiryBuckets 30 ⇒ interval 15.
     const bucketBlock = (n: number): bigint => BigInt(n * BUCKET);
-    const VOTE = [{ board: { publicKey: VALID_KEY }, vote: 1 }];
+    const VOTE = [{ community: { publicKey: VALID_KEY }, vote: 1 }];
 
     it("revives a stored intent immediately on start() when the cadence is due", async () => {
         vi.useFakeTimers();

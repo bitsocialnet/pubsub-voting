@@ -18,7 +18,7 @@ import type { BundleVerifier, BundleVerdict } from "./types.js";
  *   2. constraints (local, µs): `votes.length <= maxVotesPerAddress`, each vote in range.
  *   3. gate        (chain):     the `rule` scores the wallet `> 0n` at the bucket block.
  *                               `0n` -> not admitted -> drop.
- *   4. name        (network):   each vote's `board.name` (if any) must resolve to the
+ *   4. name        (network):   each vote's `community.name` (if any) must resolve to the
  *                               claimed `publicKey`; a squatted/absent name drops the bundle.
  *
  * Every step only ever SUBTRACTS trust (a bundle is valid or dropped), which is what lets the
@@ -43,7 +43,7 @@ export interface BundleVerifierDeps {
     chainFor: (ticker: string) => ChainClient;
     /** Bucket math for `criteria.blocksPerBucket`. */
     bucketMath: BucketMath;
-    /** Host-injected board-name resolvers (`PubsubVoterOptions.nameResolvers`). */
+    /** Host-injected community-name resolvers (`PubsubVoterOptions.nameResolvers`). */
     nameResolvers: NameResolver[];
     /**
      * Optional negative cache for gate misses, keyed by `(wallet, sampleBlock)`. When present,
@@ -93,7 +93,7 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
                 return { valid: false, disposition: "reject", reason: `not admitted: rule score is 0n at block ${sampleBlock}` };
             }
 
-            // 4. Board-name resolution (network) — a carried name is a claim, verified against
+            // 4. Community-name resolution (network) — a carried name is a claim, verified against
             //    the registry. A name that has no resolver, does not resolve, or resolves to a
             //    different publicKey than the vote claims drops the whole bundle. These failures
             //    are `ignore`, not `reject`: v1 resolves at head, so they are view-/clock-dependent
@@ -104,17 +104,17 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             //    `reject`.) The gossip gate therefore does NOT cache these verdicts.
             const resolvedNames: Record<string, string> = {};
             for (const v of bundle.votes) {
-                const name = v.board.name;
+                const name = v.community.name;
                 if (!name) continue;
                 const resolver = nameResolvers.find((r) => r.canResolve({ name }));
-                if (!resolver) return { valid: false, disposition: "ignore", reason: `no resolver handles board name "${name}"` };
+                if (!resolver) return { valid: false, disposition: "ignore", reason: `no resolver handles community name "${name}"` };
                 const record = await resolver.resolve({ name });
-                if (!record) return { valid: false, disposition: "ignore", reason: `board name "${name}" does not resolve` };
-                if (record.publicKey !== v.board.publicKey) {
+                if (!record) return { valid: false, disposition: "ignore", reason: `community name "${name}" does not resolve` };
+                if (record.publicKey !== v.community.publicKey) {
                     return {
                         valid: false,
                         disposition: "ignore",
-                        reason: `board name "${name}" resolves to ${record.publicKey}, not the claimed ${v.board.publicKey}`
+                        reason: `community name "${name}" resolves to ${record.publicKey}, not the claimed ${v.community.publicKey}`
                     };
                 }
                 resolvedNames[name] = record.publicKey;

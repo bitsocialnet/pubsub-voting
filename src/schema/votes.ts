@@ -6,7 +6,7 @@ import { SignatureSchema } from "./common.js";
 /**
  * True when `x` is a base58btc IPNS name (a `12D3KooW…` key), i.e. it decodes to a
  * multihash digest. This is the same check pkc-js uses (`isIpns`): a community identity is
- * either a resolvable domain (contains a dot) or this self-certifying B58 key. A board's
+ * either a resolvable domain (contains a dot) or this self-certifying B58 key. A community's
  * `publicKey` must be the B58 key — the stable identity the tally aggregates on — never a
  * domain, which is mutable/re-pointable. The leading `z` is base58btc's multibase prefix.
  */
@@ -36,7 +36,7 @@ function isB58IpnsKey(x: string): boolean {
 
 /**
  * True when `x` is a dotted domain name — at least two non-empty, whitespace-free labels
- * (e.g. "memes.bso"). Board names must carry a TLD so they are resolvable through a
+ * (e.g. "memes.bso"). Community names must carry a TLD so they are resolvable through a
  * name resolver; the TLD itself is deliberately not pinned (`.bso` today, possibly other
  * naming systems later) — which names actually resolve is decided by the host-injected
  * `nameResolvers` at tally time, not by this schema.
@@ -47,15 +47,15 @@ function isDottedDomain(x: string): boolean {
 }
 
 /**
- * The board being voted for: a community identified by its `publicKey`, with an
- * optional resolvable domain `name` (e.g. "memes.bso"). Board identity — the key the
+ * The community being voted for: identified by its `publicKey`, with an
+ * optional resolvable domain `name` (e.g. "memes.bso"). Community identity — the key the
  * tally aggregates on — is `publicKey` alone, but a carried `name` is a *verified
  * claim*, not a free label: names are unique (the naming registry maps one name to one
  * community), and at tally time a bundle whose `name` does not resolve to the claimed
  * `publicKey` is dropped. A vote that omits `name` still folds into the same
  * `publicKey` row. See DESIGN.md "Votes wire" and "Tally".
  */
-export const BoardSchema = z.object({
+export const CommunitySchema = z.object({
     // A pkc-js community identity: `name` is an optional resolvable domain (must be
     // dotted — carry a TLD — e.g. "memes.bso" via @bitsocial/bso-resolver), `publicKey`
     // is the B58 IPNS name (e.g. "12D3KooW..."): the self-certifying key the tally
@@ -78,13 +78,13 @@ export const BoardSchema = z.object({
 /**
  * A single vote inside a bundle. The contest is implied by the topic (one contest
  * per topic), so it is not repeated on the wire.
- * - `board` is the community being voted for (`{ name?, publicKey }`).
+ * - `community` is the community being voted for (`{ name?, publicKey }`).
  * - `vote` is numeric; its allowed range comes from `criteria.voteSchema`
  *   (v1 is upvote-only, so exactly 1). Range is enforced at verify time, not here,
  *   because the bounds live in the criteria, not in the wire type.
  */
 export const VoteSchema = z.object({
-    board: BoardSchema,
+    community: CommunitySchema,
     vote: z.number().int()
 });
 
@@ -103,19 +103,19 @@ export const VotesBundleSchema = z
         blockNumber: z.number().int().nonnegative(),
         signature: SignatureSchema
     })
-    // The votes must name pairwise-distinct boards. `maxVotesPerAddress` caps how many
-    // entries a bundle carries, but only distinctness makes that a cap on *boards*:
-    // without it a wallet allowed N approval votes could list one board N times and
+    // The votes must name pairwise-distinct communities. `maxVotesPerAddress` caps how many
+    // entries a bundle carries, but only distinctness makes that a cap on *communities*:
+    // without it a wallet allowed N approval votes could list one community N times and
     // stack N× weight on it. Unlike the criteria-dependent constraints (length cap,
     // vote range — enforced at verify time because their bounds live in the criteria),
     // distinctness is pure wire shape, so the schema owns it. Duplicate *names* need no
     // rule: same name + different keys dies at name resolution, same name + same key is
     // caught here. See DESIGN.md "Votes wire".
-    .refine((bundle) => new Set(bundle.votes.map((v) => v.board.publicKey)).size === bundle.votes.length, {
-        message: "votes must name pairwise-distinct board.publicKeys (one entry per board)",
+    .refine((bundle) => new Set(bundle.votes.map((v) => v.community.publicKey)).size === bundle.votes.length, {
+        message: "votes must name pairwise-distinct community.publicKeys (one entry per community)",
         path: ["votes"]
     });
 
-export type Board = z.infer<typeof BoardSchema>;
+export type Community = z.infer<typeof CommunitySchema>;
 export type Vote = z.infer<typeof VoteSchema>;
 export type VotesBundle = z.infer<typeof VotesBundleSchema>;

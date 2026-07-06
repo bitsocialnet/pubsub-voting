@@ -18,14 +18,14 @@ const CRITERIA_CID = hexToBytes("0x0171122069ed193edc1ad0d931d7c6ceafeb8ba40ff1c
 const CHAIN_ID = 8453;
 const SIGNER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const SIG =
-    "0x64341ee6217d7832a58504119f62028247ac101afab771427a4ef80488dc1353" +
-    "64eae2e994c87dc51d7b6da84e7730b79c1265857d4080eda44faa6fbc87f2a71b";
+    "0x67813a39ba6e600b0370934a6cc8958c5d54b2f1bdbaa5c64457262133d41e16" +
+    "3d045c635cc1ce1648421452b7a6075c4c3329205b79988c472a2e28a0bc7b5b1c";
 
 /** The frozen-vector bundle, with optional overrides fed through the wire schema. */
 function bundle(over: Partial<VotesBundle> = {}): VotesBundle {
     return VotesBundleSchema.parse({
         address: SIGNER,
-        votes: [{ board: { publicKey: KEY_A }, vote: 1 }],
+        votes: [{ community: { publicKey: KEY_A }, vote: 1 }],
         blockNumber: 1000,
         signature: { signature: SIG, type: "eip712" },
         ...over
@@ -48,8 +48,8 @@ describe("verifyBundleSignature", () => {
         expect((await verify(bundle({ address: "0x0000000000000000000000000000000000000001" }))).valid).toBe(false);
     });
 
-    it("rejects a tampered vote (different board)", async () => {
-        expect((await verify(bundle({ votes: [{ board: { publicKey: KEY_B }, vote: 1 }] }))).valid).toBe(false);
+    it("rejects a tampered vote (different community)", async () => {
+        expect((await verify(bundle({ votes: [{ community: { publicKey: KEY_B }, vote: 1 }] }))).valid).toBe(false);
     });
 
     it("rejects a tampered blockNumber", async () => {

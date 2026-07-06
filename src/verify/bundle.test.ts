@@ -71,14 +71,14 @@ function verifier(
 
 describe("makeBundleVerifier", () => {
     it("accepts a validly-signed, eligible, unnamed vote", async () => {
-        const bundle = await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]);
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n }).verify(bundle);
         expect(verdict.valid).toBe(true);
         if (verdict.valid) expect(verdict.ruleScore).toBe(1n);
     });
 
     it("rejects a wallet the gate does not admit (rule score 0n)", async () => {
-        const bundle = await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]);
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 0n }).verify(bundle);
         expect(verdict.valid).toBe(false);
         if (!verdict.valid) expect(verdict.disposition).toBe("reject"); // gate miss is provable
@@ -88,10 +88,10 @@ describe("makeBundleVerifier", () => {
         let reads = 0;
         const gateNegativeCache = makeGateNegativeCache();
         const v = verifier({ balance: 0n, onRead: () => reads++, gateNegativeCache });
-        // Two DISTINCT bundles (different board) from the same wallet at the same block: the
+        // Two DISTINCT bundles (different community) from the same wallet at the same block: the
         // first pays the gate read, the second short-circuits on the negative cache.
-        const first = await v.verify(await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]));
-        const second = await v.verify(await signedBundle([{ board: { publicKey: KEY_B }, vote: 1 }]));
+        const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
+        const second = await v.verify(await signedBundle([{ community: { publicKey: KEY_B }, vote: 1 }]));
         expect(first.valid).toBe(false);
         expect(second.valid).toBe(false);
         expect(reads).toBe(1); // only the first bundle hit the chain
@@ -99,7 +99,7 @@ describe("makeBundleVerifier", () => {
 
     it("rejects a bad signature BEFORE any chain read (cheap-first ordering)", async () => {
         let reads = 0;
-        const bundle = await signedBundle([{ board: { publicKey: KEY_A }, vote: 1 }]);
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         // Corrupt the signature after signing; verifier must drop it at step 1.
         const forged: VotesBundle = { ...bundle, address: "0x0000000000000000000000000000000000000009" };
         const verdict = await verifier({ balance: 1n, onRead: () => reads++ }).verify(forged);
@@ -108,7 +108,7 @@ describe("makeBundleVerifier", () => {
     });
 
     it("accepts a named vote whose name resolves to the claimed key", async () => {
-        const bundle = await signedBundle([{ board: { name: "memes.bso", publicKey: KEY_A }, vote: 1 }]);
+        const bundle = await signedBundle([{ community: { name: "memes.bso", publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n, names: { "memes.bso": KEY_A } }).verify(bundle);
         expect(verdict.valid).toBe(true);
         if (verdict.valid) expect(verdict.resolvedNames).toEqual({ "memes.bso": KEY_A });
@@ -116,14 +116,14 @@ describe("makeBundleVerifier", () => {
 
     it("drops a squatted name that resolves to a different key (ignore, not reject — resolved at head)", async () => {
         // memes.bso genuinely belongs to KEY_A, but this bundle claims it for KEY_B.
-        const bundle = await signedBundle([{ board: { name: "memes.bso", publicKey: KEY_B }, vote: 1 }]);
+        const bundle = await signedBundle([{ community: { name: "memes.bso", publicKey: KEY_B }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n, names: { "memes.bso": KEY_A } }).verify(bundle);
         expect(verdict.valid).toBe(false);
         if (!verdict.valid) expect(verdict.disposition).toBe("ignore");
     });
 
     it("drops a name that does not resolve (ignore, not reject)", async () => {
-        const bundle = await signedBundle([{ board: { name: "ghost.bso", publicKey: KEY_A }, vote: 1 }]);
+        const bundle = await signedBundle([{ community: { name: "ghost.bso", publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n, names: {} }).verify(bundle);
         expect(verdict.valid).toBe(false);
         if (!verdict.valid) expect(verdict.disposition).toBe("ignore");

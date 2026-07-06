@@ -21,7 +21,7 @@ import type { BundleVerifier } from "../verify/types.js";
  *     transient/local condition (unfetchable within the timeout, over the per-peer rate,
  *     internal error) or a view-/clock-dependent verdict two honest peers can disagree on
  *     right now: a bundle bucketed ahead of our chain head (`isEvaluableNow`), or a
- *     `board.name` resolved at head during a re-point window. Drop, do not forward, do NOT
+ *     `community.name` resolved at head during a re-point window. Drop, do not forward, do NOT
  *     penalize, and do NOT cache (it can change) — using `reject` here would punish honest
  *     relayers for transient conditions and hand attackers a grief vector.
  *

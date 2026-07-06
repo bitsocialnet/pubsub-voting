@@ -63,8 +63,8 @@ export const CriteriaSchema = z
         /** Allowed range for each `vote` value. v1: { min: 1, max: 1 }. */
         voteSchema: VoteRangeSchema,
         /**
-         * Max board selections per wallet in this contest (anti-spam). v1 = 1, the
-         * one-vote-per-topic rule: a wallet picks one board. An empty `votes` array is
+         * Max community selections per wallet in this contest (anti-spam). v1 = 1, the
+         * one-vote-per-topic rule: a wallet picks one community. An empty `votes` array is
          * always allowed as withdrawal/abstention regardless of this cap.
          */
         maxVotesPerAddress: z.number().int().positive(),

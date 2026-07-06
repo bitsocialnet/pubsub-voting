@@ -6,18 +6,18 @@ import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
 import { UnknownRuleError } from "../errors.js";
-import type { Tally, TallyOptions, ContestTally, BoardTally } from "./types.js";
+import type { Tally, TallyOptions, ContestTally, CommunityTally } from "./types.js";
 
 /**
  * Deterministic per-contest aggregation over the CRDT's current (already validity-gated)
  * bundles. Because the forward-gate verified signature + gate (`rule`) + name before any
  * bundle was stored, the tally never re-does that work: it only sums *weight magnitude*
- * per board and orders the rows. In v1 the weight rule is `constant`, so this does
+ * per community and orders the rows. In v1 the weight rule is `constant`, so this does
  * ZERO chain reads (see DESIGN.md "Tally"). The reserved balance-derived weight path
  * (`erc20-balance`) is where the lazy ceiling/floor early-stop would live; v1 has a trivial
  * `1` ceiling per vote, so the common case simply sums.
  *
- * Rows are keyed by `board.publicKey`, so votes carrying different (but registry-verified)
+ * Rows are keyed by `community.publicKey`, so votes carrying different (but registry-verified)
  * names for the same key fold into one row. Ties are broken by the rolling seed
  * `sha256(bucketBlockHash ‖ publicKey)` — ungrindable because a future block hash cannot be
  * predicted — and the one block-hash read happens only when an actual tie must be broken.
@@ -68,7 +68,7 @@ export function makeTally(deps: TallyDeps): Tally {
         return score;
     };
 
-    /** The rolling tie seed for a board: sha256(bucketBlockHash ‖ publicKey bytes). */
+    /** The rolling tie seed for a community: sha256(bucketBlockHash ‖ publicKey bytes). */
     const tieSeed = async (blockHash: Uint8Array, publicKey: string): Promise<Uint8Array> => {
         const pkBytes = base58btc.decode(`z${publicKey}`);
         const buf = new Uint8Array(blockHash.length + pkBytes.length);
@@ -79,22 +79,22 @@ export function makeTally(deps: TallyDeps): Tally {
 
     return {
         async compute(_options?: TallyOptions): Promise<ContestTally> {
-            // Aggregate weight per board.publicKey; fold registry-verified names into one row.
+            // Aggregate weight per community.publicKey; fold registry-verified names into one row.
             const rows = new Map<string, { name?: string; weight: bigint }>();
             for (const bundle of current()) {
                 if (bundle.votes.length === 0) continue; // withdrawal — expresses no vote
                 const w = await weightFor(bundle.address, bundle.blockNumber);
                 for (const v of bundle.votes) {
-                    const pk = v.board.publicKey;
+                    const pk = v.community.publicKey;
                     const row = rows.get(pk) ?? { weight: 0n };
                     row.weight += w;
-                    if (!row.name && v.board.name) row.name = v.board.name;
+                    if (!row.name && v.community.name) row.name = v.community.name;
                     rows.set(pk, row);
                 }
             }
 
-            const list: BoardTally[] = [...rows.entries()].map(([publicKey, row]) => ({
-                board: row.name ? { name: row.name, publicKey } : { publicKey },
+            const list: CommunityTally[] = [...rows.entries()].map(([publicKey, row]) => ({
+                community: row.name ? { name: row.name, publicKey } : { publicKey },
                 weight: row.weight,
                 verified: true // every contributing bundle was validity-gated before storage
             }));
@@ -109,10 +109,10 @@ export function makeTally(deps: TallyDeps): Tally {
 
             const blockHash = await bucketBlockHash();
             const seeds = new Map<string, Uint8Array>();
-            for (const r of list) seeds.set(r.board.publicKey, await tieSeed(blockHash, r.board.publicKey));
+            for (const r of list) seeds.set(r.community.publicKey, await tieSeed(blockHash, r.community.publicKey));
             list.sort((a, b) => {
                 if (a.weight !== b.weight) return a.weight < b.weight ? 1 : -1;
-                return compareBytes(seeds.get(a.board.publicKey)!, seeds.get(b.board.publicKey)!);
+                return compareBytes(seeds.get(a.community.publicKey)!, seeds.get(b.community.publicKey)!);
             });
             return { contestId: criteria.contestId, ranking: list };
         }

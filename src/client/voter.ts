@@ -183,9 +183,9 @@ export interface PubsubVoterOptions {
     /** Rule overrides that shadow built-ins by `type` (a flat `type -> rule` map). */
     rules?: RuleRegistry;
     /**
-     * Board-name resolvers, same instances a host gives pkc-js (e.g.
+     * Community-name resolvers, same instances a host gives pkc-js (e.g.
      * `@bitsocial/bso-resolver` for `name.bso`). The tally resolves each vote's
-     * `board.name` claim through the first resolver whose `canResolve` matches and
+     * `community.name` claim through the first resolver whose `canResolve` matches and
      * drops bundles whose name does not resolve to the claimed `publicKey`. Omit only
      * if no contest's votes carry names — with no resolver for a carried name's TLD,
      * the claim cannot be verified and the bundle is dropped (never counted unchecked).
@@ -212,7 +212,7 @@ interface ResolvedDeps {
     signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
     registry: RuleRegistry;
-    /** Board-name resolvers for verifying `board.name` claims at tally time. */
+    /** Community-name resolvers for verifying `community.name` claims at tally time. */
     nameResolvers: NameResolver[];
     /** Persistence for this voter's own vote intents (in-memory unless a host injects one). */
     store: VoteStore;
@@ -542,7 +542,7 @@ class ContestNetwork implements VoteNetwork {
  * library never starts or assumes a particular node, but it must carry a gossipsub service
  * and a blockstore), a `chains` factory, the `manifest` this voter owns (required — every
  * contest is derived from it and addressed by `contestId`), an optional `signer`, and
- * optional `nameResolvers` (needed once votes carry board names). The library has no
+ * optional `nameResolvers` (needed once votes carry community names). The library has no
  * knowledge of pkc-js or any other host: a host passes its own running Helia node in directly.
  */
 export class PubsubVoter implements VoteClient {

@@ -16,27 +16,27 @@ const bundle = (votes: VotesBundle["votes"]): VotesBundle => ({
 
 describe("checkBundleConstraints — criteria-bound offline checks", () => {
     // With the v1 cap of 1, a wallet voting for two *different* communities exceeds
-    // maxVotesPerAddress and must be rejected. Both boards are distinct and legal at the
+    // maxVotesPerAddress and must be rejected. Both communities are distinct and legal at the
     // wire layer (VotesBundleSchema accepts the bundle), so this cannot be caught at parse
     // time — it is a runtime check against the criteria, which is why it lives here.
     it("rejects a bundle with more votes than maxVotesPerAddress (v1 = 1)", () => {
         const result = checkBundleConstraints(
             bundle([
-                { board: { publicKey: KEY }, vote: 1 },
-                { board: { publicKey: KEY_B }, vote: 1 }
+                { community: { publicKey: KEY }, vote: 1 },
+                { community: { publicKey: KEY_B }, vote: 1 }
             ]),
             bizCriteria()
         );
         expect(result.valid).toBe(false);
     });
 
-    it("accepts a single-board bundle within the cap", () => {
-        const result = checkBundleConstraints(bundle([{ board: { publicKey: KEY }, vote: 1 }]), bizCriteria());
+    it("accepts a single-community bundle within the cap", () => {
+        const result = checkBundleConstraints(bundle([{ community: { publicKey: KEY }, vote: 1 }]), bizCriteria());
         expect(result.valid).toBe(true);
     });
 
     it("rejects a vote outside voteSchema (v1 range is [1, 1])", () => {
-        const result = checkBundleConstraints(bundle([{ board: { publicKey: KEY }, vote: 2 }]), bizCriteria());
+        const result = checkBundleConstraints(bundle([{ community: { publicKey: KEY }, vote: 2 }]), bizCriteria());
         expect(result.valid).toBe(false);
     });
 

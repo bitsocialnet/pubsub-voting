@@ -9,7 +9,7 @@ import type { Vote } from "../schema/votes.js";
  * that across a process restart the voter must remember what it chose — but not the signed
  * bundles (those are immutable, content-addressed, and live in the host's Helia blockstore;
  * a stale `blockNumber` makes an old bundle useless). What it persists is the re-signable
- * *intent*: which boards this wallet picked in which contest. On `start()` the voter loads
+ * *intent*: which communities this wallet picked in which contest. On `start()` the voter loads
  * every stored intent and republishes it; the republish scheduler re-signs each on the
  * liveness cadence (`ceil(voteExpiryBuckets / 2)` buckets — see DESIGN.md "Lifecycle").
  *
@@ -27,7 +27,7 @@ export interface VoteIntent {
     /** The voting wallet address (recovered from the bundle signature). One intent per topic per address. */
     address: string;
     /**
-     * The boards this wallet chose. A non-empty intent is an active vote the scheduler re-signs
+     * The communities this wallet chose. A non-empty intent is an active vote the scheduler re-signs
      * (fresh `blockNumber`) each cadence to keep alive. An **empty array is a withdrawal
      * tombstone**: the empty bundle supersedes the prior vote under LWW, and the scheduler
      * re-announces its existing CID (never re-signing it) each cadence until it expires, then
