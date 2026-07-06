@@ -5,10 +5,10 @@
  * topic derivation, manifest derivation, the verify pipeline (signature + constraints +
  * gate + name resolution), the state-based grow-only LWW winner-set CRDT, the tally, and the
  * transport's validate-before-forward gossip gate (`VoteNetwork.start`/`castVotes`/`getTally`
- * are live).
- * The `PubsubVoter` client-level republish scheduler is the remaining stub. See DESIGN.md for
- * architecture, and "Transport" for the forward-gate that verifies a bundle (signature,
- * on-chain gate, board-name resolution) before gossipsub re-forwards it.
+ * are live), plus the `PubsubVoter` client-level republish scheduler and durable vote-intent
+ * persistence (Node SQLite / browser IndexedDB), so the full `start`/`stop`/`destroy` lifecycle
+ * works. See DESIGN.md for architecture, and "Transport" for the forward-gate that verifies a
+ * bundle (signature, on-chain gate, board-name resolution) before gossipsub re-forwards it.
  */
 
 // Schemas (runtime values) and their inferred types.

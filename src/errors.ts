@@ -1,21 +1,17 @@
 /**
  * Library error types.
  *
- * The engine is implemented — schemas, encoding, topic/manifest derivation, the verify
- * pipeline, the Merkle-CRDT, the tally, and the transport's validate-before-forward gossip
- * gate — so `VoteNetwork.start`/`castVotes`/`getTally` are live. The remaining stub is the
- * `PubsubVoter` client-level republish scheduler, which still throws `NotImplementedError`.
- * See DESIGN.md.
+ * The engine and client lifecycle are implemented — schemas, encoding, topic/manifest
+ * derivation, the verify pipeline, the Merkle-CRDT, the tally, the transport's
+ * validate-before-forward gossip gate, and the `PubsubVoter` republish scheduler with durable
+ * persistence — so `VoteNetwork.start`/`castVotes`/`getTally` and `PubsubVoter.start`/`stop`/
+ * `destroy` are live. What remains is host-blocked (cold-start fetch, checkpoints); see DESIGN.md.
  */
 
-/** Thrown by the facade paths that are not yet implemented (the client-level republish scheduler). */
+/** Thrown by any facade path deferred to a later version (none in v1's shipped surface). */
 export class NotImplementedError extends Error {
     constructor(what: string) {
-        super(
-            `${what} is not implemented yet. The engine (verify, CRDT, tally, and the transport ` +
-                `forward-gate) is live; the client-level republish scheduler is the remaining stub. ` +
-                `See DESIGN.md.`
-        );
+        super(`${what} is not implemented yet. See DESIGN.md / ROADMAP.md.`);
         this.name = "NotImplementedError";
     }
 }

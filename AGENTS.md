@@ -1,6 +1,6 @@
 # Agent Instructions for @bitsocial/pubsub-votes
 
-Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. The **engine is implemented** (schemas, canonical encoding, topic/manifest derivation, the `PubsubVoter` facade, the CRDT, transport, verify, tally, and chain reads — `VoteNetwork.start`/`castVotes`/`getTally` are live); the **client-level republish scheduler** is the one remaining stub (`PubsubVoter.start()` still throws `NotImplementedError`). Read [DESIGN.md](./DESIGN.md) before changing anything.
+Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. The **engine and client lifecycle are implemented** (schemas, canonical encoding, topic/manifest derivation, the `PubsubVoter` facade, the CRDT, transport, verify, tally, chain reads, the **client-level republish scheduler**, and durable vote-intent persistence via Node SQLite / browser IndexedDB — `VoteNetwork.start`/`castVotes`/`getTally` and the full `PubsubVoter.start`/`stop`/`destroy` lifecycle are live). What remains is host-blocked deferred work: cold-start winner-CID sync over the libp2p fetch protocol (`fetchWinnerCidsFromPeer`) and checkpoint compaction. Read [DESIGN.md](./DESIGN.md) before changing anything.
 
 ## Scope rules
 

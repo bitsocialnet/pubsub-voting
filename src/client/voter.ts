@@ -29,7 +29,6 @@ import { selectVoteStore } from "../store/select.js";
 import {
     DuplicateContestIdError,
     MissingManifestError,
-    NotImplementedError,
     ReadOnlyError,
     UnknownContestError,
     UnknownRuleError
@@ -44,6 +43,17 @@ import {
 export function republishIntervalBuckets(criteria: Criteria): number {
     return Math.ceil(criteria.voteExpiryBuckets / 2);
 }
+
+/**
+ * Default wall-clock poll interval (ms) for the republish scheduler. The liveness cadence
+ * ({@link republishIntervalBuckets}) is measured in *buckets* (block counts) and the criteria
+ * carries no block-time, so the scheduler cannot arm a timer that fires exactly one cadence
+ * later. Instead it polls on this wall-clock interval and re-signs any intent whose bucket
+ * cadence is due (see `ContestNetwork.republishIfDue`). Buckets are large (day-scale in the
+ * 5chan example) and the cadence spans many of them, so a coarse poll still detects due-ness
+ * well within the half-window slack; hosts tune it via `republishPollIntervalMs`.
+ */
+export const DEFAULT_REPUBLISH_POLL_MS = 600_000;
 
 /**
  * Public facade.
@@ -76,11 +86,19 @@ export interface VoteNetwork {
     stop(): Promise<void>;
 
     /**
-     * Sign the given votes into a bundle for the current bucket, add it to the CRDT,
-     * and broadcast the new winner CIDs. Pass an empty array to withdraw (a newer empty
-     * bundle supersedes the prior one under LWW). Throws `ReadOnlyError` with no signer.
+     * Sign the given votes into a bundle for the current bucket, add it to the CRDT, and
+     * broadcast the new winner CIDs. Pass an empty array to withdraw: a newer empty bundle
+     * supersedes the prior one under LWW, and the scheduler re-announces that tombstone (without
+     * re-signing it) until it expires, then drops it. Throws `ReadOnlyError` with no signer.
      */
     castVotes(votes: Vote[]): Promise<VotesBundle>;
+
+    /**
+     * Stop keeping this wallet's vote in this contest alive — drop the stored intent so the
+     * scheduler stops re-signing it and the vote decays at its own expiry (passive withdrawal;
+     * publishes nothing, unlike `castVotes([])` which actively supersedes). Idempotent.
+     */
+    forget(): Promise<void>;
 
     /** Current contest ranking, verified lazily top-down. */
     getTally(options?: TallyOptions): Promise<ContestTally>;
@@ -101,6 +119,13 @@ export interface VoteClient {
      * topic, so repeated calls for the same contest return the same object.
      */
     getContest(args: { contestId: string }): Promise<VoteNetwork>;
+    /**
+     * Stop keeping this wallet's vote in one contest alive: drop its stored intent so the
+     * scheduler stops re-signing it and the vote decays at its own expiry (passive withdrawal;
+     * publishes nothing, unlike `castVotes([])` which actively supersedes). The `contestId` must
+     * name a contest in this voter's manifest, else `UnknownContestError`. Idempotent.
+     */
+    forget(args: { contestId: string }): Promise<void>;
     /**
      * Join every contest in the constructor `manifest`, start each network, and arm the
      * republish scheduler that keeps this wallet's own votes alive by re-signing them with a
@@ -166,6 +191,15 @@ export interface PubsubVoterOptions {
      * the claim cannot be verified and the bundle is dropped (never counted unchecked).
      */
     nameResolvers?: NameResolver[];
+    /**
+     * Wall-clock interval (ms) at which the republish scheduler polls each contest to re-sign
+     * this wallet's stored vote on the liveness cadence. Defaults to
+     * {@link DEFAULT_REPUBLISH_POLL_MS}. The cadence itself is bucket-based and per-contest
+     * (`ceil(voteExpiryBuckets / 2)`); this only sets how often the scheduler checks whether a
+     * contest is due. Lower it to react faster (at more RPC head reads); tests use a tiny value
+     * with fake timers. Ignored on a read-only voter (no signer ⇒ nothing to republish).
+     */
+    republishPollIntervalMs?: number;
 }
 
 interface ResolvedDeps {
@@ -236,6 +270,15 @@ class ContestNetwork implements VoteNetwork {
      * closure stays sync while still dropping decayed votes. Coarse-stale is fine — buckets are large.
      */
     #currentBucketCache = 0;
+    /**
+     * Bucket of the last tombstone re-announce (or the withdrawal itself), so a live
+     * empty-votes withdrawal is re-broadcast on the liveness cadence — not every poll tick —
+     * to reach peers that missed its one-shot flood. In-memory only: `undefined` means "due
+     * now" (so a restart re-announces a still-live tombstone once, then rides the cadence).
+     * Re-announcing rebroadcasts the *existing* bundle CID; it never re-signs (see
+     * {@link republishIfDue}). See DESIGN.md "Cancelling a vote".
+     */
+    #lastTombstoneAnnounceBucket: number | undefined = undefined;
 
     constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
@@ -399,10 +442,83 @@ class ContestNetwork implements VoteNetwork {
 
         await this.#crdt.add(bundle);
         await this.#transport?.broadcastWinnerCids(this.#crdt.winnerCids(bucket));
-        // Persist the re-signable intent so the republish scheduler can revive it after restart.
+        // Persist the intent so the scheduler can revive/re-announce it after a restart. A
+        // withdrawal (empty `votes`) is a tombstone: it is broadcast once here to supersede the
+        // prior vote under LWW, then the scheduler *re-announces its existing CID* (never
+        // re-signs it) on the liveness cadence until it expires, at which point the intent is
+        // dropped and the bundle decays via expiry + prune. Its blockNumber exceeds the vote it
+        // supersedes, so that vote decays strictly earlier — the tombstone need only ride out its
+        // own expiry, never an immortal one. See DESIGN.md "Cancelling a vote".
         await this.#deps.store.put({ topic: this.topic, address, votes, lastBucket: this.#bucketMath.bucketForBlock(blockNumber) });
+        // This broadcast counts as the tombstone's first announce; the next is one cadence away.
+        if (votes.length === 0) this.#lastTombstoneAnnounceBucket = bucket;
         this.#notifyUpdate();
         return bundle;
+    }
+
+    /**
+     * The republish scheduler's per-contest tick. Reloads this wallet's stored intent and acts
+     * on the liveness cadence (`republishIntervalBuckets`):
+     *   - **Active vote** (non-empty votes): if due, re-sign it with a fresh `blockNumber` via
+     *     {@link castVotes} — which re-broadcasts and writes the bumped `lastBucket` back — so the
+     *     vote stays alive.
+     *   - **Tombstone** (empty votes, from `castVotes([])`): while its bundle is still live,
+     *     *re-announce its existing CID* (re-broadcast the current winner CIDs — NO re-sign, so
+     *     the expiry clock is untouched) once per cadence, reaching peers that missed the
+     *     withdrawal's one-shot flood. Once the tombstone has expired, drop the intent — the
+     *     bundle decays via expiry + prune. A tombstone is never re-signed (that would make it
+     *     immortal); only re-announced.
+     * Also prunes decayed CRDT nodes each tick, gated on non-empty state. When there is no intent
+     * AND no state, it returns before any chain read, so an idle contest still reads no chain. A
+     * read-only voter or a contest this wallet never voted in is a no-op. Called on `start()` (to
+     * revive after a restart) and per poll.
+     */
+    async republishIfDue(): Promise<void> {
+        if (this.readOnly) return;
+        const intent = await this.#deps.store.get(this.topic);
+        const hasState = this.#crdt.nodeCount() > 0;
+        if (intent === undefined && !hasState) return; // nothing to do; no chain read
+        const bucket = await this.#refreshBucket();
+        if (intent !== undefined) {
+            if (intent.votes.length === 0) {
+                await this.#tickTombstone(intent.lastBucket, bucket);
+            } else if (intent.lastBucket + republishIntervalBuckets(this.criteria) <= bucket) {
+                await this.castVotes(intent.votes);
+            }
+        }
+        if (hasState) await this.#crdt.prune(bucket);
+    }
+
+    /**
+     * Advance a live withdrawal tombstone: re-announce its existing CID on the liveness cadence
+     * (never re-signing — the expiry clock stays fixed), and once the bundle has expired drop the
+     * intent so it stops. `withdrawalBucket` is the intent's `lastBucket` (set once by
+     * {@link castVotes}); the tombstone bundle matches the CRDT's own expiry predicate,
+     * `currentBucket > withdrawalBucket + voteExpiryBuckets`.
+     */
+    async #tickTombstone(withdrawalBucket: number, bucket: number): Promise<void> {
+        if (bucket > withdrawalBucket + this.criteria.voteExpiryBuckets) {
+            await this.#deps.store.delete(this.topic);
+            this.#lastTombstoneAnnounceBucket = undefined;
+            return;
+        }
+        const anchor = this.#lastTombstoneAnnounceBucket;
+        if (anchor === undefined || bucket - anchor >= republishIntervalBuckets(this.criteria)) {
+            // Re-announce the existing winner CIDs (the tombstone included, while live) so a peer
+            // that missed the flood converges within a cadence. No re-sign, no `lastBucket` bump.
+            await this.#transport?.broadcastWinnerCids(this.#crdt.winnerCids(bucket));
+            this.#lastTombstoneAnnounceBucket = bucket;
+        }
+    }
+
+    /**
+     * Stop keeping this wallet's vote in this contest alive — drop the stored intent so the
+     * scheduler stops re-signing it and the vote decays at its own expiry (passive withdrawal;
+     * publishes nothing, unlike `castVotes([])` which actively supersedes). Idempotent.
+     */
+    async forget(): Promise<void> {
+        await this.#deps.store.delete(this.topic);
+        this.#lastTombstoneAnnounceBucket = undefined;
     }
 
     async getTally(options?: TallyOptions): Promise<ContestTally> {
@@ -439,12 +555,10 @@ export class PubsubVoter implements VoteClient {
      * `getContest` and `start()` both read from it, and it fixes `contestIds` order.
      */
     readonly #criteriaById: Map<string, Criteria>;
-    /**
-     * Live republish timers, one per contest, cleared by `stop()` / `destroy()`. The
-     * registry and its teardown are real now; arming it (the re-sign tick) lands with the
-     * engine — see `#armRepublishScheduler`.
-     */
+    /** Live republish timers, one per contest, cleared by `stop()` / `destroy()`. */
     readonly #republishTimers = new Set<ReturnType<typeof setInterval>>();
+    /** Wall-clock poll interval (ms) for the republish scheduler. */
+    readonly #republishPollIntervalMs: number;
 
     constructor(options: PubsubVoterOptions) {
         // Fail fast: the node must expose a gossipsub service and a blockstore. Throws
@@ -461,6 +575,7 @@ export class PubsubVoter implements VoteClient {
             nameResolvers: options.nameResolvers ?? [],
             store: selectVoteStore(options.dataPath)
         };
+        this.#republishPollIntervalMs = options.republishPollIntervalMs ?? DEFAULT_REPUBLISH_POLL_MS;
 
         // The manifest is mandatory in v1: derive every contest up front, validate each
         // against the rule registry, and reject a duplicate `contestId` — the id is how a
@@ -488,6 +603,13 @@ export class PubsubVoter implements VoteClient {
         return this.#network(criteria);
     }
 
+    async forget(args: { contestId: string }): Promise<void> {
+        const criteria = this.#criteriaById.get(args.contestId);
+        if (!criteria) throw new UnknownContestError(args.contestId, [...this.#criteriaById.keys()]);
+        const network = await this.#network(criteria);
+        await network.forget();
+    }
+
     /** Build (or return the cached) network for one already-validated criteria, keyed by topic. */
     async #network(criteria: Criteria): Promise<ContestNetwork> {
         const cid = await criteriaCid(criteria);
@@ -507,9 +629,7 @@ export class PubsubVoter implements VoteClient {
             // returns local winner CIDs and relies on live gossip to converge. See ROADMAP.md.
             await network.start();
         }
-        // NOTE: still throws NotImplementedError — the client-level republish scheduler is
-        // the one remaining stub, so `PubsubVoter.start()` is not yet usable end-to-end.
-        this.#armRepublishScheduler(networks);
+        await this.#armRepublishScheduler(networks);
     }
 
     async stop(): Promise<void> {
@@ -534,15 +654,32 @@ export class PubsubVoter implements VoteClient {
     }
 
     /**
-     * Arm the per-contest republish loop. Deferred with the engine: each contest's tick
-     * will reload its `VoteIntent` from `this.#deps.store`, re-sign it with a fresh
-     * `blockNumber` via `castVotes`, and `store.put` the bumped `lastBucket`, on the
-     * `republishIntervalBuckets(criteria)` cadence — populating `#republishTimers` so
-     * `stop()` / `destroy()` can tear it down. Throws until built.
+     * Arm the per-contest republish loop that keeps this wallet's votes alive. Each contest's
+     * {@link ContestNetwork.republishIfDue} tick reloads its `VoteIntent`, re-signs it on the
+     * `republishIntervalBuckets(criteria)` bucket cadence (via `castVotes`, which re-broadcasts
+     * and writes the bumped `lastBucket`), and prunes decayed CRDT nodes. Since the cadence is
+     * bucket-based but timers are wall-clock, each contest polls on `#republishPollIntervalMs`.
+     *
+     * On `start()` every stored intent is republished immediately (DESIGN.md "on start() the
+     * voter lists every intent and republishes it") so a vote revives after a restart, then a
+     * poll timer is armed per contest and tracked in `#republishTimers` for `stop()`/`destroy()`
+     * teardown. A read-only voter (no signer) has no intents to keep alive, so it arms nothing.
      */
-    #armRepublishScheduler(_networks: VoteNetwork[]): void {
-        throw new NotImplementedError(
-            "PubsubVoter republish scheduler (re-sign + rebroadcast on the liveness cadence)"
-        );
+    async #armRepublishScheduler(networks: ContestNetwork[]): Promise<void> {
+        if (this.readOnly) return;
+        // Revive every stored intent up front (post-restart catch-up), tolerating per-contest
+        // failures so one unreachable chain does not block the others.
+        await Promise.allSettled(networks.map((network) => network.republishIfDue()));
+        for (const network of networks) {
+            const timer = setInterval(() => {
+                // Fire-and-forget: a transient failure (RPC read, broadcast) is retried next tick
+                // and must never crash the loop or the other contests' timers.
+                void network.republishIfDue().catch(() => {});
+            }, this.#republishPollIntervalMs);
+            // Don't let the scheduler hold a Node process open; no-op in the browser (where
+            // setInterval returns a number with no `unref`).
+            (timer as { unref?: () => void }).unref?.();
+            this.#republishTimers.add(timer);
+        }
     }
 }

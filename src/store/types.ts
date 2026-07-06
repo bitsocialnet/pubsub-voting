@@ -20,16 +20,19 @@ import type { Vote } from "../schema/votes.js";
  * tested against an in-memory store with no I/O.
  */
 
-/** One contest's re-signable choice for this wallet. Empty `votes` is a withdrawal intent. */
+/** One contest's re-signable (or, when empty, re-announceable) choice for this wallet. */
 export interface VoteIntent {
     /** The gossipsub topic this intent votes in = "bitsocial-votes/" + CID(dag-cbor(criteria)). */
     topic: string;
     /** The voting wallet address (recovered from the bundle signature). One intent per topic per address. */
     address: string;
     /**
-     * The boards this wallet chose. An empty array is a real, republishable intent: an
-     * empty bundle supersedes an earlier vote under LWW (withdrawal), so it too must be
-     * kept alive until it expires. See DESIGN.md "Cancelling a vote".
+     * The boards this wallet chose. A non-empty intent is an active vote the scheduler re-signs
+     * (fresh `blockNumber`) each cadence to keep alive. An **empty array is a withdrawal
+     * tombstone**: the empty bundle supersedes the prior vote under LWW, and the scheduler
+     * re-announces its existing CID (never re-signing it) each cadence until it expires, then
+     * deletes the intent — the bundle decays on its own via expiry + prune. See DESIGN.md
+     * "Cancelling a vote".
      */
     votes: Vote[];
     /** The bucket of the last successful republish, so the scheduler knows when the next is due. */

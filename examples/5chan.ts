@@ -8,8 +8,8 @@
  * `MissingPubsubError` / `MissingBlockstoreError`. This is the same shape every host uses
  * (see seedit.ts). 5chan has one directory manifest with 63 slots; the client derives one
  * criteria document (one topic) per slot and renders the winning board for each.
- * Type-checks against the public API; the live engine methods throw `NotImplementedError`
- * until built.
+ * Type-checks against the public API, and every method used here — `start`, `castVotes`,
+ * `forget`, `getTally`, `stop`/`destroy`, and the republish scheduler — is live.
  */
 import { readFileSync } from "node:fs";
 import stripJsonComments from "strip-json-comments";
@@ -71,8 +71,9 @@ if (!biz.readOnly) {
     // `name` must be the board's resolvable domain (unique per community); the tally
     // drops any vote whose name does not resolve to the claimed publicKey.
     await biz.castVotes([{ board: { name: "bizfinance.bso", publicKey: "12D3KooW...someBoardKey" }, vote: 1 }]);
-    // Withdraw later by publishing an empty bundle:
-    await biz.castVotes([]);
+    // Withdraw later, two ways:
+    await biz.castVotes([]);                    // active: broadcast an empty bundle that supersedes under LWW; the scheduler re-announces the tombstone (no re-sign) until it expires, then drops it
+    await voter.forget({ contestId: "biz" });   // passive: drop the stored intent, publish nothing, and let the vote decay at its own expiry
 }
 
 // On shutdown: stop every republish loop, leave all topics, and dispose the vote store.
