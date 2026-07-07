@@ -1,3 +1,4 @@
+import type { CID } from "multiformats/cid";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./types.js";
 import { MissingBlockstoreError, MissingFetchError, MissingPubsubError } from "../errors.js";
 
@@ -28,8 +29,21 @@ function isPubsubService(value: unknown): value is PubsubService {
     );
 }
 
+/**
+ * The host's raw blockstore surface. `get` may return EITHER a `Promise<Uint8Array>` (a plain
+ * `interface-blockstore`) OR an async generator yielding the block's bytes — Helia's real
+ * `BlockStorage` implements the streaming `Blocks` interface and yields the block (one chunk in
+ * practice), not a bare promise. The library works against the simpler {@link BlockstoreLike}
+ * contract, so {@link adaptBlockstore} normalises either shape at this one boundary.
+ */
+interface RawBlockstore {
+    get(cid: CID, options?: { signal?: AbortSignal }): AsyncIterable<Uint8Array> | Promise<Uint8Array>;
+    put(cid: CID, block: Uint8Array, options?: { signal?: AbortSignal }): Promise<CID>;
+    has(cid: CID, options?: { signal?: AbortSignal }): Promise<boolean>;
+}
+
 /** Does `value` look like a blockstore we can fetch/store blocks through? */
-function isBlockstoreLike(value: unknown): value is BlockstoreLike {
+function isRawBlockstore(value: unknown): value is RawBlockstore {
     if (value === null || typeof value !== "object") return false;
     const candidate = value as Record<string, unknown>;
     return (
@@ -37,6 +51,41 @@ function isBlockstoreLike(value: unknown): value is BlockstoreLike {
         typeof candidate.put === "function" &&
         typeof candidate.has === "function"
     );
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
+    return value !== null && typeof value === "object" && Symbol.asyncIterator in value;
+}
+
+/**
+ * Adapt a raw blockstore to the library's {@link BlockstoreLike} contract: normalise `get` to a
+ * single `Uint8Array`. Helia's `BlockStorage.get` yields the block over an async generator (a
+ * single chunk for the sub-1 MiB blocks this library stores; chunks are concatenated defensively),
+ * while a plain blockstore returns a promise — both are handled. `put`/`has` already return
+ * promises, so they pass through. Exported so the transport (and the integration harness) adapt the
+ * injected node the same way.
+ */
+export function adaptBlockstore(raw: RawBlockstore): BlockstoreLike {
+    return {
+        async get(cid, options) {
+            const result = raw.get(cid, options);
+            if (!isAsyncIterable(result)) return result; // a plain Promise<Uint8Array> blockstore
+            const chunks: Uint8Array[] = [];
+            for await (const chunk of result) chunks.push(chunk);
+            if (chunks.length === 1) return chunks[0]!;
+            if (chunks.length === 0) throw new Error(`block ${cid.toString()} yielded no bytes`);
+            const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+            const out = new Uint8Array(total);
+            let offset = 0;
+            for (const chunk of chunks) {
+                out.set(chunk, offset);
+                offset += chunk.length;
+            }
+            return out;
+        },
+        put: (cid, block) => raw.put(cid, block),
+        has: (cid) => raw.has(cid)
+    };
 }
 
 /** Does `value` look like a libp2p fetch service (the request + responder registration)? */
@@ -64,8 +113,8 @@ export function requireHeliaServices(helia: HeliaInstance): {
     const pubsub: unknown = helia.libp2p?.services?.pubsub;
     if (!isPubsubService(pubsub)) throw new MissingPubsubError();
     const blockstore: unknown = helia.blockstore;
-    if (!isBlockstoreLike(blockstore)) throw new MissingBlockstoreError();
+    if (!isRawBlockstore(blockstore)) throw new MissingBlockstoreError();
     const fetch: unknown = (helia.libp2p?.services as Record<string, unknown> | undefined)?.fetch;
     if (!isFetchService(fetch)) throw new MissingFetchError();
-    return { pubsub, blockstore, fetch };
+    return { pubsub, blockstore: adaptBlockstore(blockstore), fetch };
 }

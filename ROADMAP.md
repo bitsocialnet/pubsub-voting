@@ -17,7 +17,7 @@ Token-weighting, ERC-20 in either slot, rule combining, and multi-chain resoluti
 
 ## Status
 
-The engine, client lifecycle, and live-delta transport are implemented and unit-tested; the remaining gaps are host-side pkc-js configuration and the two-node integration test. Accurate as of this file's commit — verify against the tree, not this list, if they drift.
+The engine, client lifecycle, and live-delta transport are implemented and unit-tested, and the two-node gossipsub integration test now exercises them against real `@libp2p/gossipsub`; the only remaining gap is host-side pkc-js configuration. Accurate as of this file's commit — verify against the tree, not this list, if they drift.
 
 ### Done (implemented + unit-tested)
 
@@ -33,17 +33,18 @@ The engine, client lifecycle, and live-delta transport are implemented and unit-
 - rules: `erc721-min-balance` + `constant` (registered); `erc20-balance` present in-tree and unit-tested but **not registered** (see Deferred)
 - facade: `VoteNetwork.start` / `castVotes` / `getTally`; full `PubsubVoter.start`/`stop`/`destroy` lifecycle with the client republish scheduler (per-contest `ceil(voteExpiryBuckets / 2)` liveness cadence)
 - vote-intent persistence backends: Node SQLite under `dataPath` (WAL) and browser IndexedDB behind the `VoteStore` interface (in-memory fallback without `dataPath`)
+- **two-node gossipsub integration test** (`src/transport/integration/`, run via `npm run test:integration`, excluded from the unit `npm test`): two real loopback libp2p + Helia nodes on `@libp2p/gossipsub` `16.0.3` pinning what a fake cannot — an invalid inline bundle is not forwarded and its sender is `reject`-scored (P₄); a valid one is forwarded and merges; a verify past the deadline yields `ignore` with no penalty and is re-evaluable (uncached); a converged pair's matching root triggers no chase; a divergent root is chased over directed bitswap to convergence. It surfaced a latent bug — the injected Helia `blockstore.get` is an async generator, now normalised by `adaptBlockstore` (`src/transport/helia.ts`)
 
 ### Remaining for v1
 
-1. **Two-node gossipsub integration test.** Real `@libp2p/gossipsub`, gated behind an integration flag, pinning what a fake cannot prove: an invalid inline bundle is not forwarded and its sender is `reject`-scored; a valid one is forwarded and merges on the peer; a slow verify past the 10s deadline yields `ignore` with no penalty; heartbeat suppression stays quiet on a converged pair; a divergent root triggers a directed-bitswap chase that converges the pair.
+Nothing in this repository. The only outstanding work is the host-side pkc-js configuration below.
 
 ### Deferred pkc-js work (external dependency)
 
 - A documented, version-stable accessor on pkc-js that returns the Helia node (with `libp2p.services.pubsub`, `blockstore`, and a registered `fetch` service), so consumers stop reaching through the private `._helia` field.
 - **Adding `@libp2p/fetch` to the shared node's construction.** This library registers its own lookup function and runs its own requester against `libp2p.services.fetch` (see Done, root-record checkpoint sync) — the host only has to carry the service; `PubsubVoter` throws `MissingFetchError` at construction until it does.
 
-Filed as [pkc-js#183](https://github.com/pkcprotocol/pkc-js/issues/183) (gossipsub >= 15.0.23 + `@libp2p/fetch` on the shared node, with the accessor and score-tuning follow-ups noted).
+Filed as [pkc-js#183](https://github.com/pkcprotocol/pkc-js/issues/183) (gossipsub >= 15.0.23 + `@libp2p/fetch` on the shared node, with the accessor and score-tuning follow-ups noted). pkc-js currently ships gossipsub `16.0.2`; this library pins the latest, `16.0.3`, so a follow-up asks the host to match.
 
 ## Deferred (designed, not shipped)
 
