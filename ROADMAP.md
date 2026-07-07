@@ -17,7 +17,7 @@ Token-weighting, ERC-20 in either slot, rule combining, and multi-chain resoluti
 
 ## Status
 
-The engine and client lifecycle are implemented and unit-tested; the remaining gap is the **live-delta transport migration** (see DESIGN.md's migration note). Accurate as of this file's commit — verify against the tree, not this list, if they drift.
+The engine, client lifecycle, and live-delta transport are implemented and unit-tested; the remaining gaps are host-side pkc-js configuration and the two-node integration test. Accurate as of this file's commit — verify against the tree, not this list, if they drift.
 
 ### Done (implemented + unit-tested)
 
@@ -25,9 +25,10 @@ The engine and client lifecycle are implemented and unit-tested; the remaining g
 - topic derivation (`topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`) and manifest → per-contest criteria derivation
 - EIP-712 ballot signer + **frozen conformance vector** (the cross-client wire spec)
 - verify pipeline: signature + `address`-recovery + criteria constraints + on-chain gate (`rule`) + community-name resolution, with a per-bundle verdict cache
-- state-based CRDT: LWW winner-set keyed by wallet, dag-cbor codec, in-memory node store; forward-gate anti-amplification caches (gate-result + accepted-dedup); network-free checkpoint codec + bucket-cadenced cut
+- state-based CRDT: LWW winner-set keyed by wallet, **binary** dag-cbor bundle codec (frozen byte vector), in-memory node store; forward-gate anti-amplification caches (gate-result + accepted-dedup)
 - tally: deterministic per-contest aggregation over pre-validated bundles, rolling-seed tiebreak
-- transport **validate-before-forward gossip gate** (`src/transport/gossip-validator.ts`): the full pipeline runs in an async topic validator before `forwardMessage`
+- transport **validate-before-forward gossip gate** (`src/transport/gossip-validator.ts`) over the two-kind pubsub union (**one inline bundle per message** with the criteria-derived size cap, or a **root record**): the full pipeline runs on the inlined bytes in an async topic validator before `forwardMessage` — no fetch on the live path
+- **root-record checkpoint sync**: on-demand checkpoint encode (dirty-flag cached, blocks blockstore-backed), the suppressed 10-min root heartbeat, the libp2p-fetch responder + `k = 4` cold-join requester (`MissingFetchError` construction guard), and the bounded directed-bitswap chase of divergent roots (`src/transport/chase.ts`)
 - chain bucket math and chainTicker → RPC
 - rules: `erc721-min-balance` + `constant` (registered); `erc20-balance` present in-tree and unit-tested but **not registered** (see Deferred)
 - facade: `VoteNetwork.start` / `castVotes` / `getTally`; full `PubsubVoter.start`/`stop`/`destroy` lifecycle with the client republish scheduler (per-contest `ceil(voteExpiryBuckets / 2)` liveness cadence)
@@ -35,14 +36,12 @@ The engine and client lifecycle are implemented and unit-tested; the remaining g
 
 ### Remaining for v1
 
-1. **Live-delta wire migration.** Switch the pubsub payload from winner-CID lists + bitswap fetch to the two-kind discriminated union — **one inline bundle per message**, or a **root record** — with the criteria-derived per-message size cap, and drop the gate's fetch machinery (`GATE_FETCH_TIMEOUT_MS`, the fetch `p-limit`, `transport/winner-cids.ts`). Includes the **binary bundle block encoding** (address 20 B, signature 65 B raw, publicKey raw multihash; ~2× smaller, new frozen byte vector) and the 253-byte `name` cap in `VotesBundleSchema`. See DESIGN.md's migration note, [Transport](./DESIGN.md#transport-gossipsub-topic--validation), and [Bundle wire encoding](./DESIGN.md#bundle-wire-encoding-size).
-2. **Root-record checkpoint sync.** On-demand checkpoint encode (dirty-flag cached, blocks written to the blockstore; the bucket cadence survives as compaction only), the **root heartbeat** on the topic (10 min ± jitter, suppression, one-per-interval), the **libp2p-fetch pull** (responder lookup for `"bitsocial-votes/" + criteriaCid + "/root"` + `k = 4` cold-join requester, `MissingFetchError` construction guard), and the **directed-bitswap chase** of divergent roots through the existing verifier. See [DESIGN.md, Checkpoints](./DESIGN.md#checkpoints).
-3. **Two-node gossipsub integration test.** Real `@libp2p/gossipsub`, gated behind an integration flag, pinning what a fake cannot prove: an invalid inline bundle is not forwarded and its sender is `reject`-scored; a valid one is forwarded and merges on the peer; a slow verify past the 10s deadline yields `ignore` with no penalty; heartbeat suppression stays quiet on a converged pair; a divergent root triggers a directed-bitswap chase that converges the pair.
+1. **Two-node gossipsub integration test.** Real `@libp2p/gossipsub`, gated behind an integration flag, pinning what a fake cannot prove: an invalid inline bundle is not forwarded and its sender is `reject`-scored; a valid one is forwarded and merges on the peer; a slow verify past the 10s deadline yields `ignore` with no penalty; heartbeat suppression stays quiet on a converged pair; a divergent root triggers a directed-bitswap chase that converges the pair.
 
 ### Deferred pkc-js work (external dependency)
 
 - A documented, version-stable accessor on pkc-js that returns the Helia node (with `libp2p.services.pubsub`, `blockstore`, and a registered `fetch` service), so consumers stop reaching through the private `._helia` field.
-- **Adding `@libp2p/fetch` to the shared node's construction.** This library registers its own lookup function and runs its own requester against `libp2p.services.fetch` (#2 above) — the host only has to carry the service; `PubsubVoter` throws `MissingFetchError` at construction until it does.
+- **Adding `@libp2p/fetch` to the shared node's construction.** This library registers its own lookup function and runs its own requester against `libp2p.services.fetch` (see Done, root-record checkpoint sync) — the host only has to carry the service; `PubsubVoter` throws `MissingFetchError` at construction until it does.
 
 Track these as pkc-js issues and reference them here once filed.
 

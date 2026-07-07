@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: engine and client lifecycle implemented and unit-tested; transport migration in progress.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT, the tally, the transport's **validate-before-forward gossip gate**, the `PubsubVoter` client-level republish scheduler, and durable vote-intent persistence (Node SQLite / browser IndexedDB) are all implemented — so `start`, `castVotes`, `getTally`, and the full `PubsubVoter.start`/`stop`/`destroy` lifecycle are live. The gate runs the full validity pipeline in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. **The wire model is migrating** from winner-CID announcements + bitswap fetch to **live-delta gossip** (one inline bundle per message) with **root-record checkpoint sync** (libp2p-fetch pull + topic heartbeat, blocks via directed bitswap) — [DESIGN.md](./DESIGN.md) describes the target model and its migration note tracks shipped versus pending. See the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation) and [open questions](./DESIGN.md#open-questions).
+> **Status: engine, client lifecycle, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap), the `PubsubVoter` client-level republish scheduler, and durable vote-intent persistence (Node SQLite / browser IndexedDB) are all implemented — so `start`, `castVotes`, `getTally`, and the full `PubsubVoter.start`/`stop`/`destroy` lifecycle are live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) and the deferred two-node integration test — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -23,7 +23,7 @@ This library does not start its own node. It consumes the host's running Helia n
 ## Design at a glance
 
 - **Settings live in the topic.** `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. Two peers on the same topic provably ran identical rules, so the network validates itself with no intermediary.
-- **Votes are a state-based grow-only CRDT.** A signed `Votes` bundle is a standalone dag-cbor block (no parent links); each wallet gossips its own bundle **inline as a live delta**, validated straight from the message bytes — no fetch toward the publisher. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves. Cold start and gap-fill exchange a tiny **root record** (libp2p-fetch pull + a slow topic heartbeat) and pull the checkpoint blocks behind it via directed bitswap from its advertisers. (Code migration to this model is in progress — see DESIGN.md's migration note.)
+- **Votes are a state-based grow-only CRDT.** A signed `Votes` bundle is a standalone dag-cbor block (no parent links); each wallet gossips its own bundle **inline as a live delta**, validated straight from the message bytes — no fetch toward the publisher. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves. Cold start and gap-fill exchange a tiny **root record** (libp2p-fetch pull + a slow topic heartbeat) and pull the checkpoint blocks behind it via directed bitswap from its advertisers.
 - **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the NFT path — an `erc721-min-balance` gate `rule` (5chan Pass) and `constant` weight (1 pass = 1 vote). Balance-derived (token-weighted) voting is deferred; see [ROADMAP.md](./ROADMAP.md).
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
@@ -164,8 +164,9 @@ src/
   rules/         one file per `type` + registry/resolver          [implemented]
   chain/         ChainClient = viem PublicClient + bucket math     [implemented]
   verify/        signature + constraints + full BundleVerifier + verdict cache [implemented]
-  crdt/          state-based LWW winner-set: union, codec, in-memory store [implemented]
-  transport/     async validate-before-forward gossip gate + message codec (inline bundle / root record) + transport [implemented]
+  crdt/          state-based LWW winner-set: union, binary bundle codec, in-memory store [implemented]
+  checkpoint/    deterministic checkpoint codec (root manifest + size-capped chunks) [implemented]
+  transport/     async validate-before-forward gossip gate + message codec (inline bundle / root record) + root chase + transport [implemented]
   tally/         deterministic aggregation over pre-validated bundles [implemented]
   index.ts       public entry: re-exports + facade + design types
 ```

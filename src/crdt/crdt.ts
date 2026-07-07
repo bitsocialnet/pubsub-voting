@@ -58,8 +58,8 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
     /**
      * A bundle has decayed once the current bucket is past its `blockNumber`'s bucket plus the
      * expiry window (see DESIGN.md "Passive expiry"). This is the read-time filter that keeps an
-     * expired vote out of the tally and the broadcast winner CIDs — the same predicate `prune`
-     * uses to bound memory.
+     * expired vote out of the tally and the checkpoint — the same predicate `prune` uses to
+     * bound memory.
      */
     function isExpired(bundle: VotesBundle, currentBucket: number): boolean {
         return currentBucket > bucketMath.bucketForBlock(bundle.blockNumber) + voteExpiryBuckets;
@@ -104,16 +104,6 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
 
         async merge(cids: CID[]) {
             for (const cid of cids) await integrate(cid);
-        },
-
-        winnerCids(currentBucket) {
-            // The current winner CIDs, expiry-filtered: a wallet whose winning bundle has
-            // decayed contributes nothing, so an expired vote is never broadcast.
-            const winners: CID[] = [];
-            for (const entry of winnersByWallet().values()) {
-                if (!isExpired(entry.bundle, currentBucket)) winners.push(entry.cid);
-            }
-            return winners;
         },
 
         current(currentBucket) {

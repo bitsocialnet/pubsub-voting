@@ -36,24 +36,16 @@ export interface VoteCrdt {
     merge(cids: CID[]): Promise<void>;
 
     /**
-     * The current winner CIDs (the LWW winner per wallet — the only thing broadcast over
-     * pubsub), filtered to the given bucket: a wallet whose winning bundle has expired is
-     * dropped, so a decayed vote is never broadcast. `currentBucket` is
-     * `bucketForBlock(currentBlock)`.
-     */
-    winnerCids(currentBucket: number): CID[];
-
-    /**
      * LWW reduction (at most one bundle per wallet), filtered to the given bucket: a wallet
-     * whose winning bundle has expired drops out entirely, so the tally never counts a decayed
-     * vote. `currentBucket` is `bucketForBlock(currentBlock)`.
+     * whose winning bundle has expired drops out entirely, so neither the tally nor a
+     * checkpoint ever carries a decayed vote. `currentBucket` is `bucketForBlock(currentBlock)`.
      */
     current(currentBucket: number): VotesBundle[];
 
     /**
      * Drop bundles older than `voteExpiryBuckets` and those superseded per wallet from the
      * in-memory working set, bounding memory. Correctness does not depend on it — `current`
-     * and `winnerCids` filter expiry at read time — so this is housekeeping, not the guarantee.
+     * filters expiry at read time — so this is housekeeping, not the guarantee.
      */
     prune(currentBucket: number): Promise<void>;
 

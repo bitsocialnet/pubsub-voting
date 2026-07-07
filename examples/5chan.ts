@@ -4,8 +4,10 @@
  * The library never takes a pkc instance — it takes the host's running Helia node
  * directly (no adapter). 5chan runs on pkc-js, so it passes pkc's shared node, today
  * reached at `pkc.clients.libp2pJsClients[key]._helia`. That node must carry a gossipsub
- * service at `libp2p.services.pubsub` and a `blockstore`, or construction throws
- * `MissingPubsubError` / `MissingBlockstoreError`. This is the same shape every host uses
+ * service at `libp2p.services.pubsub`, a `blockstore`, and a libp2p fetch service at
+ * `libp2p.services.fetch` (`@libp2p/fetch` — the checkpoint root-record pull), or
+ * construction throws `MissingPubsubError` / `MissingBlockstoreError` /
+ * `MissingFetchError`. This is the same shape every host uses
  * (see seedit.ts). 5chan has one directory manifest with 63 slots; the client derives one
  * criteria document (one topic) per slot and renders the winning community for each.
  * Type-checks against the public API, and every method used here — `start`, `castVotes`,
@@ -38,7 +40,7 @@ declare const bsoResolver: NameResolver; // e.g. new BsoResolver({ key: "bso-vie
 // One voter for the whole app. The manifest is owned by the voter, so a single
 // `voter.start()` joins all 63 directory contests and keeps this wallet's votes
 // republished (re-signed with a fresh blockNumber on each contest's liveness cadence).
-// The Helia node (gossipsub + blockstore) is the only mandatory seam. `dataPath` (Node,
+// The Helia node (gossipsub + blockstore + fetch service) is the only mandatory seam. `dataPath` (Node,
 // same convention as pkc-js) keeps this wallet's vote intents in a SQLite file so
 // republishing resumes after a restart.
 const voter = new PubsubVoter({
