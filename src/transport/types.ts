@@ -1,18 +1,21 @@
 import type { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
 import type { Helia } from "helia";
+import type { RootRecord } from "./messages.js";
 
 /**
  * Transport interfaces. This is the ONLY part of the library that
  * touches libp2p/helia. The core (schema/verify/crdt/tally) does not import it, so the
  * engine is testable without a network.
  *
- * Two transports:
- *   - pubsub: broadcast and receive winner bundle CIDs (gossipsub), with a topic validator
- *     that drops invalid messages before the mesh re-forwards them.
- *   - fetch: resolve vote bundles by CID through the host's blockstore, and pull a
- *     peer's current winner CIDs on cold start, then union across peers so a single liar
- *     cannot hide a vote.
+ * Three exchanges (see DESIGN.md "Transport"):
+ *   - pubsub: broadcast and receive **inline bundle deltas** and **root-record heartbeats**
+ *     (gossipsub), with a topic validator that drops invalid messages before the mesh
+ *     re-forwards them.
+ *   - fetch protocol: pull a connected peer's current root record on cold start / reconnect,
+ *     then union across peers so a single liar cannot hide a vote.
+ *   - directed bitswap: pull the checkpoint blocks behind an advertised root from the
+ *     connected peers that advertised it (through the blockstore) — the only bitswap use.
  *
  * The library does not start a node and does not take a host SDK. It receives the
  * host's already-running **Helia node** directly (e.g. the value `createHelia` returns,
@@ -89,7 +92,7 @@ export type GossipTopicValidator = (
  * generics we do not need here.
  */
 export interface BlockstoreLike {
-    /** `options.signal` cancels an in-flight bitswap fetch — see the gate's per-fetch timeout. */
+    /** `options.signal` cancels an in-flight bitswap fetch — see the chase deadline (DESIGN.md "Checkpoints"). */
     get(cid: CID, options?: { signal?: AbortSignal }): Promise<Uint8Array>;
     put(cid: CID, block: Uint8Array): Promise<CID>;
     has(cid: CID): Promise<boolean>;
@@ -103,26 +106,18 @@ export interface BlockstoreLike {
  */
 export type HeliaInstance = Helia;
 
-/** Live winner-CID propagation over pubsub. */
+/** Live-delta propagation over pubsub (one inline bundle per message + root heartbeats). */
 export interface VoteTransport {
     /**
-     * Subscribe to the topic and install the cheap topic validator, built from the
-     * criteria (max CIDs per message, size cap, per-peer rate), then fetch and union
-     * winner CIDs from peers. See DESIGN.md "Transport: gossipsub topic + validation".
+     * Subscribe to the topic and install the async validate-before-forward gate as the
+     * topic validator. See DESIGN.md "Transport: gossipsub topic + validation".
      */
     start(): Promise<void>;
     stop(): Promise<void>;
 
-    /** Announce our current winner CIDs to the topic. */
-    broadcastWinnerCids(cids: CID[]): Promise<void>;
+    /** Publish one bundle's exact binary block bytes as a live delta (cast / re-sign / tombstone re-announce). */
+    publishBundle(blockBytes: Uint8Array): Promise<void>;
 
-    /** Called when a peer announces winner CIDs. */
-    onWinnerCids(cb: (cids: CID[], from: PeerId) => void): void;
-
-    /**
-     * Cold-start sync: fetch current winner CIDs from up to `k` peers and union them.
-     * Union is safe because more sources can only add knowledge; this is the
-     * anti-censorship guarantee. See DESIGN.md "Can always-online peers drop votes?".
-     */
-    fetchWinnerCidsFromPeers(k: number): Promise<CID[]>;
+    /** Publish a root-record heartbeat (see DESIGN.md "Checkpoints"). */
+    publishRootRecord(record: RootRecord): Promise<void>;
 }

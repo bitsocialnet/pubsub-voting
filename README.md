@@ -165,7 +165,7 @@ src/
   chain/         ChainClient = viem PublicClient + bucket math     [implemented]
   verify/        signature + constraints + full BundleVerifier + verdict cache [implemented]
   crdt/          state-based LWW winner-set: union, codec, in-memory store [implemented]
-  transport/     async validate-before-forward gossip gate + winner-CID codec + transport [implemented]
+  transport/     async validate-before-forward gossip gate + message codec (inline bundle / root record) + transport [implemented]
   tally/         deterministic aggregation over pre-validated bundles [implemented]
   index.ts       public entry: re-exports + facade + design types
 ```

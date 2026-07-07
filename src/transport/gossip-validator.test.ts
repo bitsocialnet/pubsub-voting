@@ -2,11 +2,18 @@ import { describe, it, expect } from "vitest";
 import pLimit from "p-limit";
 import type { CID } from "multiformats/cid";
 import { makeGossipGate, type GossipGateDeps } from "./gossip-validator.js";
-import { encodeWinnerCids, decodeWinnerCids } from "./winner-cids.js";
+import {
+    decodeVoteMessage,
+    encodeBundleMessage,
+    encodeRootMessage,
+    MAX_ROOT_MESSAGE_BYTES,
+    ROOT_RECORD_VERSION,
+    type RootRecord
+} from "./messages.js";
 import { makeVerdictCache } from "../verify/cache.js";
 import { makeAcceptedDedup } from "./accepted-dedup.js";
 import { makeBucketMath } from "../chain/bucket.js";
-import { bundleCid } from "../crdt/codec.js";
+import { encodeBundle, decodeBundle, bundleCid, bundleCidForBytes } from "../crdt/codec.js";
 import type { BundleVerifier } from "../verify/types.js";
 import type { VotesBundle } from "../schema/votes.js";
 
@@ -26,282 +33,223 @@ function bundle(address: string, blockNumber = 1, sig = "0x"): VotesBundle {
     };
 }
 
-async function makeNode(address: string, blockNumber = 1, sig = "0x"): Promise<{ cid: CID; node: VotesBundle }> {
+/** An inline live-delta message for a bundle, plus its CID (the verdict-cache key). */
+async function makeDelta(address: string, blockNumber = 1, sig = "0x"): Promise<{ cid: CID; node: VotesBundle; message: Uint8Array }> {
     const node = bundle(address, blockNumber, sig);
-    return { cid: await bundleCid(node), node };
+    return { cid: await bundleCid(node), node, message: encodeBundleMessage(encodeBundle(node)) };
+}
+
+async function makeRootRecord(): Promise<RootRecord> {
+    return { version: ROOT_RECORD_VERSION, root: await bundleCid(bundle("0xcc")), count: 3, sizeBytes: 700 };
 }
 
 const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
 const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
-/** A verifier whose failure is transient (view-/clock-dependent), e.g. a name resolved at head. */
-const ignoreVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "ignore", reason: "name at head" }) };
 
-const DEFAULT_BOUNDS = { maxWinnerCidsPerMessage: 16, maxMessageBytes: 1 << 20 };
-
-function gate(over: Partial<GossipGateDeps> & { fetchNode: GossipGateDeps["fetchNode"] }) {
+function gate(over: Partial<GossipGateDeps> = {}) {
     return makeGossipGate({
-        decodeWinnerCids,
+        decodeMessage: decodeVoteMessage,
+        parseBundle: async (blockBytes) => ({ cid: await bundleCidForBytes(blockBytes), bundle: decodeBundle(blockBytes) }),
         verifier: okVerifier,
         cache: makeVerdictCache(),
-        merge: async () => {},
+        admit: async () => {},
         limit: (fn) => fn(),
-        allowPeer: () => true,
-        bounds: DEFAULT_BOUNDS,
+        allowBundlePeer: () => true,
+        allowRootPeer: () => true,
+        maxBundleMessageBytes: 4096,
+        maxRootMessageBytes: MAX_ROOT_MESSAGE_BYTES,
         timeoutMs: 5000,
-        fetchTimeoutMs: 5000,
         ...over
     });
 }
 
-const fetcher =
-    (nodes: Map<string, VotesBundle>) =>
-    async (cid: CID): Promise<VotesBundle | undefined> =>
-        nodes.get(cid.toString());
-
-describe("makeGossipGate", () => {
-    it("accepts a valid single-CID message and merges it", async () => {
-        const { cid, node } = await makeNode("0x1");
-        let merged: CID[] | undefined;
-        const accepted: Array<[CID[], string]> = [];
+describe("makeGossipGate — bundle deltas", () => {
+    it("accepts a valid inline bundle, admits its exact bytes, and notifies", async () => {
+        const { cid, message } = await makeDelta("0x1");
+        let admitted: { cid: CID; bytes: Uint8Array } | undefined;
+        const accepted: Array<[CID, string]> = [];
         const g = gate({
-            fetchNode: fetcher(new Map([[cid.toString(), node]])),
-            merge: async (h) => {
-                merged = h;
+            admit: async ({ cid: c, bytes }) => {
+                admitted = { cid: c, bytes };
             },
-            onAccept: (h, from) => accepted.push([h, from])
+            onAccept: (c, _bundle, from) => accepted.push([c, from])
         });
 
-        expect(await g.validate(encodeWinnerCids([cid]), "peer1")).toBe("accept");
-        expect(merged?.[0].equals(cid)).toBe(true);
+        expect(await g.validate(message, "peer1")).toBe("accept");
+        expect(admitted?.cid.equals(cid)).toBe(true);
+        // Byte-identity: the stored block is the sender's exact bytes, so its hash IS the CID.
+        expect((await bundleCidForBytes(admitted!.bytes)).equals(cid)).toBe(true);
+        expect(accepted[0][0].equals(cid)).toBe(true);
         expect(accepted[0][1]).toBe("peer1");
     });
 
     it("rejects malformed bytes (layer-1)", async () => {
-        const g = gate({ fetchNode: async () => undefined });
+        const g = gate();
         expect(await g.validate(new Uint8Array([0xff, 0xff]), "p")).toBe("reject");
     });
 
-    it("rejects an oversized message", async () => {
-        const { cid, node } = await makeNode("0x1");
-        const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), bounds: { ...DEFAULT_BOUNDS, maxMessageBytes: 5 } });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
+    it("rejects a bundle message over the derived cap", async () => {
+        const { message } = await makeDelta("0x1");
+        const g = gate({ maxBundleMessageBytes: 5 });
+        expect(await g.validate(message, "p")).toBe("reject");
     });
 
-    it("rejects too many CIDs", async () => {
-        const { cid, node } = await makeNode("0x1");
-        const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), bounds: { ...DEFAULT_BOUNDS, maxWinnerCidsPerMessage: 0 } });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
+    it("rejects an envelope whose bundle bytes are garbage", async () => {
+        const g = gate();
+        expect(await g.validate(encodeBundleMessage(new Uint8Array([1, 2, 3])), "p")).toBe("reject");
     });
 
-    it("ignores a peer over its rate limit (no penalty)", async () => {
-        const { cid, node } = await makeNode("0x1");
-        const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), allowPeer: () => false });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
-    });
-
-    it("ignores an empty CID announcement", async () => {
-        const g = gate({ fetchNode: async () => undefined });
-        expect(await g.validate(encodeWinnerCids([]), "p")).toBe("ignore");
-    });
-
-    it("ignores an unfetchable CID (not the sender's provable fault)", async () => {
-        const { cid } = await makeNode("0x1");
-        const g = gate({ fetchNode: async () => undefined }); // never resolves to a node
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+    it("ignores a peer over its bundle rate limit (no penalty)", async () => {
+        const { message } = await makeDelta("0x1");
+        const g = gate({ allowBundlePeer: () => false });
+        expect(await g.validate(message, "p")).toBe("ignore");
     });
 
     it("rejects a bundle that fails verification", async () => {
-        const { cid, node } = await makeNode("0xbad");
-        const g = gate({ fetchNode: fetcher(new Map([[cid.toString(), node]])), verifier: badVerifier });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
+        const { message } = await makeDelta("0xbad");
+        const g = gate({ verifier: badVerifier });
+        expect(await g.validate(message, "p")).toBe("reject");
     });
 
-    it("short-circuits to accept on a verdict-cache hit without fetching", async () => {
-        const { cid } = await makeNode("0x1");
+    it("accepts a re-published known-valid bundle for one hash — no re-verify, no re-admit", async () => {
+        const { cid, message } = await makeDelta("0x1");
         const cache = makeVerdictCache();
         cache.set(cid, { valid: true, ruleScore: 1n, resolvedNames: {} });
-        let fetches = 0;
+        let verifies = 0;
+        let admits = 0;
         const g = gate({
-            fetchNode: async () => {
-                fetches++;
-                return undefined;
+            cache,
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                }
             },
-            cache
-        });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("accept");
-        expect(fetches).toBe(0);
-    });
-
-    it("rejects on a cached-invalid CID without fetching", async () => {
-        const { cid } = await makeNode("0x1");
-        const cache = makeVerdictCache();
-        cache.set(cid, { valid: false, disposition: "reject", reason: "known bad" });
-        let fetches = 0;
-        const g = gate({
-            fetchNode: async () => {
-                fetches++;
-                return undefined;
-            },
-            cache
-        });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
-        expect(fetches).toBe(0);
-    });
-
-    it("rejects when more CIDs than maxWinnerCidsPerMessage are announced", async () => {
-        const a = await makeNode("0x1");
-        const b = await makeNode("0x2");
-        const nodes = new Map([
-            [a.cid.toString(), a.node],
-            [b.cid.toString(), b.node]
-        ]);
-        const g = gate({ fetchNode: fetcher(nodes), bounds: { ...DEFAULT_BOUNDS, maxWinnerCidsPerMessage: 1 } });
-        expect(await g.validate(encodeWinnerCids([a.cid, b.cid]), "p")).toBe("reject");
-    });
-
-    it("wraps every fetch through the concurrency limiter", async () => {
-        const a = await makeNode("0x1");
-        const b = await makeNode("0x2");
-        const nodes = new Map([
-            [a.cid.toString(), a.node],
-            [b.cid.toString(), b.node]
-        ]);
-        let limited = 0;
-        const g = gate({
-            fetchNode: fetcher(nodes),
-            limit: (fn) => {
-                limited++;
-                return fn();
+            admit: async () => {
+                admits++;
             }
         });
-        expect(await g.validate(encodeWinnerCids([a.cid, b.cid]), "p")).toBe("accept");
-        expect(limited).toBe(2); // one per fetched bundle in the message
+        // Forwarded (a tombstone re-announce must reach late peers) but not re-worked.
+        expect(await g.validate(message, "p")).toBe("accept");
+        expect(verifies).toBe(0);
+        expect(admits).toBe(0);
+    });
+
+    it("rejects a cached-invalid bundle without re-verifying", async () => {
+        const { cid, message } = await makeDelta("0x1");
+        const cache = makeVerdictCache();
+        cache.set(cid, { valid: false, disposition: "reject", reason: "known bad" });
+        let verifies = 0;
+        const g = gate({
+            cache,
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                }
+            }
+        });
+        expect(await g.validate(message, "p")).toBe("reject");
+        expect(verifies).toBe(0);
     });
 
     it("ignores (no penalty) a transient-invalid bundle and does NOT cache the verdict", async () => {
-        const { cid, node } = await makeNode("0x1");
+        const { cid, message } = await makeDelta("0x1");
         const cache = makeVerdictCache();
         let verifies = 0;
         const g = gate({
-            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            cache,
             verifier: {
                 verify: async () => {
                     verifies++;
                     return { valid: false, disposition: "ignore", reason: "name at head" };
                 }
-            },
-            cache
+            }
         });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
-        // A re-announce re-verifies (verdict not pinned) — the condition can resolve later.
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+        expect(await g.validate(message, "p")).toBe("ignore");
+        // A re-publish re-verifies (verdict not pinned) — the condition can resolve later.
+        expect(await g.validate(message, "p")).toBe("ignore");
         expect(verifies).toBe(2);
         expect(cache.has(cid)).toBe(false);
     });
 
-    it("caches a provable reject so a re-announce is not re-verified", async () => {
-        const { cid, node } = await makeNode("0xbad");
+    it("caches a provable reject so a re-publish is not re-verified", async () => {
+        const { cid, message } = await makeDelta("0xbad");
         const cache = makeVerdictCache();
         let verifies = 0;
         const g = gate({
-            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            cache,
             verifier: {
                 verify: async () => {
                     verifies++;
                     return { valid: false, disposition: "reject", reason: "bad sig" };
                 }
-            },
-            cache
+            }
         });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("reject");
-        expect(verifies).toBe(1); // second announce short-circuits on the cached reject
+        expect(await g.validate(message, "p")).toBe("reject");
+        expect(await g.validate(message, "p")).toBe("reject");
+        expect(verifies).toBe(1); // second publish short-circuits on the cached reject
         expect(cache.has(cid)).toBe(true);
     });
 
     it("ignores a bundle bucketed ahead of head (future-head guard) without verifying or caching", async () => {
-        const { cid, node } = await makeNode("0x1");
+        const { cid, message } = await makeDelta("0x1");
         const cache = makeVerdictCache();
         let verifies = 0;
         const g = gate({
-            fetchNode: fetcher(new Map([[cid.toString(), node]])),
+            cache,
             isEvaluableNow: async () => false, // its sample block is ahead of our head
             verifier: {
                 verify: async () => {
                     verifies++;
                     return { valid: true, ruleScore: 1n, resolvedNames: {} };
                 }
-            },
-            cache
+            }
         });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+        expect(await g.validate(message, "p")).toBe("ignore");
         expect(verifies).toBe(0); // dropped before the (chain-touching) verifier runs
         expect(cache.has(cid)).toBe(false);
     });
 
     it("verifies normally once the bundle is evaluable (future-head guard passes)", async () => {
-        const { cid, node } = await makeNode("0x1");
-        const g = gate({
-            fetchNode: fetcher(new Map([[cid.toString(), node]])),
-            isEvaluableNow: async () => true
-        });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("accept");
+        const { message } = await makeDelta("0x1");
+        const g = gate({ isEvaluableNow: async () => true });
+        expect(await g.validate(message, "p")).toBe("accept");
     });
 
-    it("ignores (does not hang) when a fetch exceeds the timeout", async () => {
-        const { cid } = await makeNode("0x1");
-        const g = gate({ fetchNode: () => new Promise<undefined>(() => {}), timeoutMs: 50 });
-        expect(await g.validate(encodeWinnerCids([cid]), "p")).toBe("ignore");
+    it("wraps the verify through the concurrency limiter", async () => {
+        const { message } = await makeDelta("0x1");
+        let limited = 0;
+        const limit = pLimit(1);
+        const g = gate({
+            limit: (fn) => {
+                limited++;
+                return limit(fn);
+            }
+        });
+        expect(await g.validate(message, "p")).toBe("accept");
+        expect(limited).toBe(1);
     });
 
-    it("aborts a hung fetch at fetchTimeoutMs and frees the p-limit slot for later fetches", async () => {
-        const hung = await makeNode("0x1");
-        const good = await makeNode("0x2");
-        const goodNodes = new Map([[good.cid.toString(), good.node]]);
-        let aborted = false;
-        const limit = pLimit(1); // one slot: a leak here would starve the second fetch
+    it("ignores (does not hang) when the verify exceeds the message deadline", async () => {
+        const { message } = await makeDelta("0x1");
         const g = gate({
-            fetchNode: (cid, signal) => {
-                if (cid.toString() === hung.cid.toString()) {
-                    // Never settles on its own; the gate's per-fetch deadline must abort + free the slot.
-                    return new Promise<VotesBundle | undefined>((resolve) => {
-                        signal?.addEventListener("abort", () => {
-                            aborted = true;
-                            resolve(undefined);
-                        });
-                    });
-                }
-                return Promise.resolve(goodNodes.get(cid.toString()));
-            },
-            limit: (fn) => limit(fn),
-            fetchTimeoutMs: 20,
-            timeoutMs: 10_000 // message budget far exceeds the per-fetch deadline
+            verifier: { verify: () => new Promise(() => {}) }, // a hung RPC / name resolution
+            timeoutMs: 50
         });
-
-        const start = Date.now();
-        expect(await g.validate(encodeWinnerCids([hung.cid]), "p")).toBe("ignore");
-        expect(aborted).toBe(true); // the hung fetch was aborted, not left dangling
-        expect(Date.now() - start).toBeLessThan(2000); // resolved at the per-fetch deadline, not the 10s message budget
-        // The single slot was released, so a subsequent fetchable CID still validates.
-        expect(await g.validate(encodeWinnerCids([good.cid]), "p")).toBe("accept");
+        expect(await g.validate(message, "p")).toBe("ignore");
     });
 
     // blocksPerBucket large enough that blockNumbers 1 and 2 share bucket 0 — a same-bucket re-sign.
     const bucketMath = () => makeBucketMath(1000);
 
-    it("ignores a lone same-bucket, same-choice re-sign without a second verify (no re-flood)", async () => {
-        const first = await makeNode("0x1", 1, "0xaa");
-        const resign = await makeNode("0x1", 2, "0xbb"); // same wallet+votes+bucket, fresh CID
+    it("ignores a same-bucket, same-choice re-sign without a second verify (no re-flood)", async () => {
+        const first = await makeDelta("0x1", 1, "0xaa");
+        const resign = await makeDelta("0x1", 2, "0xbb"); // same wallet+votes+bucket, fresh bytes
         expect(first.cid.equals(resign.cid)).toBe(false);
         const acceptedDedup = makeAcceptedDedup(bucketMath());
         let verifies = 0;
         const g = gate({
-            fetchNode: fetcher(
-                new Map([
-                    [first.cid.toString(), first.node],
-                    [resign.cid.toString(), resign.node]
-                ])
-            ),
             acceptedDedup,
             verifier: {
                 verify: async () => {
@@ -310,52 +258,20 @@ describe("makeGossipGate", () => {
                 }
             }
         });
-        expect(await g.validate(encodeWinnerCids([first.cid]), "p")).toBe("accept"); // records the vote
-        expect(await g.validate(encodeWinnerCids([resign.cid]), "p")).toBe("ignore"); // re-sign dropped
+        expect(await g.validate(first.message, "p")).toBe("accept"); // records the vote
+        expect(await g.validate(resign.message, "p")).toBe("ignore"); // re-sign dropped, not forwarded
         expect(verifies).toBe(1); // the re-sign never reached the (chain-touching) verifier
     });
 
-    it("still accepts a message carrying a genuinely-new vote alongside a re-sign duplicate", async () => {
-        const first = await makeNode("0x1", 1, "0xaa");
-        const resign = await makeNode("0x1", 2, "0xbb"); // dup of first
-        const fresh = await makeNode("0x2", 1, "0xcc"); // a different wallet's genuinely-new vote
-        const acceptedDedup = makeAcceptedDedup(bucketMath());
-        let merged: CID[] | undefined;
-        const g = gate({
-            fetchNode: fetcher(
-                new Map([
-                    [first.cid.toString(), first.node],
-                    [resign.cid.toString(), resign.node],
-                    [fresh.cid.toString(), fresh.node]
-                ])
-            ),
-            acceptedDedup,
-            merge: async (h) => {
-                merged = h;
-            }
-        });
-        expect(await g.validate(encodeWinnerCids([first.cid]), "p")).toBe("accept");
-        expect(await g.validate(encodeWinnerCids([resign.cid, fresh.cid]), "p")).toBe("accept");
-        // Only the genuinely-new CID is merged/forwarded; the re-sign duplicate is excluded.
-        expect(merged?.length).toBe(1);
-        expect(merged?.[0].equals(fresh.cid)).toBe(true);
-    });
-
     it("cannot be poisoned: a matching-key bundle is dropped (ignore) even if it would 'verify'", async () => {
-        const real = await makeNode("0x1", 1, "0xaa");
+        const real = await makeDelta("0x1", 1, "0xaa");
         // Attacker reuses the victim's (wallet, votes) at another same-bucket block with garbage —
-        // a matching dedup key. It must never be accepted or merged, regardless of the verifier.
-        const forged = await makeNode("0x1", 2, "0xdeadbeef");
+        // a matching dedup key. It must never be accepted or admitted, regardless of the verifier.
+        const forged = await makeDelta("0x1", 2, "0xdeadbeef");
         const acceptedDedup = makeAcceptedDedup(bucketMath());
-        let mergedForged = false;
+        let admittedForged = false;
         let verifies = 0;
         const g = gate({
-            fetchNode: fetcher(
-                new Map([
-                    [real.cid.toString(), real.node],
-                    [forged.cid.toString(), forged.node]
-                ])
-            ),
             acceptedDedup,
             verifier: {
                 verify: async () => {
@@ -363,13 +279,59 @@ describe("makeGossipGate", () => {
                     return { valid: true, ruleScore: 1n, resolvedNames: {} }; // would "pass" if ever run
                 }
             },
-            merge: async (h) => {
-                if (h.some((c) => c.equals(forged.cid))) mergedForged = true;
+            admit: async ({ cid }) => {
+                if (cid.equals(forged.cid)) admittedForged = true;
             }
         });
-        expect(await g.validate(encodeWinnerCids([real.cid]), "p")).toBe("accept");
-        expect(await g.validate(encodeWinnerCids([forged.cid]), "p")).toBe("ignore");
+        expect(await g.validate(real.message, "p")).toBe("accept");
+        expect(await g.validate(forged.message, "p")).toBe("ignore");
         expect(verifies).toBe(1); // forged bundle never verified (short-circuited as redundant)
-        expect(mergedForged).toBe(false); // and never merged/stored
+        expect(admittedForged).toBe(false); // and never admitted/stored
+    });
+});
+
+describe("makeGossipGate — root records", () => {
+    it("accepts a well-formed root record and surfaces it as a hint", async () => {
+        const record = await makeRootRecord();
+        const heard: Array<[RootRecord, string]> = [];
+        const g = gate({ onRootRecord: (r, from) => heard.push([r, from]) });
+        expect(await g.validate(encodeRootMessage(record), "peer1")).toBe("accept");
+        expect(heard).toHaveLength(1);
+        expect(heard[0][0].root.equals(record.root)).toBe(true);
+        expect(heard[0][1]).toBe("peer1");
+    });
+
+    it("never verifies or admits on a root record (it is only a hint)", async () => {
+        const record = await makeRootRecord();
+        let verifies = 0;
+        let admits = 0;
+        const g = gate({
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                }
+            },
+            admit: async () => {
+                admits++;
+            }
+        });
+        expect(await g.validate(encodeRootMessage(record), "p")).toBe("accept");
+        expect(verifies).toBe(0);
+        expect(admits).toBe(0);
+    });
+
+    it("ignores a peer over its root rate limit (no penalty, hint not surfaced)", async () => {
+        const record = await makeRootRecord();
+        const heard: RootRecord[] = [];
+        const g = gate({ allowRootPeer: () => false, onRootRecord: (r) => heard.push(r) });
+        expect(await g.validate(encodeRootMessage(record), "p")).toBe("ignore");
+        expect(heard).toHaveLength(0);
+    });
+
+    it("rejects a root message over the fixed root cap", async () => {
+        const record = await makeRootRecord();
+        const g = gate({ maxRootMessageBytes: 5, maxBundleMessageBytes: 4096 });
+        expect(await g.validate(encodeRootMessage(record), "p")).toBe("reject");
     });
 });

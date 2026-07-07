@@ -139,8 +139,13 @@ export function decodeBundle(bytes: Uint8Array): VotesBundle {
     return fromWireBundle(dagCbor.decode(bytes));
 }
 
+/** The CIDv1 (dag-cbor, sha2-256) content address of already-encoded bundle block bytes. */
+export async function bundleCidForBytes(bytes: Uint8Array): Promise<CID> {
+    const digest = await sha256.digest(bytes);
+    return CID.createV1(dagCborCode, digest);
+}
+
 /** The CIDv1 (dag-cbor, sha2-256) content address of a VotesBundle. */
 export async function bundleCid(bundle: VotesBundle): Promise<CID> {
-    const digest = await sha256.digest(encodeBundle(bundle));
-    return CID.createV1(dagCborCode, digest);
+    return bundleCidForBytes(encodeBundle(bundle));
 }

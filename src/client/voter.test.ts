@@ -54,7 +54,7 @@ function dupContestIdManifest(): unknown {
 
 /**
  * A Helia node whose gossipsub `publish` is a spy, so a test can count re-broadcasts: every
- * cast/republish calls `broadcastWinnerCids` → `publish`. Otherwise a no-op node like `fakeHelia`.
+ * cast/republish calls `publishBundle` → `publish`. Otherwise a no-op node like `fakeHelia`.
  */
 function spyableHelia(): { helia: HeliaInstance; publish: ReturnType<typeof vi.fn> } {
     const publish = vi.fn(async () => undefined);

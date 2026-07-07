@@ -3,50 +3,50 @@ import type { VotesBundle } from "../schema/votes.js";
 import { isCacheableVerdict, type VerdictCache } from "../verify/cache.js";
 import type { BundleVerifier } from "../verify/types.js";
 import type { AcceptedDedup } from "./accepted-dedup.js";
+import type { RootRecord, VoteMessage } from "./messages.js";
 
 /**
  * The forward-gate: the async gossipsub topic validator's decision core, written as a pure
  * function over injected seams (no libp2p import) so it is fully unit-testable. It runs the
- * FULL validity pipeline for a received bundle-CID announcement BEFORE the message is
+ * FULL validity pipeline on the bundle INLINED in a received message BEFORE the message is
  * re-forwarded, so an invalid bundle never crosses an honest hop and gossipsub's `reject`
  * scores the sender for semantic — not just byte-level — badness. See DESIGN.md "Transport".
  *
- * Each gossiped CID is a standalone bundle (no parent links, no ancestor walk): the gate
- * fetches it by CID, verifies it, and LWW-merges it on its own.
+ * The payload is a two-kind discriminated union (see transport/messages.ts):
+ *   - a **bundle delta** — the wallet's own bundle as exact block bytes, validated straight
+ *     from the message (no fetch toward the publisher exists on this path);
+ *   - a **root record** — the checkpoint heartbeat, a fixed-shape unverifiable *hint* that
+ *     short-circuits at layer 1: forwarded within its own per-peer rate and handed to the
+ *     chase logic, never verified here (only equality with our own root is checkable) and
+ *     never trusted.
  *
  * Verdicts (who gets blamed):
- *   - "accept": every referenced bundle verified — deliver, merge, forward.
- *   - "reject": something is PROVABLY invalid (malformed message, a bundle that fails
- *     verification, a known-bad referenced CID) — drop, do not forward, penalize the sender.
+ *   - "accept": the inlined bundle verified (or is a known-valid re-publish), or a
+ *     well-formed within-rate root record — deliver, merge (bundles), forward.
+ *   - "reject": something is PROVABLY invalid (malformed message, over the derived size cap,
+ *     a bundle that fails verification) — drop, do not forward, penalize the sender.
  *   - "ignore": no verdict reachable through no provable fault of the sender — either a
- *     transient/local condition (unfetchable within the timeout, over the per-peer rate,
- *     internal error) or a view-/clock-dependent verdict two honest peers can disagree on
- *     right now: a bundle bucketed ahead of our chain head (`isEvaluableNow`), or a
- *     `community.name` resolved at head during a re-point window. Drop, do not forward, do NOT
- *     penalize, and do NOT cache (it can change) — using `reject` here would punish honest
- *     relayers for transient conditions and hand attackers a grief vector.
+ *     transient/local condition (over the per-peer rate, internal error, deadline) or a
+ *     view-/clock-dependent verdict two honest peers can disagree on right now: a bundle
+ *     bucketed ahead of our chain head (`isEvaluableNow`), or a `community.name` resolved at
+ *     head during a re-point window. Drop, do not forward, do NOT penalize, and do NOT cache
+ *     (it can change) — using `reject` here would punish honest relayers for transient
+ *     conditions and hand attackers a grief vector.
  *
- * Cheap-to-expensive with early exit: size/rate/decode first, then per-bundle fetch + verify,
- * de-duplicated through the verdict cache so a re-announced known bundle costs zero network.
+ * Cheap-to-expensive with early exit: size/decode/rate first, then hash + caches, then the
+ * verify pipeline — so a re-published known bundle costs one hash and zero chain work.
  */
 
 export type MessageVerdict = "accept" | "reject" | "ignore";
 
-export interface GossipGateBounds {
-    /** Max bundle CIDs per message (layer-1 cap). */
-    maxWinnerCidsPerMessage: number;
-    /** Max message payload bytes (layer-1 cap). */
-    maxMessageBytes: number;
-}
-
 export interface GossipGateDeps {
-    /** Decode a payload to bundle CIDs; throws on malformed (see transport/winner-cids.ts). */
-    decodeWinnerCids: (data: Uint8Array) => CID[];
+    /** Decode a payload to its message kind; throws on malformed (see transport/messages.ts). */
+    decodeMessage: (data: Uint8Array) => VoteMessage;
     /**
-     * Fetch a bundle by CID (blockstore + bitswap); `undefined` if unfetchable. `signal` aborts
-     * an in-flight fetch when the gate's per-fetch timeout fires (see `fetchTimeoutMs`).
+     * Decode inlined bundle-block bytes and hash them to the bundle CID (the verdict-cache
+     * key). Throws on malformed block bytes — provable layer-1 badness.
      */
-    fetchNode: (cid: CID, signal?: AbortSignal) => Promise<VotesBundle | undefined>;
+    parseBundle: (blockBytes: Uint8Array) => Promise<{ cid: CID; bundle: VotesBundle }>;
     /** The full validity pipeline for one bundle (see verify/bundle.ts). */
     verifier: BundleVerifier;
     /**
@@ -54,37 +54,47 @@ export interface GossipGateDeps {
      * bucket sample block already reachable from our chain head? A bundle dated to a future
      * bucket (the voter's head ahead of ours, clock skew, or an absurd `blockNumber`) is not
      * yet evaluable — transient, so the gate `ignore`s it (no penalty, uncached) until our head
-     * catches up. Omitted ⇒ no freshness check (prior behaviour). Steady-state votes resolve
-     * `true` with no chain read; only a look-ahead bundle costs a (memoized) head read.
+     * catches up. Omitted ⇒ no freshness check. Steady-state votes resolve `true` with no chain
+     * read; only a look-ahead bundle costs a (memoized) head read.
      */
     isEvaluableNow?: (bundle: VotesBundle) => Promise<boolean>;
-    /** Per-CID verdict cache — dedups re-announced bundles and known-bad CIDs. */
+    /** Per-CID verdict cache — dedups re-published bundles and known-bad blocks. */
     cache: VerdictCache;
     /**
      * Optional dedup of already-accepted votes by `(wallet, bucket, votes)`. A same-bucket,
-     * same-choice re-sign under a fresh CID is dropped as "redundant" — not verified, not merged,
-     * and never the reason a message is forwarded — so a re-sign flood costs no gate read and is
-     * not re-broadcast. Omitted ⇒ every fresh CID is verified on its own (prior behaviour).
+     * same-choice re-sign under fresh bytes is dropped — not verified, not merged, not
+     * forwarded — so a re-sign flood costs no gate read and does not amplify. Omitted ⇒ every
+     * fresh bundle is verified on its own.
      */
     acceptedDedup?: AcceptedDedup;
-    /** Admit a validated bundle-CID set into the CRDT (idempotent; reads fetched bundles from the store). */
-    merge: (cids: CID[]) => Promise<void>;
-    /** Concurrency limiter (p-limit) shared across in-flight validations. */
+    /**
+     * Store the verified bundle's exact block bytes and admit its CID into the CRDT
+     * (idempotent). Exact bytes preserve byte-identity with the sender's block.
+     */
+    admit: (args: { cid: CID; bytes: Uint8Array; bundle: VotesBundle }) => Promise<void>;
+    /**
+     * Concurrency limiter (p-limit) shared across in-flight verifications — the gate chain
+     * read and name resolution are network calls, so concurrent RPC work stays bounded.
+     */
     limit: <T>(fn: () => Promise<T>) => Promise<T>;
-    /** Per-peer rate gate; `false` means the peer is over its rate this window. */
-    allowPeer: (peer: string) => boolean;
-    /** Called after a message is accepted and merged (drives tally-update notifications). */
-    onAccept?: (cids: CID[], from: string) => void;
-    bounds: GossipGateBounds;
+    /** Per-peer rate gate for bundle-kind messages; `false` means over-rate this window. */
+    allowBundlePeer: (peer: string) => boolean;
+    /** Per-peer rate gate for root-kind messages (heartbeats are ~1 per 10 min when honest). */
+    allowRootPeer: (peer: string) => boolean;
+    /** Called after a fresh bundle is verified and merged (drives tally-update notifications). */
+    onAccept?: (cid: CID, bundle: VotesBundle, from: string) => void;
+    /**
+     * Called with every well-formed, within-rate root record (an unverifiable hint). NOT
+     * awaited — acting on a hint (the directed-bitswap chase) is lazy and bounded elsewhere,
+     * never on the validator's critical path.
+     */
+    onRootRecord?: (record: RootRecord, from: string) => void;
+    /** The criteria-derived cap for a bundle-kind message (see messages.ts). Over ⇒ reject. */
+    maxBundleMessageBytes: number;
+    /** The fixed cap for a root-kind message (~100 B record). Over ⇒ reject. */
+    maxRootMessageBytes: number;
     /** Hard per-message validation deadline; on expiry the verdict is `ignore`. */
     timeoutMs: number;
-    /**
-     * Per-fetch deadline (ms), shorter than `timeoutMs`. A single unfetchable CID cannot hold its
-     * `limit` (p-limit) slot for the whole message budget: at this deadline the fetch is aborted (its
-     * bitswap want cancelled) and the slot released, so a flood of unfetchable CIDs cannot starve the
-     * shared fetch pool. See DESIGN.md "Transport", resource-exhaustion residual.
-     */
-    fetchTimeoutMs: number;
 }
 
 export interface GossipGate {
@@ -121,110 +131,89 @@ function withDeadline<T>(p: Promise<T>, ms: number, onTimeout: T): Promise<T> {
     });
 }
 
-/**
- * One referenced-CID outcome:
- *   - "ok":        a fresh-verified valid bundle, or a re-announced known winner — forward + merge.
- *   - "redundant": a same-bucket, same-choice re-sign of an already-accepted vote — inert, dropped
- *                  without verifying or merging; never the reason a message is forwarded.
- *   - "reject" / "ignore": terminal message verdicts (see `MessageVerdict`).
- */
-type BundleResult = "ok" | "redundant" | "reject" | "ignore";
-
 export function makeGossipGate(deps: GossipGateDeps): GossipGate {
-    const { decodeWinnerCids, fetchNode, verifier, isEvaluableNow, cache, acceptedDedup, merge, limit, allowPeer, onAccept, bounds, timeoutMs, fetchTimeoutMs } =
-        deps;
-
-    /**
-     * Fetch one bundle under a per-fetch deadline. On timeout the `AbortSignal` cancels the bitswap
-     * want AND `withDeadline` resolves `undefined` regardless of whether the underlying fetch honours
-     * the abort — so the `limit` slot is always freed at `fetchTimeoutMs`, never leaked to a hung fetch.
-     */
-    async function fetchWithTimeout(cid: CID): Promise<VotesBundle | undefined> {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
-        try {
-            return await withDeadline(fetchNode(cid, controller.signal), fetchTimeoutMs, undefined);
-        } finally {
-            clearTimeout(timer);
-        }
-    }
+    const {
+        decodeMessage,
+        parseBundle,
+        verifier,
+        isEvaluableNow,
+        cache,
+        acceptedDedup,
+        admit,
+        limit,
+        allowBundlePeer,
+        allowRootPeer,
+        onAccept,
+        onRootRecord,
+        maxBundleMessageBytes,
+        maxRootMessageBytes,
+        timeoutMs
+    } = deps;
 
     async function doValidate(data: Uint8Array, from: string): Promise<MessageVerdict> {
-        // Layer 1: size, rate, decode — all pre-fetch.
-        if (data.length > bounds.maxMessageBytes) return "reject";
-        if (!allowPeer(from)) return "ignore";
+        // Layer 1: size and decode — the cheapest, pre-verify checks.
+        if (data.length > Math.max(maxBundleMessageBytes, maxRootMessageBytes)) return "reject";
 
-        let cids: CID[];
+        let message: VoteMessage;
         try {
-            cids = decodeWinnerCids(data);
+            message = decodeMessage(data);
         } catch {
-            return "reject"; // malformed bytes / not a bounded CID list — provable layer-1 badness
+            return "reject"; // malformed bytes / not one of the two kinds — provable layer-1 badness
         }
-        if (cids.length === 0) return "ignore"; // useless announcement
-        if (cids.length > bounds.maxWinnerCidsPerMessage) return "reject";
 
-        // Verify each referenced bundle independently, de-duplicated through the verdict cache.
-        const seen = new Set<string>();
-
-        const check = async (cid: CID): Promise<{ result: BundleResult; bundle?: VotesBundle }> => {
-            const key = cid.toString();
-            if (seen.has(key)) return { result: "ok" }; // already handled earlier in this message
-            seen.add(key);
-
-            const cached = cache.get(cid);
-            if (cached) return { result: cached.valid ? "ok" : cached.disposition };
-
-            const bundle = await limit(() => fetchWithTimeout(cid));
-            if (!bundle) return { result: "ignore" }; // unfetchable/timeout — not provably the sender's fault
-
-            // Freshness guard (transient, so it runs here — not in the cacheable verifier — and
-            // its verdict is never cached): a bundle bucketed ahead of our head is not yet
-            // evaluable, so `ignore` it without penalty until our head advances. Also defuses an
-            // absurd-future `blockNumber` (e.g. uint256.max) — it never merges into the set.
-            if (isEvaluableNow && !(await isEvaluableNow(bundle))) return { result: "ignore" };
-
-            // Re-sign flood guard: a same-bucket, same-choice re-sign of a vote we already accepted
-            // is inert under LWW, so drop it WITHOUT verifying (no gate read) or merging (it is
-            // unverified — merging would bypass the gate). Safe on the untrusted `address` because a
-            // hit only ever suppresses forwarding of something an honest peer already has.
-            if (acceptedDedup?.isResignDuplicate(bundle)) return { result: "redundant" };
-
-            const verdict = await verifier.verify(bundle);
-            if (isCacheableVerdict(verdict)) cache.set(cid, verdict); // only terminal verdicts (accept / provable reject)
-            return { result: verdict.valid ? "ok" : verdict.disposition, bundle };
-        };
-
-        let sawIgnore = false;
-        let sawForward = false; // at least one CID worth forwarding (fresh-valid or known winner)
-        const toMerge: CID[] = [];
-        const toRecord: VotesBundle[] = [];
-        for (const cid of cids) {
-            const { result, bundle } = await check(cid);
-            if (result === "reject") return "reject"; // reject takes precedence (penalize)
-            if (result === "ignore") {
-                sawIgnore = true;
-                continue;
-            }
-            if (result === "redundant") continue; // inert; never merged, never a reason to forward
-            sawForward = true;
-            toMerge.push(cid);
-            if (bundle) toRecord.push(bundle); // only fresh-verified valid bundles carry a bundle
+        if (message.kind === "root") {
+            if (data.length > maxRootMessageBytes) return "reject";
+            if (!allowRootPeer(from)) return "ignore";
+            // An unverifiable hint: forward within rate, hand to the (lazy, bounded) chase.
+            // Never `reject`ed on content — only equality with our own root is checkable.
+            onRootRecord?.(message.record, from);
+            return "accept";
         }
-        if (sawIgnore) return "ignore";
-        // A message whose only fresh content was re-sign duplicates carries nothing new, so it is
-        // not re-flooded (drop, no penalty) — the anti-amplification win.
-        if (!sawForward) return "ignore";
 
-        await merge(toMerge);
-        for (const b of toRecord) acceptedDedup?.record(b);
-        onAccept?.(toMerge, from);
+        if (data.length > maxBundleMessageBytes) return "reject";
+        if (!allowBundlePeer(from)) return "ignore";
+
+        let cid: CID;
+        let bundle: VotesBundle;
+        try {
+            ({ cid, bundle } = await parseBundle(message.bundle));
+        } catch {
+            return "reject"; // malformed bundle block bytes — provable
+        }
+
+        // A known bundle short-circuits on the verdict cache for the cost of one hash: a
+        // re-published valid bundle (e.g. a tombstone re-announce) is forwarded so late peers
+        // converge, without re-verifying or re-merging; a known-bad one rejects without work.
+        const cached = cache.get(cid);
+        if (cached) return cached.valid ? "accept" : cached.disposition;
+
+        // Freshness guard (transient, so it runs here — not in the cacheable verifier — and
+        // its verdict is never cached): a bundle bucketed ahead of our head is not yet
+        // evaluable, so `ignore` it without penalty until our head advances. Also defuses an
+        // absurd-future `blockNumber` (e.g. uint256.max) — it never merges into the set.
+        if (isEvaluableNow && !(await isEvaluableNow(bundle))) return "ignore";
+
+        // Re-sign flood guard: a same-bucket, same-choice re-sign of a vote we already accepted
+        // is inert under LWW, so drop it WITHOUT verifying (no gate read), merging, or
+        // forwarding — the anti-amplification win. Safe on the untrusted `address` because a
+        // hit only ever suppresses something an honest peer already forwarded.
+        if (acceptedDedup?.isResignDuplicate(bundle)) return "ignore";
+
+        const verdict = await limit(() => verifier.verify(bundle));
+        if (isCacheableVerdict(verdict)) cache.set(cid, verdict); // only terminal verdicts (accept / provable reject)
+        if (!verdict.valid) return verdict.disposition;
+
+        await admit({ cid, bytes: message.bundle, bundle });
+        acceptedDedup?.record(bundle);
+        onAccept?.(cid, bundle, from);
         return "accept";
     }
 
     return {
         validate(data: Uint8Array, from: string): Promise<MessageVerdict> {
-            // Whole-message deadline: an internal hang or slow fetch yields `ignore`, never a
-            // stuck validator (which would strand the message in gossipsub's mcache).
+            // Whole-message deadline: an internal hang or slow RPC/name resolution yields
+            // `ignore`, never a stuck validator (which would strand the message in gossipsub's
+            // mcache).
             return withDeadline(doValidate(data, from), timeoutMs, "ignore");
         }
     };

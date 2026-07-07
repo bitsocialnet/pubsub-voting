@@ -10,7 +10,8 @@ import { makeBlockstoreBundleStore } from "../transport/bundle-store.js";
 import { makeRateLimiter } from "../transport/rate-limit.js";
 import { makeGossipGate } from "../transport/gossip-validator.js";
 import { makeVoteTransport } from "../transport/transport.js";
-import { encodeWinnerCids, decodeWinnerCids } from "../transport/winner-cids.js";
+import { decodeVoteMessage, maxBundleMessageBytes, MAX_ROOT_MESSAGE_BYTES } from "../transport/messages.js";
+import { encodeBundle, decodeBundle, bundleCidForBytes } from "../crdt/codec.js";
 import type { RuleRegistry } from "../rules/types.js";
 import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
@@ -96,15 +97,15 @@ export interface VoteNetwork {
     /** True when no signer was provided: tallies readable, voting disabled. */
     readonly readOnly: boolean;
 
-    /** Join the topic, fetch and union winner CIDs from peers, subscribe to gossip. */
+    /** Join the topic behind the validate-before-forward gate and subscribe to gossip. */
     start(): Promise<void>;
     /** Leave the topic and release the transport. Does not stop the host node. */
     stop(): Promise<void>;
 
     /**
      * Sign the given votes into a bundle for the current bucket, add it to the CRDT, and
-     * broadcast the new winner CIDs. Pass an empty array to withdraw: a newer empty bundle
-     * supersedes the prior one under LWW, and the scheduler re-announces that tombstone (without
+     * publish it inline as a live delta. Pass an empty array to withdraw: a newer empty bundle
+     * supersedes the prior one under LWW, and the scheduler re-publishes that tombstone (without
      * re-signing it) until it expires, then drops it. Throws `ReadOnlyError` with no signer.
      */
     castVotes(votes: Vote[]): Promise<VotesBundle>;
@@ -234,20 +235,17 @@ interface ResolvedDeps {
     store: VoteStore;
 }
 
-/** Hard per-message validation deadline (ms): the 10s budget for fetch + verify in the gate. */
+/** Hard per-message validation deadline (ms): the 10s budget for the verify pipeline in the gate. */
 const GATE_TIMEOUT_MS = 10_000;
-/**
- * Per-fetch deadline (ms), shorter than {@link GATE_TIMEOUT_MS}. Caps how long one unfetchable CID
- * can hold a shared p-limit fetch slot before it is aborted and released, so a flood of unfetchable
- * CIDs cannot starve the fetch pool (see DESIGN.md "Transport", resource-exhaustion residual).
- */
-const GATE_FETCH_TIMEOUT_MS = 3_000;
-/** Forward-gate layer-1 bounds (see DESIGN.md "Transport"). */
-const GATE_BOUNDS = { maxWinnerCidsPerMessage: 64, maxMessageBytes: 1 << 20 };
-/** Concurrent in-flight fetch/verify operations across the gate. */
+/** Concurrent in-flight verifications across the gate (chain reads + name resolution are RPC). */
 const GATE_CONCURRENCY = 8;
-/** Per-peer rate window: how many messages one peer may make us validate per interval. */
+/** Per-peer rate window for bundle-kind messages: how many one peer may make us validate per interval. */
 const GATE_RATE = { limit: 256, intervalMs: 10_000 };
+/**
+ * Per-peer rate window for root-kind messages. An honest heartbeat is ~1 per 10 minutes (plus a
+ * divergence response), so 4/min is ≫ any honest rate while flattening a root spray.
+ */
+const GATE_ROOT_RATE = { limit: 4, intervalMs: 60_000 };
 /**
  * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
  * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
@@ -288,16 +286,16 @@ class ContestNetwork implements VoteNetwork {
     /**
      * Last-known current bucket on the gating chain, refreshed by {@link #refreshBucket} on
      * every chain read the network already does (start, cast, tally). The CRDT's read-time
-     * expiry filter (`current`/`winnerCids`) reads it, so the sync transport `getWinnerCids`
-     * closure stays sync while still dropping decayed votes. Coarse-stale is fine — buckets are large.
+     * expiry filter (`current`) reads it, so decayed votes drop without a per-read chain call.
+     * Coarse-stale is fine — buckets are large.
      */
     #currentBucketCache = 0;
     /**
      * Bucket of the last tombstone re-announce (or the withdrawal itself), so a live
-     * empty-votes withdrawal is re-broadcast on the liveness cadence — not every poll tick —
+     * empty-votes withdrawal is re-published on the liveness cadence — not every poll tick —
      * to reach peers that missed its one-shot flood. In-memory only: `undefined` means "due
      * now" (so a restart re-announces a still-live tombstone once, then rides the cadence).
-     * Re-announcing rebroadcasts the *existing* bundle CID; it never re-signs (see
+     * Re-announcing re-publishes the *existing* bundle bytes; it never re-signs (see
      * {@link republishIfDue}). See DESIGN.md "Cancelling a vote".
      */
     #lastTombstoneAnnounceBucket: number | undefined = undefined;
@@ -422,33 +420,39 @@ class ContestNetwork implements VoteNetwork {
     async start(): Promise<void> {
         const limit = pLimit(GATE_CONCURRENCY);
         const gate = makeGossipGate({
-            decodeWinnerCids,
-            fetchNode: (cid, signal) => this.#store.get(cid, signal ? { signal } : undefined),
+            decodeMessage: decodeVoteMessage,
+            parseBundle: async (blockBytes) => ({
+                cid: await bundleCidForBytes(blockBytes),
+                bundle: decodeBundle(blockBytes)
+            }),
             verifier: this.#verifier,
             isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
             cache: this.#cache,
             acceptedDedup: this.#acceptedDedup,
-            merge: (cids) => this.#crdt.merge(cids),
+            // Store the sender's exact block bytes (byte-identity with its CID), then merge.
+            admit: async ({ cid, bytes }) => {
+                await this.#deps.blockstore.put(cid, bytes);
+                await this.#crdt.merge([cid]);
+            },
             limit: (fn) => limit(fn),
-            allowPeer: makeRateLimiter(GATE_RATE),
+            allowBundlePeer: makeRateLimiter(GATE_RATE),
+            allowRootPeer: makeRateLimiter(GATE_ROOT_RATE),
             onAccept: () => this.#notifyUpdate(),
-            bounds: GATE_BOUNDS,
-            timeoutMs: GATE_TIMEOUT_MS,
-            fetchTimeoutMs: GATE_FETCH_TIMEOUT_MS
+            // Root records surface here as unverifiable hints; the divergence chase that acts
+            // on them lands with the heartbeat (see ROADMAP "Root-record checkpoint sync").
+            maxBundleMessageBytes: maxBundleMessageBytes(this.criteria),
+            maxRootMessageBytes: MAX_ROOT_MESSAGE_BYTES,
+            timeoutMs: GATE_TIMEOUT_MS
         });
         this.#transport = makeVoteTransport({
             pubsub: this.#deps.pubsub,
             topic: this.topic,
-            gate,
-            encodeWinnerCids,
-            decodeWinnerCids,
-            getWinnerCids: () => this.#crdt.winnerCids(this.#currentBucketCache)
+            gate
         });
         await this.#transport.start();
-        // If cold start merged any winner CIDs, refresh the bucket and prune the decayed nodes it
-        // pulled in. Gated on non-empty state so an empty join stays network-free (no getBlockNumber
-        // read), preserving the "zero chain reads for a constant-weight tally" property. Periodic
-        // pruning should ride the republish scheduler tick once that lands.
+        // If a restart left state behind, refresh the bucket and prune the decayed nodes. Gated
+        // on non-empty state so an empty join stays network-free (no getBlockNumber read),
+        // preserving the "zero chain reads for a constant-weight tally" property.
         if (this.#crdt.nodeCount() > 0) {
             await this.#refreshBucket();
             await this.#crdt.prune(this.#currentBucketCache);
@@ -475,10 +479,11 @@ class ContestNetwork implements VoteNetwork {
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
         await this.#crdt.add(bundle);
-        await this.#transport?.broadcastWinnerCids(this.#crdt.winnerCids(bucket));
+        // The live delta: this wallet's own bundle, inlined — never the whole winner-set.
+        await this.#transport?.publishBundle(encodeBundle(bundle));
         // Persist the intent so the scheduler can revive/re-announce it after a restart. A
         // withdrawal (empty `votes`) is a tombstone: it is broadcast once here to supersede the
-        // prior vote under LWW, then the scheduler *re-announces its existing CID* (never
+        // prior vote under LWW, then the scheduler *re-publishes its existing bytes* (never
         // re-signs it) on the liveness cadence until it expires, at which point the intent is
         // dropped and the bundle decays via expiry + prune. Its blockNumber exceeds the vote it
         // supersedes, so that vote decays strictly earlier — the tombstone need only ride out its
@@ -497,11 +502,11 @@ class ContestNetwork implements VoteNetwork {
      *     {@link castVotes} — which re-broadcasts and writes the bumped `lastBucket` back — so the
      *     vote stays alive.
      *   - **Tombstone** (empty votes, from `castVotes([])`): while its bundle is still live,
-     *     *re-announce its existing CID* (re-broadcast the current winner CIDs — NO re-sign, so
-     *     the expiry clock is untouched) once per cadence, reaching peers that missed the
-     *     withdrawal's one-shot flood. Once the tombstone has expired, drop the intent — the
-     *     bundle decays via expiry + prune. A tombstone is never re-signed (that would make it
-     *     immortal); only re-announced.
+     *     *re-publish its existing bytes* (the same inline bundle — NO re-sign, so the expiry
+     *     clock is untouched) once per cadence, reaching peers that missed the withdrawal's
+     *     one-shot flood. Once the tombstone has expired, drop the intent — the bundle decays
+     *     via expiry + prune. A tombstone is never re-signed (that would make it immortal);
+     *     only re-published.
      * Also prunes decayed CRDT nodes each tick, gated on non-empty state. When there is no intent
      * AND no state, it returns before any chain read, so an idle contest still reads no chain. A
      * read-only voter or a contest this wallet never voted in is a no-op. Called on `start()` (to
@@ -515,7 +520,7 @@ class ContestNetwork implements VoteNetwork {
         const bucket = await this.#refreshBucket();
         if (intent !== undefined) {
             if (intent.votes.length === 0) {
-                await this.#tickTombstone(intent.lastBucket, bucket);
+                await this.#tickTombstone(intent.address, intent.lastBucket, bucket);
             } else if (intent.lastBucket + republishIntervalBuckets(this.criteria) <= bucket) {
                 await this.castVotes(intent.votes);
             }
@@ -553,13 +558,13 @@ class ContestNetwork implements VoteNetwork {
     }
 
     /**
-     * Advance a live withdrawal tombstone: re-announce its existing CID on the liveness cadence
-     * (never re-signing — the expiry clock stays fixed), and once the bundle has expired drop the
-     * intent so it stops. `withdrawalBucket` is the intent's `lastBucket` (set once by
+     * Advance a live withdrawal tombstone: re-publish its existing bundle bytes on the liveness
+     * cadence (never re-signing — the expiry clock stays fixed), and once the bundle has expired
+     * drop the intent so it stops. `withdrawalBucket` is the intent's `lastBucket` (set once by
      * {@link castVotes}); the tombstone bundle matches the CRDT's own expiry predicate,
      * `currentBucket > withdrawalBucket + voteExpiryBuckets`.
      */
-    async #tickTombstone(withdrawalBucket: number, bucket: number): Promise<void> {
+    async #tickTombstone(address: string, withdrawalBucket: number, bucket: number): Promise<void> {
         if (bucket > withdrawalBucket + this.criteria.voteExpiryBuckets) {
             await this.#deps.store.delete(this.topic);
             this.#lastTombstoneAnnounceBucket = undefined;
@@ -567,9 +572,14 @@ class ContestNetwork implements VoteNetwork {
         }
         const anchor = this.#lastTombstoneAnnounceBucket;
         if (anchor === undefined || bucket - anchor >= republishIntervalBuckets(this.criteria)) {
-            // Re-announce the existing winner CIDs (the tombstone included, while live) so a peer
-            // that missed the flood converges within a cadence. No re-sign, no `lastBucket` bump.
-            await this.#transport?.broadcastWinnerCids(this.#crdt.winnerCids(bucket));
+            // Re-publish the existing tombstone bundle — the same bytes inline, no re-sign, no
+            // `lastBucket` bump — so a peer that missed its one-shot flood converges within a
+            // cadence. The wallet's LWW winner while the tombstone is live IS the tombstone.
+            const wallet = address.toLowerCase();
+            const tombstone = this.#crdt
+                .current(bucket)
+                .find((b) => b.address.toLowerCase() === wallet && b.votes.length === 0);
+            if (tombstone) await this.#transport?.publishBundle(encodeBundle(tombstone));
             this.#lastTombstoneAnnounceBucket = bucket;
         }
     }
@@ -687,9 +697,9 @@ export class PubsubVoter implements VoteClient {
     async start(): Promise<void> {
         const networks = await Promise.all([...this.#criteriaById.values()].map((criteria) => this.#network(criteria)));
         for (const network of networks) {
-            // Joins the topic and installs the forward gate; cold-start winner-CID sync over
-            // the libp2p fetch protocol (`fetchWinnerCidsFromPeer`) is still unset, so this
-            // returns local winner CIDs and relies on live gossip to converge. See ROADMAP.md.
+            // Joins the topic and installs the forward gate; the cold-start root pull over the
+            // libp2p fetch protocol lands with the root-record sync (see ROADMAP.md), so a cold
+            // join currently relies on live gossip to converge.
             await network.start();
         }
         await this.#armRepublishScheduler(networks);
