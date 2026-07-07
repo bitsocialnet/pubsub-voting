@@ -38,7 +38,7 @@ import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
-import { deriveCriteria } from "../manifest/manifest.js";
+import { deriveCriteria, type DirectoryManifest } from "../manifest/manifest.js";
 import type { VoteStore } from "../store/types.js";
 import { selectVoteStore } from "../store/select.js";
 import {
@@ -186,7 +186,7 @@ export interface PubsubVoterOptions {
      * Its `contestId`s MUST be unique — a duplicate throws `DuplicateContestIdError` at
      * construction — and a missing/invalid manifest throws `MissingManifestError`.
      */
-    manifest: unknown;
+    manifest: DirectoryManifest;
     /**
      * Directory for the voter's persistence, Node only — the same `dataPath` convention
      * pkc-js and `@bitsocial/bso-resolver` use. When set, the Node backend keeps this

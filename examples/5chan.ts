@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import stripJsonComments from "strip-json-comments";
 import {
     PubsubVoter,
+    DirectoryManifestSchema,
     type HeliaInstance,
     type ChainClientFactory,
     type VoteSigner,
@@ -24,8 +25,10 @@ import {
 } from "@bitsocial/pubsub-votes";
 
 // The manifest is JSONC (commented for human readers), so strip comments before parsing.
-const manifest: unknown = JSON.parse(
-    stripJsonComments(readFileSync(new URL("../5chan-directory-criteria.jsonc", import.meta.url), "utf8"))
+// Validate it through the schema at load: this yields a typed `DirectoryManifest` and
+// surfaces a malformed file here rather than deep in the constructor.
+const manifest = DirectoryManifestSchema.parse(
+    JSON.parse(stripJsonComments(readFileSync(new URL("../5chan-directory-criteria.jsonc", import.meta.url), "utf8")))
 );
 
 // Host-provided seams. 5chan wires these from pkc + viem in its own code. The name
