@@ -1,5 +1,5 @@
-import type { BlockstoreLike, HeliaInstance, PubsubService } from "./types.js";
-import { MissingBlockstoreError, MissingPubsubError } from "../errors.js";
+import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./types.js";
+import { MissingBlockstoreError, MissingFetchError, MissingPubsubError } from "../errors.js";
 
 /**
  * The helia/libp2p-touching glue. Like the rest of `transport/`, this is the only place
@@ -39,15 +39,33 @@ function isBlockstoreLike(value: unknown): value is BlockstoreLike {
     );
 }
 
+/** Does `value` look like a libp2p fetch service (the request + responder registration)? */
+function isFetchService(value: unknown): value is FetchServiceLike {
+    if (value === null || typeof value !== "object") return false;
+    const candidate = value as Record<string, unknown>;
+    return (
+        typeof candidate.fetch === "function" &&
+        typeof candidate.registerLookupFunction === "function" &&
+        typeof candidate.unregisterLookupFunction === "function"
+    );
+}
+
 /**
- * Resolve and validate the gossipsub service and blockstore on an injected Helia node,
- * throwing {@link MissingPubsubError} or {@link MissingBlockstoreError} if either is
- * absent or malformed. Returns the narrowed handles so callers do not re-check.
+ * Resolve and validate the gossipsub service, blockstore, and fetch service on an injected
+ * Helia node, throwing {@link MissingPubsubError} / {@link MissingBlockstoreError} /
+ * {@link MissingFetchError} if any is absent or malformed. Returns the narrowed handles so
+ * callers do not re-check.
  */
-export function requireHeliaServices(helia: HeliaInstance): { pubsub: PubsubService; blockstore: BlockstoreLike } {
+export function requireHeliaServices(helia: HeliaInstance): {
+    pubsub: PubsubService;
+    blockstore: BlockstoreLike;
+    fetch: FetchServiceLike;
+} {
     const pubsub: unknown = helia.libp2p?.services?.pubsub;
     if (!isPubsubService(pubsub)) throw new MissingPubsubError();
     const blockstore: unknown = helia.blockstore;
     if (!isBlockstoreLike(blockstore)) throw new MissingBlockstoreError();
-    return { pubsub, blockstore };
+    const fetch: unknown = (helia.libp2p?.services as Record<string, unknown> | undefined)?.fetch;
+    if (!isFetchService(fetch)) throw new MissingFetchError();
+    return { pubsub, blockstore, fetch };
 }

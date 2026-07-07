@@ -80,6 +80,26 @@ export class MissingBlockstoreError extends Error {
 }
 
 /**
+ * Thrown at construction when the injected Helia node's libp2p has no usable **fetch
+ * service** at `libp2p.services.fetch`. The root-record pull — cold-start / reconnect
+ * checkpoint sync — rides the libp2p fetch protocol (this library registers its own lookup
+ * and runs its own requester), so the host must register `@libp2p/fetch` on the shared
+ * node. See DESIGN.md "Checkpoints" and "Deferred pkc-js work".
+ */
+export class MissingFetchError extends Error {
+    constructor() {
+        super(
+            "The injected Helia node's libp2p has no usable fetch service at " +
+                "`libp2p.services.fetch`. This library pulls peers' checkpoint root records " +
+                "over the libp2p fetch protocol on cold start, so the service is required. " +
+                "Register `@libp2p/fetch` as `services.fetch` before constructing PubsubVoter. " +
+                "See DESIGN.md \"Checkpoints\"."
+        );
+        this.name = "MissingFetchError";
+    }
+}
+
+/**
  * Thrown at construction when no `manifest` is given. v1 requires a `PubsubVoter` to own a
  * directory manifest: every contest is derived from it (`deriveCriteria`) and addressed by
  * its `contestId` (`getContest`). There is no ad-hoc, manifest-free contest path in v1.

@@ -74,6 +74,18 @@ export function decodeVoteMessage(data: Uint8Array): VoteMessage {
     return parsed.kind === "bundle" ? { kind: "bundle", bundle: parsed.bundle } : { kind: "root", record: parsed.record };
 }
 
+/**
+ * The libp2p fetch-protocol key suffix for a topic's root record: the full key is
+ * `topic + "/root"` (the topic prefix only namespaces *which* contest a multi-contest
+ * responder is asked about — it is not a pubsub topic). See DESIGN.md "Checkpoints".
+ */
+export const ROOT_FETCH_KEY_SUFFIX = "/root";
+
+/** The fetch-protocol key for one contest's root record. */
+export function rootFetchKey(topic: string): string {
+    return `${topic}${ROOT_FETCH_KEY_SUFFIX}`;
+}
+
 /** Standalone root-record codec — the same record served over the libp2p fetch protocol. */
 export function encodeRootRecord(record: RootRecord): Uint8Array {
     return encodeCanonical(RootRecordSchema.parse(record));

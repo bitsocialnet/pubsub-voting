@@ -1,6 +1,6 @@
 import { createPublicClient, http } from "viem";
 import type { Criteria } from "./schema/criteria.js";
-import type { BlockstoreLike, HeliaInstance, PubsubService } from "./transport/types.js";
+import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./transport/types.js";
 import type { ChainClient, ChainClientFactory } from "./chain/types.js";
 import type { VoteSigner } from "./signer/types.js";
 import { EIP712_SIGNATURE_TYPE } from "./signer/eip712.js";
@@ -56,29 +56,47 @@ function fakeBlockstore(): BlockstoreLike {
     };
 }
 
-/**
- * Build a Helia node from its parts, asserting in (not `any`) the rest of the `Helia`
- * surface the library never touches. Construction only reads `libp2p.services.pubsub`
- * and `blockstore`, so only those are populated; pass `undefined` to omit one and
- * exercise the construction guards.
- */
-function makeFakeHelia(pubsub: PubsubService | undefined, blockstore: BlockstoreLike | undefined): HeliaInstance {
-    return { libp2p: { services: { pubsub } }, blockstore } as unknown as HeliaInstance;
+/** A no-op libp2p fetch service (no peers answer, registrations are inert). */
+export function fakeFetchService(): FetchServiceLike {
+    return {
+        fetch: async () => undefined,
+        registerLookupFunction: () => {},
+        unregisterLookupFunction: () => {}
+    };
 }
 
-/** A Helia node carrying a gossipsub service and a blockstore, as a host injects. */
+/**
+ * Build a Helia node from its parts, asserting in (not `any`) the rest of the `Helia`
+ * surface the library never touches. Construction only reads `libp2p.services.pubsub`,
+ * `libp2p.services.fetch`, and `blockstore`, so only those are populated; pass
+ * `undefined` to omit one and exercise the construction guards.
+ */
+function makeFakeHelia(
+    pubsub: PubsubService | undefined,
+    blockstore: BlockstoreLike | undefined,
+    fetch: FetchServiceLike | undefined
+): HeliaInstance {
+    return { libp2p: { services: { pubsub, fetch } }, blockstore } as unknown as HeliaInstance;
+}
+
+/** A Helia node carrying a gossipsub service, a blockstore, and a fetch service, as a host injects. */
 export function fakeHelia(): HeliaInstance {
-    return makeFakeHelia(fakePubsub(), fakeBlockstore());
+    return makeFakeHelia(fakePubsub(), fakeBlockstore(), fakeFetchService());
 }
 
 /** A Helia node whose libp2p has no pubsub service, to assert construction rejects it. */
 export function fakeHeliaWithoutPubsub(): HeliaInstance {
-    return makeFakeHelia(undefined, fakeBlockstore());
+    return makeFakeHelia(undefined, fakeBlockstore(), fakeFetchService());
 }
 
 /** A Helia node with no blockstore, to assert construction rejects it. */
 export function fakeHeliaWithoutBlockstore(): HeliaInstance {
-    return makeFakeHelia(fakePubsub(), undefined);
+    return makeFakeHelia(fakePubsub(), undefined, fakeFetchService());
+}
+
+/** A Helia node whose libp2p has no fetch service, to assert construction rejects it. */
+export function fakeHeliaWithoutFetch(): HeliaInstance {
+    return makeFakeHelia(fakePubsub(), fakeBlockstore(), undefined);
 }
 
 /**

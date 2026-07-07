@@ -1,14 +1,24 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { CID } from "multiformats/cid";
 import { PubsubVoter, republishIntervalBuckets } from "./voter.js";
-import { decodeVoteMessage, encodeRootMessage, ROOT_RECORD_VERSION, type RootRecord } from "../transport/messages.js";
+import {
+    decodeVoteMessage,
+    decodeRootRecord,
+    encodeRootMessage,
+    encodeRootRecord,
+    rootFetchKey,
+    ROOT_RECORD_VERSION,
+    type RootRecord
+} from "../transport/messages.js";
+import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory } from "../chain/types.js";
-import type { HeliaInstance, PubsubService } from "../transport/types.js";
+import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import { MemoryVoteStore } from "../store/memory.js";
 import { selectVoteStore } from "../store/select.js";
 import {
     DuplicateContestIdError,
     MissingBlockstoreError,
+    MissingFetchError,
     MissingManifestError,
     MissingPubsubError,
     ReadOnlyError,
@@ -20,6 +30,8 @@ import {
     fakeHelia,
     fakeHeliaWithoutPubsub,
     fakeHeliaWithoutBlockstore,
+    fakeHeliaWithoutFetch,
+    fakeFetchService,
     fakeChains,
     stubChains,
     fakeSigner
@@ -69,7 +81,7 @@ function spyableHelia(): { helia: HeliaInstance; publish: ReturnType<typeof vi.f
         topicValidators: new Map()
     } satisfies PubsubService;
     const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
-    const helia = { libp2p: { services: { pubsub } }, blockstore } as unknown as HeliaInstance;
+    const helia = { libp2p: { services: { pubsub, fetch: fakeFetchService() } }, blockstore } as unknown as HeliaInstance;
     return { helia, publish };
 }
 
@@ -89,6 +101,12 @@ describe("PubsubVoter construction + read-only", () => {
         expect(
             () => new PubsubVoter({ helia: fakeHeliaWithoutBlockstore(), chains: fakeChains(), manifest: bizManifest() })
         ).toThrow(MissingBlockstoreError);
+    });
+
+    it("throws MissingFetchError when the node's libp2p has no fetch service", () => {
+        expect(
+            () => new PubsubVoter({ helia: fakeHeliaWithoutFetch(), chains: fakeChains(), manifest: bizManifest() })
+        ).toThrow(MissingFetchError);
     });
 
     it("throws MissingManifestError when no manifest is given", () => {
@@ -617,5 +635,99 @@ describe("root-record heartbeat", () => {
         await vi.advanceTimersByTimeAsync(INTERVAL_MS);
         expect(rootPublishes(h.publish)).toBe(2);
         await h.voter.stop();
+    });
+});
+
+/**
+ * The root-record fetch protocol: the responder registered on the host's fetch service and
+ * the cold-join requester (see DESIGN.md "Checkpoints", "Cold-join pull").
+ */
+describe("root-record fetch protocol", () => {
+    /** A helia whose fetch service records registrations and serves canned per-peer answers. */
+    function fetchSpyHelia(peerAnswers: Map<string, Uint8Array>) {
+        const lookups = new Map<string, (key: string) => Promise<Uint8Array | undefined>>();
+        const fetchCalls: Array<{ peer: string; key: string }> = [];
+        const fetchService: FetchServiceLike = {
+            fetch: async (peer, key) => {
+                fetchCalls.push({ peer: peer.toString(), key });
+                return peerAnswers.get(peer.toString());
+            },
+            registerLookupFunction: (prefix, lookup) => {
+                lookups.set(prefix, lookup);
+            },
+            unregisterLookupFunction: (prefix) => {
+                lookups.delete(prefix);
+            }
+        };
+        const subscribers = [...peerAnswers.keys()].map((id) => ({ toString: () => id }));
+        const chased: string[] = []; // root CIDs the chase pulled blocks for
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => subscribers as unknown as ReturnType<PubsubService["getSubscribers"]>,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = {
+            get: async (cid: CID) => {
+                chased.push(cid.toString());
+                throw new Error("no block"); // the chase yields nothing; only the attempt matters here
+            },
+            put: async (cid: CID) => cid,
+            has: async () => false
+        };
+        const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
+        return { helia, lookups, fetchCalls, chased };
+    }
+
+    it("registers a responder that answers <topic>/root with the on-demand record, and unregisters on stop", async () => {
+        const h = fetchSpyHelia(new Map());
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains(), manifest: bizManifest() });
+        await voter.start();
+        const lookup = h.lookups.get(TOPIC_PREFIX);
+        expect(lookup).toBeDefined();
+
+        const contest = await voter.getContest({ contestId: "biz" });
+        const answer = await lookup!(rootFetchKey(contest.topic));
+        expect(answer).toBeDefined();
+        const record = decodeRootRecord(answer!);
+        expect(record.version).toBe(ROOT_RECORD_VERSION);
+        expect(record.count).toBe(0); // an empty winner-set still answers (the empty checkpoint)
+
+        // Foreign key shapes and unknown topics answer nothing.
+        expect(await lookup!(contest.topic)).toBeUndefined(); // no /root suffix
+        expect(await lookup!(rootFetchKey(`${TOPIC_PREFIX}nope`))).toBeUndefined();
+
+        await voter.stop();
+        expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
+    });
+
+    it("cold-joins by pulling each subscriber's record and chasing every distinct divergent root (union, not quorum)", async () => {
+        const rootA = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const rootB = CID.parse("bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4");
+        const recordOf = (root: CID) => encodeRootRecord({ version: ROOT_RECORD_VERSION, root, count: 1, sizeBytes: 100 });
+        const h = fetchSpyHelia(
+            new Map([
+                ["peerA", recordOf(rootA)], // two peers agree on rootA...
+                ["peerB", recordOf(rootA)],
+                ["peerC", recordOf(rootB)], // ...one lone peer differs — still chased
+                ["peerD", new Uint8Array([0xff])] // and one answers garbage — ignored
+            ])
+        );
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains(), manifest: bizManifest() });
+        await voter.start();
+        const contest = await voter.getContest({ contestId: "biz" });
+
+        await vi.waitFor(() => expect(h.fetchCalls.length).toBe(4));
+        expect(new Set(h.fetchCalls.map((c) => c.key))).toEqual(new Set([rootFetchKey(contest.topic)]));
+        // Both distinct roots were chased (the lone divergent one included); the agreeing pair
+        // collapsed into one chase via the in-flight dedup.
+        await vi.waitFor(() => {
+            expect(h.chased).toContain(rootA.toString());
+            expect(h.chased).toContain(rootB.toString());
+        });
+        await voter.stop();
     });
 });

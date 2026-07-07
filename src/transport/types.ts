@@ -86,6 +86,23 @@ export type GossipTopicValidator = (
 ) => TopicValidatorResult | Promise<TopicValidatorResult>;
 
 /**
+ * The subset of the libp2p **fetch service** (`@libp2p/fetch`) this library drives,
+ * declared structurally so no runtime dependency on the package is needed. The host MUST
+ * register it at `libp2p.services.fetch`; construction throws `MissingFetchError`
+ * otherwise. Used for the root-record pull (see DESIGN.md "Checkpoints"): this library
+ * registers a lookup for its own key prefix (the responder) and fetches connected topic
+ * peers' records on cold start (the requester).
+ */
+export interface FetchServiceLike {
+    /** Request the value for `key` from a connected peer; nullish when the peer has none. */
+    fetch(peer: PeerId, key: string, options?: { signal?: AbortSignal }): Promise<Uint8Array | undefined | null>;
+    /** Register the responder for every key starting with `prefix`. */
+    registerLookupFunction(prefix: string, lookup: (key: string) => Promise<Uint8Array | undefined>): void;
+    /** Remove a registered responder (all of the prefix's, when `lookup` is omitted). */
+    unregisterLookupFunction(prefix: string, lookup?: (key: string) => Promise<Uint8Array | undefined>): void;
+}
+
+/**
  * The subset of a Helia blockstore this library drives, declared structurally. Vote
  * bundles are content-addressed blocks fetched/stored by CID through it (bitswap
  * retrieves through the blockstore). The full `Blocks` type carries progress-event

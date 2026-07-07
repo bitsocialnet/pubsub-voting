@@ -4,7 +4,7 @@ import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.
 import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { tickerForRef } from "../chain/ticker.js";
-import type { BlockstoreLike, HeliaInstance, PubsubService, VoteTransport } from "../transport/types.js";
+import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService, VoteTransport } from "../transport/types.js";
 import { requireHeliaServices } from "../transport/helia.js";
 import { makeBlockstoreBundleStore } from "../transport/bundle-store.js";
 import { makeRateLimiter } from "../transport/rate-limit.js";
@@ -12,8 +12,12 @@ import { makeGossipGate } from "../transport/gossip-validator.js";
 import { makeVoteTransport } from "../transport/transport.js";
 import {
     decodeVoteMessage,
+    decodeRootRecord,
+    encodeRootRecord,
     maxBundleMessageBytes,
+    rootFetchKey,
     MAX_ROOT_MESSAGE_BYTES,
+    ROOT_FETCH_KEY_SUFFIX,
     ROOT_RECORD_VERSION,
     type RootRecord
 } from "../transport/messages.js";
@@ -219,6 +223,8 @@ interface ResolvedDeps {
     pubsub: PubsubService;
     /** The node's blockstore, validated once at construction. */
     blockstore: BlockstoreLike;
+    /** The node's libp2p fetch service (root-record pull), validated once at construction. */
+    fetch: FetchServiceLike;
     chains: ChainClientFactory;
     signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
@@ -240,6 +246,8 @@ const GATE_RATE = { limit: 256, intervalMs: 10_000 };
  * divergence response), so 4/min is ≫ any honest rate while flattening a root spray.
  */
 const GATE_ROOT_RATE = { limit: 4, intervalMs: 60_000 };
+/** Cold-join fan-out: connected topic peers asked for their root record on start. */
+const COLD_START_PEERS = 4;
 /**
  * Root-record heartbeat interval (ms): 10 minutes — the IPNS-over-pubsub rebroadcast default
  * (`go-libp2p-pubsub-router`) — jittered ±25% per firing, with suppression on top (skip when a
@@ -495,6 +503,10 @@ class ContestNetwork implements VoteNetwork {
         });
         await this.#transport.start();
         this.#armHeartbeat();
+        // Cold-start / reconnect pull: ask connected topic peers for their root records and
+        // chase any divergence. Fire-and-forget — joining must not block on slow peers, and
+        // live gossip plus the heartbeat converge regardless; this only shortens the gap.
+        void this.#coldStart().catch(() => {});
         // If a restart left state behind, refresh the bucket and prune the decayed nodes. Gated
         // on non-empty state so an empty join stays network-free (no getBlockNumber read),
         // preserving the "zero chain reads for a constant-weight tally" property.
@@ -502,6 +514,29 @@ class ContestNetwork implements VoteNetwork {
             await this.#refreshBucket();
             await this.#crdt.prune(this.#currentBucketCache);
         }
+    }
+
+    /**
+     * The cold-join pull (DESIGN.md "Checkpoints"): ask up to {@link COLD_START_PEERS}
+     * connected topic peers, over the libp2p **fetch protocol**, for their current root
+     * record, and chase every root that differs from our own. Roots are **unioned, never
+     * quorum'd**: a record served by a single peer is still chased — trust is per-bundle
+     * (the chase verifies each), not per-checkpoint — so a colluding majority cannot hide a
+     * vote. A peer that answers nothing, garbage, or our own root contributes nothing.
+     */
+    async #coldStart(): Promise<void> {
+        const peers = this.#deps.pubsub.getSubscribers(this.topic).slice(0, COLD_START_PEERS);
+        if (peers.length === 0) return;
+        const own = await this.rootRecord();
+        await Promise.allSettled(
+            peers.map(async (peer) => {
+                const value = await this.#deps.fetch.fetch(peer, rootFetchKey(this.topic));
+                if (value === undefined || value === null) return;
+                const record = decodeRootRecord(value); // throws on garbage — settled, ignored
+                if (record.root.equals(own.root)) return;
+                this.#chaser?.chase(record.root);
+            })
+        );
     }
 
     async stop(): Promise<void> {
@@ -749,14 +784,16 @@ export class PubsubVoter implements VoteClient {
     readonly #republishPollIntervalMs: number;
 
     constructor(options: PubsubVoterOptions) {
-        // Fail fast: the node must expose a gossipsub service and a blockstore. Throws
-        // MissingPubsubError / MissingBlockstoreError at construction (not a lazy failure
-        // on the first publish/fetch) and narrows both handles.
-        const { pubsub, blockstore } = requireHeliaServices(options.helia);
+        // Fail fast: the node must expose a gossipsub service, a blockstore, and a libp2p
+        // fetch service. Throws MissingPubsubError / MissingBlockstoreError /
+        // MissingFetchError at construction (not a lazy failure on the first
+        // publish/fetch) and narrows the handles.
+        const { pubsub, blockstore, fetch } = requireHeliaServices(options.helia);
         this.#deps = {
             helia: options.helia,
             pubsub,
             blockstore,
+            fetch,
             chains: options.chains,
             signer: options.signer,
             registry: resolveRegistry(options.rules),
@@ -809,12 +846,30 @@ export class PubsubVoter implements VoteClient {
         return network;
     }
 
+    /**
+     * The fetch-protocol responder: answer `"<topic>/root"` with that contest's current root
+     * record, encoded on demand (see DESIGN.md "Checkpoints"). Unauthenticated and tiny by
+     * design — a request can never compel blocks; those travel over directed bitswap. An
+     * unknown topic, foreign key shape, or encode failure answers nothing.
+     */
+    readonly #rootLookup = async (key: string): Promise<Uint8Array | undefined> => {
+        if (!key.endsWith(ROOT_FETCH_KEY_SUFFIX)) return undefined;
+        const network = this.#contests.get(key.slice(0, -ROOT_FETCH_KEY_SUFFIX.length));
+        if (!network) return undefined;
+        try {
+            return encodeRootRecord(await network.rootRecord());
+        } catch {
+            return undefined;
+        }
+    };
+
     async start(): Promise<void> {
         const networks = await Promise.all([...this.#criteriaById.values()].map((criteria) => this.#network(criteria)));
+        // One responder for every contest this voter serves, keyed by the shared topic prefix.
+        this.#deps.fetch.registerLookupFunction(TOPIC_PREFIX, this.#rootLookup);
         for (const network of networks) {
-            // Joins the topic and installs the forward gate; the cold-start root pull over the
-            // libp2p fetch protocol lands with the root-record sync (see ROADMAP.md), so a cold
-            // join currently relies on live gossip to converge.
+            // Joins the topic, installs the forward gate, arms the heartbeat, and fires the
+            // cold-start root pull against connected topic peers.
             await network.start();
         }
         await this.#armRepublishScheduler(networks);
@@ -822,6 +877,7 @@ export class PubsubVoter implements VoteClient {
 
     async stop(): Promise<void> {
         this.#clearRepublishTimers();
+        this.#deps.fetch.unregisterLookupFunction(TOPIC_PREFIX, this.#rootLookup);
         await this.stopAll();
     }
 
@@ -831,6 +887,7 @@ export class PubsubVoter implements VoteClient {
 
     async destroy(): Promise<void> {
         this.#clearRepublishTimers();
+        this.#deps.fetch.unregisterLookupFunction(TOPIC_PREFIX, this.#rootLookup);
         await this.stopAll();
         await this.#deps.store.destroy?.();
     }

@@ -18,7 +18,7 @@ The same engine generalizes to the original use case in [pkc-js issue #25](https
 - The engine is reusable across clients and contests.
 - The core (`schema/`, `verify/`, `crdt/`, `tally/`) is transport-agnostic and unit-testable without a network. libp2p only appears in `transport/`.
 
-This library does not start its own node. It consumes the host's running Helia node directly — no adapter — and drives that node's gossipsub service and blockstore itself. The node must carry a pubsub service at `libp2p.services.pubsub` (a plain Helia node does not — register e.g. `@chainsafe/libp2p-gossipsub`) and a usable `blockstore`; construction throws `MissingPubsubError` / `MissingBlockstoreError` otherwise. With pkc-js today that node is reached at `pkc.clients.libp2pJsClients[key]._helia`; a version-stable accessor on pkc-js is a planned follow-up (see [DESIGN.md, Deferred pkc-js work](./DESIGN.md#deferred-pkc-js-work)).
+This library does not start its own node. It consumes the host's running Helia node directly — no adapter — and drives that node's gossipsub service and blockstore itself. The node must carry a pubsub service at `libp2p.services.pubsub` (a plain Helia node does not — register e.g. `@chainsafe/libp2p-gossipsub`), a usable `blockstore`, and a libp2p fetch service at `libp2p.services.fetch` (register `@libp2p/fetch` — the checkpoint root-record pull rides it); construction throws `MissingPubsubError` / `MissingBlockstoreError` / `MissingFetchError` otherwise. With pkc-js today that node is reached at `pkc.clients.libp2pJsClients[key]._helia`; a version-stable accessor on pkc-js is a planned follow-up (see [DESIGN.md, Deferred pkc-js work](./DESIGN.md#deferred-pkc-js-work)).
 
 ## Design at a glance
 
@@ -58,7 +58,7 @@ const voter = new PubsubVoter({
 
 The `manifest` is mandatory: the voter derives every contest from it at construction and addresses each by its unique `contestId`. If you only care about one contest, pass a one-entry manifest (empty `defaults`, the criteria as the single `contests` entry).
 
-Construction throws `MissingPubsubError` or `MissingBlockstoreError` if the node lacks a usable pubsub service or blockstore — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through.)
+Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingFetchError` if the node lacks a usable pubsub service, blockstore, or libp2p fetch service — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through. The fetch service carries the checkpoint root-record pull; the library registers its own responder on it.)
 
 ### Read a tally (no signer needed)
 
