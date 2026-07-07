@@ -43,7 +43,7 @@ The engine, client lifecycle, and live-delta transport are implemented and unit-
 - A documented, version-stable accessor on pkc-js that returns the Helia node (with `libp2p.services.pubsub`, `blockstore`, and a registered `fetch` service), so consumers stop reaching through the private `._helia` field.
 - **Adding `@libp2p/fetch` to the shared node's construction.** This library registers its own lookup function and runs its own requester against `libp2p.services.fetch` (see Done, root-record checkpoint sync) — the host only has to carry the service; `PubsubVoter` throws `MissingFetchError` at construction until it does.
 
-Track these as pkc-js issues and reference them here once filed.
+Filed as [pkc-js#183](https://github.com/pkcprotocol/pkc-js/issues/183) (gossipsub >= 15.0.23 + `@libp2p/fetch` on the shared node, with the accessor and score-tuning follow-ups noted).
 
 ## Deferred (designed, not shipped)
 
