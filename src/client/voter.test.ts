@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import type { CID } from "multiformats/cid";
-import { PubsubVoter, republishIntervalBuckets, checkpointIntervalBuckets } from "./voter.js";
+import { CID } from "multiformats/cid";
+import { PubsubVoter, republishIntervalBuckets } from "./voter.js";
+import { decodeVoteMessage, encodeRootMessage, ROOT_RECORD_VERSION, type RootRecord } from "../transport/messages.js";
 import type { ChainClient, ChainClientFactory } from "../chain/types.js";
 import type { HeliaInstance, PubsubService } from "../transport/types.js";
 import { MemoryVoteStore } from "../store/memory.js";
@@ -228,10 +229,6 @@ describe("republish cadence", () => {
         expect(republishIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 1 })).toBe(1);
     });
 
-    it("cuts checkpoints once per full expiry window (coarser than republish)", () => {
-        expect(checkpointIntervalBuckets(bizCriteria())).toBe(30); // one whole voteExpiryBuckets
-        expect(checkpointIntervalBuckets({ ...bizCriteria(), voteExpiryBuckets: 7 })).toBe(7);
-    });
 });
 
 describe("selectVoteStore", () => {
@@ -366,7 +363,7 @@ describe("republish scheduler", () => {
         await voter.stop();
     });
 
-    it("cuts a checkpoint on the coarse cadence (not every tick), storing blocks and exposing the root", async () => {
+    it("encodes the root record on demand, caches it until the state changes, and stores its blocks", async () => {
         vi.useFakeTimers();
         let block = bucketBlock(1);
         const puts = new Set<string>();
@@ -386,22 +383,28 @@ describe("republish scheduler", () => {
         });
         await voter.start();
         const contest = await voter.getContest({ contestId: "biz" });
-        // `latestCheckpointRoot` is exposed for the (host-blocked) fetch responder, not on the public
-        // VoteNetwork interface, so reach it structurally in the test.
-        const ck = contest as unknown as { latestCheckpointRoot(): CID | undefined };
-        expect(ck.latestCheckpointRoot()).toBeUndefined(); // no state ⇒ nothing to snapshot
+        // `rootRecord`/`latestCheckpointRoot` serve the fetch responder + heartbeat, not the
+        // public VoteNetwork interface, so reach them structurally in the test.
+        const ck = contest as unknown as {
+            rootRecord(): Promise<RootRecord>;
+            latestCheckpointRoot(): CID | undefined;
+        };
+        expect(ck.latestCheckpointRoot()).toBeUndefined(); // nothing encoded yet
 
         await contest.castVotes(VOTE); // state at bucket 1
-        block = bucketBlock(40); // past the republish (15) and checkpoint (30) cadences
-        await vi.advanceTimersByTimeAsync(1000); // one poll tick: re-sign + prune + checkpoint cut
-        const root = ck.latestCheckpointRoot();
-        expect(root).toBeDefined();
-        expect(puts.has(root!.toString())).toBe(true); // the root block was written to the blockstore
+        const record = await ck.rootRecord();
+        expect(record.count).toBe(1);
+        expect(puts.has(record.root.toString())).toBe(true); // blocks written for directed bitswap
+        expect(ck.latestCheckpointRoot()?.equals(record.root)).toBe(true);
 
-        // A further tick within the cadence must NOT re-cut — the cut is bucket-coarse, not per-tick.
-        block = bucketBlock(41);
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(ck.latestCheckpointRoot()).toBe(root);
+        // Cached: an unchanged winner-set returns the same record without a re-encode.
+        expect(await ck.rootRecord()).toBe(record);
+
+        // A state change (the scheduler's re-sign at a later bucket) invalidates the cache.
+        block = bucketBlock(20); // past the republish cadence (15)
+        await vi.advanceTimersByTimeAsync(1000); // one poll tick: re-sign
+        const after = await ck.rootRecord();
+        expect(after.root.equals(record.root)).toBe(false);
         await voter.stop();
     });
 
@@ -524,5 +527,95 @@ describe("republish scheduler", () => {
             manifest: bizManifest()
         });
         await expect(voter.forget({ contestId: "nope" })).rejects.toBeInstanceOf(UnknownContestError);
+    });
+});
+
+/**
+ * Root-record heartbeat (see DESIGN.md "Checkpoints", "Two transports for the same record").
+ * `Math.random` is pinned to 0.5 so the ±25% jitter resolves to exactly the 10-minute base
+ * interval, making timer advances deterministic.
+ */
+describe("root-record heartbeat", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+    });
+
+    const INTERVAL_MS = 600_000; // jitter factor 0.75 + 0.5 * 0.5 = 1.0 under the pinned random
+
+    /** Count published messages that decode to the root kind. */
+    function rootPublishes(publish: ReturnType<typeof vi.fn>): number {
+        return publish.mock.calls.filter((call) => {
+            try {
+                return decodeVoteMessage((call as [string, Uint8Array])[1]).kind === "root";
+            } catch {
+                return false;
+            }
+        }).length;
+    }
+
+    /** A read-only voter (no scheduler noise) with its topic validator + publish spy exposed. */
+    async function heartbeatHarness() {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0.5);
+        const { helia, publish } = spyableHelia();
+        const pubsub = (helia as unknown as { libp2p: { services: { pubsub: PubsubService } } }).libp2p.services.pubsub;
+        const voter = new PubsubVoter({ helia, chains: advancingChains(() => bucketBlock(1)), manifest: bizManifest() });
+        await voter.start();
+        const contest = await voter.getContest({ contestId: "biz" });
+        const validator = pubsub.topicValidators!.get(contest.topic)!;
+        const deliver = async (record: RootRecord, from = "peer2") => {
+            const peer = { toString: () => from } as unknown as Parameters<typeof validator>[0];
+            const verdict = await validator(peer, { topic: contest.topic, data: encodeRootMessage(record) });
+            await vi.advanceTimersByTimeAsync(1); // flush the fire-and-forget hint handler
+            return verdict;
+        };
+        const ownRecord = () => (contest as unknown as { rootRecord(): Promise<RootRecord> }).rootRecord();
+        return { voter, contest, publish, deliver, ownRecord };
+    }
+
+    it("heartbeats its root record once per interval when nothing was heard", async () => {
+        const h = await heartbeatHarness();
+        expect(rootPublishes(h.publish)).toBe(0);
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(1);
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(2);
+        await h.voter.stop();
+        // stop() disarms the timer: no further heartbeats.
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3);
+        expect(rootPublishes(h.publish)).toBe(2);
+    });
+
+    it("suppresses its heartbeat when a matching root was heard this interval", async () => {
+        const h = await heartbeatHarness();
+        expect(await h.deliver(await h.ownRecord())).toBe("accept"); // a converged peer spoke first
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(0); // suppressed — the topic already carried this root
+        // The next interval heard nothing, so the heartbeat resumes.
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(1);
+        await h.voter.stop();
+    });
+
+    it("answers a divergent root once per interval (no chorus) and stays quiet that interval", async () => {
+        const h = await heartbeatHarness();
+        const foreign: RootRecord = {
+            version: ROOT_RECORD_VERSION,
+            root: CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4"),
+            count: 1,
+            sizeBytes: 100
+        };
+        expect(await h.deliver(foreign)).toBe("accept"); // forwarded (an unverifiable hint)
+        expect(rootPublishes(h.publish)).toBe(1); // answered with our own record...
+        await h.deliver(foreign, "peer3");
+        expect(rootPublishes(h.publish)).toBe(1); // ...but only once per interval, however many arrive
+        // The response already spoke for this interval: the timer stays quiet...
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(1);
+        // ...and the following (silent) interval heartbeats normally.
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(2);
+        await h.voter.stop();
     });
 });

@@ -10,7 +10,14 @@ import { makeBlockstoreBundleStore } from "../transport/bundle-store.js";
 import { makeRateLimiter } from "../transport/rate-limit.js";
 import { makeGossipGate } from "../transport/gossip-validator.js";
 import { makeVoteTransport } from "../transport/transport.js";
-import { decodeVoteMessage, maxBundleMessageBytes, MAX_ROOT_MESSAGE_BYTES } from "../transport/messages.js";
+import {
+    decodeVoteMessage,
+    maxBundleMessageBytes,
+    MAX_ROOT_MESSAGE_BYTES,
+    ROOT_RECORD_VERSION,
+    type RootRecord
+} from "../transport/messages.js";
+import { makeRootChaser, type RootChaser } from "../transport/chase.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../crdt/codec.js";
 import type { RuleRegistry } from "../rules/types.js";
 import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
@@ -46,19 +53,6 @@ import {
  */
 export function republishIntervalBuckets(criteria: Criteria): number {
     return Math.ceil(criteria.voteExpiryBuckets / 2);
-}
-
-/**
- * How often to cut a checkpoint, in buckets: one full expiry window. Checkpoints are compaction +
- * cold-start (see DESIGN.md "Checkpoints"), not liveness, so the cadence is deliberately coarser
- * than {@link republishIntervalBuckets} — a fresh cut per expiry window keeps the snapshot current
- * enough for a cold joiner while the CRDT's read-time expiry filter already bounds the live set.
- * This is a *bucket* cadence rolled onto the republish poll tick — never a per-block trigger, which
- * would re-encode the whole winner set every block and churn the root CID, defeating seeder
- * byte-identity.
- */
-export function checkpointIntervalBuckets(criteria: Criteria): number {
-    return criteria.voteExpiryBuckets;
 }
 
 /**
@@ -247,6 +241,17 @@ const GATE_RATE = { limit: 256, intervalMs: 10_000 };
  */
 const GATE_ROOT_RATE = { limit: 4, intervalMs: 60_000 };
 /**
+ * Root-record heartbeat interval (ms): 10 minutes — the IPNS-over-pubsub rebroadcast default
+ * (`go-libp2p-pubsub-router`) — jittered ±25% per firing, with suppression on top (skip when a
+ * matching root was heard this interval) so a converged topic stays near-silent. See DESIGN.md
+ * "Checkpoints" and "Transport constants (v1)".
+ */
+const HEARTBEAT_INTERVAL_MS = 600_000;
+/** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
+const CHASE_TIMEOUT_MS = 30_000;
+/** Concurrent root chases; a spray of divergent roots queues, never floods. */
+const CHASE_CONCURRENCY = 2;
+/**
  * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
  * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
  * consults the head, and this TTL caps that to ≤1 `getBlockNumber` per window under a flood of
@@ -299,14 +304,23 @@ class ContestNetwork implements VoteNetwork {
      * {@link republishIfDue}). See DESIGN.md "Cancelling a vote".
      */
     #lastTombstoneAnnounceBucket: number | undefined = undefined;
-    /** Bucket of the last checkpoint cut, so the cut rides the coarse cadence, not every poll tick. */
-    #lastCheckpointBucket: number | undefined = undefined;
     /**
-     * Root CID of the most recent checkpoint this contest cut (blocks are in the blockstore). Held
-     * for the future cold-start fetch responder to serve; the responder wiring is host-blocked on
-     * the pkc-js fetch service (see ROADMAP / DESIGN.md "Deferred pkc-js work").
+     * The on-demand checkpoint cache: the last encoded root record and the bucket it was encoded
+     * at. Invalidated by {@link #markStateChanged} (any merge/cast/chase admit) and by a bucket
+     * advance (expiry changes the winner set without any message). See DESIGN.md "Checkpoints",
+     * "On-demand encode".
      */
-    #latestCheckpointRoot: CID | undefined = undefined;
+    #rootRecordCache: { record: RootRecord; bucket: number } | undefined = undefined;
+    /** True when the winner-set changed since the last encode; the next `rootRecord()` re-encodes. */
+    #checkpointDirty = true;
+    /** Live once `start()` runs; chases advertised roots that differ from our own. */
+    #chaser: RootChaser | undefined;
+    /** The armed heartbeat timer (jittered; see {@link #armHeartbeat}), cleared by `stop()`. */
+    #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+    /** True when a heartbeat matching our own root was heard this interval (suppression). */
+    #heardMatchingRoot = false;
+    /** True once we published our record this interval (heartbeat OR divergence response). */
+    #publishedRootThisInterval = false;
 
     constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
@@ -437,12 +451,42 @@ class ContestNetwork implements VoteNetwork {
             limit: (fn) => limit(fn),
             allowBundlePeer: makeRateLimiter(GATE_RATE),
             allowRootPeer: makeRateLimiter(GATE_ROOT_RATE),
-            onAccept: () => this.#notifyUpdate(),
-            // Root records surface here as unverifiable hints; the divergence chase that acts
-            // on them lands with the heartbeat (see ROADMAP "Root-record checkpoint sync").
+            onAccept: () => {
+                this.#markStateChanged();
+                this.#notifyUpdate();
+            },
+            // Root records surface as unverifiable hints: compare to our own root, chase a
+            // divergence lazily, answer it once per interval. Never awaited by the validator.
+            onRootRecord: (record) => {
+                void this.#handleRootRecord(record).catch(() => {});
+            },
             maxBundleMessageBytes: maxBundleMessageBytes(this.criteria),
             maxRootMessageBytes: MAX_ROOT_MESSAGE_BYTES,
             timeoutMs: GATE_TIMEOUT_MS
+        });
+        const chaseLimit = pLimit(CHASE_CONCURRENCY);
+        this.#chaser = makeRootChaser({
+            getBlock: async (cid, signal) => {
+                try {
+                    // Blockstore + bitswap: the advertisers are connected topic peers that
+                    // provably hold these blocks, so the want resolves against them directly.
+                    return await this.#deps.blockstore.get(cid, { signal });
+                } catch {
+                    return undefined;
+                }
+            },
+            verifier: this.#verifier,
+            cache: this.#cache,
+            isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
+            hasBundle: (cid) => this.#store.has(cid),
+            admit: async ({ cid, bytes }) => {
+                await this.#deps.blockstore.put(cid, bytes);
+                await this.#crdt.merge([cid]);
+                this.#markStateChanged();
+            },
+            onMerged: () => this.#notifyUpdate(),
+            limit: (fn) => chaseLimit(fn),
+            timeoutMs: CHASE_TIMEOUT_MS
         });
         this.#transport = makeVoteTransport({
             pubsub: this.#deps.pubsub,
@@ -450,6 +494,7 @@ class ContestNetwork implements VoteNetwork {
             gate
         });
         await this.#transport.start();
+        this.#armHeartbeat();
         // If a restart left state behind, refresh the bucket and prune the decayed nodes. Gated
         // on non-empty state so an empty join stays network-free (no getBlockNumber read),
         // preserving the "zero chain reads for a constant-weight tally" property.
@@ -460,6 +505,11 @@ class ContestNetwork implements VoteNetwork {
     }
 
     async stop(): Promise<void> {
+        if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
+        this.#heartbeatTimer = undefined;
+        this.#heardMatchingRoot = false;
+        this.#publishedRootThisInterval = false;
+        this.#chaser = undefined;
         await this.#transport?.stop();
         this.#transport = undefined;
     }
@@ -479,6 +529,7 @@ class ContestNetwork implements VoteNetwork {
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
         await this.#crdt.add(bundle);
+        this.#markStateChanged();
         // The live delta: this wallet's own bundle, inlined — never the whole winner-set.
         await this.#transport?.publishBundle(encodeBundle(bundle));
         // Persist the intent so the scheduler can revive/re-announce it after a restart. A
@@ -526,35 +577,99 @@ class ContestNetwork implements VoteNetwork {
             }
         }
         if (hasState) {
+            // Compaction: drop expired/superseded nodes from memory. Blockstore GC of the
+            // now-unreferenced blocks is deferred housekeeping (see DESIGN.md "Checkpoints").
             await this.#crdt.prune(bucket);
-            await this.#cutCheckpointIfDue(bucket);
+        }
+    }
+
+    /** Invalidate the on-demand checkpoint cache: the winner-set changed (cast/merge/chase). */
+    #markStateChanged(): void {
+        this.#checkpointDirty = true;
+    }
+
+    /**
+     * The contest's current root record, encoded **on demand** and cached until the winner-set
+     * changes ({@link #markStateChanged}) or the bucket advances (expiry changes the set with no
+     * message). Each encode writes its blocks to the blockstore — content-addressed and
+     * idempotent — so directed bitswap can serve them to a chasing peer. Served by the fetch
+     * responder and heartbeated on the topic; there is NO cut cadence (see DESIGN.md
+     * "Checkpoints", "On-demand encode").
+     */
+    async rootRecord(): Promise<RootRecord> {
+        const bucket = this.#currentBucketCache;
+        const cached = this.#rootRecordCache;
+        if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
+        const winners = this.#crdt.current(bucket);
+        const { root, blocks } = await encodeCheckpoint(winners);
+        for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
+        const record: RootRecord = {
+            version: ROOT_RECORD_VERSION,
+            root,
+            count: winners.length,
+            sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
+        };
+        this.#rootRecordCache = { record, bucket };
+        this.#checkpointDirty = false;
+        return record;
+    }
+
+    /**
+     * The root CID of this contest's current checkpoint, or `undefined` before the first
+     * encode. The blocks it references are in the blockstore.
+     */
+    latestCheckpointRoot(): CID | undefined {
+        return this.#rootRecordCache?.record.root;
+    }
+
+    /**
+     * Handle a heard root record (an unverifiable hint, surfaced by the gate at layer 1):
+     *   - matching our own root ⇒ note it for heartbeat **suppression** (a converged topic
+     *     stays near-silent);
+     *   - differing ⇒ **chase** it lazily (bounded; see transport/chase.ts) and answer with our
+     *     own record at most once per interval, so both sides learn of the split without an
+     *     attacker being able to make honest peers chorus.
+     * See DESIGN.md "Checkpoints", "Two transports for the same record".
+     */
+    async #handleRootRecord(record: RootRecord): Promise<void> {
+        const own = await this.rootRecord();
+        if (own.root.equals(record.root)) {
+            this.#heardMatchingRoot = true;
+            return;
+        }
+        this.#chaser?.chase(record.root);
+        if (!this.#publishedRootThisInterval) {
+            this.#publishedRootThisInterval = true;
+            await this.#transport?.publishRootRecord(own);
         }
     }
 
     /**
-     * Cut a checkpoint if the coarse cadence ({@link checkpointIntervalBuckets}) is due: snapshot the
-     * current non-expired LWW winners, store the resulting blocks in the blockstore, and remember the
-     * root CID. Rides the republish poll tick — never a per-block trigger — so it re-encodes the
-     * winner set at most once per expiry window, not once per block. No-op until the cadence elapses.
+     * Arm the next heartbeat firing: {@link HEARTBEAT_INTERVAL_MS} jittered ±25%, re-armed
+     * after each tick. The tick publishes our root record UNLESS this interval already carried
+     * it — either a matching heartbeat was heard (suppression) or we already published (the
+     * one-per-interval cap, shared with the divergence response).
      */
-    async #cutCheckpointIfDue(bucket: number): Promise<void> {
-        const due =
-            this.#lastCheckpointBucket === undefined ||
-            bucket >= this.#lastCheckpointBucket + checkpointIntervalBuckets(this.criteria);
-        if (!due) return;
-        const { root, blocks } = await encodeCheckpoint(this.#crdt.current(bucket));
-        for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
-        this.#latestCheckpointRoot = root;
-        this.#lastCheckpointBucket = bucket;
+    #armHeartbeat(): void {
+        const delay = HEARTBEAT_INTERVAL_MS * (0.75 + Math.random() * 0.5);
+        const timer = setTimeout(() => {
+            void this.#heartbeatTick()
+                .catch(() => {}) // transient publish/encode failure — next interval retries
+                .finally(() => {
+                    if (this.#heartbeatTimer !== undefined) this.#armHeartbeat();
+                });
+        }, delay);
+        // Don't hold a Node process open; no-op in the browser.
+        (timer as { unref?: () => void }).unref?.();
+        this.#heartbeatTimer = timer;
     }
 
-    /**
-     * The root CID of the most recent checkpoint cut for this contest, or `undefined` if none has
-     * been cut yet. Exposed for the cold-start fetch responder (host-blocked on the pkc-js fetch
-     * service); the blocks it references are in the blockstore.
-     */
-    latestCheckpointRoot(): CID | undefined {
-        return this.#latestCheckpointRoot;
+    async #heartbeatTick(): Promise<void> {
+        const suppressed = this.#heardMatchingRoot || this.#publishedRootThisInterval;
+        this.#heardMatchingRoot = false;
+        this.#publishedRootThisInterval = false;
+        if (suppressed) return;
+        await this.#transport?.publishRootRecord(await this.rootRecord());
     }
 
     /**
