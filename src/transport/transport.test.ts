@@ -67,7 +67,12 @@ async function harness() {
         decodeWinnerCids,
         getWinnerCids: () => crdt.winnerCids(0)
     });
-    const bundle: VotesBundle = { address: "0x1", votes: [{ community: { publicKey: KEY_A }, vote: 1 }], blockNumber: 1, signature: { signature: "0x", type: "eip712" } };
+    const bundle: VotesBundle = {
+        address: `0x${"1".padStart(40, "0")}`,
+        votes: [{ community: { publicKey: KEY_A }, vote: 1 }],
+        blockNumber: 1,
+        signature: { signature: `0x${"11".repeat(65)}`, type: "eip712" }
+    };
     const cid = await store.put(bundle);
     return { transport, topicValidators, published, subscribed, crdt, cid };
 }

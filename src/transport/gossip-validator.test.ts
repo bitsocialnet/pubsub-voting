@@ -12,8 +12,18 @@ import type { VotesBundle } from "../schema/votes.js";
 
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
+// The binary codec requires well-formed field sizes (20-byte address, 65-byte signature), so
+// short hex tags are padded here; validity is still the verifier's concern, not the codec's.
+const padAddress = (tag: string) => `0x${tag.replace(/^0x/, "").padStart(40, "0")}`;
+const padSig = (tag: string) => `0x${tag.replace(/^0x/, "").padEnd(130, "0")}`;
+
 function bundle(address: string, blockNumber = 1, sig = "0x"): VotesBundle {
-    return { address, votes: [{ community: { publicKey: KEY_A }, vote: 1 }], blockNumber, signature: { signature: sig, type: "eip712" } };
+    return {
+        address: padAddress(address),
+        votes: [{ community: { publicKey: KEY_A }, vote: 1 }],
+        blockNumber,
+        signature: { signature: padSig(sig), type: "eip712" }
+    };
 }
 
 async function makeNode(address: string, blockNumber = 1, sig = "0x"): Promise<{ cid: CID; node: VotesBundle }> {

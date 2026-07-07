@@ -90,11 +90,11 @@ export function fakeChains(): ChainClientFactory {
     return ({ config }) => createPublicClient({ transport: http(config.rpcUrls[0]) });
 }
 
-/** A minimal signer for write-path tests. */
+/** A minimal signer for write-path tests (65-byte placeholder — the binary codec checks size). */
 export function fakeSigner(): VoteSigner {
     return {
         address: () => "0x0000000000000000000000000000000000000001",
-        signBallot: () => ({ signature: "0xdeadbeef", type: EIP712_SIGNATURE_TYPE })
+        signBallot: () => ({ signature: `0x${"de".repeat(65)}`, type: EIP712_SIGNATURE_TYPE })
     };
 }
 

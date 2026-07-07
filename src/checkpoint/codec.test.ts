@@ -5,7 +5,8 @@ import type { VotesBundle } from "../schema/votes.js";
 
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const KEY_B = "12Czge2qhmFg7TPsvfRDyZiWbwho51g5fgqc6LoVD6nTUWbodZXw";
-const sig = { signature: "0x", type: "eip712" } as const;
+// The binary codec requires a well-formed 65-byte signature (validity is checked elsewhere).
+const sig = { signature: `0x${"11".repeat(65)}`, type: "eip712" } as const;
 
 // Deliberately NOT in address order — the codec must sort.
 const WINNERS: VotesBundle[] = [
@@ -23,7 +24,7 @@ describe("checkpoint codec", () => {
     // so any change to the layout (codec options, sort, chunk rule) is a breaking re-freeze.
     it("pins the root CID for a known winner set (fixed vector)", async () => {
         const { root, blocks } = await encodeCheckpoint(WINNERS);
-        expect(root.toString()).toBe("bafyreibimch6jv7f5mfpisa6j4inx7exrd4qd5ayrt4mz44fbmtfj54afy");
+        expect(root.toString()).toBe("bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4");
         expect(blocks.length).toBe(2); // one chunk + the root manifest
     });
 
@@ -45,7 +46,7 @@ describe("checkpoint codec", () => {
 
     it("splits into multiple chunks under a small size cap (fixed vector)", async () => {
         const { root, blocks } = await encodeCheckpoint(WINNERS, 1); // cap forces one bundle per chunk
-        expect(root.toString()).toBe("bafyreih3afwxuk3hav3otgvx5tzo3fviivpyhlm4oatmbgtt73f4k4r5mq");
+        expect(root.toString()).toBe("bafyreicqqw4tj3zgvvwllr6xjnopk47cefmnulm6ge6f7wmhm6mgmpckom");
         expect(blocks.length).toBe(3); // two chunks + the root manifest
         // Chunking must not change the decoded winners.
         expect((await decodeCheckpoint(root, storeOf(blocks))).length).toBe(2);

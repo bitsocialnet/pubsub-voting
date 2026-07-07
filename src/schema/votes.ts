@@ -67,6 +67,10 @@ export const CommunitySchema = z.object({
     name: z
         .string()
         .min(1)
+        // The DNS hostname ceiling. A wire-shape hygiene bound, not a criteria knob: it makes a
+        // vote entry's size finite so the per-message cap is derivable from the criteria alone
+        // (see DESIGN.md "Message size cap").
+        .max(253)
         .refine(isDottedDomain, "name must be a resolvable domain with a TLD (e.g. memes.bso)")
         .optional(),
     publicKey: z

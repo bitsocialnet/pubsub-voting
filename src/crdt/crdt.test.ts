@@ -9,9 +9,10 @@ const OTHER = "0x2222222222222222222222222222222222222222";
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const KEY_B = "12Czge2qhmFg7TPsvfRDyZiWbwho51g5fgqc6LoVD6nTUWbodZXw";
 
-// The CRDT is trust-neutral storage; it never checks signatures, so a placeholder is fine.
+// The CRDT is trust-neutral storage; it never checks signatures, so a well-formed placeholder
+// (the binary codec requires exactly 65 bytes) is fine.
 function bundle(address: string, votes: Vote[], blockNumber: number): VotesBundle {
-    return { address, votes, blockNumber, signature: { signature: "0xsig", type: "eip712" } };
+    return { address, votes, blockNumber, signature: { signature: `0x${"11".repeat(65)}`, type: "eip712" } };
 }
 
 const BLOCKS_PER_BUCKET = 43200;

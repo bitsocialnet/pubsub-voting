@@ -2,7 +2,7 @@ import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 import * as dagCbor from "@ipld/dag-cbor";
 import { encodeCanonical, dagCborCode } from "../encoding/canonical.js";
-import { encodeBundle } from "../crdt/codec.js";
+import { encodeBundle, toWireBundle, fromWireBundle } from "../crdt/codec.js";
 import type { VotesBundle } from "../schema/votes.js";
 
 /**
@@ -58,7 +58,12 @@ export async function encodeCheckpoint(
     winners: VotesBundle[],
     maxChunkBytes: number = DEFAULT_MAX_CHUNK_BYTES
 ): Promise<EncodedCheckpoint> {
-    const sorted = [...winners].sort((a, b) => (a.address < b.address ? -1 : a.address > b.address ? 1 : 0));
+    // Lowercase before comparing so the sort equals raw byte order regardless of how a caller
+    // cased an address — casing is presentation, the wire form is lowercase bytes.
+    const sorted = [...winners]
+        .map((bundle) => ({ bundle, key: bundle.address.toLowerCase() }))
+        .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+        .map((entry) => entry.bundle);
 
     // Size-cap fill on the inlined-bundle byte total (a pure function of the bundles, so seeders
     // agree without encoding a partial chunk each step).
@@ -80,7 +85,9 @@ export async function encodeCheckpoint(
     const blocks: CheckpointBlock[] = [];
     const chunkCids: CID[] = [];
     for (const chunk of chunks) {
-        const block = await blockFor(encodeCanonical(chunk));
+        // Chunks inline the same binary wire objects the bundle block uses (see crdt/codec.ts),
+        // so the binary-field byte saving multiplies across every inlined winner.
+        const block = await blockFor(encodeCanonical(chunk.map(toWireBundle)));
         blocks.push(block);
         chunkCids.push(block.cid);
     }
@@ -93,9 +100,10 @@ export async function encodeCheckpoint(
 
 /**
  * Decode a checkpoint back into its inlined winner bundles, given a way to fetch each block by CID
- * (blockstore/bitswap). This is a pure *structural* decode — it does NOT verify the bundles; the
- * caller re-verifies each through the forward gate before merging (a single seeder cannot forge or
- * hide a vote — see DESIGN.md "Checkpoints"). Throws if a referenced block is unavailable.
+ * (blockstore/bitswap). This is a *structural* decode — each bundle is schema-validated (wire shape,
+ * B58 key, distinct communities) but NOT signature-verified; the caller re-verifies each through the
+ * same verifier the gate uses before merging (a single seeder cannot forge or hide a vote — see
+ * DESIGN.md "Checkpoints"). Throws if a referenced block is unavailable or malformed.
  */
 export async function decodeCheckpoint(
     root: CID,
@@ -109,7 +117,9 @@ export async function decodeCheckpoint(
     for (const chunkCid of manifest.chunks) {
         const chunkBytes = await getBlock(chunkCid);
         if (!chunkBytes) throw new Error(`checkpoint chunk block ${chunkCid.toString()} is unavailable`);
-        winners.push(...dagCbor.decode<VotesBundle[]>(chunkBytes));
+        const wires = dagCbor.decode<unknown>(chunkBytes);
+        if (!Array.isArray(wires)) throw new Error(`checkpoint chunk ${chunkCid.toString()} is not a bundle array`);
+        for (const wire of wires) winners.push(fromWireBundle(wire));
     }
     return winners;
 }
