@@ -2,13 +2,20 @@
 // Cold-join latency benchmark — ORCHESTRATOR.
 //
 // Drives a real cross-machine sweep: a SEEDER runs on a remote WAN host (`ssh <host>`), a fresh COLD
-// JOINER runs locally and dials the seeder through an SSH port-forward (so `127.0.0.1:<localPort>` is
-// the seeder across the real link, RTT preserved, NAT/firewall sidestepped). For each N it seeds N
-// real-signed winners on the remote, then times how long a cold local peer takes to reach a full
-// tally — the "which board to load" signal. Prints a median-of-repeats table.
+// JOINER runs locally and dials the seeder **directly at its public multiaddr over the real
+// internet** (no SSH tunnel — a TCP-over-TCP tunnel inflates per-RTT latency and hides the true path).
+// SSH is used only to launch the remote seeder process and read its readiness line. For each N it
+// seeds N real-signed winners on the remote, then times how long a cold local peer takes to reach a
+// full tally — the "which board to load" signal. Prints a median-of-repeats table.
+//
+// Reachability: the seeder listens on 0.0.0.0:<port> on the remote, so that port must be dialable
+// from this machine (a public IP with the port open — no inbound firewall rule blocking it). The
+// cold joiner only dials out, so it may sit behind NAT.
 //
 // Env:
 //   BENCH_HOST=<ssh-host>        remote ssh host to run the seeder on (REQUIRED)
+//   BENCH_HOST_IP=<ip-or-dns>    public IP/DNS the joiner dials the seeder at
+//                                (default: the `hostname` from `ssh -G $BENCH_HOST`)
 //   BENCH_REMOTE_DIR=~/pubsub-votes-bench   remote checkout dir
 //   BENCH_NS=1,5,10,100,1000     voter counts to sweep
 //   BENCH_REPEATS=3              cold joins per N (median reported)
@@ -31,6 +38,9 @@ const REPEATS = Number(process.env.BENCH_REPEATS ?? "3");
 const BASE_PORT = 41000;
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const COLD_JOIN_JS = path.join(REPO, "benchmark/cold-join.js");
+
+// The public IP/DNS the cold joiner dials the seeder at (resolved once in main()).
+let DIAL_HOST;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const median = (xs) => {
@@ -78,21 +88,45 @@ function spawnUntil(cmd, args, ready, timeoutMs, label) {
     });
 }
 
-/** Wait until a local TCP port accepts a connection (the SSH forward is ready). */
-async function waitPort(port, timeoutMs) {
+/** Wait until `host:port` accepts a TCP connection (the seeder is dialable over the real link). */
+async function waitPort(host, port, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
         const ok = await new Promise((res) => {
-            const sock = net.connect({ host: "127.0.0.1", port }, () => {
+            const sock = net.connect({ host, port }, () => {
                 sock.destroy();
                 res(true);
             });
             sock.on("error", () => res(false));
+            sock.setTimeout(5000, () => {
+                sock.destroy();
+                res(false);
+            });
         });
         if (ok) return;
-        if (Date.now() > deadline) throw new Error(`port ${port} not open after ${timeoutMs}ms`);
+        if (Date.now() > deadline) throw new Error(`${host}:${port} not dialable after ${timeoutMs}ms (firewall? wrong BENCH_HOST_IP?)`);
         await sleep(200);
     }
+}
+
+/**
+ * The public IP/DNS the cold joiner should dial the seeder at: `BENCH_HOST_IP` if set, else the
+ * resolved `hostname` from `ssh -G $BENCH_HOST` (the address SSH itself connects to — normally the
+ * host's public IP). This is the data path now, so it must be directly reachable, not a tunnel.
+ */
+async function resolveDialHost() {
+    if (process.env.BENCH_HOST_IP) return process.env.BENCH_HOST_IP;
+    const g = await run("ssh", ["-G", HOST]);
+    const line = g.stdout.split("\n").find((l) => l.startsWith("hostname "));
+    const hostname = line?.slice("hostname ".length).trim();
+    if (!hostname) throw new Error(`could not resolve a dial host from \`ssh -G ${HOST}\`; set BENCH_HOST_IP explicitly`);
+    return hostname;
+}
+
+/** Build the seeder's dialable multiaddr from the resolved dial host (IPv4 literal → /ip4, else /dns4). */
+function providerMultiaddr(dialHost, port, peerId) {
+    const proto = /^\d{1,3}(\.\d{1,3}){3}$/.test(dialHost) ? "ip4" : "dns4";
+    return `/${proto}/${dialHost}/tcp/${port}/p2p/${peerId}`;
 }
 
 async function syncAndBuildRemote() {
@@ -120,7 +154,6 @@ async function syncAndBuildRemote() {
 
 async function measureOne(n, i) {
     const remotePort = BASE_PORT + i;
-    const localPort = BASE_PORT + 100 + i;
 
     // 1) Launch the remote seeder (ssh -tt so it dies when we close the pipe); await SEEDER_READY.
     const seedTimeout = 120_000 + n * 200; // seeding grows with N (feeder graft + verify)
@@ -136,18 +169,16 @@ async function measureOne(n, i) {
     seeder.stdout.on("data", () => {});
     seeder.stderr.on("data", () => {});
 
-    // 2) Open the SSH port-forward and wait for it to accept. Force a dedicated connection
-    //    (ControlPath=none) so the forward never contends with the `-tt` seeder over a shared
-    //    ControlMaster socket — the cause of a transient "port not open" on the forward.
-    const forward = spawn("ssh", ["-o", "ControlPath=none", "-N", "-L", `${localPort}:127.0.0.1:${remotePort}`, HOST]);
-    forward.stderr.on("data", () => {});
+    // 2) The joiner dials the seeder directly at its public multiaddr over the real internet — no
+    //    tunnel, so the measured RTT is the true path. Wait until the remote port is dialable.
+    const providerAddr = providerMultiaddr(DIAL_HOST, remotePort, peerId);
     let results = [];
     try {
-        await waitPort(localPort, 25_000);
+        await waitPort(DIAL_HOST, remotePort, 25_000);
 
         // 3) Run REPEATS fresh cold joins against the same static seeder.
         for (let r = 0; r < REPEATS; r++) {
-            const cj = await run("node", [COLD_JOIN_JS, String(localPort), peerId, topic, String(n)], {
+            const cj = await run("node", [COLD_JOIN_JS, providerAddr, peerId, topic, String(n)], {
                 env: { ...process.env }
             });
             const line = cj.stdout.split("\n").find((l) => l.startsWith("RESULT "));
@@ -164,7 +195,6 @@ async function measureOne(n, i) {
             );
         }
     } finally {
-        forward.kill("SIGKILL");
         seeder.kill("SIGKILL");
         await run("ssh", [HOST, `pkill -f "seeder.js ${n} ${remotePort}" || true`]);
     }
@@ -192,13 +222,16 @@ async function main() {
         if (bb.code !== 0) throw new Error(`local benchmark build failed:\n${bb.stderr}`);
     }
 
+    DIAL_HOST = await resolveDialHost();
+    console.log(`[bench] seeder dialed directly at ${DIAL_HOST} (no SSH tunnel)`);
+
     const rows = [];
     for (let i = 0; i < NS.length; i++) {
         console.log(`\n[bench] === N=${NS[i]} (${REPEATS} repeats) ===`);
         rows.push(await measureOne(NS[i], i));
     }
 
-    console.log(`\nCold-join latency — seeder on ${HOST}, discovered via HTTP router, median of ${REPEATS} (times → s)`);
+    console.log(`\nCold-join latency — seeder on ${HOST} (dialed directly at ${DIAL_HOST}), discovered via HTTP router, median of ${REPEATS} (times → s)`);
     console.log("N(voters)  router   connect   fetch    bitswap  verify+merge   START→TALLY");
     for (const r of rows) {
         if (!r.ok) {

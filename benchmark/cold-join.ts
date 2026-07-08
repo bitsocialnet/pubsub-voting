@@ -10,7 +10,8 @@ import { benchChains, benchManifest } from "./signing.js";
  *
  * Flow, all inside `start()`:
  *   1. `#coldStart` asks the (local, ~1s-latency) HTTP router "who provides `<criteriaCid>`?";
- *   2. the router names the seeder (reachable at `127.0.0.1:<localPort>` across the SSH-forwarded WAN);
+ *   2. the router names the seeder at its **public multiaddr** (`<providerAddr>`), dialed directly
+ *      over the real internet — no SSH tunnel, so the measured RTT is the true network path;
  *   3. the node dials it and **fetches the root record immediately** — no wait for gossipsub
  *      subscription gossip;
  *   4. the divergent root is chased over directed bitswap, verified, merged;
@@ -21,7 +22,8 @@ import { benchChains, benchManifest } from "./signing.js";
  * network ops are timed by wrapping the injected `blockstore.get` + `fetch` seams (no production
  * changes); the router lookup shares this process's `performance.now()` clock.
  *
- * Usage: `node benchmark/cold-join.js <localPort> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
+ * Usage: `node benchmark/cold-join.js <providerAddr> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
+ *   `<providerAddr>` is the seeder's full dialable multiaddr, e.g. `/ip4/1.2.3.4/tcp/41000/p2p/<id>`.
  * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000).
  */
 
@@ -59,7 +61,8 @@ export interface ColdJoinMilestones {
 }
 
 export interface ColdJoinArgs {
-    localPort: number;
+    /** The seeder's full dialable multiaddr (includes `/p2p/<id>`), dialed directly over the WAN. */
+    providerAddr: string;
     seederPeerId: string;
     topic: string;
     expectedN: number;
@@ -124,7 +127,7 @@ function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; l
 export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMilestones> {
     const timeoutMs = args.timeoutMs ?? 60_000;
     const cidString = args.topic.slice(TOPIC_PREFIX.length);
-    const providerAddr = `/ip4/127.0.0.1/tcp/${args.localPort}/p2p/${args.seederPeerId}`;
+    const providerAddr = args.providerAddr;
 
     // The local HTTP content router: names the seeder as the provider of the criteria CID, after a
     // realistic ~1s lookup latency. This is the ONLY way the cold node learns about the seeder.
@@ -232,15 +235,15 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
 }
 
 async function main(): Promise<void> {
-    const localPort = Number(process.argv[2]);
+    const providerAddr = process.argv[2];
     const seederPeerId = process.argv[3];
     const topic = process.argv[4];
     const expectedN = Number(process.argv[5]);
-    if (!Number.isInteger(localPort) || !seederPeerId || !topic || !Number.isInteger(expectedN)) {
-        throw new Error("usage: cold-join.js <localPort> <seederPeerId> <topic> <N>");
+    if (!providerAddr || !seederPeerId || !topic || !Number.isInteger(expectedN)) {
+        throw new Error("usage: cold-join.js <providerAddr> <seederPeerId> <topic> <N>");
     }
     const routerLatencyMs = process.env.BENCH_ROUTER_LATENCY_MS ? Number(process.env.BENCH_ROUTER_LATENCY_MS) : 1000;
-    const r = await measureColdJoin({ localPort, seederPeerId, topic, expectedN, routerLatencyMs });
+    const r = await measureColdJoin({ providerAddr, seederPeerId, topic, expectedN, routerLatencyMs });
     const s = (ms: number | null): string => (ms === null ? "n/a" : `${(ms / 1000).toFixed(2)}s`);
     process.stderr.write(
         `[cold-join] N=${r.n}\n` +

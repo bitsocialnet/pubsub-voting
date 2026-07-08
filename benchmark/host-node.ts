@@ -18,9 +18,10 @@ import type { PubsubService } from "../dist/transport/types.js";
  *
  * Unlike the unit-test harness this measures wall-clock latency, so the config leans realistic: no
  * heartbeat override unless asked (gossipsub's own default), and the ONE score tweak the benchmark
- * genuinely needs — `IPColocationFactorWeight: 0`. Over an SSH port-forward both peers appear on
- * 127.0.0.1, so the colocation penalty would graylist an honest peer; the two-node harness zeroes it
- * for the same loopback reason.
+ * genuinely needs — `IPColocationFactorWeight: 0`. The seeder's in-process feeders all connect to it
+ * over 127.0.0.1, so the colocation penalty would graylist them mid-seed and stall the checkpoint;
+ * the two-node harness zeroes it for the same loopback reason. (The cold joiner now dials the seeder
+ * at its real public IP, so that path no longer colocates regardless.)
  */
 
 /** The gossipsub introspection the benchmark reads (mesh + subscriber views), beyond `PubsubService`. */
