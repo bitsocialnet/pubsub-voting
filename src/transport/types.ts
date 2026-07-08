@@ -96,10 +96,15 @@ export type GossipTopicValidator = (
 export interface FetchServiceLike {
     /** Request the value for `key` from a connected peer; nullish when the peer has none. */
     fetch(peer: PeerId, key: string, options?: { signal?: AbortSignal }): Promise<Uint8Array | undefined | null>;
-    /** Register the responder for every key starting with `prefix`. */
-    registerLookupFunction(prefix: string, lookup: (key: string) => Promise<Uint8Array | undefined>): void;
+    /**
+     * Register the responder for every key starting with `prefix`. `@libp2p/fetch` invokes the
+     * lookup with the requested key as **raw bytes** (`Uint8Array`), not a string — it matches the
+     * `prefix` against the utf8-decoded key but hands the callback the identifier bytes. The
+     * responder decodes them itself (see `PubsubVoter.#rootLookup`).
+     */
+    registerLookupFunction(prefix: string, lookup: (key: Uint8Array) => Promise<Uint8Array | undefined>): void;
     /** Remove a registered responder (all of the prefix's, when `lookup` is omitted). */
-    unregisterLookupFunction(prefix: string, lookup?: (key: string) => Promise<Uint8Array | undefined>): void;
+    unregisterLookupFunction(prefix: string, lookup?: (key: Uint8Array) => Promise<Uint8Array | undefined>): void;
 }
 
 /**

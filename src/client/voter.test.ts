@@ -645,7 +645,8 @@ describe("root-record heartbeat", () => {
 describe("root-record fetch protocol", () => {
     /** A helia whose fetch service records registrations and serves canned per-peer answers. */
     function fetchSpyHelia(peerAnswers: Map<string, Uint8Array>) {
-        const lookups = new Map<string, (key: string) => Promise<Uint8Array | undefined>>();
+        // `@libp2p/fetch` invokes the lookup with the key as raw bytes, not a string.
+        const lookups = new Map<string, (key: Uint8Array) => Promise<Uint8Array | undefined>>();
         const fetchCalls: Array<{ peer: string; key: string }> = [];
         const fetchService: FetchServiceLike = {
             fetch: async (peer, key) => {
@@ -690,15 +691,17 @@ describe("root-record fetch protocol", () => {
         expect(lookup).toBeDefined();
 
         const contest = await voter.getContest({ contestId: "biz" });
-        const answer = await lookup!(rootFetchKey(contest.topic));
+        // The key arrives as utf8 bytes, exactly as `@libp2p/fetch` hands it to the responder.
+        const asKey = (s: string): Uint8Array => new TextEncoder().encode(s);
+        const answer = await lookup!(asKey(rootFetchKey(contest.topic)));
         expect(answer).toBeDefined();
         const record = decodeRootRecord(answer!);
         expect(record.version).toBe(ROOT_RECORD_VERSION);
         expect(record.count).toBe(0); // an empty winner-set still answers (the empty checkpoint)
 
         // Foreign key shapes and unknown topics answer nothing.
-        expect(await lookup!(contest.topic)).toBeUndefined(); // no /root suffix
-        expect(await lookup!(rootFetchKey(`${TOPIC_PREFIX}nope`))).toBeUndefined();
+        expect(await lookup!(asKey(contest.topic))).toBeUndefined(); // no /root suffix
+        expect(await lookup!(asKey(rootFetchKey(`${TOPIC_PREFIX}nope`)))).toBeUndefined();
 
         await voter.stop();
         expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
@@ -727,6 +730,67 @@ describe("root-record fetch protocol", () => {
         await vi.waitFor(() => {
             expect(h.chased).toContain(rootA.toString());
             expect(h.chased).toContain(rootB.toString());
+        });
+        await voter.stop();
+    });
+
+    it("cold-joins via the HTTP content router even with NO topic subscribers: finds the provider of the criteria CID, dials it, fetches, and chases", async () => {
+        // The pkc-js discovery path: gossipsub knows no subscribers yet, but the content router
+        // names a provider of the criteria CID. The library must dial + fetch it immediately.
+        const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, count: 1, sizeBytes: 100 });
+        const providerId = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
+        const fetchCalls: Array<{ peer: string; key: string }> = [];
+        const dialed: string[] = [];
+        const chased: string[] = [];
+        const fetchService: FetchServiceLike = {
+            fetch: async (peer, key) => {
+                fetchCalls.push({ peer: peer.toString(), key });
+                return peer.toString() === providerId ? record : undefined;
+            },
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [], // NO subscribers — only the router can supply the provider
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = {
+            get: async (cid: CID) => {
+                chased.push(cid.toString());
+                throw new Error("no block"); // the chase attempt is what we assert
+            },
+            put: async (cid: CID) => cid,
+            has: async () => false
+        };
+        const contentRouting = {
+            findProviders: async function* () {
+                yield { id: { toString: () => providerId }, multiaddrs: ["/ip4/127.0.0.1/tcp/1"] };
+            }
+        };
+        const libp2p = {
+            peerId: { toString: () => "self" },
+            dial: async (addrs: unknown) => {
+                dialed.push(String(addrs));
+            },
+            contentRouting,
+            services: { pubsub, fetch: fetchService }
+        };
+        const helia = { libp2p, blockstore } as unknown as HeliaInstance;
+
+        const voter = new PubsubVoter({ helia, chains: fakeChains(), manifest: bizManifest() });
+        await voter.start();
+        const contest = await voter.getContest({ contestId: "biz" });
+
+        await vi.waitFor(() => {
+            expect(dialed.length).toBeGreaterThan(0); // the discovered provider was dialed...
+            expect(fetchCalls.some((c) => c.peer === providerId && c.key === rootFetchKey(contest.topic))).toBe(true); // ...and asked for its root
+            expect(chased).toContain(root.toString()); // ...and its divergent root chased
         });
         await voter.stop();
     });

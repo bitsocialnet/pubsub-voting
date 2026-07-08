@@ -32,7 +32,8 @@ import { makeVerdictCache } from "../verify/cache.js";
 import { makeGateResultCache } from "../verify/gate-result-cache.js";
 import { makeAcceptedDedup } from "../transport/accepted-dedup.js";
 import { encodeCheckpoint } from "../checkpoint/codec.js";
-import type { CID } from "multiformats/cid";
+import { CID } from "multiformats/cid";
+import type { PeerId } from "@libp2p/interface";
 import { makeTally } from "../tally/tally.js";
 import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
@@ -246,8 +247,14 @@ const GATE_RATE = { limit: 256, intervalMs: 10_000 };
  * divergence response), so 4/min is ≫ any honest rate while flattening a root spray.
  */
 const GATE_ROOT_RATE = { limit: 4, intervalMs: 60_000 };
-/** Cold-join fan-out: connected topic peers asked for their root record on start. */
+/** Cold-join fan-out: how many peers (per discovery source) we ask for their root record on start. */
 const COLD_START_PEERS = 4;
+/**
+ * Deadline (ms) for the cold-join HTTP content-router lookup. `findProviders` over a delegated
+ * router is a network call that can stall; on expiry the abort ends it and cold-start falls back to
+ * whatever the gossipsub-subscriber source and live gossip provide.
+ */
+const COLD_START_ROUTER_TIMEOUT_MS = 10_000;
 /**
  * Root-record heartbeat interval (ms): 10 minutes — the IPNS-over-pubsub rebroadcast default
  * (`go-libp2p-pubsub-router`) — jittered ±25% per firing, with suppression on top (skip when a
@@ -517,26 +524,94 @@ class ContestNetwork implements VoteNetwork {
     }
 
     /**
-     * The cold-join pull (DESIGN.md "Checkpoints"): ask up to {@link COLD_START_PEERS}
-     * connected topic peers, over the libp2p **fetch protocol**, for their current root
-     * record, and chase every root that differs from our own. Roots are **unioned, never
-     * quorum'd**: a record served by a single peer is still chased — trust is per-bundle
-     * (the chase verifies each), not per-checkpoint — so a colluding majority cannot hide a
-     * vote. A peer that answers nothing, garbage, or our own root contributes nothing.
+     * The cold-join pull (DESIGN.md "Checkpoints"): ask up to {@link COLD_START_PEERS} peers, over
+     * the libp2p **fetch protocol**, for their current root record, and chase every root that
+     * differs from our own. Peers come from **two sources raced concurrently, neither blocking the
+     * other**:
+     *   1. the peers gossipsub already knows subscribe to this topic (`getSubscribers`) — often
+     *      empty at the instant of a fresh join, before subscription gossip has propagated;
+     *   2. the providers of the criteria CID from the host's HTTP content router(s)
+     *      (`contentRouting.findProviders`, the pkc-js delegated-Routing-V1 pattern, no DHT) —
+     *      dialed and fetched **immediately**, so a cold peer need not wait to *learn* who is
+     *      subscribed before pulling the state.
+     * Roots are **unioned, never quorum'd**: a record served by a single peer is still chased —
+     * trust is per-bundle (the chase verifies each), not per-checkpoint — so a colluding majority
+     * cannot hide a vote. A peer that answers nothing, garbage, or our own root contributes nothing.
      */
     async #coldStart(): Promise<void> {
-        const peers = this.#deps.pubsub.getSubscribers(this.topic).slice(0, COLD_START_PEERS);
-        if (peers.length === 0) return;
-        const own = await this.rootRecord();
-        await Promise.allSettled(
-            peers.map(async (peer) => {
+        const seen = new Set<string>();
+        const selfId = this.#deps.helia.libp2p.peerId?.toString();
+        // Encode our own root only when a peer actually returns one to compare against, so an empty
+        // join (no subscribers, no providers) does no checkpoint work.
+        let ownRoot: Promise<RootRecord> | undefined;
+        const pull = async (peer: PeerId): Promise<void> => {
+            const id = peer.toString();
+            if (id === selfId || seen.has(id)) return; // skip self and any peer already asked
+            seen.add(id);
+            try {
                 const value = await this.#deps.fetch.fetch(peer, rootFetchKey(this.topic));
                 if (value === undefined || value === null) return;
-                const record = decodeRootRecord(value); // throws on garbage — settled, ignored
-                if (record.root.equals(own.root)) return;
-                this.#chaser?.chase(record.root);
-            })
-        );
+                const record = decodeRootRecord(value); // throws on garbage — caught, contributes nothing
+                const own = await (ownRoot ??= this.rootRecord());
+                if (!record.root.equals(own.root)) this.#chaser?.chase(record.root);
+            } catch {
+                // Peer offline, no record, or malformed answer — best-effort; the other source and
+                // live gossip still converge.
+            }
+        };
+        const fromSubscribers = this.#deps.pubsub.getSubscribers(this.topic).slice(0, COLD_START_PEERS).map(pull);
+        await Promise.allSettled([...fromSubscribers, this.#discoverProviders(pull)]);
+    }
+
+    /**
+     * Cold-join discovery source 2: ask the injected node's HTTP content router(s) who provides the
+     * criteria CID (`libp2p.contentRouting.findProviders`), dial each provider, and hand it to
+     * `pull`. This is the pkc-js peer-discovery pattern — delegated Routing V1 over HTTP, no DHT —
+     * and the criteria CID doubles as the routing key (a provider record for it means "I run this
+     * contest"). Best-effort and bounded: a node with no content router, a router error, or an
+     * undialable provider contributes nothing and never throws.
+     */
+    async #discoverProviders(pull: (peer: PeerId) => Promise<void>): Promise<void> {
+        const libp2p = this.#deps.helia.libp2p;
+        const contentRouting = libp2p.contentRouting;
+        if (contentRouting === undefined) return; // the injected node carries no content router
+        let cid: CID;
+        try {
+            cid = CID.decode(this.#criteriaCid);
+        } catch {
+            return;
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), COLD_START_ROUTER_TIMEOUT_MS);
+        (timer as { unref?: () => void }).unref?.();
+        // `@libp2p/interface` bundles its own multiformats copy, so its `CID` is nominally distinct
+        // from ours despite identical bytes; bridge the two at this one boundary call.
+        const routingCid = cid as unknown as Parameters<typeof contentRouting.findProviders>[0];
+        try {
+            const dials: Promise<void>[] = [];
+            let count = 0;
+            for await (const provider of contentRouting.findProviders(routingCid, { signal: controller.signal })) {
+                if (count >= COLD_START_PEERS) break;
+                count += 1;
+                dials.push(
+                    (async () => {
+                        try {
+                            if (provider.multiaddrs.length > 0) {
+                                await libp2p.dial(provider.multiaddrs, { signal: controller.signal });
+                            }
+                        } catch {
+                            // Undialable via its advertised addrs — `pull` still tries (it may be connected).
+                        }
+                        await pull(provider.id);
+                    })()
+                );
+            }
+            await Promise.allSettled(dials);
+        } catch {
+            // Router error or abort — treated as "no providers", mirroring pkc-js's findProviders wrap.
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     async stop(): Promise<void> {
@@ -852,7 +927,10 @@ export class PubsubVoter implements VoteClient {
      * design — a request can never compel blocks; those travel over directed bitswap. An
      * unknown topic, foreign key shape, or encode failure answers nothing.
      */
-    readonly #rootLookup = async (key: string): Promise<Uint8Array | undefined> => {
+    readonly #rootLookup = async (keyBytes: Uint8Array): Promise<Uint8Array | undefined> => {
+        // `@libp2p/fetch` hands the lookup the requested key as raw bytes; decode the utf8 topic
+        // string the requester sent (`rootFetchKey(topic)`) before matching.
+        const key = new TextDecoder().decode(keyBytes);
         if (!key.endsWith(ROOT_FETCH_KEY_SUFFIX)) return undefined;
         const network = this.#contests.get(key.slice(0, -ROOT_FETCH_KEY_SUFFIX.length));
         if (!network) return undefined;
