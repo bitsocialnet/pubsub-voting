@@ -12,6 +12,7 @@ Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. 
 ## Before committing
 
 - **MUST** run the full test suite (`npm test`) before every commit and confirm it passes. Do not commit with failing or skipped tests. Also run `npm run typecheck` and `npm run typecheck:examples` when changing types or the public API.
+- **MUST** re-run the cold-join benchmark (`BENCH_HOST=<ssh-host> npm run bench:cold-join`) whenever you change transport code (anything under `src/transport/`, plus the cold-start / checkpoint / discovery paths in `src/client/voter.ts`), and compare against [benchmark/RESULTS.md](./benchmark/RESULTS.md). **Lower latency is better** — a big regression in `START→TALLY` (or any per-operation column) is a red flag to investigate before committing. If a change legitimately shifts the numbers, update `benchmark/RESULTS.md` with the new table in the same change so it stays the current baseline.
 
 ## Documentation
 
