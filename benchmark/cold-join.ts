@@ -1,5 +1,5 @@
-import { PubsubVoter } from "../../../client/voter.js";
-import { TOPIC_PREFIX } from "../../../topic.js";
+import { PubsubVoter } from "../dist/client/voter.js";
+import { TOPIC_PREFIX } from "../dist/topic.js";
 import { makeHostNode, waitFor, type HostNode } from "./host-node.js";
 import { startRouter, type RunningRouter } from "./router.js";
 import { benchChains, benchManifest } from "./signing.js";
@@ -21,7 +21,7 @@ import { benchChains, benchManifest } from "./signing.js";
  * network ops are timed by wrapping the injected `blockstore.get` + `fetch` seams (no production
  * changes); the router lookup shares this process's `performance.now()` clock.
  *
- * Usage: `node dist/transport/integration/bench/cold-join.js <localPort> <seederPeerId> <topic> <N>`.
+ * Usage: `node benchmark/cold-join.js <localPort> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
  * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000).
  */
 

@@ -30,7 +30,7 @@ const NS = (process.env.BENCH_NS ?? "1,5,10,100,1000").split(",").map((s) => Num
 const REPEATS = Number(process.env.BENCH_REPEATS ?? "3");
 const BASE_PORT = 41000;
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const COLD_JOIN_JS = path.join(REPO, "dist/transport/integration/bench/cold-join.js");
+const COLD_JOIN_JS = path.join(REPO, "benchmark/cold-join.js");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const median = (xs) => {
@@ -110,10 +110,10 @@ async function syncAndBuildRemote() {
         `${HOST}:${REMOTE_DIR}/`
     ]);
     if (rsync.code !== 0) throw new Error(`rsync failed: ${rsync.stderr}`);
-    console.log(`[bench] remote npm install && npm run build (first run is slow)…`);
+    console.log(`[bench] remote npm install && npm run build && build:bench (first run is slow)…`);
     // `npm install` (not `ci`): the committed lockfile can drift on optional platform deps
     // (e.g. utf-8-validate); a bench host just needs a working tree, not a locked one.
-    const build = await run("ssh", [HOST, `cd ${REMOTE_DIR} && npm install --no-audit --no-fund && npm run build`]);
+    const build = await run("ssh", [HOST, `cd ${REMOTE_DIR} && npm install --no-audit --no-fund && npm run build && npm run build:bench`]);
     if (build.code !== 0) throw new Error(`remote build failed:\n${build.stderr}\n${build.stdout}`);
     console.log(`[bench] remote build ok`);
 }
@@ -126,7 +126,7 @@ async function measureOne(n, i) {
     const seedTimeout = 120_000 + n * 200; // seeding grows with N (feeder graft + verify)
     const { child: seeder, match } = await spawnUntil(
         "ssh",
-        ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && node dist/transport/integration/bench/seeder.js ${n} ${remotePort}`],
+        ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && node benchmark/seeder.js ${n} ${remotePort}`],
         /SEEDER_READY peerId=(\S+) port=\d+ topic=(\S+)/,
         seedTimeout,
         `seeder(N=${n})`
@@ -185,9 +185,11 @@ async function measureOne(n, i) {
 async function main() {
     if (!process.env.BENCH_SKIP_SYNC) await syncAndBuildRemote();
     if (!process.env.BENCH_SKIP_BUILD) {
-        console.log("[bench] local npm run build");
+        console.log("[bench] local npm run build && build:bench");
         const b = await run("npm", ["run", "build"], { cwd: REPO });
         if (b.code !== 0) throw new Error(`local build failed:\n${b.stderr}`);
+        const bb = await run("npm", ["run", "build:bench"], { cwd: REPO });
+        if (bb.code !== 0) throw new Error(`local benchmark build failed:\n${bb.stderr}`);
     }
 
     const rows = [];

@@ -1,12 +1,12 @@
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
-import type { ChainClient, ChainClientFactory } from "../../../chain/types.js";
-import type { VoteSigner } from "../../../signer/types.js";
-import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../../../signer/eip712.js";
-import { VotesBundleSchema, type VotesBundle } from "../../../schema/votes.js";
-import { makeBucketMath } from "../../../chain/bucket.js";
-import { criteriaCid } from "../../../topic.js";
-import type { Criteria } from "../../../schema/criteria.js";
-import { DirectoryManifestSchema, type DirectoryManifest } from "../../../manifest/manifest.js";
+import type { ChainClient, ChainClientFactory } from "../dist/chain/types.js";
+import type { VoteSigner } from "../dist/signer/types.js";
+import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../dist/signer/eip712.js";
+import { VotesBundleSchema, type VotesBundle } from "../dist/schema/votes.js";
+import { makeBucketMath } from "../dist/chain/bucket.js";
+import { criteriaCid } from "../dist/topic.js";
+import type { Criteria } from "../dist/schema/criteria.js";
+import { DirectoryManifestSchema, type DirectoryManifest } from "../dist/manifest/manifest.js";
 
 /**
  * Real signing + fake-chain fixtures for the cold-join latency benchmark.

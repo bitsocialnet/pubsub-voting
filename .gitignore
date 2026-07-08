@@ -2,3 +2,9 @@ node_modules/
 dist/
 *.log
 .tmp/
+
+# benchmark/ is TypeScript compiled in place (see benchmark/tsconfig.json); ignore the emitted JS,
+# keep the .ts sources and the .mjs orchestrator.
+/benchmark/*.js
+/benchmark/*.d.ts
+/benchmark/*.js.map

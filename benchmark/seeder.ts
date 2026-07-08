@@ -1,6 +1,6 @@
-import { PubsubVoter, type VoteNetwork } from "../../../client/voter.js";
-import { encodeBundle } from "../../../crdt/codec.js";
-import { encodeBundleMessage } from "../../messages.js";
+import { PubsubVoter, type VoteNetwork } from "../dist/client/voter.js";
+import { encodeBundle } from "../dist/crdt/codec.js";
+import { encodeBundleMessage } from "../dist/transport/messages.js";
 import { makeHostNode, connectPeers, waitFor, delay, type HostNode } from "./host-node.js";
 import { benchChains, benchManifest, benchCriteria, makeSigningContext, signRandomVoter } from "./signing.js";
 
@@ -17,7 +17,7 @@ import { benchChains, benchManifest, benchCriteria, makeSigningContext, signRand
  * push 1000 bundles. Chunking across feeders (each ≤ {@link FEED_CHUNK}) keeps every bundle within a
  * feeder's window, so all `N` merge without touching any production constant.
  *
- * Usage: `node dist/transport/integration/bench/seeder.js <N> <PORT>` (or env `BENCH_N`/`BENCH_PORT`).
+ * Usage: `node benchmark/seeder.js <N> <PORT>` (or env `BENCH_N`/`BENCH_PORT`), after `npm run build:bench`.
  */
 
 /** Voter ballots published per feeder peer — safely under the gate's 256/10s per-peer bundle window. */

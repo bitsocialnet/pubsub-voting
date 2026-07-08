@@ -7,7 +7,7 @@ import { gossipsub } from "@libp2p/gossipsub";
 import { fetch as fetchService } from "@libp2p/fetch";
 import { delegatedRoutingV1HttpApiClient } from "@helia/delegated-routing-v1-http-api-client";
 import { createHelia, type Helia } from "helia";
-import type { PubsubService } from "../../types.js";
+import type { PubsubService } from "../dist/transport/types.js";
 
 /**
  * The real libp2p + Helia node the cold-join **latency benchmark** stands up — the same stack a
