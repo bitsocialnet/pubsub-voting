@@ -710,7 +710,7 @@ describe("root-record fetch protocol", () => {
     it("cold-joins by pulling each subscriber's record and chasing every distinct divergent root (union, not quorum)", async () => {
         const rootA = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
         const rootB = CID.parse("bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4");
-        const recordOf = (root: CID) => encodeRootRecord({ version: ROOT_RECORD_VERSION, root, count: 1, sizeBytes: 100 });
+        const recordOf = (root: CID) => encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
         const h = fetchSpyHelia(
             new Map([
                 ["peerA", recordOf(rootA)], // two peers agree on rootA...
@@ -738,7 +738,7 @@ describe("root-record fetch protocol", () => {
         // The pkc-js discovery path: gossipsub knows no subscribers yet, but the content router
         // names a provider of the criteria CID. The library must dial + fetch it immediately.
         const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
-        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, count: 1, sizeBytes: 100 });
+        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
         const providerId = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
         const fetchCalls: Array<{ peer: string; key: string }> = [];
         const dialed: string[] = [];

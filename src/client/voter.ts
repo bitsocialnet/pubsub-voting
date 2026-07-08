@@ -19,7 +19,8 @@ import {
     MAX_ROOT_MESSAGE_BYTES,
     ROOT_FETCH_KEY_SUFFIX,
     ROOT_RECORD_VERSION,
-    type RootRecord
+    type RootRecord,
+    type FetchRootRecord
 } from "../transport/messages.js";
 import { makeRootChaser, type RootChaser } from "../transport/chase.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../crdt/codec.js";
@@ -325,7 +326,7 @@ class ContestNetwork implements VoteNetwork {
      * advance (expiry changes the winner set without any message). See DESIGN.md "Checkpoints",
      * "On-demand encode".
      */
-    #rootRecordCache: { record: RootRecord; bucket: number } | undefined = undefined;
+    #rootRecordCache: { record: FetchRootRecord; bucket: number } | undefined = undefined;
     /** True when the winner-set changed since the last encode; the next `rootRecord()` re-encodes. */
     #checkpointDirty = true;
     /** Live once `start()` runs; chases advertised roots that differ from our own. */
@@ -543,7 +544,7 @@ class ContestNetwork implements VoteNetwork {
         const selfId = this.#deps.helia.libp2p.peerId?.toString();
         // Encode our own root only when a peer actually returns one to compare against, so an empty
         // join (no subscribers, no providers) does no checkpoint work.
-        let ownRoot: Promise<RootRecord> | undefined;
+        let ownRoot: Promise<FetchRootRecord> | undefined;
         const pull = async (peer: PeerId): Promise<void> => {
             const id = peer.toString();
             if (id === selfId || seen.has(id)) return; // skip self and any peer already asked
@@ -553,7 +554,9 @@ class ContestNetwork implements VoteNetwork {
                 if (value === undefined || value === null) return;
                 const record = decodeRootRecord(value); // throws on garbage — caught, contributes nothing
                 const own = await (ownRoot ??= this.rootRecord());
-                if (!record.root.equals(own.root)) this.#chaser?.chase(record.root);
+                // Hand the piggybacked chunk index to the chase: verified against `record.root`, it
+                // skips the root-manifest bitswap round-trip (see DESIGN.md "Block pull").
+                if (!record.root.equals(own.root)) this.#chaser?.chase(record.root, record.chunks);
             } catch {
                 // Peer offline, no record, or malformed answer — best-effort; the other source and
                 // live gossip still converge.
@@ -706,16 +709,20 @@ class ContestNetwork implements VoteNetwork {
      * responder and heartbeated on the topic; there is NO cut cadence (see DESIGN.md
      * "Checkpoints", "On-demand encode").
      */
-    async rootRecord(): Promise<RootRecord> {
+    async rootRecord(): Promise<FetchRootRecord> {
         const bucket = this.#currentBucketCache;
         const cached = this.#rootRecordCache;
         if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
         const winners = this.#crdt.current(bucket);
-        const { root, blocks } = await encodeCheckpoint(winners);
+        const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
-        const record: RootRecord = {
+        const record: FetchRootRecord = {
             version: ROOT_RECORD_VERSION,
             root,
+            // The chunk-CID index rides the fetch-protocol response so a cold joiner skips the
+            // root-manifest bitswap round-trip (see DESIGN.md "Block pull"). Stripped from the
+            // pubsub heartbeat by `encodeRootMessage`, which keeps that message constant-size.
+            chunks,
             count: winners.length,
             sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
         };

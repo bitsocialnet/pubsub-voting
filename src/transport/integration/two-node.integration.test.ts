@@ -9,6 +9,13 @@ import { makeVoteNode, connectNodes, waitFor, delay, sampleBundle, type VoteNode
  * cannot: real gossipsub forwarding, real peer scoring on a `reject`, the real validation
  * deadline, heartbeat-suppression quiet, and a real directed-bitswap chase across a live
  * connection. Slow by design — gated out of `npm test`, run via `npm run test:integration`.
+ *
+ * KNOWN GAP: the directed-bitswap chase here is driven from a **heartbeat** root record (no chunk
+ * index), so it exercises the manifest-fetch **fallback** path. The cold-start **piggyback
+ * fast-path** (a fetch-protocol `FetchRootRecord.chunks` verified against the root, skipping the
+ * root-manifest round-trip — see DESIGN.md "Block pull") is covered only by the codec/chaser unit
+ * tests (`checkpoint/codec.test.ts`, `chase.test.ts`) and the WAN benchmark, NOT here. Pinning it
+ * over real gossipsub+bitswap needs the harness to drive a cold-start fetch pull (deferred).
  */
 
 const TOPIC = "bitsocial-votes/integration-test";

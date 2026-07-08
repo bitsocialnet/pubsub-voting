@@ -190,7 +190,8 @@ async function measureOne(n, i) {
             results.push(parsed);
             console.log(
                 `[bench] N=${n} rep ${r + 1}/${REPEATS}: router=${s(parsed.router.durMs)} ` +
-                    `fetch=${s(parsed.fetch.totalMs)} bitswap=${s(parsed.blockGets.totalMs)} ` +
+                    `fetch=${s(parsed.fetch.totalMs)} (negotiate=${s(parsed.fetchPhases?.negotiateMs)} ` +
+                    `w→r=${s(parsed.fetchPhases?.writeReadMs)}) bitswap=${s(parsed.blockGets.totalMs)} ` +
                     `verify+merge=${s(parsed.verifyMergeMs)} start→tally=${s(parsed.tallyReadyMs)}`
             );
         }
@@ -206,6 +207,8 @@ async function measureOne(n, i) {
         routerMs: med((r) => r.router.durMs),
         connectMs: med((r) => r.connectMs),
         fetchMs: med((r) => r.fetch.totalMs),
+        fetchNegotiateMs: med((r) => r.fetchPhases?.negotiateMs),
+        fetchWriteReadMs: med((r) => r.fetchPhases?.writeReadMs),
         bitswapMs: med((r) => r.blockGets.totalMs),
         verifyMergeMs: med((r) => r.verifyMergeMs),
         tallyReadyMs: med((r) => r.tallyReadyMs)
@@ -242,6 +245,12 @@ async function main() {
             `${String(r.n).padEnd(10)} ${s(r.routerMs)}  ${s(r.connectMs)}   ${s(r.fetchMs)}  ` +
                 `${s(r.bitswapMs)}  ${s(r.verifyMergeMs)}         ${s(r.tallyReadyMs)}`
         );
+    }
+    console.log("\nfetch sub-phase split (median → s):");
+    console.log("N(voters)  fetch    negotiate  write→read");
+    for (const r of rows) {
+        if (!r.ok) continue;
+        console.log(`${String(r.n).padEnd(10)} ${s(r.fetchMs)}  ${s(r.fetchNegotiateMs)}     ${s(r.fetchWriteReadMs)}`);
     }
 }
 

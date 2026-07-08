@@ -33,6 +33,14 @@ export interface CheckpointBlock {
 /** The result of a checkpoint cut: the root CID plus every block to store (chunks + root). */
 export interface EncodedCheckpoint {
     root: CID;
+    /**
+     * The chunk-CID index (the root manifest's contents), in root order. Exposed so the
+     * root record can carry it (see DESIGN.md "Checkpoints", "Block pull"): a cold joiner
+     * handed a verified chunk index skips the root-manifest bitswap round-trip and pulls
+     * every chunk in parallel. `CID(encodeCanonical({ chunks })) === root`, so it is
+     * self-verifying against the root and cannot be a new trust vector.
+     */
+    chunks: CID[];
     blocks: CheckpointBlock[];
 }
 
@@ -47,6 +55,17 @@ export const DEFAULT_MAX_CHUNK_BYTES = 1 << 20;
 async function blockFor(bytes: Uint8Array): Promise<CheckpointBlock> {
     const digest = await sha256.digest(bytes);
     return { cid: CID.createV1(dagCborCode, digest), bytes };
+}
+
+/**
+ * The root-manifest block for a chunk-CID list: `{ chunks }` canonically encoded and hashed. Its
+ * CID is the checkpoint root, so re-deriving it from a chunk list proves the list belongs to a
+ * given root — the local check that lets a joiner trust a piggybacked chunk index (see
+ * {@link decodeCheckpoint}) without fetching the manifest.
+ */
+async function checkpointRootBlock(chunks: CID[]): Promise<CheckpointBlock> {
+    const root: CheckpointRoot = { chunks };
+    return blockFor(encodeCanonical(root));
 }
 
 /**
@@ -92,10 +111,9 @@ export async function encodeCheckpoint(
         chunkCids.push(block.cid);
     }
 
-    const root: CheckpointRoot = { chunks: chunkCids };
-    const rootBlock = await blockFor(encodeCanonical(root));
+    const rootBlock = await checkpointRootBlock(chunkCids);
     blocks.push(rootBlock);
-    return { root: rootBlock.cid, blocks };
+    return { root: rootBlock.cid, chunks: chunkCids, blocks };
 }
 
 /**
@@ -107,19 +125,33 @@ export async function encodeCheckpoint(
  */
 export async function decodeCheckpoint(
     root: CID,
-    getBlock: (cid: CID) => Promise<Uint8Array | undefined>
+    getBlock: (cid: CID) => Promise<Uint8Array | undefined>,
+    knownChunks?: CID[]
 ): Promise<VotesBundle[]> {
-    const rootBytes = await getBlock(root);
-    if (!rootBytes) throw new Error(`checkpoint root block ${root.toString()} is unavailable`);
-    const manifest = dagCbor.decode<CheckpointRoot>(rootBytes);
-
-    const winners: VotesBundle[] = [];
-    for (const chunkCid of manifest.chunks) {
-        const chunkBytes = await getBlock(chunkCid);
-        if (!chunkBytes) throw new Error(`checkpoint chunk block ${chunkCid.toString()} is unavailable`);
-        const wires = dagCbor.decode<unknown>(chunkBytes);
-        if (!Array.isArray(wires)) throw new Error(`checkpoint chunk ${chunkCid.toString()} is not a bundle array`);
-        for (const wire of wires) winners.push(fromWireBundle(wire));
+    // If the caller supplies a chunk index (piggybacked on the root record — see DESIGN.md
+    // "Block pull"), trust it only after re-deriving the manifest and checking its CID equals
+    // `root`: a lie fails this local check and falls back to the manifest fetch, so the index is
+    // an optimization, never a new trust vector. When it verifies, the root-manifest bitswap
+    // round-trip is skipped entirely.
+    let chunks: CID[];
+    if (knownChunks !== undefined && (await checkpointRootBlock(knownChunks)).cid.equals(root)) {
+        chunks = knownChunks;
+    } else {
+        const rootBytes = await getBlock(root);
+        if (!rootBytes) throw new Error(`checkpoint root block ${root.toString()} is unavailable`);
+        chunks = dagCbor.decode<CheckpointRoot>(rootBytes).chunks;
     }
-    return winners;
+
+    // The chunks are independent blocks, so pull them concurrently (one bitswap round-trip for
+    // the whole set, not one per chunk); decode preserves root order for a deterministic result.
+    const perChunk = await Promise.all(
+        chunks.map(async (chunkCid): Promise<VotesBundle[]> => {
+            const chunkBytes = await getBlock(chunkCid);
+            if (!chunkBytes) throw new Error(`checkpoint chunk block ${chunkCid.toString()} is unavailable`);
+            const wires = dagCbor.decode<unknown>(chunkBytes);
+            if (!Array.isArray(wires)) throw new Error(`checkpoint chunk ${chunkCid.toString()} is not a bundle array`);
+            return wires.map(fromWireBundle);
+        })
+    );
+    return perChunk.flat();
 }

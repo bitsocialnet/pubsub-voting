@@ -41,9 +41,32 @@ export interface RootRecord {
     sizeBytes: number;
 }
 
+/**
+ * The **fetch-protocol** root response: the advertisement plus the checkpoint's chunk-CID index
+ * (the root manifest's contents). Carrying it lets a cold joiner skip the root-manifest bitswap
+ * round-trip — it re-derives `CID(dag-cbor({ chunks }))`, checks it equals `root` (self-verifying,
+ * so the index is never a new trust vector), and pulls every chunk in parallel (see DESIGN.md
+ * "Checkpoints", "Block pull"). Only the *direct fetch response* carries the index; the pubsub
+ * heartbeat stays the bare {@link RootRecord} so its message cap remains a tiny fixed constant
+ * (the anti-amplification property — the index is O(sizeBytes / chunk-ceiling), a ~36 B/MiB
+ * pointer list, not the payload, but the broadcast path keeps the stricter guarantee anyway).
+ */
+export interface FetchRootRecord extends RootRecord {
+    /** The checkpoint's chunk CIDs, in root order. `CID(dag-cbor({ chunks })) === root`. */
+    chunks: CID[];
+}
+
 const RootRecordSchema = z.strictObject({
     version: z.number().int().positive(),
+    root: CidSchema, // TODO to which schema does this cid point to?
+    count: z.number().int().nonnegative(),
+    sizeBytes: z.number().int().nonnegative()
+});
+
+const FetchRootRecordSchema = z.strictObject({
+    version: z.number().int().positive(),
     root: CidSchema,
+    chunks: z.array(CidSchema),
     count: z.number().int().nonnegative(),
     sizeBytes: z.number().int().nonnegative()
 });
@@ -55,14 +78,23 @@ const MessageSchema = z.discriminatedUnion("kind", [
 
 export type VoteMessage = { kind: "bundle"; bundle: Uint8Array } | { kind: "root"; record: RootRecord };
 
+/** Project any root record (possibly a {@link FetchRootRecord}) to the bare advertisement fields. */
+function toRootRecord(record: RootRecord): RootRecord {
+    return { version: record.version, root: record.root, count: record.count, sizeBytes: record.sizeBytes };
+}
+
 /** Encode one bundle's binary block bytes as a live-delta message. */
 export function encodeBundleMessage(blockBytes: Uint8Array): Uint8Array {
     return encodeCanonical({ v: MESSAGE_VERSION, kind: "bundle", bundle: blockBytes });
 }
 
-/** Encode a root record as a heartbeat message. */
+/**
+ * Encode a root record as a heartbeat message. The broadcast heartbeat carries only the bare
+ * advertisement (never the fetch response's chunk index), so its size stays a tiny fixed
+ * constant — accepts a {@link FetchRootRecord} and drops the index (see {@link FetchRootRecord}).
+ */
 export function encodeRootMessage(record: RootRecord): Uint8Array {
-    return encodeCanonical({ v: MESSAGE_VERSION, kind: "root", record: RootRecordSchema.parse(record) });
+    return encodeCanonical({ v: MESSAGE_VERSION, kind: "root", record: RootRecordSchema.parse(toRootRecord(record)) });
 }
 
 /**
@@ -86,14 +118,17 @@ export function rootFetchKey(topic: string): string {
     return `${topic}${ROOT_FETCH_KEY_SUFFIX}`;
 }
 
-/** Standalone root-record codec — the same record served over the libp2p fetch protocol. */
-export function encodeRootRecord(record: RootRecord): Uint8Array {
-    return encodeCanonical(RootRecordSchema.parse(record));
+/**
+ * Standalone root-record codec — the record served over the libp2p fetch protocol, carrying the
+ * chunk-CID index so a cold joiner can skip the root-manifest round-trip (see {@link FetchRootRecord}).
+ */
+export function encodeRootRecord(record: FetchRootRecord): Uint8Array {
+    return encodeCanonical(FetchRootRecordSchema.parse(record));
 }
 
-/** Decode a fetch-protocol root-record value; throws on malformed. */
-export function decodeRootRecord(bytes: Uint8Array): RootRecord {
-    return RootRecordSchema.parse(dagCbor.decode(bytes));
+/** Decode a fetch-protocol root-record value (with its chunk index); throws on malformed. */
+export function decodeRootRecord(bytes: Uint8Array): FetchRootRecord {
+    return FetchRootRecordSchema.parse(dagCbor.decode(bytes));
 }
 
 /**

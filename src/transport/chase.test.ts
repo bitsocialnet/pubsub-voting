@@ -23,12 +23,16 @@ function bundle(address: string, blockNumber = 1): VotesBundle {
 const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
 const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
 
-/** Encode `winners` into checkpoint blocks and return the root + a block-map getBlock. */
+/** Encode `winners` into checkpoint blocks and return the root, chunk index, and a block-map getBlock. */
 async function checkpointOf(winners: VotesBundle[]) {
-    const { root, blocks } = await encodeCheckpoint(winners);
+    const { root, chunks, blocks } = await encodeCheckpoint(winners);
     const map = new Map(blocks.map((b) => [b.cid.toString(), b.bytes]));
-    const getBlock: RootChaserDeps["getBlock"] = async (cid) => map.get(cid.toString());
-    return { root, getBlock };
+    const fetched: string[] = [];
+    const getBlock: RootChaserDeps["getBlock"] = async (cid) => {
+        fetched.push(cid.toString());
+        return map.get(cid.toString());
+    };
+    return { root, chunks, getBlock, fetched };
 }
 
 /**
@@ -74,6 +78,31 @@ describe("makeRootChaser", () => {
         expect(h.admitted).toHaveLength(2);
         expect(h.merged()).toBe(1);
         expect(h.chaser.inFlight()).toBe(0);
+    });
+
+    it("skips the root-manifest fetch when handed a verified chunk index (piggyback fast-path)", async () => {
+        const winners = [bundle("0x1"), bundle("0x2")];
+        const { root, chunks, getBlock, fetched } = await checkpointOf(winners);
+        const h = harness({ getBlock });
+        // Cold-start hands the chase the chunk index from the fetch response; verified against
+        // `root`, it pulls the chunks directly and never fetches the root-manifest block.
+        h.chaser.chase(root, chunks);
+        await h.settle();
+        expect(h.admitted).toHaveLength(2);
+        expect(fetched).not.toContain(root.toString());
+        expect(fetched).toEqual(chunks.map((c) => c.toString()));
+    });
+
+    it("falls back to the manifest fetch when the piggybacked chunk index is wrong", async () => {
+        const winners = [bundle("0x1"), bundle("0x2")];
+        const { root, getBlock, fetched } = await checkpointOf(winners);
+        const bogus = await encodeCheckpoint([bundle("0x9")]); // chunks that do not re-derive to `root`
+        const h = harness({ getBlock });
+        h.chaser.chase(root, bogus.chunks);
+        await h.settle();
+        // The lie fails the local check, so the chase fetches the real manifest and still converges.
+        expect(h.admitted).toHaveLength(2);
+        expect(fetched).toContain(root.toString());
     });
 
     it("skips bundles we already hold without re-verifying", async () => {

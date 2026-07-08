@@ -63,4 +63,39 @@ describe("checkpoint codec", () => {
         const { root } = await encodeCheckpoint(WINNERS);
         await expect(decodeCheckpoint(root, async () => undefined)).rejects.toThrow(/unavailable/);
     });
+
+    it("skips the root-manifest fetch when handed a verified chunk index (piggyback fast-path)", async () => {
+        const { root, chunks, blocks } = await encodeCheckpoint(WINNERS);
+        const getBlock = storeOf(blocks);
+        const fetched: string[] = [];
+        const spy = async (cid: CID): Promise<Uint8Array | undefined> => {
+            fetched.push(cid.toString());
+            return getBlock(cid);
+        };
+        // The chunk index re-derives to `root`, so decode pulls the chunks directly and never
+        // asks for the manifest block — one fewer round-trip.
+        const decoded = await decodeCheckpoint(root, spy, chunks);
+        expect(decoded.map((b) => b.address)).toEqual([
+            "0x0000000000000000000000000000000000000001",
+            "0x0000000000000000000000000000000000000002"
+        ]);
+        expect(fetched).not.toContain(root.toString());
+        expect(fetched).toEqual(chunks.map((c) => c.toString()));
+    });
+
+    it("falls back to the manifest fetch when the piggybacked chunk index does not match the root", async () => {
+        const { root, blocks } = await encodeCheckpoint(WINNERS);
+        const getBlock = storeOf(blocks);
+        const fetched: string[] = [];
+        const spy = async (cid: CID): Promise<Uint8Array | undefined> => {
+            fetched.push(cid.toString());
+            return getBlock(cid);
+        };
+        // A lie (chunk index that does not re-derive to `root`) fails the local check, so decode
+        // fetches the real manifest and still returns the correct winners — never a trust vector.
+        const bogus = await encodeCheckpoint([WINNERS[0]!]);
+        const decoded = await decodeCheckpoint(root, spy, bogus.chunks);
+        expect(decoded.length).toBe(2);
+        expect(fetched).toContain(root.toString());
+    });
 });

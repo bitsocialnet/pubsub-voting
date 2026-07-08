@@ -9,7 +9,8 @@ import {
     maxBundleMessageBytes,
     MAX_ROOT_MESSAGE_BYTES,
     ROOT_RECORD_VERSION,
-    type RootRecord
+    type RootRecord,
+    type FetchRootRecord
 } from "./messages.js";
 import { encodeBundle, bundleCidForBytes } from "../crdt/codec.js";
 import type { VotesBundle } from "../schema/votes.js";
@@ -26,6 +27,8 @@ const BUNDLE: VotesBundle = {
 // A fixed root CID (the bundle-codec vector's CID) so the record vector is deterministic.
 const ROOT = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
 const RECORD: RootRecord = { version: ROOT_RECORD_VERSION, root: ROOT, count: 2, sizeBytes: 470 };
+// The fetch-protocol response adds the chunk-CID index (see FetchRootRecord).
+const FETCH_RECORD: FetchRootRecord = { ...RECORD, chunks: [ROOT] };
 
 describe("pubsub message codec (two-kind union)", () => {
     // Cross-client spec: the envelope layout is pinned by these vectors — any change is a
@@ -49,13 +52,16 @@ describe("pubsub message codec (two-kind union)", () => {
     });
 
     it("round-trips a root record, in the envelope and standalone (fetch protocol)", () => {
-        const inEnvelope = decodeVoteMessage(encodeRootMessage(RECORD));
+        // The pubsub heartbeat carries only the bare advertisement — the chunk index is stripped,
+        // keeping the broadcast message constant-size.
+        const inEnvelope = decodeVoteMessage(encodeRootMessage(FETCH_RECORD));
         expect(inEnvelope.kind).toBe("root");
         if (inEnvelope.kind === "root") expect(inEnvelope.record).toEqual(RECORD);
 
-        const standalone = decodeRootRecord(encodeRootRecord(RECORD));
-        expect(standalone.root.equals(RECORD.root)).toBe(true);
-        expect(standalone).toEqual(RECORD);
+        // The fetch response carries the chunk-CID index so a cold joiner can skip the manifest pull.
+        const standalone = decodeRootRecord(encodeRootRecord(FETCH_RECORD));
+        expect(standalone.root.equals(FETCH_RECORD.root)).toBe(true);
+        expect(standalone).toEqual(FETCH_RECORD);
     });
 
     it("keeps the root message within its fixed constant cap", () => {

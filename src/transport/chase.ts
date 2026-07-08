@@ -49,8 +49,14 @@ export interface RootChaser {
      * Chase one advertised root, fire-and-forget: never throws, never blocks the caller
      * (the validator hands hints here without awaiting). A root already being chased is
      * dropped — the in-flight run covers it.
+     *
+     * `chunks` is the optional piggybacked chunk-CID index from a fetch-protocol root record
+     * (see DESIGN.md "Block pull"): when supplied and it re-derives to `root`, the chase skips
+     * the root-manifest bitswap round-trip and pulls the chunks directly. A heartbeat hint (no
+     * index) omits it and takes the manifest-fetch path. The index is verified against `root`,
+     * so a bad one simply falls back — never a trust vector.
      */
-    chase(root: CID): void;
+    chase(root: CID, chunks?: CID[]): void;
     /** Roots currently being chased (for tests/introspection). */
     inFlight(): number;
 }
@@ -59,21 +65,25 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
     const { getBlock, verifier, cache, isEvaluableNow, hasBundle, admit, onMerged, limit, timeoutMs } = deps;
     const inFlight = new Set<string>();
 
-    async function runChase(root: CID): Promise<void> {
+    async function runChase(root: CID, chunks?: CID[]): Promise<void> {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
             // Race the decode against the deadline so even a `getBlock` that ignores its abort
             // signal cannot pin this chase slot past `timeoutMs` — the slot is always freed.
             const winners = await Promise.race([
-                decodeCheckpoint(root, async (cid) => {
-                    if (controller.signal.aborted) return undefined;
-                    try {
-                        return await getBlock(cid, controller.signal);
-                    } catch {
-                        return undefined; // unfetchable/aborted — decode throws "unavailable", chase yields nothing
-                    }
-                }),
+                decodeCheckpoint(
+                    root,
+                    async (cid) => {
+                        if (controller.signal.aborted) return undefined;
+                        try {
+                            return await getBlock(cid, controller.signal);
+                        } catch {
+                            return undefined; // unfetchable/aborted — decode throws "unavailable", chase yields nothing
+                        }
+                    },
+                    chunks
+                ),
                 new Promise<undefined>((resolve) => {
                     controller.signal.addEventListener("abort", () => resolve(undefined), { once: true });
                 })
@@ -109,11 +119,11 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
     }
 
     return {
-        chase(root: CID): void {
+        chase(root: CID, chunks?: CID[]): void {
             const key = root.toString();
-            if (inFlight.has(key)) return; // the in-flight run covers this hint
+            if (inFlight.has(key)) return; // the in-flight run covers this hint (chunks derive from root)
             inFlight.add(key);
-            void limit(() => runChase(root))
+            void limit(() => runChase(root, chunks))
                 .catch(() => {}) // a failed chase contributes nothing; the hint was never trusted
                 .finally(() => inFlight.delete(key));
         },

@@ -34,6 +34,13 @@ export interface OpTiming {
     startMs: number;
     durMs: number;
     bytes?: number;
+    /**
+     * Fetch sub-phase (fetch ops only): the `connection.newStream` multistream-select
+     * negotiation, in ms. The remainder of `durMs` is openConnection (≈0 on a reused
+     * connection) + the request write→response read. Isolates whether the mss-negotiate RTT
+     * or the actual request RTT dominates the fetch (see the fetch-latency memory).
+     */
+    negotiateMs?: number;
 }
 
 export interface ColdJoinMilestones {
@@ -48,6 +55,12 @@ export interface ColdJoinMilestones {
     identifyMs: number | null;
     /** The cold-start root-record fetch(es): count + total ms + first start (t0-relative). */
     fetch: { count: number; totalMs: number; firstStartMs: number | null };
+    /**
+     * Fetch sub-phase split (summed across fetch ops): the multistream-select negotiate time vs
+     * the remainder (openConnection + request write→response read). Confirms which RTT dominates
+     * the root-record fetch before any production change.
+     */
+    fetchPhases: { negotiateMs: number | null; writeReadMs: number | null };
     /** The checkpoint block pulls over bitswap: count + total ms + slowest single pull + net count. */
     blockGets: { count: number; totalMs: number; maxMs: number; networkCount: number };
     /** `start()` call → the first `update` event (chase merged), ms; null if none fired. */
@@ -97,9 +110,14 @@ async function drainBlock(result: AsyncIterable<Uint8Array> | Promise<Uint8Array
     return out;
 }
 
+/** A live connection whose `newStream` we can wrap to time the mss-negotiate sub-phase. */
+interface TimedConnection {
+    newStream(protocol: string, options?: unknown): Promise<unknown>;
+}
+
 /** Wrap `node`'s injected blockstore + fetch to record a timestamped event per operation. */
-function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; label: string; start: number; end: number; bytes?: number }> } {
-    const events: Array<{ kind: OpTiming["kind"]; label: string; start: number; end: number; bytes?: number }> = [];
+function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; label: string; start: number; end: number; bytes?: number; negotiateMs?: number }> } {
+    const events: Array<{ kind: OpTiming["kind"]; label: string; start: number; end: number; bytes?: number; negotiateMs?: number }> = [];
 
     const bs = node.helia.blockstore as unknown as TimedBlockstore;
     const rawGet = bs.get.bind(bs);
@@ -110,14 +128,36 @@ function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; l
         return bytes;
     };
 
+    const libp2p = node.libp2p as unknown as { getConnections?(peer: unknown): TimedConnection[] };
     const fetchSvc = node.libp2p.services.fetch as unknown as TimedFetch;
     const rawFetch = fetchSvc.fetch.bind(fetchSvc);
     fetchSvc.fetch = async (peer, key, options) => {
         const start = performance.now();
-        const value = await rawFetch(peer, key, options);
-        const label = typeof key === "string" ? key : new TextDecoder().decode(key);
-        events.push({ kind: "fetch", label, start, end: performance.now() });
-        return value;
+        // Isolate the mss-negotiate RTT: wrap `newStream` on the connection(s) already open to this
+        // peer (cold-start dials the provider before fetching, so the connection is reused and
+        // openConnection ≈ 0). The remainder of the fetch is the request write→response read.
+        let negotiateMs: number | undefined;
+        const restores: Array<() => void> = [];
+        for (const conn of libp2p.getConnections?.(peer) ?? []) {
+            const rawNewStream = conn.newStream.bind(conn);
+            restores.push(() => {
+                conn.newStream = rawNewStream;
+            });
+            conn.newStream = async (protocol: string, opts?: unknown): Promise<unknown> => {
+                const ns = performance.now();
+                const stream = await rawNewStream(protocol, opts);
+                if (negotiateMs === undefined) negotiateMs = performance.now() - ns;
+                return stream;
+            };
+        }
+        try {
+            const value = await rawFetch(peer, key, options);
+            const label = typeof key === "string" ? key : new TextDecoder().decode(key);
+            events.push({ kind: "fetch", label, start, end: performance.now(), ...(negotiateMs !== undefined ? { negotiateMs } : {}) });
+            return value;
+        } finally {
+            for (const restore of restores) restore();
+        }
     };
 
     return { events };
@@ -191,9 +231,13 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
                 label: e.label,
                 startMs: e.start - t0,
                 durMs: e.end - e.start,
-                ...(e.bytes !== undefined ? { bytes: e.bytes } : {})
+                ...(e.bytes !== undefined ? { bytes: e.bytes } : {}),
+                ...(e.negotiateMs !== undefined ? { negotiateMs: e.negotiateMs } : {})
             }));
         const fetchOps = ops.filter((o) => o.kind === "fetch");
+        const negotiateOps = fetchOps.filter((o) => o.negotiateMs !== undefined);
+        const negotiateMs = negotiateOps.length ? negotiateOps.reduce((s, o) => s + (o.negotiateMs ?? 0), 0) : null;
+        const fetchTotalMs = fetchOps.reduce((s, o) => s + o.durMs, 0);
         const blockOps = ops.filter((o) => o.kind === "blockGet");
         const networkBlocks = blockOps.filter((o) => o.durMs >= 5); // a real bitswap pull, not a local hit
         const routerReq = router.requests.find((r) => r.cid === cidString);
@@ -213,8 +257,12 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             identifyMs: identifyAbs === null ? null : identifyAbs - t0,
             fetch: {
                 count: fetchOps.length,
-                totalMs: fetchOps.reduce((s, o) => s + o.durMs, 0),
+                totalMs: fetchTotalMs,
                 firstStartMs: fetchOps.length ? Math.min(...fetchOps.map((o) => o.startMs)) : null
+            },
+            fetchPhases: {
+                negotiateMs,
+                writeReadMs: negotiateMs === null ? null : fetchTotalMs - negotiateMs
             },
             blockGets: {
                 count: blockOps.length,
@@ -248,7 +296,7 @@ async function main(): Promise<void> {
     process.stderr.write(
         `[cold-join] N=${r.n}\n` +
             `  discovery:   router-lookup=${s(r.router.durMs)} (@${s(r.router.startMs)}) connect=${s(r.connectMs)} identify=${s(r.identifyMs)}\n` +
-            `  cold-start:  fetch=${s(r.fetch.totalMs)} (${r.fetch.count}x) ` +
+            `  cold-start:  fetch=${s(r.fetch.totalMs)} (${r.fetch.count}x, negotiate=${s(r.fetchPhases.negotiateMs)} write→read=${s(r.fetchPhases.writeReadMs)}) ` +
             `bitswap=${s(r.blockGets.totalMs)} (${r.blockGets.networkCount} net/${r.blockGets.count} gets, max ${s(r.blockGets.maxMs)}) ` +
             `verify+merge=${s(r.verifyMergeMs)}\n` +
             `  total:       start->tally=${s(r.tallyReadyMs)}  (first-update ${s(r.firstUpdateMs)})\n`
