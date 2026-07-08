@@ -58,7 +58,8 @@ export interface FetchRootRecord extends RootRecord {
 
 const RootRecordSchema = z.strictObject({
     version: z.number().int().positive(),
-    root: CidSchema, // TODO to which schema does this cid point to?
+    // Points to a `CheckpointRoot` block (`{ chunks: CID[] }`, checkpoint/codec.ts).
+    root: CidSchema,
     count: z.number().int().nonnegative(),
     sizeBytes: z.number().int().nonnegative()
 });
