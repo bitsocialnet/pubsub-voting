@@ -1,8 +1,8 @@
 /**
  * Library error types.
  *
- * The engine and client lifecycle are implemented — schemas, encoding, topic/manifest
- * derivation, the verify pipeline, the LWW winner-set CRDT, the tally, the transport's
+ * The engine and client lifecycle are implemented — schemas, encoding, topic derivation,
+ * the verify pipeline, the LWW winner-set CRDT, the tally, the transport's
  * validate-before-forward gossip gate, and the reactive `PubsubVoter` / `Contest` / `ContestVote`
  * facade. Republishing a live vote is the client's job (no scheduler, no persistence); see
  * DESIGN.md "Republishing is the client's job".
@@ -100,61 +100,10 @@ export class MissingFetchError extends Error {
 }
 
 /**
- * Thrown at construction when no `manifest` is given. v1 requires a `PubsubVoter` to own a
- * directory manifest: every contest is derived from it (`deriveCriteria`) and addressed by
- * its `contestId` (`createContest` / `createContestVote`). There is no ad-hoc, manifest-free
- * contest path in v1.
- */
-export class MissingManifestError extends Error {
-    constructor() {
-        super(
-            "PubsubVoter requires a `manifest` at construction. v1 derives every contest from the " +
-                "directory manifest the voter owns and addresses each by its `contestId` " +
-                "(`createContest({ contestId })`); there is no ad-hoc contest path. Pass a directory " +
-                "manifest (see `deriveCriteria` / DESIGN.md \"Facade\")."
-        );
-        this.name = "MissingManifestError";
-    }
-}
-
-/**
- * Thrown at construction when a manifest declares the same `contestId` on more than one
- * `contests` entry. `contestId` is how a host addresses a single contest
- * (`createContest({ contestId })`), so it MUST be unique within a manifest.
- */
-export class DuplicateContestIdError extends Error {
-    constructor(readonly contestId: string) {
-        super(
-            `Duplicate contestId "${contestId}" in the manifest. Each contest's \`contestId\` must be ` +
-                `unique — it is how a host addresses one contest (\`createContest({ contestId })\`). ` +
-                `Rename or remove the duplicate \`contests\` entry.`
-        );
-        this.name = "DuplicateContestIdError";
-    }
-}
-
-/**
- * Thrown by `createContest` / `createContestVote` when no contest in this voter's manifest carries
- * the requested `contestId`.
- */
-export class UnknownContestError extends Error {
-    constructor(
-        readonly contestId: string,
-        readonly known: readonly string[]
-    ) {
-        super(
-            `No contest with contestId "${contestId}" in this voter's manifest. ` +
-                `Known contestIds: ${known.length ? known.join(", ") : "(none)"}.`
-        );
-        this.name = "UnknownContestError";
-    }
-}
-
-/**
  * Thrown once a voter has been `destroy()`ed and something tries to keep using it. Unlike `stop()`
  * (which leaves every topic but keeps the client reusable), `destroy()` is terminal: every contest
- * is stopped and can no longer update or publish. Surfaced by `createContest` / `createContestVote`
- * / `start`, and by a pre-existing `Contest.update()` / `ContestVote.publish()`. Construct a new
+ * is stopped and can no longer update or publish. Surfaced by `createContest` / `createContestVote`,
+ * and by a pre-existing `Contest.update()` / `ContestVote.publish()`. Construct a new
  * `PubsubVoter` to participate again.
  */
 export class VoterDestroyedError extends Error {

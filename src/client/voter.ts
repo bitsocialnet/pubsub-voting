@@ -1,5 +1,5 @@
 import pLimit from "p-limit";
-import type { Criteria } from "../schema/criteria.js";
+import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
 import { makeBucketMath } from "../chain/bucket.js";
@@ -40,15 +40,7 @@ import type { ContestTally, TallyOptions } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
-import { deriveCriteria, type DirectoryManifest } from "../manifest/manifest.js";
-import {
-    DuplicateContestIdError,
-    MissingManifestError,
-    ReadOnlyError,
-    UnknownContestError,
-    UnknownRuleError,
-    VoterDestroyedError
-} from "../errors.js";
+import { ReadOnlyError, UnknownRuleError, VoterDestroyedError } from "../errors.js";
 
 /**
  * The recommended cadence, in buckets, at which a client should re-publish a live vote to keep
@@ -62,7 +54,7 @@ import {
  * `blockNumber` on a published `VotesBundle`, and `criteria.voteExpiryBuckets` /
  * `criteria.blocksPerBucket` are what a client uses to schedule its own refreshes: a vote sampled
  * at bucket `b` expires once the current bucket exceeds `b + voteExpiryBuckets`; refresh by
- * calling `createContestVote({ contestId, votes }).publish()` again before then.
+ * calling `createContestVote({ criteria, votes }).publish()` again before then.
  */
 export function republishIntervalBuckets(criteria: Criteria): number {
     return Math.ceil(criteria.voteExpiryBuckets / 2);
@@ -70,10 +62,11 @@ export function republishIntervalBuckets(criteria: Criteria): number {
 
 /**
  * Public facade — three objects, mirroring pkc-js / plebbit-js:
- *   - {@link PubsubVoter} (`VoteClient`): the factory. Holds the host-injected dependencies once,
- *     derives every contest from the required `manifest`, and owns one engine per contest. This is
- *     what a host like 5chan touches — 63 directory slots = 63 contests = 63 topics from one
- *     manifest, so it should not wire dependencies 63 times.
+ *   - {@link PubsubVoter} (`VoteClient`): the factory. Holds the host-injected dependencies once
+ *     and owns one engine per contest, keyed by topic. A contest is addressed by its full criteria
+ *     document — `createContest({ criteria })` validates it and derives the topic — so a directory
+ *     host like 5chan authors its 63 documents however it likes (e.g. merged from a local
+ *     manifest) and creates each contest, without wiring dependencies 63 times.
  *   - {@link Contest} (`createContest`): one contest's reactive **read** view. `update()` starts
  *     syncing and emits `update` (carrying a fresh `tally`) / `error`, like `subplebbit.update()`.
  *   - {@link ContestVote} (`createContestVote`): one publishable **ballot**. `publish()` signs and
@@ -171,42 +164,34 @@ export interface ContestVote {
 export interface VoteClient {
     /** True when constructed without a signer: every contest is read-only. */
     readonly readOnly: boolean;
-    /** The `contestId`s of every contest in this voter's manifest, in manifest order. */
-    readonly contestIds: readonly string[];
     /**
-     * Create the reactive read view for one contest by its `contestId`. The id must name a contest
-     * in this voter's manifest, else `UnknownContestError`. Returns the stable per-topic object
-     * (one CRDT/engine per topic per node), so repeated calls for the same contest return the same
-     * `Contest`.
+     * Create the reactive read view for one contest from its full criteria document. The document
+     * is strictly validated (`CriteriaSchema` + the rule registry — an unimplemented rule throws
+     * `UnknownRuleError`) and its topic derived (`topic = CID(dag-cbor(criteria))`). Returns the
+     * stable per-topic object (one CRDT/engine per topic per node), so repeated calls with
+     * byte-identical criteria return the same `Contest`.
      */
-    createContest(args: { contestId: string }): Promise<Contest>;
+    createContest(args: { criteria: Criteria }): Promise<Contest>;
     /**
-     * Create a publishable ballot for one contest. The id must name a contest in this voter's
-     * manifest, else `UnknownContestError`. Each call returns a fresh `ContestVote` over the shared
-     * per-topic engine; pass `votes: []` to build a withdrawal.
+     * Create a publishable ballot for one contest, validated and addressed exactly like
+     * `createContest`. Each call returns a fresh `ContestVote` over the shared per-topic engine;
+     * pass `votes: []` to build a withdrawal.
      */
-    createContestVote(args: { contestId: string; votes: Vote[] }): Promise<ContestVote>;
+    createContestVote(args: { criteria: Criteria; votes: Vote[] }): Promise<ContestVote>;
     /**
-     * Join and sync every contest in the constructor `manifest`, and register the checkpoint fetch
-     * responder — the "participate in and serve the whole directory" path a seeder or full host
-     * uses. A light client can skip this and just `createContest` / `createContestVote` the slots it
-     * cares about. Idempotent to the extent engines join idempotently.
-     */
-    start(): Promise<void>;
-    /**
-     * Leave every topic and unregister the fetch responder, resetting each read view so it can
-     * `update()` again. The client stays fully reusable — call `start()` / `createContest` after.
+     * Leave every topic this client joined, resetting each read view so it can `update()` again.
+     * The checkpoint fetch responder unregisters itself once the last topic is left (see
+     * `PubsubVoter`'s lazy responder lifecycle). The client stays fully reusable — call
+     * `createContest` / `update()` after.
      */
     stop(): Promise<void>;
-    /** Leave every contest this client joined and reset its read views (no responder change). */
-    stopAll(): Promise<void>;
     /**
      * Terminal teardown (mirrors pkc-js `destroy`): leave every topic, unregister the fetch
      * responder, and mark the voter and all its contests destroyed. Unlike `stop`, this is NOT
-     * reusable — every subsequent `createContest` / `createContestVote` / `start`, and any
-     * pre-existing `Contest.update()` / `ContestVote.publish()`, throws `VoterDestroyedError`.
-     * Construct a new `PubsubVoter` to participate again. There is no store to dispose
-     * (republishing / persistence is the client's concern).
+     * reusable — every subsequent `createContest` / `createContestVote`, and any pre-existing
+     * `Contest.update()` / `ContestVote.publish()`, throws `VoterDestroyedError`. Construct a new
+     * `PubsubVoter` to participate again. There is no store to dispose (republishing / persistence
+     * is the client's concern).
      */
     destroy(): Promise<void>;
 }
@@ -231,14 +216,6 @@ export interface PubsubVoterOptions {
     chains: ChainClientFactory;
     /** Identity. Omit for a read-only voter (renders tallies, cannot publish). */
     signer?: VoteSigner;
-    /**
-     * The 5chan-style directory manifest this voter owns. Required in v1: the voter derives
-     * every contest from it (via `deriveCriteria`) at construction and addresses each by its
-     * unique `contestId` (`createContest` / `createContestVote`). Its `contestId`s MUST be
-     * unique — a duplicate throws `DuplicateContestIdError` at construction — and a
-     * missing/invalid manifest throws `MissingManifestError`.
-     */
-    manifest: DirectoryManifest;
     /** Rule overrides that shadow built-ins by `type` (a flat `type -> rule` map). */
     rules?: RuleRegistry;
     /**
@@ -266,6 +243,14 @@ interface ResolvedDeps {
     registry: RuleRegistry;
     /** Community-name resolvers for verifying `community.name` claims at tally time. */
     nameResolvers: NameResolver[];
+    /**
+     * Engine → voter notifications, fired exactly once per real topic join / leave transition.
+     * They drive the voter's lazy fetch-responder lifecycle: the responder is registered while
+     * at least one engine is joined, so a node serves root records for exactly the contests it
+     * participates in, for exactly as long as it participates.
+     */
+    onTopicJoined: () => void;
+    onTopicLeft: () => void;
 }
 
 /** Hard per-message validation deadline (ms): the 10s budget for the verify pipeline in the gate. */
@@ -359,7 +344,7 @@ class ContestEngine {
     readonly #tally: ReturnType<typeof makeTally>;
     /** Live once joined; the gate + gossip wiring for this topic. */
     #transport: VoteTransport | undefined;
-    /** True between `join()` and `leave()`; makes both idempotent so views + `start()` compose. */
+    /** True between `join()` and `leave()`; makes both idempotent so views and ballots compose. */
     #joined = false;
     /**
      * True once the owning voter was `destroy()`ed. Terminal: {@link join} then throws, so no view
@@ -647,6 +632,10 @@ class ContestEngine {
         });
         await this.#transport.start();
         this.#joined = true;
+        // Notify the voter of the real join transition (drives lazy responder registration):
+        // a node that participates in a topic serves its root record, symmetric with the
+        // heartbeat it broadcasts there.
+        this.#deps.onTopicJoined();
         this.#armHeartbeat();
         // Cold-start / reconnect pull: ask connected topic peers for their root records and
         // chase any divergence. Fire-and-forget — joining must not block on slow peers, and
@@ -777,9 +766,13 @@ class ContestEngine {
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         this.#chaser = undefined;
+        const wasJoined = this.#joined;
         this.#joined = false;
         await this.#transport?.stop();
         this.#transport = undefined;
+        // Fire once per real transition only: `leave()` is idempotent and also runs on engines
+        // that never joined, so the voter's joined-count must not underflow.
+        if (wasJoined) this.#deps.onTopicLeft();
     }
 
     /**
@@ -986,9 +979,9 @@ class ContestVotePublication implements ContestVote {
     #state: PublishingState = "stopped";
     #bundle: VotesBundle | undefined;
 
-    constructor(engine: ContestEngine, contestId: string, votes: Vote[]) {
+    constructor(engine: ContestEngine, votes: Vote[]) {
         this.#engine = engine;
-        this.contestId = contestId;
+        this.contestId = engine.criteria.contestId;
         this.votes = votes;
     }
 
@@ -1044,28 +1037,28 @@ class ContestVotePublication implements ContestVote {
 
 /**
  * The default `VoteClient`. Construct with the host-injected seams: a `helia` node (must carry a
- * gossipsub service, a blockstore, and a libp2p fetch service), a `chains` factory, the `manifest`
- * this voter owns (required — every contest is derived from it and addressed by `contestId`), an
- * optional `signer`, and optional `nameResolvers` (needed once votes carry community names). The
- * library has no knowledge of pkc-js or any other host: a host passes its own running Helia node
- * in directly. Republishing a live vote is the client's concern — see
+ * gossipsub service, a blockstore, and a libp2p fetch service), a `chains` factory, an optional
+ * `signer`, and optional `nameResolvers` (needed once votes carry community names). Contests are
+ * addressed by their full criteria document at `createContest` / `createContestVote`; the library
+ * has no knowledge of pkc-js or any other host: a host passes its own running Helia node in
+ * directly. Republishing a live vote is the client's concern — see
  * {@link republishIntervalBuckets} and DESIGN.md "Republishing is the client's job".
  */
 export class PubsubVoter implements VoteClient {
     readonly #deps: ResolvedDeps;
-    /** One engine per contest, keyed by topic so identical criteria share one CRDT/transport. */
+    /** One engine per contest, keyed by topic so byte-identical criteria share one CRDT/transport. */
     readonly #engines = new Map<string, ContestEngine>();
     /** Cached read views, one per topic (stable per-contest object). */
     readonly #views = new Map<string, ContestView>();
-    /**
-     * Every contest this voter owns, derived from the constructor manifest and keyed by its
-     * unique `contestId` (validated at construction). This is the single source of contests;
-     * `createContest`/`createContestVote`/`start()` all read from it, and it fixes `contestIds` order.
-     */
-    readonly #criteriaById: Map<string, Criteria>;
-    /** True once the fetch responder is registered (by `start()`), so teardown can unregister once. */
+    /** True while the fetch responder is registered, making register/unregister idempotent. */
     #responderRegistered = false;
-    /** True once `destroy()` ran. Terminal: every create/start path then throws (mirrors pkc-js). */
+    /**
+     * How many engines are currently joined to their topic. The fetch responder is registered
+     * lazily while this is > 0 (see {@link ResolvedDeps.onTopicJoined}): no constructor work, no
+     * public API — a node serves root records for exactly the contests it participates in.
+     */
+    #joinedEngines = 0;
+    /** True once `destroy()` ran. Terminal: every create path then throws (mirrors pkc-js). */
     #destroyed = false;
 
     constructor(options: PubsubVoterOptions) {
@@ -1081,37 +1074,24 @@ export class PubsubVoter implements VoteClient {
             chains: options.chains,
             signer: options.signer,
             registry: resolveRegistry(options.rules),
-            nameResolvers: options.nameResolvers ?? []
+            nameResolvers: options.nameResolvers ?? [],
+            onTopicJoined: this.#onTopicJoined,
+            onTopicLeft: this.#onTopicLeft
         };
-
-        // The manifest is mandatory in v1: derive every contest up front, validate each
-        // against the rule registry, and reject a duplicate `contestId` — the id is how a
-        // host addresses one contest, so it must be unique.
-        if (options.manifest === undefined || options.manifest === null) throw new MissingManifestError();
-        this.#criteriaById = new Map();
-        for (const criteria of deriveCriteria(options.manifest)) {
-            validateCriteriaRules(criteria, this.#deps.registry);
-            if (this.#criteriaById.has(criteria.contestId)) throw new DuplicateContestIdError(criteria.contestId);
-            this.#criteriaById.set(criteria.contestId, criteria);
-        }
     }
 
     get readOnly(): boolean {
         return this.#deps.signer === undefined;
     }
 
-    get contestIds(): readonly string[] {
-        return [...this.#criteriaById.keys()];
-    }
-
-    /** Guard the create/start paths after {@link destroy}: a destroyed voter is terminal. */
+    /** Guard the create paths after {@link destroy}: a destroyed voter is terminal. */
     #assertLive(): void {
         if (this.#destroyed) throw new VoterDestroyedError();
     }
 
-    async createContest(args: { contestId: string }): Promise<Contest> {
+    async createContest(args: { criteria: Criteria }): Promise<Contest> {
         this.#assertLive();
-        const engine = await this.#engineFor(this.#criteriaOrThrow(args.contestId));
+        const engine = await this.#engineFor(this.#validateCriteria(args.criteria));
         const existing = this.#views.get(engine.topic);
         if (existing) return existing;
         const view = new ContestView(engine);
@@ -1119,15 +1099,21 @@ export class PubsubVoter implements VoteClient {
         return view;
     }
 
-    async createContestVote(args: { contestId: string; votes: Vote[] }): Promise<ContestVote> {
+    async createContestVote(args: { criteria: Criteria; votes: Vote[] }): Promise<ContestVote> {
         this.#assertLive();
-        const engine = await this.#engineFor(this.#criteriaOrThrow(args.contestId));
-        return new ContestVotePublication(engine, args.contestId, args.votes);
+        const engine = await this.#engineFor(this.#validateCriteria(args.criteria));
+        return new ContestVotePublication(engine, args.votes);
     }
 
-    #criteriaOrThrow(contestId: string): Criteria {
-        const criteria = this.#criteriaById.get(contestId);
-        if (!criteria) throw new UnknownContestError(contestId, [...this.#criteriaById.keys()]);
+    /**
+     * Strictly validate one criteria document at the create seam: `CriteriaSchema` (shape,
+     * canonical encodability) plus the rule registry (an unimplemented rule must recuse, not
+     * miscount — `UnknownRuleError`). The parsed result is what gets encoded, so the engine and
+     * the topic always derive from a schema-clean document.
+     */
+    #validateCriteria(input: Criteria): Criteria {
+        const criteria = CriteriaSchema.parse(input);
+        validateCriteriaRules(criteria, this.#deps.registry);
         return criteria;
     }
 
@@ -1162,41 +1148,45 @@ export class PubsubVoter implements VoteClient {
         }
     };
 
-    async start(): Promise<void> {
-        this.#assertLive();
-        const engines = await Promise.all([...this.#criteriaById.values()].map((criteria) => this.#engineFor(criteria)));
-        // One responder for every contest this voter serves, keyed by the shared topic prefix.
-        if (!this.#responderRegistered) {
-            this.#deps.fetch.registerLookupFunction(TOPIC_PREFIX, this.#rootLookup);
-            this.#responderRegistered = true;
-        }
-        // Join each topic (installs the forward gate, arms the heartbeat, fires cold-start).
-        for (const engine of engines) await engine.join();
-    }
+    /**
+     * Lazy responder lifecycle, driven by the engines' real join/leave transitions: the first
+     * joined topic registers the fetch responder, the last left topic unregisters it. This is an
+     * invariant, not an opt-in — any node participating in a topic answers root-record fetches
+     * there, symmetric with the heartbeat it already broadcasts.
+     */
+    readonly #onTopicJoined = (): void => {
+        this.#joinedEngines += 1;
+        if (this.#responderRegistered) return;
+        this.#deps.fetch.registerLookupFunction(TOPIC_PREFIX, this.#rootLookup);
+        this.#responderRegistered = true;
+    };
+
+    readonly #onTopicLeft = (): void => {
+        this.#joinedEngines -= 1;
+        if (this.#joinedEngines <= 0) this.#unregisterResponder();
+    };
 
     async stop(): Promise<void> {
-        this.#unregisterResponder();
-        await this.stopAll();
-    }
-
-    async stopAll(): Promise<void> {
         // Reset each read view (detach its engine listeners, clear `#subscribed`) so it can
         // `update()` again — this is what keeps `stop()` reusable. Then leave any engine with no
-        // view (created via `createContestVote` / `start`); `leave()` is idempotent, so
-        // double-leaving a view's engine is a no-op.
+        // view (created via `createContestVote`); `leave()` is idempotent, so double-leaving a
+        // view's engine is a no-op. Each real leave notifies `#onTopicLeft`, so the responder
+        // unregisters exactly when the last joined topic is left.
         await Promise.all([...this.#views.values()].map((view) => view.stop()));
         await Promise.all([...this.#engines.values()].map((engine) => engine.leave()));
     }
 
     async destroy(): Promise<void> {
         // Terminal, mirroring pkc-js: mark the voter and every engine destroyed BEFORE tearing
-        // down, so any create/start path and any pre-existing view/publication (whose `update()` /
-        // `publish()` funnels through `engine.join()`) now throws `VoterDestroyedError`. `stopAll()`
-        // then resets the views and leaves every topic. Unlike `stop()`, the client does not come back.
+        // down, so any create path and any pre-existing view/publication (whose `update()` /
+        // `publish()` funnels through `engine.join()`) now throws `VoterDestroyedError`. `stop()`
+        // then resets the views and leaves every topic (unregistering the responder via the
+        // counted release); the explicit unregister first is the terminal-path safety net.
+        // Unlike `stop()`, the client does not come back.
         this.#destroyed = true;
         for (const engine of this.#engines.values()) engine.markDestroyed();
         this.#unregisterResponder();
-        await this.stopAll();
+        await this.stop();
     }
 
     #unregisterResponder(): void {

@@ -56,8 +56,8 @@ export const CriteriaSchema = z
         /** Human-readable label, not consensus-critical beyond changing the CID. */
         name: z.string().min(1),
         /**
-         * The directory-slot code this topic decides. One contest per topic; it is how a host
-         * addresses a contest (`PubsubVoter.createContest`), so it MUST be unique within a manifest.
+         * The directory-slot code this topic decides. One contest per topic: a distinct
+         * `contestId` makes the document's bytes distinct, which forks the topic automatically.
          */
         contestId: z.string().min(1),
         /** Allowed range for each `vote` value. v1: { min: 1, max: 1 }. */

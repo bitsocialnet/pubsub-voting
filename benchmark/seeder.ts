@@ -2,7 +2,7 @@ import { PubsubVoter, type Contest } from "../dist/client/voter.js";
 import { encodeBundle } from "../dist/crdt/codec.js";
 import { encodeBundleMessage } from "../dist/transport/messages.js";
 import { makeHostNode, connectPeers, waitFor, delay, type HostNode } from "./host-node.js";
-import { benchChains, benchManifest, benchCriteria, makeSigningContext, signRandomVoter } from "./signing.js";
+import { benchChains, benchCriteria, makeSigningContext, signRandomVoter } from "./signing.js";
 
 /**
  * Cold-join benchmark — SEEDER side (runs on the remote WAN host).
@@ -62,9 +62,9 @@ async function main(): Promise<void> {
     if (!Number.isInteger(port) || port <= 0) throw new Error(`bad PORT: ${process.argv[3]}`);
 
     const seeder = await makeHostNode({ port });
-    const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains(), manifest: benchManifest() });
-    await voter.start();
-    const network = await voter.createContest({ contestId: "biz" });
+    const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains() });
+    const network = await voter.createContest({ criteria: benchCriteria() });
+    await network.update(); // join + serve: installs the gate and registers the fetch responder
 
     if (n > 0) await seedVoters(seeder, network.topic, network, n);
 

@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: engine, reactive facade, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, and the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap) are all implemented — so the reactive `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) facade is live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. **Keeping a live vote from decaying is the consuming client's job** — this library publishes each vote once and exposes `republishIntervalBuckets` so the client can schedule its own refreshes (see [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys)). What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
+> **Status: engine, reactive facade, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, and the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap) are all implemented — so the reactive `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) facade is live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. **Keeping a live vote from decaying is the consuming client's job** — this library publishes each vote once and exposes `republishIntervalBuckets` so the client can schedule its own refreshes (see [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys)). What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -38,7 +38,8 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `community.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
-| `manifest` | `DirectoryManifest` | yes | the directory manifest this voter owns (structural type — runtime-validated at construction via `deriveCriteria`, so a malformed manifest still throws `MissingManifestError`); the voter derives every contest from it and addresses each by its unique `contestId` (`createContest` / `createContestVote`). A duplicate `contestId` throws `DuplicateContestIdError` |
+
+A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists.
 
 ### Construct a voter
 
@@ -48,13 +49,10 @@ import { PubsubVoter } from "@bitsocial/pubsub-votes";
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
   chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
-  manifest,                     // required: the directory manifest this voter owns (one contest per entry, unique contestId)
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver]  // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
 });
 ```
-
-The `manifest` is mandatory: the voter derives every contest from it at construction and addresses each by its unique `contestId`. If you only care about one contest, pass a one-entry manifest (empty `defaults`, the criteria as the single `contests` entry).
 
 Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingFetchError` if the node lacks a usable pubsub service, blockstore, or libp2p fetch service — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through. The fetch service carries the checkpoint root-record pull; the library registers its own responder on it.)
 
@@ -63,7 +61,7 @@ Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingF
 `createContest` mints a per-contest read object; `update()` starts syncing and it emits `update` (carrying a fresh `tally`) and `error`, just like a plebbit-js `subplebbit`:
 
 ```ts
-const contest = await voter.createContest({ contestId }); // contestId: a slot in the voter's manifest
+const contest = await voter.createContest({ criteria });  // criteria: the contest's full document (strictly validated here)
 contest.on("update", () => render(contest.tally));        // tally rides the object; recomputed before each emit
 contest.on("error", (err) => showConnectivityWarning(err)); // e.g. the tally's chain read failed
 await contest.update();                                   // join the topic, cold-start, begin emitting
@@ -72,17 +70,19 @@ const winner = contest.tally?.ranking[0]?.community;      // { name?: string, pu
 // await contest.stop();                                  // leave the topic
 ```
 
+Repeated `createContest` calls with byte-identical criteria return the same `Contest` (engines are keyed by topic, the criteria CID).
+
 ### Publish or withdraw a vote (needs a signer)
 
 `createContestVote` mints a publishable ballot; `publish()` signs and broadcasts it once and emits `publishingstatechange`, like a plebbit-js publication:
 
 ```ts
-const vote = await voter.createContestVote({ contestId: "biz", votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
+const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
 vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → succeeded (or failed)
 const { bundle, recipientCount } = await vote.publish();          // the signed VotesBundle + how many peers gossipsub sent it directly to
 
 // Withdraw (active): publish an empty ballot; it supersedes the prior vote under LWW.
-await (await voter.createContestVote({ contestId: "biz", votes: [] })).publish();
+await (await voter.createContestVote({ criteria, votes: [] })).publish();
 ```
 
 A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
@@ -105,32 +105,33 @@ const cadence = republishIntervalBuckets(criteria); // ceil(voteExpiryBuckets / 
 
 See [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys) for why an always-on re-signer was deliberately kept out of a library that runs on the host's shared node.
 
-### Many contests from one manifest
+### Many contests (a 5chan-style directory)
 
-A 5chan-style directory manifest derives one contest (one topic) per slot. The voter owns the manifest, so it already knows every contest — enumerate them by `contestId` and reach each with `createContest`:
+One criteria document is one contest (one topic). A directory host authors its documents however it likes — e.g. a local JSONC manifest of shared defaults merged per slot, as in [5chan-directory-criteria.jsonc](./5chan-directory-criteria.jsonc) and [examples/5chan.ts](./examples/5chan.ts) — but what participants must share **byte-identically** is the finished documents themselves (the topic is their CID), so distribute those, not an authoring format. Then create each contest:
 
 ```ts
-const contests = await Promise.all(voter.contestIds.map((contestId) => voter.createContest({ contestId }))); // → Contest[]
+const contests = await Promise.all(allCriteria.map((criteria) => voter.createContest({ criteria }))); // → Contest[]
+for (const contest of contests) await contest.update(); // a full host joins + serves the whole directory
 ```
 
-### Whole-directory lifecycle (`start` / `stop` / `destroy`)
+There is no separate seeder API: a node that joins a topic (via `update()` or `publish()`) automatically serves that contest's checkpoint root record over libp2p-fetch — the responder registers itself on the first joined topic and unregisters when the last is left. A seeder is just a client that joins everything.
 
-For a seeder or full host that wants to participate in and serve *every* contest at once, `voter.start()` joins all of them and registers the checkpoint fetch responder; a light client can skip it and just `createContest`/`createContestVote` the slots it cares about. `stop()` leaves the topics but keeps the voter **reusable** — each `Contest` can `update()` again and you can `start()`/`createContest` afterward. `destroy()` is **terminal** (like pkc-js): it leaves every topic, unregisters the responder, and marks the voter and its contests dead — any later `createContest`/`createContestVote`/`start`, or a pre-existing `Contest.update()`/`ContestVote.publish()`, throws `VoterDestroyedError`. Construct a new `PubsubVoter` to participate again. (There is no store to dispose — republishing is the client's concern.)
+### Lifecycle (`stop` / `destroy`)
+
+`stop()` leaves every joined topic but keeps the voter **reusable** — each `Contest` can `update()` again and you can `createContest` afterward. `destroy()` is **terminal** (like pkc-js): it leaves every topic, unregisters the fetch responder, and marks the voter and its contests dead — any later `createContest`/`createContestVote`, or a pre-existing `Contest.update()`/`ContestVote.publish()`, throws `VoterDestroyedError`. Construct a new `PubsubVoter` to participate again. (There is no store to dispose — republishing is the client's concern.)
 
 ```ts
-const voter = new PubsubVoter({ helia, chains, signer, manifest }); // manifest owned by the voter
-await voter.start();     // join + serve every contest
-// … app runs …
+const voter = new PubsubVoter({ helia, chains, signer });
+// … create + update contests, app runs …
 await voter.destroy();   // terminal: leave all topics, unregister the responder, forbid reuse
 ```
 
 ### Pure helpers (no node, no network)
 
 ```ts
-import { topicFor, deriveCriteria } from "@bitsocial/pubsub-votes";
+import { topicFor } from "@bitsocial/pubsub-votes";
 
 const topic = await topicFor(criteria);       // "bitsocial-votes/" + CID(dag-cbor(criteria))
-const allCriteria = deriveCriteria(manifest); // defaults ⊕ each entry, each validated
 ```
 
 Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a read-only consumer are in [examples/](./examples/).
@@ -154,7 +155,7 @@ const seeditModAllowlist: Rule<{ type: "seedit-mod-allowlist"; allow: string[] }
 };
 
 const voter = new PubsubVoter({
-  libp2p, chains,
+  helia, chains,
   rules: { "seedit-mod-allowlist": seeditModAllowlist } // flat map; shadows/extends built-ins by `type`
 });
 ```
@@ -172,10 +173,9 @@ src/
   schema/        zod schemas (criteria, votes, shared wire primitives) + inferred types
   encoding/      canonical dag-cbor encoding                      [implemented]
   topic.ts       topic = "bitsocial-votes/" + CID(dag-cbor)       [implemented]
-  manifest/      derive one criteria document per contest         [implemented]
   signer/        VoteSigner seam + EIP-712 ballot typed data       [implemented]
   client/        reactive facade: PubsubVoter + Contest (createContest) + ContestVote (createContestVote) [implemented]
-  errors.ts      ReadOnly/MissingPubsub/Blockstore/MissingManifest/... [implemented]
+  errors.ts      ReadOnly/MissingPubsub/MissingBlockstore/MissingFetch/... [implemented]
   rules/         one file per `type` + registry/resolver          [implemented]
   chain/         ChainClient = viem PublicClient + bucket math     [implemented]
   verify/        signature + constraints + full BundleVerifier + verdict cache [implemented]

@@ -2,7 +2,7 @@ import { PubsubVoter } from "../dist/client/voter.js";
 import { TOPIC_PREFIX } from "../dist/topic.js";
 import { makeHostNode, waitFor, type HostNode } from "./host-node.js";
 import { startRouter, type RunningRouter } from "./router.js";
-import { benchChains, benchManifest } from "./signing.js";
+import { benchChains, benchCriteria } from "./signing.js";
 
 /**
  * Cold-join benchmark — COLD JOINER side (runs locally; discovers the remote seeder via an HTTP
@@ -181,8 +181,8 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchChains(), manifest: benchManifest() });
-        const network = await voter.createContest({ contestId: "biz" });
+        voter = new PubsubVoter({ helia: node.helia, chains: benchChains() });
+        const network = await voter.createContest({ criteria: benchCriteria() });
         if (network.topic !== args.topic) {
             throw new Error(`derived topic ${network.topic} != seeder topic ${args.topic} (criteria mismatch)`);
         }

@@ -5,8 +5,7 @@ import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../dist/signer/eip712.js
 import { VotesBundleSchema, type VotesBundle } from "../dist/schema/votes.js";
 import { makeBucketMath } from "../dist/chain/bucket.js";
 import { criteriaCid } from "../dist/topic.js";
-import type { Criteria } from "../dist/schema/criteria.js";
-import { DirectoryManifestSchema, type DirectoryManifest } from "../dist/manifest/manifest.js";
+import { CriteriaSchema, type Criteria } from "../dist/schema/criteria.js";
 
 /**
  * Real signing + fake-chain fixtures for the cold-join latency benchmark.
@@ -44,12 +43,6 @@ export function benchCriteria(): Criteria {
     };
 }
 
-/** The one-contest directory manifest the benchmark's `PubsubVoter` derives (the `bizManifest` shape). */
-export function benchManifest(): DirectoryManifest {
-    const { name, contestId, ...defaults } = benchCriteria();
-    return DirectoryManifestSchema.parse({ name: "bench-directory", defaults, contests: [{ contestId, name }] });
-}
-
 /**
  * The synthetic contestId for slot `i` in the directory-load benchmark (`c0`, `c1`, …). Kept as a
  * pure function so the seeder and the cold joiner derive the SAME criteria CID (hence the same
@@ -60,18 +53,17 @@ export function benchContestId(i: number): string {
 }
 
 /**
- * A synthetic **directory manifest** of `m` contests for the directory-load benchmark — a 5chan-style
- * cold load where one shared seeder provides many contest topics at once. Every slot inherits the
- * same `/biz/` gate/weight/expiry from `defaults` (so all `m` derived documents are valid criteria),
- * and differs only in `contestId` (`c0`…`c{m-1}`), which makes each one a DISTINCT canonical document
- * → distinct CID → distinct topic. This mirrors the real 5chan directory's shape (one topic per
- * contest, shared seeder) without pinning the real 5chan CIDs.
+ * The `m` synthetic criteria documents for the directory-load benchmark — a 5chan-style cold load
+ * where one shared seeder provides many contest topics at once. Every slot shares the `/biz/`
+ * gate/weight/expiry and differs only in `contestId` (`c0`…`c{m-1}`) and `name`, which makes each
+ * one a DISTINCT canonical document → distinct CID → distinct topic. This mirrors the real 5chan
+ * directory's shape (one topic per contest, shared seeder) without pinning the real 5chan CIDs.
  */
-export function benchDirectoryManifest(m: number): DirectoryManifest {
+export function benchDirectoryCriteria(m: number): Criteria[] {
     if (!Number.isInteger(m) || m < 1) throw new Error(`bad contest count M: ${m}`);
-    const { name: _name, contestId: _contestId, ...defaults } = benchCriteria();
-    const contests = Array.from({ length: m }, (_, i) => ({ contestId: benchContestId(i), name: `bench contest ${benchContestId(i)}` }));
-    return DirectoryManifestSchema.parse({ name: "bench-directory", defaults, contests });
+    return Array.from({ length: m }, (_, i) =>
+        CriteriaSchema.parse({ ...benchCriteria(), contestId: benchContestId(i), name: `bench contest ${benchContestId(i)}` })
+    );
 }
 
 /**

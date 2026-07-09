@@ -1,12 +1,10 @@
 import { PubsubVoter, type Contest } from "../dist/client/voter.js";
-import { deriveCriteria } from "../dist/manifest/manifest.js";
 import { encodeBundle } from "../dist/crdt/codec.js";
 import { encodeBundleMessage } from "../dist/transport/messages.js";
 import { makeHostNode, connectPeers, waitFor, delay, type HostNode } from "./host-node.js";
 import {
     benchChains,
-    benchContestId,
-    benchDirectoryManifest,
+    benchDirectoryCriteria,
     makeSigningContext,
     signRandomVoter,
     type SigningContext
@@ -21,8 +19,8 @@ import {
  * whole directory over ONE reused connection — which is exactly the amortization the shared
  * bitsocial-seeder gives 5chan.app. See {@link ./directory-join.ts}.
  *
- * It stands up one node, builds a `PubsubVoter` over a synthetic `M`-contest manifest
- * (`benchDirectoryManifest`), seeds every contest through the REAL forward gate, waits until every
+ * It stands up one node, builds a `PubsubVoter` over `M` synthetic criteria documents
+ * (`benchDirectoryCriteria`), seeds every contest through the REAL forward gate, waits until every
  * contest's tally reflects all `N`, then prints a single `SEEDER_READY …` line and parks. Killed
  * with SIGINT/SIGTERM between sweep points.
  *
@@ -110,15 +108,14 @@ async function main(): Promise<void> {
     // defaults to 32), to test whether that alone lets a naive all-at-once directory join converge.
     const fetchMaxStreams = process.env.BENCH_FETCH_MAX_STREAMS ? Number(process.env.BENCH_FETCH_MAX_STREAMS) : undefined;
     const seeder = await makeHostNode({ port, ...(fetchMaxStreams !== undefined ? { fetchMaxStreams } : {}) });
-    const manifest = benchDirectoryManifest(m);
-    const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains(), manifest });
-    await voter.start();
+    const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains() });
 
-    // Derive each contest's criteria (for its signing context) in the SAME order the joiner will.
-    const criteria = deriveCriteria(manifest);
+    // Build each contest's criteria (for its signing context) in the SAME order the joiner will.
+    const criteria = benchDirectoryCriteria(m);
     const contests = await Promise.all(
-        criteria.map(async (c, i) => {
-            const network = await voter.createContest({ contestId: benchContestId(i) });
+        criteria.map(async (c) => {
+            const network = await voter.createContest({ criteria: c });
+            await network.update(); // join + serve: installs the gate and registers the fetch responder
             const ctx = await makeSigningContext(c);
             return { network, ctx };
         })
@@ -146,7 +143,7 @@ async function main(): Promise<void> {
     process.on("SIGTERM", () => void shutdown());
 
     // Single machine-parseable readiness line (the orchestrator greps for it), then park forever.
-    // The joiner derives the M topics itself from the same synthetic manifest, so only M/N travel here.
+    // The joiner derives the M topics itself from the same synthetic criteria, so only M/N travel here.
     process.stdout.write(`SEEDER_READY peerId=${seeder.peerId} port=${port} m=${m} n=${n}\n`);
     for (const addr of seeder.multiaddrs()) process.stderr.write(`[dir-seeder] listening ${addr}\n`);
     await new Promise<never>(() => {});

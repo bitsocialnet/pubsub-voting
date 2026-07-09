@@ -2,7 +2,7 @@
  * Public entry.
  *
  * The engine is implemented and unit-tested: the zod schemas, canonical dag-cbor encoding,
- * topic derivation, manifest derivation, the verify pipeline (signature + constraints +
+ * topic derivation, the verify pipeline (signature + constraints +
  * gate + name resolution), the state-based grow-only LWW winner-set CRDT, the tally, and the
  * transport's validate-before-forward gossip gate. The public facade is the reactive
  * `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) trio. Keeping a
@@ -29,10 +29,9 @@ export * from "./rules/erc721-min-balance.js";
 export * from "./rules/constant.js";
 export * from "./rules/registry.js";
 
-// Implemented runtime: encoding, topic, manifest, errors, identity seam, facade.
+// Implemented runtime: encoding, topic, errors, identity seam, facade.
 export * from "./encoding/canonical.js";
 export * from "./topic.js";
-export * from "./manifest/manifest.js";
 export * from "./errors.js";
 export * from "./client/voter.js";
 // There is no library-side vote persistence: republishing a live vote is the client's job, so

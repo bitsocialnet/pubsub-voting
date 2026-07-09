@@ -11,7 +11,7 @@
  */
 import {
     PubsubVoter,
-    deriveCriteria,
+    topicFor,
     type HeliaInstance,
     type ChainClientFactory,
     type VoteSigner,
@@ -24,30 +24,26 @@ declare function seeditHelia(): HeliaInstance;
 declare function viemChains(): ChainClientFactory;
 declare function seeditSigner(): VoteSigner;
 
-// seedit votes on a single contest it cares about rather than a whole directory, but v1
-// still owns its contests through a manifest. A one-entry manifest wraps that single
-// criteria (empty `defaults`, so the entry IS the whole document).
+// seedit votes on a single contest it cares about. A contest is addressed by its full
+// criteria document — the exact bytes every participant shares (the topic is their CID),
+// so seedit ships the document with the app and passes it straight to the create calls.
 declare const criteria: Criteria;
 const voter = new PubsubVoter({
     helia: seeditHelia(),
     chains: viemChains(),
-    signer: seeditSigner(),
-    manifest: { name: criteria.name, defaults: {}, contests: [criteria] }
+    signer: seeditSigner()
 });
 
-const contest = await voter.createContest({ contestId: criteria.contestId });
+const contest = await voter.createContest({ criteria });
 await contest.update(); // start syncing this contest
 
 console.log(`contest ${contest.criteria.contestId} on topic ${contest.topic}`);
 const tally = await contest.getTally();
 console.log("ranking:", tally.ranking);
 
-const vote = await voter.createContestVote({ contestId: criteria.contestId, votes: [{ community: { publicKey: "12D3KooW...community" }, vote: 1 }] });
+const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW...community" }, vote: 1 }] });
 await vote.publish();
 // Keeping the vote alive is seedit's job: re-publish before it expires (see republishIntervalBuckets).
 
-// A host can also derive criteria from a manifest without constructing a voter at all
-// — pure, no network — e.g. to precompute topics for a directory index.
-declare const someManifest: unknown;
-const allCriteria: Criteria[] = deriveCriteria(someManifest);
-console.log(`${allCriteria.length} criteria derived`);
+// Topic derivation is pure and needs no voter — e.g. to precompute a directory index.
+console.log("topic:", await topicFor(criteria));

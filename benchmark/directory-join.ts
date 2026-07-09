@@ -1,9 +1,8 @@
 import { PubsubVoter, type Contest } from "../dist/client/voter.js";
-import { deriveCriteria } from "../dist/manifest/manifest.js";
 import { criteriaCid } from "../dist/topic.js";
 import { makeHostNode, type HostNode } from "./host-node.js";
 import { startRouter, type RouterProvider, type RunningRouter } from "./router.js";
-import { benchChains, benchContestId, benchDirectoryManifest } from "./signing.js";
+import { benchChains, benchDirectoryCriteria } from "./signing.js";
 
 /**
  * Directory-load benchmark — COLD JOINER side (runs locally).
@@ -129,8 +128,7 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
 
     // Derive every contest's criteria CID up front (offline) so the router can name the shared seeder
     // as the provider of ALL M topics before the node exists.
-    const manifest = benchDirectoryManifest(args.m);
-    const criteria = deriveCriteria(manifest);
+    const criteria = benchDirectoryCriteria(args.m);
     const cids = await Promise.all(criteria.map((c) => criteriaCid(c)));
     const providers = new Map(cids.map((cid) => [cid.toString(), provider] as const));
 
@@ -141,11 +139,9 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         router = await startRouter({ providers, latencyMs: args.routerLatencyMs ?? 1000 });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchChains(), manifest });
+        voter = new PubsubVoter({ helia: node.helia, chains: benchChains() });
 
-        const networks: Contest[] = await Promise.all(
-            Array.from({ length: args.m }, (_, i) => voter!.createContest({ contestId: benchContestId(i) }))
-        );
+        const networks: Contest[] = await Promise.all(criteria.map((c) => voter!.createContest({ criteria: c })));
 
         // Count connections opened to the shared seeder — the amortization signal (want 1, not M).
         let seederConnections = 0;

@@ -15,13 +15,11 @@ import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory } from "../chain/types.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
-    DuplicateContestIdError,
     MissingBlockstoreError,
     MissingFetchError,
-    MissingManifestError,
     MissingPubsubError,
     ReadOnlyError,
-    UnknownContestError,
+    UnknownRuleError,
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
@@ -55,18 +53,6 @@ function advancingChains(currentBlock: () => bigint): ChainClientFactory {
     return () => client as unknown as ChainClient;
 }
 
-/** A minimal directory manifest deriving one contest (the /biz/ slot) from the shared fixture. */
-function bizManifest(): unknown {
-    const { name, contestId, ...defaults } = bizCriteria();
-    return { name: "test-directory", defaults, contests: [{ contestId, name }] };
-}
-
-/** A manifest that repeats one `contestId`, to exercise the constructor uniqueness guard. */
-function dupContestIdManifest(): unknown {
-    const { name, contestId, ...defaults } = bizCriteria();
-    return { name: "dup", defaults, contests: [{ contestId, name }, { contestId, name: `${name} (again)` }] };
-}
-
 /**
  * A Helia node whose gossipsub `publish` is a spy, so a test can count broadcasts: every
  * publish/heartbeat calls `publishBundle`/`publishRootRecord` → `publish`. Otherwise a no-op node.
@@ -89,90 +75,89 @@ function spyableHelia(): { helia: HeliaInstance; publish: ReturnType<typeof vi.f
 
 describe("PubsubVoter construction + read-only", () => {
     it("is read-only without a signer", () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
         expect(voter.readOnly).toBe(true);
     });
 
     it("throws MissingPubsubError when the node's libp2p has no gossipsub service", () => {
         expect(
-            () => new PubsubVoter({ helia: fakeHeliaWithoutPubsub(), chains: fakeChains(), manifest: bizManifest() })
+            () => new PubsubVoter({ helia: fakeHeliaWithoutPubsub(), chains: fakeChains() })
         ).toThrow(MissingPubsubError);
     });
 
     it("throws MissingBlockstoreError when the node has no blockstore", () => {
         expect(
-            () => new PubsubVoter({ helia: fakeHeliaWithoutBlockstore(), chains: fakeChains(), manifest: bizManifest() })
+            () => new PubsubVoter({ helia: fakeHeliaWithoutBlockstore(), chains: fakeChains() })
         ).toThrow(MissingBlockstoreError);
     });
 
     it("throws MissingFetchError when the node's libp2p has no fetch service", () => {
         expect(
-            () => new PubsubVoter({ helia: fakeHeliaWithoutFetch(), chains: fakeChains(), manifest: bizManifest() })
+            () => new PubsubVoter({ helia: fakeHeliaWithoutFetch(), chains: fakeChains() })
         ).toThrow(MissingFetchError);
-    });
-
-    it("throws MissingManifestError when no manifest is given", () => {
-        // @ts-expect-error manifest is required in v1
-        expect(() => new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() })).toThrow(MissingManifestError);
-    });
-
-    it("throws DuplicateContestIdError when a manifest repeats a contestId", () => {
-        expect(
-            () => new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: dupContestIdManifest() })
-        ).toThrow(DuplicateContestIdError);
     });
 
     it("is writable with a signer", () => {
         const voter = new PubsubVoter({
             helia: fakeHelia(),
             chains: fakeChains(),
-            signer: fakeSigner(),
-            manifest: bizManifest()
+            signer: fakeSigner()
         });
         expect(voter.readOnly).toBe(false);
     });
 });
 
 describe("PubsubVoter.createContest", () => {
-    it("exposes contestIds in manifest order", () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        expect(voter.contestIds).toEqual(["biz"]);
-    });
-
     it("derives the correct topic and criteria", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         expect(contest.topic).toBe(await topicFor(bizCriteria()));
         expect(contest.criteria.contestId).toBe("biz");
     });
 
-    it("returns the stable per-contest object", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        const a = await voter.createContest({ contestId: "biz" });
-        const b = await voter.createContest({ contestId: "biz" });
+    it("returns the stable per-contest object for byte-identical criteria", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const a = await voter.createContest({ criteria: bizCriteria() });
+        const b = await voter.createContest({ criteria: bizCriteria() });
         expect(a).toBe(b);
     });
 
-    it("throws UnknownContestError for a contestId not in the manifest", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        await expect(voter.createContest({ contestId: "nope" })).rejects.toBeInstanceOf(UnknownContestError);
+    it("forks byte-distinct criteria into distinct contests even under a shared contestId", async () => {
+        // Engines are keyed by topic (the criteria bytes), not by contestId: two documents that
+        // happen to share an id are different contests on different topics.
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const a = await voter.createContest({ criteria: bizCriteria() });
+        const b = await voter.createContest({ criteria: { ...bizCriteria(), voteExpiryBuckets: 60 } });
+        expect(a).not.toBe(b);
+        expect(a.topic).not.toBe(b.topic);
+        expect(b.criteria.contestId).toBe("biz");
     });
 
-    it("rejects a manifest whose derived criteria is invalid", () => {
-        const bad = { name: "m", defaults: {}, contests: [{ contestId: "x", name: "/x/" }] };
-        expect(() => new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bad })).toThrow();
+    it("rejects an invalid criteria document (strict schema at the create seam)", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const missingFields = { contestId: "x", name: "/x/" } as unknown as ReturnType<typeof bizCriteria>;
+        await expect(voter.createContest({ criteria: missingFields })).rejects.toThrow();
+        const unknownField = { ...bizCriteria(), extra: 1 } as unknown as ReturnType<typeof bizCriteria>;
+        await expect(voter.createContest({ criteria: unknownField })).rejects.toThrow();
+    });
+
+    it("rejects a criteria naming a rule this client does not implement (recuse, not miscount)", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const foreignRule = { ...bizCriteria(), requires: { ...bizCriteria().requires, rules: ["not-a-rule"] } };
+        await expect(voter.createContest({ criteria: foreignRule })).rejects.toThrow(UnknownRuleError);
     });
 });
 
 describe("createContestVote (publish path)", () => {
-    it("throws UnknownContestError for a contestId not in the manifest", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner(), manifest: bizManifest() });
-        await expect(voter.createContestVote({ contestId: "nope", votes: [] })).rejects.toBeInstanceOf(UnknownContestError);
+    it("rejects an invalid criteria document like createContest", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
+        const missingFields = { contestId: "x", name: "/x/" } as unknown as ReturnType<typeof bizCriteria>;
+        await expect(voter.createContestVote({ criteria: missingFields, votes: [] })).rejects.toThrow();
     });
 
     it("publish() throws ReadOnlyError (and emits error + failed state) without a signer", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        const vote = await voter.createContestVote({ contestId: "biz", votes: VOTE });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
         const states: PublishingState[] = [];
         const errors: unknown[] = [];
         vote.on("publishingstatechange", (s) => states.push(s));
@@ -184,8 +169,8 @@ describe("createContestVote (publish path)", () => {
     });
 
     it("walks publishingState stopped -> signing -> publishing -> succeeded and resolves the bundle", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner(), manifest: bizManifest() });
-        const vote = await voter.createContestVote({ contestId: "biz", votes: VOTE });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
         const states: PublishingState[] = [];
         vote.on("publishingstatechange", (s) => states.push(s));
         expect(vote.publishingState).toBe("stopped");
@@ -203,8 +188,8 @@ describe("createContestVote (publish path)", () => {
 
     it("broadcasts the bundle once over the host node's gossipsub", async () => {
         const { helia, publish } = spyableHelia();
-        const voter = new PubsubVoter({ helia, chains: stubChains(), signer: fakeSigner(), manifest: bizManifest() });
-        const vote = await voter.createContestVote({ contestId: "biz", votes: VOTE });
+        const voter = new PubsubVoter({ helia, chains: stubChains(), signer: fakeSigner() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
         await vote.publish();
         // Exactly one bundle-kind message (the live delta). The heartbeat only fires 10 min out.
         const bundleBroadcasts = publish.mock.calls.filter((call) => {
@@ -220,16 +205,16 @@ describe("createContestVote (publish path)", () => {
 
 describe("Contest read view + tally", () => {
     it("returns an empty ranking for a contest with no votes (no chain reads)", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         expect(await contest.getTally()).toEqual({ contestId: "biz", ranking: [] });
     });
 
     it("reflects a published vote end-to-end (publish -> shared engine CRDT -> tally)", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner(), manifest: bizManifest() });
-        await (await voter.createContestVote({ contestId: "biz", votes: VOTE })).publish();
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
 
-        const contest = await voter.createContest({ contestId: "biz" });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         const tally = await contest.getTally();
         expect(tally.ranking).toHaveLength(1);
         expect(tally.ranking[0].community.publicKey).toBe(VALID_KEY);
@@ -237,8 +222,8 @@ describe("Contest read view + tally", () => {
     });
 
     it("update() emits an initial update and a fresh tally when a later vote is published", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner(), manifest: bizManifest() });
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         let updates = 0;
         contest.on("update", () => {
             updates += 1;
@@ -247,7 +232,7 @@ describe("Contest read view + tally", () => {
         expect(updates).toBe(1); // initial update fires with the current (empty) state
         expect(contest.tally).toEqual({ contestId: "biz", ranking: [] });
 
-        await (await voter.createContestVote({ contestId: "biz", votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
         await vi.waitFor(() => expect(contest.tally?.ranking).toHaveLength(1));
         expect(updates).toBeGreaterThanOrEqual(2); // the publish triggered a recompute + emit
         expect(contest.tally?.ranking[0].community.publicKey).toBe(VALID_KEY);
@@ -261,11 +246,10 @@ describe("Contest read view + tally", () => {
         const voter = new PubsubVoter({
             helia: fakeHelia(),
             chains: advancingChains(() => block),
-            signer: fakeSigner(),
-            manifest: bizManifest()
+            signer: fakeSigner()
         });
-        await (await voter.createContestVote({ contestId: "biz", votes: VOTE })).publish();
-        const contest = await voter.createContest({ contestId: "biz" });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
 
         // Still live at bucket 1: the vote counts.
         expect((await contest.getTally()).ranking).toHaveLength(1);
@@ -278,8 +262,8 @@ describe("Contest read view + tally", () => {
 
 describe("Contest lifecycle", () => {
     it("update() and stop() resolve, wiring the real forward-gate over the host node", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         await expect(contest.update()).resolves.toBeUndefined();
         await expect(contest.stop()).resolves.toBeUndefined();
     });
@@ -294,31 +278,20 @@ describe("republish cadence helper (client-owned republishing)", () => {
 });
 
 describe("PubsubVoter lifecycle", () => {
-    it("start() joins every contest and keeps the voter usable", async () => {
-        const voter = new PubsubVoter({
-            helia: fakeHelia(),
-            chains: fakeChains(),
-            signer: fakeSigner(),
-            manifest: bizManifest()
-        });
-        await expect(voter.start()).resolves.toBeUndefined();
-        await voter.stop();
-    });
-
-    it("destroy() is a safe teardown, even before start()", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+    it("destroy() is a safe teardown, even before any join", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
         await expect(voter.destroy()).resolves.toBeUndefined();
     });
 
     it("stop() leaves topics and stays reusable", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        await voter.createContest({ criteria: bizCriteria() });
         await expect(voter.stop()).resolves.toBeUndefined();
     });
 
     it("stop() lets a pre-existing contest update() again (client stays reusable)", async () => {
-        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         let updates = 0;
         contest.on("update", () => {
             updates += 1;
@@ -334,28 +307,25 @@ describe("PubsubVoter lifecycle", () => {
         await voter.stop();
     });
 
-    it("destroy() is terminal: create + start paths reject afterward", async () => {
+    it("destroy() is terminal: create paths reject afterward", async () => {
         const voter = new PubsubVoter({
             helia: fakeHelia(),
             chains: fakeChains(),
-            signer: fakeSigner(),
-            manifest: bizManifest()
+            signer: fakeSigner()
         });
         await voter.destroy();
-        await expect(voter.createContest({ contestId: "biz" })).rejects.toThrow(VoterDestroyedError);
-        await expect(voter.createContestVote({ contestId: "biz", votes: VOTE })).rejects.toThrow(VoterDestroyedError);
-        await expect(voter.start()).rejects.toThrow(VoterDestroyedError);
+        await expect(voter.createContest({ criteria: bizCriteria() })).rejects.toThrow(VoterDestroyedError);
+        await expect(voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).rejects.toThrow(VoterDestroyedError);
     });
 
     it("destroy() stops pre-existing contests and forbids re-update / re-publish", async () => {
         const voter = new PubsubVoter({
             helia: fakeHelia(),
             chains: fakeChains(),
-            signer: fakeSigner(),
-            manifest: bizManifest()
+            signer: fakeSigner()
         });
-        const contest = await voter.createContest({ contestId: "biz" });
-        const vote = await voter.createContestVote({ contestId: "biz", votes: VOTE });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
         await contest.update(); // live before teardown
         await voter.destroy();
 
@@ -390,11 +360,9 @@ describe("checkpoint root record (on-demand encode + cache)", () => {
         const voter = new PubsubVoter({
             helia,
             chains: advancingChains(() => block),
-            signer: fakeSigner(),
-            manifest: bizManifest()
+            signer: fakeSigner()
         });
-        await voter.start();
-        const contest = await voter.createContest({ contestId: "biz" });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
         // `rootRecord`/`latestCheckpointRoot` are internal hooks on the view (see voter.ts), not part
         // of the public Contest interface; reach them structurally in the test.
         const ck = contest as unknown as {
@@ -403,7 +371,7 @@ describe("checkpoint root record (on-demand encode + cache)", () => {
         };
         expect(ck.latestCheckpointRoot()).toBeUndefined(); // nothing encoded yet
 
-        await (await voter.createContestVote({ contestId: "biz", votes: VOTE })).publish(); // state at bucket 1
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish(); // state at bucket 1
         const record = await ck.rootRecord();
         expect(record.count).toBe(1);
         expect(puts.has(record.root.toString())).toBe(true); // blocks written for directed bitswap
@@ -414,7 +382,7 @@ describe("checkpoint root record (on-demand encode + cache)", () => {
 
         // A state change (re-publishing at a later bucket supersedes under LWW) invalidates the cache.
         block = bucketBlock(20);
-        await (await voter.createContestVote({ contestId: "biz", votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
         const after = await ck.rootRecord();
         expect(after.root.equals(record.root)).toBe(false);
         await voter.stop();
@@ -452,9 +420,9 @@ describe("root-record heartbeat", () => {
         vi.spyOn(Math, "random").mockReturnValue(0.5);
         const { helia, publish } = spyableHelia();
         const pubsub = (helia as unknown as { libp2p: { services: { pubsub: PubsubService } } }).libp2p.services.pubsub;
-        const voter = new PubsubVoter({ helia, chains: advancingChains(() => bucketBlock(1)), manifest: bizManifest() });
-        await voter.start();
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia, chains: advancingChains(() => bucketBlock(1)) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // joins the topic: installs the gate and arms the heartbeat
         const validator = pubsub.topicValidators!.get(contest.topic)!;
         const deliver = async (record: RootRecord, from = "peer2") => {
             const peer = { toString: () => from } as unknown as Parameters<typeof validator>[0];
@@ -532,15 +500,18 @@ describe("root-record fetch protocol", () => {
         // `@libp2p/fetch` invokes the lookup with the key as raw bytes, not a string.
         const lookups = new Map<string, (key: Uint8Array) => Promise<Uint8Array | undefined>>();
         const fetchCalls: Array<{ peer: string; key: string }> = [];
+        const counts = { register: 0, unregister: 0 };
         const fetchService: FetchServiceLike = {
             fetch: async (peer, key) => {
                 fetchCalls.push({ peer: peer.toString(), key });
                 return peerAnswers.get(peer.toString());
             },
             registerLookupFunction: (prefix, lookup) => {
+                counts.register += 1;
                 lookups.set(prefix, lookup);
             },
             unregisterLookupFunction: (prefix) => {
+                counts.unregister += 1;
                 lookups.delete(prefix);
             }
         };
@@ -564,17 +535,17 @@ describe("root-record fetch protocol", () => {
             has: async () => false
         };
         const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
-        return { helia, lookups, fetchCalls, chased };
+        return { helia, lookups, fetchCalls, chased, counts };
     }
 
     it("registers a responder that answers <topic>/root with the on-demand record, and unregisters on stop", async () => {
         const h = fetchSpyHelia(new Map());
-        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains(), manifest: bizManifest() });
-        await voter.start();
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // the join registers the responder (lazy lifecycle)
         const lookup = h.lookups.get(TOPIC_PREFIX);
         expect(lookup).toBeDefined();
 
-        const contest = await voter.createContest({ contestId: "biz" });
         // The key arrives as utf8 bytes, exactly as `@libp2p/fetch` hands it to the responder.
         const asKey = (s: string): Uint8Array => new TextEncoder().encode(s);
         const answer = await lookup!(asKey(rootFetchKey(contest.topic)));
@@ -603,9 +574,9 @@ describe("root-record fetch protocol", () => {
                 ["peerD", new Uint8Array([0xff])] // and one answers garbage — ignored
             ])
         );
-        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains(), manifest: bizManifest() });
-        await voter.start(); // start() joins the engine, which fires the cold-start pull
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // the join fires the cold-start pull
 
         await vi.waitFor(() => expect(h.fetchCalls.length).toBe(4));
         expect(new Set(h.fetchCalls.map((c) => c.key))).toEqual(new Set([rootFetchKey(contest.topic)]));
@@ -654,9 +625,8 @@ describe("root-record fetch protocol", () => {
             has: async () => false
         };
         const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
-        const voter = new PubsubVoter({ helia, chains: fakeChains(), manifest: bizManifest() });
-        await voter.start();
-        await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia, chains: fakeChains() });
+        await (await voter.createContest({ criteria: bizCriteria() })).update();
 
         // The retry re-fetches after the reset, so the record's root is still chased.
         await vi.waitFor(() => expect(chased).toContain(root.toString()), { timeout: 5000 });
@@ -713,9 +683,9 @@ describe("root-record fetch protocol", () => {
         };
         const helia = { libp2p, blockstore } as unknown as HeliaInstance;
 
-        const voter = new PubsubVoter({ helia, chains: fakeChains(), manifest: bizManifest() });
-        await voter.start();
-        const contest = await voter.createContest({ contestId: "biz" });
+        const voter = new PubsubVoter({ helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // the join fires the cold-start pull
 
         await vi.waitFor(() => {
             expect(dialed.length).toBeGreaterThan(0); // the discovered provider was dialed...
@@ -723,5 +693,47 @@ describe("root-record fetch protocol", () => {
             expect(chased).toContain(root.toString()); // ...and its divergent root chased
         });
         await voter.stop();
+    });
+
+    describe("lazy responder registration (no public start(): the join/leave transitions drive it)", () => {
+        it("registers on the first joined topic, stays while any topic is joined, unregisters on the last leave, and re-registers on re-join", async () => {
+            const h = fetchSpyHelia(new Map());
+            const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(false); // construction registers nothing
+
+            const a = await voter.createContest({ criteria: bizCriteria() });
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(false); // creating a contest is still lazy
+
+            await a.update(); // the first real join registers the responder
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(true);
+            expect(h.counts.register).toBe(1);
+
+            const b = await voter.createContest({ criteria: { ...bizCriteria(), contestId: "g", name: "/g/" } });
+            await b.update(); // a second joined topic reuses the one registration
+            expect(h.counts.register).toBe(1);
+
+            await a.stop(); // one topic still joined: the responder stays
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(true);
+
+            await b.stop(); // the last leave unregisters
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
+            expect(h.counts.unregister).toBe(1);
+
+            await a.update(); // the voter stays reusable: a re-join re-registers
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(true);
+            expect(h.counts.register).toBe(2);
+            await voter.stop();
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
+        });
+
+        it("publishing a ballot also joins, so a write-only client serves root records too", async () => {
+            const h = fetchSpyHelia(new Map());
+            const voter = new PubsubVoter({ helia: h.helia, chains: stubChains(), signer: fakeSigner() });
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(true);
+            await voter.stop();
+            expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
+        });
     });
 });

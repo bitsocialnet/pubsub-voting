@@ -18,21 +18,17 @@ declare function hostHelia(): HeliaInstance;
 declare function viemChains(): ChainClientFactory;
 declare const criteria: Criteria;
 
-// No `signer` → read-only voter. The voter still owns its contests through a manifest; a
-// one-entry manifest wraps the single criteria this consumer renders.
-const voter = new PubsubVoter({
-    helia: hostHelia(),
-    chains: viemChains(),
-    manifest: { name: criteria.name, defaults: {}, contests: [criteria] }
-});
+// No `signer` → read-only voter. A contest is addressed by its full criteria document;
+// there is nothing else to configure.
+const voter = new PubsubVoter({ helia: hostHelia(), chains: viemChains() });
 console.log("read-only:", voter.readOnly); // true
 
-const contest = await voter.createContest({ contestId: criteria.contestId });
+const contest = await voter.createContest({ criteria });
 const tally = await contest.getTally(); // allowed — reading needs no signer
 console.log(tally.ranking[0]?.community);
 // Or subscribe reactively: contest.on("update", () => render(contest.tally)); await contest.update();
 
-const vote = await voter.createContestVote({ contestId: criteria.contestId, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
+const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
 try {
     await vote.publish(); // throws ReadOnlyError (and emits an "error" event)
 } catch (err) {
