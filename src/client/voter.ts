@@ -558,6 +558,11 @@ class ContestEngine {
         })();
     }
 
+    /** True while joined to the topic (between `join()` and `leave()`); gates the fetch responder. */
+    get joined(): boolean {
+        return this.#joined;
+    }
+
     /** Any admit (gossip accept, chase merge, local publish) changed the winner set. */
     #onStateChanged(): void {
         this.#markStateChanged();
@@ -1132,7 +1137,9 @@ export class PubsubVoter implements VoteClient {
      * The fetch-protocol responder: answer `"<topic>/root"` with that contest's current root
      * record, encoded on demand (see DESIGN.md "Checkpoints"). Unauthenticated and tiny by
      * design — a request can never compel blocks; those travel over directed bitswap. An
-     * unknown topic, foreign key shape, or encode failure answers nothing.
+     * unknown topic, foreign key shape, or encode failure answers nothing. So does a contest
+     * whose engine exists but is not joined (e.g. a ballot created but never published): this
+     * node holds no view of that contest, and an empty record would masquerade as one.
      */
     readonly #rootLookup = async (keyBytes: Uint8Array): Promise<Uint8Array | undefined> => {
         // `@libp2p/fetch` hands the lookup the requested key as raw bytes; decode the utf8 topic
@@ -1140,7 +1147,7 @@ export class PubsubVoter implements VoteClient {
         const key = new TextDecoder().decode(keyBytes);
         if (!key.endsWith(ROOT_FETCH_KEY_SUFFIX)) return undefined;
         const engine = this.#engines.get(key.slice(0, -ROOT_FETCH_KEY_SUFFIX.length));
-        if (!engine) return undefined;
+        if (!engine?.joined) return undefined;
         try {
             return encodeRootRecord(await engine.rootRecord());
         } catch {

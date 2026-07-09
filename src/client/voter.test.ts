@@ -562,6 +562,27 @@ describe("root-record fetch protocol", () => {
         expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
     });
 
+    it("answers nothing for a contest that was created but never joined (serves exactly the topics it participates in)", async () => {
+        const h = fetchSpyHelia(new Map());
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+        const joined = await voter.createContest({ criteria: bizCriteria() });
+        await joined.update(); // registers the responder
+
+        // A ballot for a second contest builds its engine, but publish() never runs — so this
+        // node never joins that topic and holds no view of that contest.
+        const bystander = { ...bizCriteria(), contestId: "pol" };
+        await voter.createContestVote({ criteria: bystander, votes: [] });
+
+        const asKey = (s: string): Uint8Array => new TextEncoder().encode(s);
+        const lookup = h.lookups.get(TOPIC_PREFIX);
+        expect(lookup).toBeDefined();
+        expect(await lookup!(asKey(rootFetchKey(joined.topic)))).toBeDefined();
+        // The never-joined engine must answer "no record", not an empty checkpoint that
+        // masquerades as this node's view of a contest it does not participate in.
+        expect(await lookup!(asKey(rootFetchKey(await topicFor(bystander))))).toBeUndefined();
+        await voter.stop();
+    });
+
     it("cold-joins by pulling each subscriber's record and chasing every distinct divergent root (union, not quorum)", async () => {
         const rootA = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
         const rootB = CID.parse("bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4");
