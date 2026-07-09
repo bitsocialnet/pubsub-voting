@@ -137,7 +137,7 @@ export interface VoteTransport {
     start(): Promise<void>;
     stop(): Promise<void>;
 
-    /** Publish one bundle's exact binary block bytes as a live delta (cast / re-sign / tombstone re-announce). */
+    /** Publish one bundle's exact binary block bytes as a live delta (a new vote, a client re-publish, or a withdrawal). */
     publishBundle(blockBytes: Uint8Array): Promise<void>;
 
     /** Publish a root-record heartbeat (see DESIGN.md "Checkpoints"). */

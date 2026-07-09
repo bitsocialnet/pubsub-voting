@@ -27,12 +27,14 @@ const voter = new PubsubVoter({
 });
 console.log("read-only:", voter.readOnly); // true
 
-const contest = await voter.getContest({ contestId: criteria.contestId });
-const tally = await contest.getTally(); // allowed
+const contest = await voter.createContest({ contestId: criteria.contestId });
+const tally = await contest.getTally(); // allowed — reading needs no signer
 console.log(tally.ranking[0]?.community);
+// Or subscribe reactively: contest.on("update", () => render(contest.tally)); await contest.update();
 
+const vote = await voter.createContestVote({ contestId: criteria.contestId, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
 try {
-    await contest.castVotes([{ community: { publicKey: "12D3KooW..." }, vote: 1 }]); // throws ReadOnlyError
+    await vote.publish(); // throws ReadOnlyError (and emits an "error" event)
 } catch (err) {
     if (err instanceof ReadOnlyError) console.log("cannot vote without a signer, as expected");
     else throw err;

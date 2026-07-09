@@ -57,7 +57,7 @@ export const CriteriaSchema = z
         name: z.string().min(1),
         /**
          * The directory-slot code this topic decides. One contest per topic; it is how a host
-         * addresses a contest (`PubsubVoter.getContest`), so it MUST be unique within a manifest.
+         * addresses a contest (`PubsubVoter.createContest`), so it MUST be unique within a manifest.
          */
         contestId: z.string().min(1),
         /** Allowed range for each `vote` value. v1: { min: 1, max: 1 }. */

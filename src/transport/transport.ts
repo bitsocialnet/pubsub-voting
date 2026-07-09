@@ -9,7 +9,7 @@ import { encodeBundleMessage, encodeRootMessage, type RootRecord } from "./messa
  *
  * On `start` it installs the gate as the topic validator (gossipsub awaits it before
  * re-forwarding — see DESIGN.md "Transport") and subscribes. Publishing is the live-delta
- * model: one inline bundle per message (a cast, re-sign, or tombstone re-announce), or a
+ * model: one inline bundle per message (a new vote, a client re-publish, or a withdrawal), or a
  * root-record heartbeat. Cold-start root pulls ride the libp2p fetch protocol, not pubsub
  * (see DESIGN.md "Checkpoints").
  */

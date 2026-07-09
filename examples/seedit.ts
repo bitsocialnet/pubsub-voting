@@ -35,14 +35,16 @@ const voter = new PubsubVoter({
     manifest: { name: criteria.name, defaults: {}, contests: [criteria] }
 });
 
-const contest = await voter.getContest({ contestId: criteria.contestId });
-await contest.start();
+const contest = await voter.createContest({ contestId: criteria.contestId });
+await contest.update(); // start syncing this contest
 
 console.log(`contest ${contest.criteria.contestId} on topic ${contest.topic}`);
 const tally = await contest.getTally();
 console.log("ranking:", tally.ranking);
 
-await contest.castVotes([{ community: { publicKey: "12D3KooW...community" }, vote: 1 }]);
+const vote = await voter.createContestVote({ contestId: criteria.contestId, votes: [{ community: { publicKey: "12D3KooW...community" }, vote: 1 }] });
+await vote.publish();
+// Keeping the vote alive is seedit's job: re-publish before it expires (see republishIntervalBuckets).
 
 // A host can also derive criteria from a manifest without constructing a voter at all
 // — pure, no network — e.g. to precompute topics for a directory index.

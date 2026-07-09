@@ -1,4 +1,4 @@
-import { PubsubVoter, type VoteNetwork } from "../dist/client/voter.js";
+import { PubsubVoter, type Contest } from "../dist/client/voter.js";
 import { deriveCriteria } from "../dist/manifest/manifest.js";
 import { criteriaCid } from "../dist/topic.js";
 import { makeHostNode, type HostNode } from "./host-node.js";
@@ -143,8 +143,8 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         const { events } = instrument(node);
         voter = new PubsubVoter({ helia: node.helia, chains: benchChains(), manifest });
 
-        const networks: VoteNetwork[] = await Promise.all(
-            Array.from({ length: args.m }, (_, i) => voter!.getContest({ contestId: benchContestId(i) }))
+        const networks: Contest[] = await Promise.all(
+            Array.from({ length: args.m }, (_, i) => voter!.createContest({ contestId: benchContestId(i) }))
         );
 
         // Count connections opened to the shared seeder — the amortization signal (want 1, not M).
@@ -182,7 +182,7 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
                 if (!started[i]) {
                     started[i] = true;
                     inFlight++;
-                    void networks[i]!.start();
+                    void networks[i]!.update();
                 }
             }
         };

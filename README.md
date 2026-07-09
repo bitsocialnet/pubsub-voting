@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: engine, client lifecycle, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap), the `PubsubVoter` client-level republish scheduler, and durable vote-intent persistence (Node SQLite / browser IndexedDB) are all implemented — so `start`, `castVotes`, `getTally`, and the full `PubsubVoter.start`/`stop`/`destroy` lifecycle are live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) and the deferred two-node integration test — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
+> **Status: engine, reactive facade, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic/manifest derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, and the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap) are all implemented — so the reactive `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) facade is live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. **Keeping a live vote from decaying is the consuming client's job** — this library publishes each vote once and exposes `republishIntervalBuckets` so the client can schedule its own refreshes (see [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys)). What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -38,9 +38,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `community.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
-| `manifest` | `DirectoryManifest` | yes | the directory manifest this voter owns (structural type — runtime-validated at construction via `deriveCriteria`, so a malformed manifest still throws `MissingManifestError`); the voter derives every contest from it, addresses each by its unique `contestId` (`getContest`), and keeps them republished under one lifecycle (see [Lifecycle](#lifecycle-start--stop--destroy)). A duplicate `contestId` throws `DuplicateContestIdError` |
-| `dataPath` | `string` | no | Node only: directory for the SQLite file that persists this voter's vote intents so republishing survives a restart (the same `dataPath` convention as pkc-js / `@bitsocial/bso-resolver`). In the browser the voter uses IndexedDB; with no `dataPath` on Node, persistence is in-memory (lost on restart) |
-| `republishPollIntervalMs` | `number` | no | how often (wall-clock ms) the republish scheduler checks each contest for a due re-sign; defaults to 10 minutes. The cadence itself is bucket-based per contest (`ceil(voteExpiryBuckets / 2)`); this only sets the poll granularity. Lower it to react faster at the cost of more RPC head reads |
+| `manifest` | `DirectoryManifest` | yes | the directory manifest this voter owns (structural type — runtime-validated at construction via `deriveCriteria`, so a malformed manifest still throws `MissingManifestError`); the voter derives every contest from it and addresses each by its unique `contestId` (`createContest` / `createContestVote`). A duplicate `contestId` throws `DuplicateContestIdError` |
 
 ### Construct a voter
 
@@ -60,52 +58,68 @@ The `manifest` is mandatory: the voter derives every contest from it at construc
 
 Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingFetchError` if the node lacks a usable pubsub service, blockstore, or libp2p fetch service — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through. The fetch service carries the checkpoint root-record pull; the library registers its own responder on it.)
 
-### Read a tally (no signer needed)
+### Read a tally reactively (no signer needed)
+
+`createContest` mints a per-contest read object; `update()` starts syncing and it emits `update` (carrying a fresh `tally`) and `error`, just like a plebbit-js `subplebbit`:
 
 ```ts
-const contest = await voter.getContest({ contestId }); // contestId: a slot in the voter's manifest
-await contest.start();
-const tally = await contest.getTally();
-const winner = tally.ranking[0]?.community; // { name?: string, publicKey: string } — identity is publicKey
+const contest = await voter.createContest({ contestId }); // contestId: a slot in the voter's manifest
+contest.on("update", () => render(contest.tally));        // tally rides the object; recomputed before each emit
+contest.on("error", (err) => showConnectivityWarning(err)); // e.g. the tally's chain read failed
+await contest.update();                                   // join the topic, cold-start, begin emitting
+const winner = contest.tally?.ranking[0]?.community;      // { name?: string, publicKey: string } — identity is publicKey
+// const fresh = await contest.getTally();                // or force a fresh read, bypassing the cache
+// await contest.stop();                                  // leave the topic
 ```
 
-### Cast or withdraw a vote (needs a signer)
+### Publish or withdraw a vote (needs a signer)
+
+`createContestVote` mints a publishable ballot; `publish()` signs and broadcasts it once and emits `publishingstatechange`, like a plebbit-js publication:
 
 ```ts
-await contest.castVotes([{ community: { publicKey: "12D3KooW..." }, vote: 1 }]); // community: { name?, publicKey } (B58 IPNS name); v1: one upvote per topic
-await contest.castVotes([]);                                  // active withdrawal: broadcast an empty bundle that supersedes under LWW; the scheduler re-announces that tombstone (without re-signing it) until it expires, then drops it
-await voter.forget({ contestId: "biz" });                     // passive withdrawal: drop the stored intent, publish nothing, and let the vote decay at its own expiry
+const vote = await voter.createContestVote({ contestId: "biz", votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
+vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → succeeded (or failed)
+const bundle = await vote.publish();                             // resolves the signed VotesBundle
+
+// Withdraw (active): publish an empty ballot; it supersedes the prior vote under LWW.
+await (await voter.createContestVote({ contestId: "biz", votes: [] })).publish();
 ```
 
 A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
 
-There are two ways to stop voting. `castVotes([])` is the **active** path: it broadcasts an empty bundle that immediately supersedes the prior vote under LWW. The scheduler then **re-announces that tombstone** — re-broadcasting its existing CID on the liveness cadence, *without* re-signing it, so its expiry clock is untouched — so peers that missed the one-shot flood converge within a cycle; once the tombstone expires the scheduler drops the intent and the bundle decays via expiry + prune (never an immortal heartbeat). `forget({ contestId })` is the **passive** path: it drops the stored intent and publishes nothing, so the vote simply decays once its last bundle expires. Both are idempotent; `forget` on an unknown `contestId` throws `UnknownContestError`.
+`publish()` on a voter built without a `signer` throws `ReadOnlyError` (and emits an `error`).
 
-`castVotes` on a voter built without a `signer` throws `ReadOnlyError`; `forget` on a read-only voter just drops any stored intent (there is none) and is a harmless no-op.
+### Republishing is the client's job
+
+A vote is not permanent: a bundle is valid only for `voteExpiryBuckets` after its `blockNumber`, so a live vote must be re-published before it decays. **This library does not do that automatically** — it publishes each vote once and the consuming client decides when (or whether) to refresh. To refresh, just `createContestVote(...).publish()` again; a new bundle at the current bucket supersedes the old one. To stop, simply stop refreshing and let the vote lapse. The library gives you what you need to schedule it — all pure, no chain reads:
+
+```ts
+import { republishIntervalBuckets } from "@bitsocial/pubsub-votes";
+
+const cadence = republishIntervalBuckets(criteria); // ceil(voteExpiryBuckets / 2) — the recommended cadence, in buckets
+// A vote sampled at bucket b (bundle.blockNumber / criteria.blocksPerBucket) expires once the
+// current bucket exceeds b + criteria.voteExpiryBuckets; refresh before then.
+```
+
+See [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys) for why an always-on re-signer was deliberately kept out of a library that runs on the host's shared node.
 
 ### Many contests from one manifest
 
-A 5chan-style directory manifest derives one contest (one topic) per slot. The voter owns the manifest, so it already knows every contest — enumerate them by `contestId` and reach each with `getContest`:
+A 5chan-style directory manifest derives one contest (one topic) per slot. The voter owns the manifest, so it already knows every contest — enumerate them by `contestId` and reach each with `createContest`:
 
 ```ts
-const contests = await Promise.all(voter.contestIds.map((contestId) => voter.getContest({ contestId }))); // → VoteNetwork[]
+const contests = await Promise.all(voter.contestIds.map((contestId) => voter.createContest({ contestId }))); // → Contest[]
 ```
 
-### Lifecycle (`start` / `stop` / `destroy`)
+### Whole-directory lifecycle (`start` / `stop` / `destroy`)
 
-Pass the `manifest` at construction and let one lifecycle own every contest. `start()` joins them all and arms a republish loop that keeps this wallet's votes alive by re-signing them with a fresh `blockNumber` on a per-contest cadence — `ceil(voteExpiryBuckets / 2)` buckets, half the expiry window, so a missed cycle still has slack. `stop()` leaves the topics (reusable); `destroy()` also disposes the vote store.
+For a seeder or full host that wants to participate in and serve *every* contest at once, `voter.start()` joins all of them and registers the checkpoint fetch responder; a light client can skip it and just `createContest`/`createContestVote` the slots it cares about. `stop()` leaves the topics (reusable); `destroy()` is the discard path (there is no store to dispose — republishing is the client's concern — so it mirrors `stop`).
 
 ```ts
 const voter = new PubsubVoter({ helia, chains, signer, manifest }); // manifest owned by the voter
-await voter.start();     // join every contest + start republishing this wallet's votes
+await voter.start();     // join + serve every contest
 // … app runs …
-await voter.destroy();   // stop the republish loops, leave all topics, dispose the store
-```
-
-Persistence is what lets republishing survive a restart: the voter stores its own re-signable *intent* per contest (which communities it picked), not the signed bundles. On Node, pass `dataPath` to keep those intents in a SQLite file under that directory; in the browser the voter uses IndexedDB automatically; with no `dataPath` on Node, persistence is in-memory and lost on restart.
-
-```ts
-const voter = new PubsubVoter({ helia, chains, signer, manifest, dataPath: "./.bitsocial-votes" }); // Node: SQLite under dataPath
+await voter.destroy();   // leave all topics, unregister the responder
 ```
 
 ### Pure helpers (no node, no network)
@@ -158,8 +172,7 @@ src/
   topic.ts       topic = "bitsocial-votes/" + CID(dag-cbor)       [implemented]
   manifest/      derive one criteria document per contest         [implemented]
   signer/        VoteSigner seam + EIP-712 ballot typed data       [implemented]
-  store/         vote-intent persistence (memory / Node SQLite / browser IDB) [implemented]
-  client/        PubsubVoter facade + per-contest VoteNetwork + republish scheduler [implemented]
+  client/        reactive facade: PubsubVoter + Contest (createContest) + ContestVote (createContestVote) [implemented]
   errors.ts      ReadOnly/MissingPubsub/Blockstore/MissingManifest/... [implemented]
   rules/         one file per `type` + registry/resolver          [implemented]
   chain/         ChainClient = viem PublicClient + bucket math     [implemented]

@@ -182,8 +182,9 @@ export function makeGossipGate(deps: GossipGateDeps): GossipGate {
         }
 
         // A known bundle short-circuits on the verdict cache for the cost of one hash: a
-        // re-published valid bundle (e.g. a tombstone re-announce) is forwarded so late peers
-        // converge, without re-verifying or re-merging; a known-bad one rejects without work.
+        // re-published valid bundle (e.g. a client refreshing its vote or re-announcing a
+        // withdrawal) is forwarded so late peers converge, without re-verifying or re-merging;
+        // a known-bad one rejects without work.
         const cached = cache.get(cid);
         if (cached) return cached.valid ? "accept" : cached.disposition;
 

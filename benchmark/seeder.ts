@@ -1,4 +1,4 @@
-import { PubsubVoter, type VoteNetwork } from "../dist/client/voter.js";
+import { PubsubVoter, type Contest } from "../dist/client/voter.js";
 import { encodeBundle } from "../dist/crdt/codec.js";
 import { encodeBundleMessage } from "../dist/transport/messages.js";
 import { makeHostNode, connectPeers, waitFor, delay, type HostNode } from "./host-node.js";
@@ -23,7 +23,7 @@ import { benchChains, benchManifest, benchCriteria, makeSigningContext, signRand
 /** Voter ballots published per feeder peer — safely under the gate's 256/10s per-peer bundle window. */
 const FEED_CHUNK = 240;
 
-async function seedVoters(seeder: HostNode, topic: string, network: VoteNetwork, count: number): Promise<void> {
+async function seedVoters(seeder: HostNode, topic: string, network: Contest, count: number): Promise<void> {
     const ctx = await makeSigningContext(benchCriteria());
     let published = 0;
     // One feeder per chunk, DRAINED before the next: publish a chunk, wait for the seeder to
@@ -64,7 +64,7 @@ async function main(): Promise<void> {
     const seeder = await makeHostNode({ port });
     const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains(), manifest: benchManifest() });
     await voter.start();
-    const network = await voter.getContest({ contestId: "biz" });
+    const network = await voter.createContest({ contestId: "biz" });
 
     if (n > 0) await seedVoters(seeder, network.topic, network, n);
 

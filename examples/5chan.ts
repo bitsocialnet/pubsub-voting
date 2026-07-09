@@ -7,17 +7,19 @@
  * service at `libp2p.services.pubsub`, a `blockstore`, and a libp2p fetch service at
  * `libp2p.services.fetch` (`@libp2p/fetch` — the checkpoint root-record pull), or
  * construction throws `MissingPubsubError` / `MissingBlockstoreError` /
- * `MissingFetchError`. This is the same shape every host uses
- * (see seedit.ts). 5chan has one directory manifest with 63 slots; the client derives one
- * criteria document (one topic) per slot and renders the winning community for each.
- * Type-checks against the public API, and every method used here — `start`, `castVotes`,
- * `forget`, `getTally`, `stop`/`destroy`, and the republish scheduler — is live.
+ * `MissingFetchError`. This is the same shape every host uses (see seedit.ts). 5chan has one
+ * directory manifest with 63 slots; the client derives one criteria document (one topic) per
+ * slot and renders the winning community for each. Type-checks against the public API — the
+ * reactive `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`)
+ * facade. Keeping a vote alive is 5chan's job: it tracks what it voted for and refreshes on the
+ * `republishIntervalBuckets` cadence (this library never re-publishes on its own).
  */
 import { readFileSync } from "node:fs";
 import stripJsonComments from "strip-json-comments";
 import {
     PubsubVoter,
     DirectoryManifestSchema,
+    republishIntervalBuckets,
     type HeliaInstance,
     type ChainClientFactory,
     type VoteSigner,
@@ -41,45 +43,55 @@ declare const signer: VoteSigner;
 declare const bsoResolver: NameResolver; // e.g. new BsoResolver({ key: "bso-viem", provider: "viem" })
 
 // One voter for the whole app. The manifest is owned by the voter, so a single
-// `voter.start()` joins all 63 directory contests and keeps this wallet's votes
-// republished (re-signed with a fresh blockNumber on each contest's liveness cadence).
-// The Helia node (gossipsub + blockstore + fetch service) is the only mandatory seam. `dataPath` (Node,
-// same convention as pkc-js) keeps this wallet's vote intents in a SQLite file so
-// republishing resumes after a restart.
+// `voter.start()` joins and serves all 63 directory contests. The Helia node
+// (gossipsub + blockstore + fetch service) is the only mandatory seam. There is no
+// library-side persistence: 5chan keeps track of its own votes and republishes them itself.
 const voter = new PubsubVoter({
     helia: pkcHelia(),
     chains: viemChains(),
     signer,
     nameResolvers: [bsoResolver],
-    manifest,
-    dataPath: "./.5chan-votes"
+    manifest
 });
 
-// Join every slot and arm republishing in one call.
+// Join + serve every slot in one call (a full 5chan host participates in the whole directory).
 await voter.start();
 
 // Render the homepage: the winning community for each slot. The voter owns the manifest, so it
-// already knows every contest — reach each by its `contestId` (networks cache by topic, so
-// these are the very networks start() joined).
-const contests = await Promise.all(voter.contestIds.map((contestId) => voter.getContest({ contestId })));
-console.log(`joined ${contests.length} directory contests`);
+// already knows every contest — reach each by its `contestId` (contests cache by topic).
+const contests = await Promise.all(voter.contestIds.map((contestId) => voter.createContest({ contestId })));
+console.log(`created ${contests.length} directory contests`);
 
 for (const contest of contests) {
-    const tally = await contest.getTally();
-    const winner = tally.ranking[0]?.community ?? "(no votes yet)";
-    console.log(`${contest.criteria.contestId}: ${winner}  [topic ${contest.topic}]`);
+    // Subscribe reactively: re-render the slot whenever incoming votes change the tally.
+    contest.on("update", () => {
+        const winner = contest.tally?.ranking[0]?.community ?? "(no votes yet)";
+        console.log(`${contest.criteria.contestId}: ${JSON.stringify(winner)}  [topic ${contest.topic}]`);
+    });
+    contest.on("error", (err) => console.warn(`${contest.criteria.contestId}: ${String(err)}`));
+    await contest.update(); // start syncing + fire the initial update
 }
 
-// Cast a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
-const biz = await voter.getContest({ contestId: "biz" });
-if (!biz.readOnly) {
+// Publish a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
+if (!voter.readOnly) {
     // `name` must be the community's resolvable domain (unique per community); the tally
     // drops any vote whose name does not resolve to the claimed publicKey.
-    await biz.castVotes([{ community: { name: "bizfinance.bso", publicKey: "12D3KooW...someCommunityKey" }, vote: 1 }]);
-    // Withdraw later, two ways:
-    await biz.castVotes([]);                    // active: broadcast an empty bundle that supersedes under LWW; the scheduler re-announces the tombstone (no re-sign) until it expires, then drops it
-    await voter.forget({ contestId: "biz" });   // passive: drop the stored intent, publish nothing, and let the vote decay at its own expiry
+    const vote = await voter.createContestVote({
+        contestId: "biz",
+        votes: [{ community: { name: "bizfinance.bso", publicKey: "12D3KooW...someCommunityKey" }, vote: 1 }]
+    });
+    vote.on("publishingstatechange", (state) => console.log(`biz vote: ${state}`));
+    const bundle = await vote.publish();
+
+    // Keeping it alive is 5chan's job: it schedules a refresh before the vote expires. A vote
+    // sampled at bucket b expires once the current bucket exceeds b + voteExpiryBuckets; the
+    // recommended cadence is republishIntervalBuckets(criteria) buckets. To refresh, publish again.
+    const criteria = (await voter.createContest({ contestId: "biz" })).criteria;
+    console.log(`refresh /biz/ every ~${republishIntervalBuckets(criteria)} buckets; last vote at block ${bundle.blockNumber}`);
+
+    // Withdraw (active): publish an empty ballot that supersedes the prior vote under LWW.
+    await (await voter.createContestVote({ contestId: "biz", votes: [] })).publish();
 }
 
-// On shutdown: stop every republish loop, leave all topics, and dispose the vote store.
+// On shutdown: leave all topics and unregister the fetch responder.
 await voter.destroy();

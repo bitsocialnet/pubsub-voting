@@ -4,11 +4,12 @@
  * The engine is implemented and unit-tested: the zod schemas, canonical dag-cbor encoding,
  * topic derivation, manifest derivation, the verify pipeline (signature + constraints +
  * gate + name resolution), the state-based grow-only LWW winner-set CRDT, the tally, and the
- * transport's validate-before-forward gossip gate (`VoteNetwork.start`/`castVotes`/`getTally`
- * are live), plus the `PubsubVoter` client-level republish scheduler and durable vote-intent
- * persistence (Node SQLite / browser IndexedDB), so the full `start`/`stop`/`destroy` lifecycle
- * works. See DESIGN.md for architecture, and "Transport" for the forward-gate that verifies a
- * bundle (signature, on-chain gate, community-name resolution) before gossipsub re-forwards it.
+ * transport's validate-before-forward gossip gate. The public facade is the reactive
+ * `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) trio. Keeping a
+ * live vote from decaying is the consuming client's job — this library publishes each vote once
+ * (see `republishIntervalBuckets` and DESIGN.md "Republishing is the client's job"). See DESIGN.md
+ * for architecture, and "Transport" for the forward-gate that verifies a bundle (signature,
+ * on-chain gate, community-name resolution) before gossipsub re-forwards it.
  */
 
 // Schemas (runtime values) and their inferred types.
@@ -34,10 +35,9 @@ export * from "./topic.js";
 export * from "./manifest/manifest.js";
 export * from "./errors.js";
 export * from "./client/voter.js";
-// Vote-intent persistence is internal: the voter selects a backend by environment (SQLite
-// under `dataPath` on Node, IndexedDB in the browser) — there is no host-facing store seam,
-// only the `dataPath` option. The `VoteStore` contract and backends stay in `src/store/`.
-// See DESIGN.md "Persistence".
+// There is no library-side vote persistence: republishing a live vote is the client's job, so
+// the client tracks what it voted for (see DESIGN.md "Republishing is the client's job"). The
+// facade exports `republishIntervalBuckets` to help the client schedule its own refreshes.
 // Identity seam: the EIP-712 ballot builder + constants a host needs to implement a
 // signer, plus the signer interface itself.
 export * from "./signer/eip712.js";

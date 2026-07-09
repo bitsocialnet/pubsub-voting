@@ -10,9 +10,6 @@
       "import": "./dist/index.js"
     }
   },
-  "browser": {
-    "better-sqlite3": false
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -27,7 +24,6 @@
   "dependencies": {
     "@ipld/dag-cbor": "9.2.7",
     "@libp2p/interface": "3.2.4",
-    "better-sqlite3": "12.11.1",
     "helia": "6.1.4",
     "multiformats": "13.4.2",
     "p-limit": "6.2.0",
@@ -44,8 +40,6 @@
     "@libp2p/tcp": "11.0.22",
     "@multiformats/multiaddr": "13.0.3",
     "@pkcprotocol/pkc-js": "0.0.63",
-    "@types/better-sqlite3": "7.6.13",
-    "fake-indexeddb": "6.2.5",
     "libp2p": "3.3.4",
     "strip-json-comments": "5.0.3",
     "typescript": "5.9.3",

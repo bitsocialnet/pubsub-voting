@@ -182,7 +182,7 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
         voter = new PubsubVoter({ helia: node.helia, chains: benchChains(), manifest: benchManifest() });
-        const network = await voter.getContest({ contestId: "biz" });
+        const network = await voter.createContest({ contestId: "biz" });
         if (network.topic !== args.topic) {
             throw new Error(`derived topic ${network.topic} != seeder topic ${args.topic} (criteria mismatch)`);
         }
@@ -202,14 +202,16 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             }
         });
 
-        // t0: start() fires #coldStart → router lookup → dial → fetch → chase. Arm the update observer first.
+        // t0: update() fires #coldStart → router lookup → dial → fetch → chase. update() emits one
+        // initial (empty) tally event before returning, so arm the "first merge" observer AFTER it
+        // returns — cold-start merges land asynchronously well after, over the WAN.
         let firstUpdateAbs: number | null = null;
         const t0 = performance.now();
+        await network.update();
+        const startReturnMs = performance.now() - t0;
         network.on("update", () => {
             if (firstUpdateAbs === null) firstUpdateAbs = performance.now();
         });
-        await network.start();
-        const startReturnMs = performance.now() - t0;
 
         // Poll the tally until every seeded voter is pulled, verified, and merged.
         const target = BigInt(args.expectedN);

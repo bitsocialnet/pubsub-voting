@@ -129,7 +129,7 @@ describe("makeGossipGate — bundle deltas", () => {
                 admits++;
             }
         });
-        // Forwarded (a tombstone re-announce must reach late peers) but not re-worked.
+        // Forwarded (a client re-publish must reach late peers) but not re-worked.
         expect(await g.validate(message, "p")).toBe("accept");
         expect(verifies).toBe(0);
         expect(admits).toBe(0);

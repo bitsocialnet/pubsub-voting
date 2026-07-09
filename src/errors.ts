@@ -2,10 +2,10 @@
  * Library error types.
  *
  * The engine and client lifecycle are implemented — schemas, encoding, topic/manifest
- * derivation, the verify pipeline, the Merkle-CRDT, the tally, the transport's
- * validate-before-forward gossip gate, and the `PubsubVoter` republish scheduler with durable
- * persistence — so `VoteNetwork.start`/`castVotes`/`getTally` and `PubsubVoter.start`/`stop`/
- * `destroy` are live. What remains is host-blocked (cold-start fetch, checkpoints); see DESIGN.md.
+ * derivation, the verify pipeline, the LWW winner-set CRDT, the tally, the transport's
+ * validate-before-forward gossip gate, and the reactive `PubsubVoter` / `Contest` / `ContestVote`
+ * facade. Republishing a live vote is the client's job (no scheduler, no persistence); see
+ * DESIGN.md "Republishing is the client's job".
  */
 
 /** Thrown by any facade path deferred to a later version (none in v1's shipped surface). */
@@ -102,15 +102,16 @@ export class MissingFetchError extends Error {
 /**
  * Thrown at construction when no `manifest` is given. v1 requires a `PubsubVoter` to own a
  * directory manifest: every contest is derived from it (`deriveCriteria`) and addressed by
- * its `contestId` (`getContest`). There is no ad-hoc, manifest-free contest path in v1.
+ * its `contestId` (`createContest` / `createContestVote`). There is no ad-hoc, manifest-free
+ * contest path in v1.
  */
 export class MissingManifestError extends Error {
     constructor() {
         super(
             "PubsubVoter requires a `manifest` at construction. v1 derives every contest from the " +
                 "directory manifest the voter owns and addresses each by its `contestId` " +
-                "(`getContest({ contestId })`); there is no ad-hoc contest path. Pass a directory " +
-                "manifest (see `deriveCriteria` / DESIGN.md \"Lifecycle\")."
+                "(`createContest({ contestId })`); there is no ad-hoc contest path. Pass a directory " +
+                "manifest (see `deriveCriteria` / DESIGN.md \"Facade\")."
         );
         this.name = "MissingManifestError";
     }
@@ -119,20 +120,23 @@ export class MissingManifestError extends Error {
 /**
  * Thrown at construction when a manifest declares the same `contestId` on more than one
  * `contests` entry. `contestId` is how a host addresses a single contest
- * (`getContest({ contestId })`), so it MUST be unique within a manifest.
+ * (`createContest({ contestId })`), so it MUST be unique within a manifest.
  */
 export class DuplicateContestIdError extends Error {
     constructor(readonly contestId: string) {
         super(
             `Duplicate contestId "${contestId}" in the manifest. Each contest's \`contestId\` must be ` +
-                `unique — it is how a host addresses one contest (\`getContest({ contestId })\`). ` +
+                `unique — it is how a host addresses one contest (\`createContest({ contestId })\`). ` +
                 `Rename or remove the duplicate \`contests\` entry.`
         );
         this.name = "DuplicateContestIdError";
     }
 }
 
-/** Thrown by `getContest` when no contest in this voter's manifest carries the requested `contestId`. */
+/**
+ * Thrown by `createContest` / `createContestVote` when no contest in this voter's manifest carries
+ * the requested `contestId`.
+ */
 export class UnknownContestError extends Error {
     constructor(
         readonly contestId: string,
@@ -146,12 +150,12 @@ export class UnknownContestError extends Error {
     }
 }
 
-/** Thrown when a write (cast/withdraw) is attempted on a voter constructed without a signer. */
+/** Thrown when a publish (vote/withdraw) is attempted on a voter constructed without a signer. */
 export class ReadOnlyError extends Error {
     constructor() {
         super(
             "This voter is read-only: it was constructed without a `signer`. " +
-                "Provide a VoteSigner to cast or withdraw votes; reading tallies needs no signer."
+                "Provide a VoteSigner to publish or withdraw votes; reading tallies needs no signer."
         );
         this.name = "ReadOnlyError";
     }

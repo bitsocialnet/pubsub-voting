@@ -1,4 +1,4 @@
-import { PubsubVoter, type VoteNetwork } from "../dist/client/voter.js";
+import { PubsubVoter, type Contest } from "../dist/client/voter.js";
 import { deriveCriteria } from "../dist/manifest/manifest.js";
 import { encodeBundle } from "../dist/crdt/codec.js";
 import { encodeBundleMessage } from "../dist/transport/messages.js";
@@ -63,7 +63,7 @@ async function connectFeeder(feeder: HostNode, seeder: HostNode, topic: string):
  * formation starves and times out. Publishing a chunk, waiting for the seeder to catch up, then
  * dropping the feeder keeps the event loop free when each new feeder meshes.
  */
-async function seedContest(seeder: HostNode, topic: string, network: VoteNetwork, ctx: SigningContext, count: number): Promise<void> {
+async function seedContest(seeder: HostNode, topic: string, network: Contest, ctx: SigningContext, count: number): Promise<void> {
     let published = 0;
     for (let offset = 0; offset < count; offset += FEED_CHUNK) {
         const chunk = Math.min(FEED_CHUNK, count - offset);
@@ -118,7 +118,7 @@ async function main(): Promise<void> {
     const criteria = deriveCriteria(manifest);
     const contests = await Promise.all(
         criteria.map(async (c, i) => {
-            const network = await voter.getContest({ contestId: benchContestId(i) });
+            const network = await voter.createContest({ contestId: benchContestId(i) });
             const ctx = await makeSigningContext(c);
             return { network, ctx };
         })
