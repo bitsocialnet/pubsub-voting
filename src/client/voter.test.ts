@@ -734,6 +734,55 @@ describe("root-record fetch protocol", () => {
         await voter.stop();
     });
 
+    it("retries a fetch reset by the shared node's inbound-stream cap, so the board still cold-joins instead of silently stranding", async () => {
+        // A shared seeder over its per-protocol `maxInboundStreams` cap (libp2p's default is 32)
+        // resets the fetch stream, which libp2p surfaces as a thrown error. This is the failure mode
+        // that strands ~half a large directory's boards on a naive all-at-once cold-join: every board
+        // fires one root-record fetch at once, so the node serves the first 32 and resets the rest.
+        // Without a retry the reset is swallowed and the board never pulls its checkpoint; with one it
+        // re-fetches and converges. Here the FIRST attempt throws, the retry lands.
+        const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        let attempts = 0;
+        const chased: string[] = [];
+        const fetchService: FetchServiceLike = {
+            fetch: async () => {
+                attempts += 1;
+                if (attempts === 1) throw new Error("stream reset"); // TooManyInboundProtocolStreamsError on the seeder
+                return record;
+            },
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [{ toString: () => "peerA" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = {
+            get: async (cid: CID) => {
+                chased.push(cid.toString());
+                throw new Error("no block"); // the chase attempt is what we assert
+            },
+            put: async (cid: CID) => cid,
+            has: async () => false
+        };
+        const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
+        const voter = new PubsubVoter({ helia, chains: fakeChains(), manifest: bizManifest() });
+        await voter.start();
+        const contest = await voter.getContest({ contestId: "biz" });
+        void contest;
+
+        // The retry re-fetches after the reset, so the record's root is still chased.
+        await vi.waitFor(() => expect(chased).toContain(root.toString()), { timeout: 5000 });
+        expect(attempts).toBeGreaterThanOrEqual(2);
+        await voter.stop();
+    });
+
     it("cold-joins via the HTTP content router even with NO topic subscribers: finds the provider of the criteria CID, dials it, fetches, and chases", async () => {
         // The pkc-js discovery path: gossipsub knows no subscribers yet, but the content router
         // names a provider of the criteria CID. The library must dial + fetch it immediately.

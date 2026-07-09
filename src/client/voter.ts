@@ -263,6 +263,25 @@ const COLD_START_ROUTER_TIMEOUT_MS = 10_000;
  * "Checkpoints" and "Transport constants (v1)".
  */
 const HEARTBEAT_INTERVAL_MS = 600_000;
+/**
+ * Cold-join fetch retry. A shared seeder registers `@libp2p/fetch` with libp2p's default per-protocol
+ * `maxInboundStreams` (32 in libp2p 3.3.4), so when a cold peer joins a whole directory at once — one
+ * root-record fetch per contest, fired concurrently — the node serves the first 32 and *resets* the
+ * rest, and libp2p surfaces the reset as a thrown fetch. Without a retry those boards silently never
+ * pull their checkpoint (measured: a naive 63-board join converges only 32/63).
+ *
+ * The cap is not just briefly exceeded — while more boards want to fetch than the node has slots, it
+ * stays *saturated*: every freed slot is instantly retaken, so a fixed handful of retries can lose the
+ * race and still strand a board (measured: 5 attempts → 53/63). So we retry a THROWN fetch until a
+ * **deadline**, with full-jittered exponential backoff: the jitter spreads retries across the freeing
+ * slots and the deadline guarantees a board keeps trying until it wins one, while still bounding a
+ * genuinely unreachable peer (cold-start is best-effort — live gossip and the heartbeat converge it
+ * regardless). Only a throw retries; a value or a definitive `undefined`/`null` ("no record") is
+ * returned as-is. See DESIGN.md "Deferred pkc-js work".
+ */
+const COLD_START_FETCH_DEADLINE_MS = 30_000;
+const COLD_START_FETCH_BACKOFF_MS = 400;
+const COLD_START_FETCH_BACKOFF_CAP_MS = 4_000;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
@@ -550,7 +569,7 @@ class ContestNetwork implements VoteNetwork {
             if (id === selfId || seen.has(id)) return; // skip self and any peer already asked
             seen.add(id);
             try {
-                const value = await this.#deps.fetch.fetch(peer, rootFetchKey(this.topic));
+                const value = await this.#fetchRootWithRetry(peer);
                 if (value === undefined || value === null) return;
                 const record = decodeRootRecord(value); // throws on garbage — caught, contributes nothing
                 const own = await (ownRoot ??= this.rootRecord());
@@ -564,6 +583,36 @@ class ContestNetwork implements VoteNetwork {
         };
         const fromSubscribers = this.#deps.pubsub.getSubscribers(this.topic).slice(0, COLD_START_PEERS).map(pull);
         await Promise.allSettled([...fromSubscribers, this.#discoverProviders(pull)]);
+    }
+
+    /**
+     * Pull one peer's root record over the fetch protocol, retrying a THROWN fetch with full-jittered
+     * exponential backoff until {@link COLD_START_FETCH_DEADLINE_MS}. The retry exists for one specific,
+     * measured failure: a shared seeder that resets the stream because it is over its per-protocol
+     * `maxInboundStreams` cap when a cold peer fetches a whole directory's root records at once. A
+     * *definitive* answer never retries — a value is used, and `undefined`/`null` ("no record") is
+     * returned as-is; only a throw (a reset, a transient dial race) is retried. Bails immediately if
+     * the contest was stopped mid-retry (`#chaser` is cleared by `stop()`), so a torn-down contest
+     * never keeps re-fetching. After the last attempt the final error propagates to `pull`'s
+     * best-effort `catch`, exactly as a single failing fetch did before.
+     */
+    async #fetchRootWithRetry(peer: PeerId): Promise<Uint8Array | undefined | null> {
+        const deadline = Date.now() + COLD_START_FETCH_DEADLINE_MS;
+        let lastError: unknown;
+        for (let attempt = 0; ; attempt++) {
+            if (attempt > 0) {
+                if (this.#chaser === undefined || Date.now() >= deadline) break; // stopped or out of time
+                const ceiling = Math.min(COLD_START_FETCH_BACKOFF_CAP_MS, COLD_START_FETCH_BACKOFF_MS * 2 ** (attempt - 1));
+                await new Promise((resolve) => setTimeout(resolve, Math.random() * ceiling));
+                if (this.#chaser === undefined) return undefined; // stopped mid-backoff — abandon quietly
+            }
+            try {
+                return await this.#deps.fetch.fetch(peer, rootFetchKey(this.topic));
+            } catch (error) {
+                lastError = error; // transient (e.g. seeder over its inbound-stream cap) — back off and retry
+            }
+        }
+        throw lastError;
     }
 
     /**
