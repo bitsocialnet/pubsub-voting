@@ -52,6 +52,15 @@ export interface Rule<O = unknown> {
     readonly type: string;
     readonly optionsSchema: z.ZodType<O>;
     evaluate(args: { options: O; walletAddress: string; ctx: ChainReadContext }): Promise<RuleResult>;
+    /**
+     * Optional batched form of {@link evaluate}: score many wallets at the SAME sampled block in
+     * as few RPC round trips as the rule can manage (e.g. one multicall3 `aggregate3` for a whole
+     * checkpoint's wallets). Returns one result per input wallet, in order. Semantics MUST equal
+     * mapping `evaluate` over the wallets — this is a transport optimization, never a different
+     * answer. The background chain verifier prefers it when present and falls back to per-wallet
+     * `evaluate` calls otherwise (see verify/background.ts).
+     */
+    evaluateMany?(args: { options: O; walletAddresses: string[]; ctx: ChainReadContext }): Promise<RuleResult[]>;
 }
 
 /**

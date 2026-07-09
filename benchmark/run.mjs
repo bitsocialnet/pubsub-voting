@@ -20,6 +20,7 @@
 //   BENCH_NS=1,5,10,100,1000     voter counts to sweep
 //   BENCH_REPEATS=3              cold joins per N (median reported)
 //   BENCH_ROUTER_LATENCY_MS=1000 simulated HTTP-router lookup latency (paid once)
+//   BENCH_RPC_LATENCY_MS=270     simulated ETH-gateway latency per RPC round trip (rpc-gateway.ts)
 //   BENCH_SKIP_SYNC=1            skip rsync+remote build (reuse an already-synced remote)
 //   BENCH_SKIP_BUILD=1           skip the local `npm run build`
 //
@@ -192,7 +193,8 @@ async function measureOne(n, i) {
                 `[bench] N=${n} rep ${r + 1}/${REPEATS}: router=${s(parsed.router.durMs)} ` +
                     `fetch=${s(parsed.fetch.totalMs)} (negotiate=${s(parsed.fetchPhases?.negotiateMs)} ` +
                     `w→r=${s(parsed.fetchPhases?.writeReadMs)}) bitswap=${s(parsed.blockGets.totalMs)} ` +
-                    `verify+merge=${s(parsed.verifyMergeMs)} start→tally=${s(parsed.tallyReadyMs)}`
+                    `verify+merge=${s(parsed.verifyMergeMs)} rpc=${parsed.gateRpc?.requests ?? "n/a"} ` +
+                    `start→tally=${s(parsed.tallyReadyMs)} start→verified=${s(parsed.verifiedTallyMs)}`
             );
         }
     } finally {
@@ -211,7 +213,10 @@ async function measureOne(n, i) {
         fetchWriteReadMs: med((r) => r.fetchPhases?.writeReadMs),
         bitswapMs: med((r) => r.blockGets.totalMs),
         verifyMergeMs: med((r) => r.verifyMergeMs),
-        tallyReadyMs: med((r) => r.tallyReadyMs)
+        tallyReadyMs: med((r) => r.tallyReadyMs),
+        verifiedTallyMs: med((r) => r.verifiedTallyMs),
+        gateRpcRequests: med((r) => r.gateRpc?.requests),
+        gateRpcReads: med((r) => (r.gateRpc ? r.gateRpc.ethCalls + r.gateRpc.multicallReads : null))
     };
 }
 
@@ -235,7 +240,7 @@ async function main() {
     }
 
     console.log(`\nCold-join latency — seeder on ${HOST} (dialed directly at ${DIAL_HOST}), discovered via HTTP router, median of ${REPEATS} (times → s)`);
-    console.log("N(voters)  router   connect   fetch    bitswap  verify+merge   START→TALLY");
+    console.log("N(voters)  router   connect   fetch    bitswap  verify+merge   gate-RPC   START→TALLY   START→VERIFIED");
     for (const r of rows) {
         if (!r.ok) {
             console.log(`${String(r.n).padEnd(10)} (no successful cold join)`);
@@ -243,7 +248,8 @@ async function main() {
         }
         console.log(
             `${String(r.n).padEnd(10)} ${s(r.routerMs)}  ${s(r.connectMs)}   ${s(r.fetchMs)}  ` +
-                `${s(r.bitswapMs)}  ${s(r.verifyMergeMs)}         ${s(r.tallyReadyMs)}`
+                `${s(r.bitswapMs)}  ${s(r.verifyMergeMs)}         ${r.gateRpcRequests ?? "n/a"}          ` +
+                `${s(r.tallyReadyMs)}        ${s(r.verifiedTallyMs)}`
         );
     }
     console.log("\nfetch sub-phase split (median → s):");

@@ -4,7 +4,7 @@ import { makeRootChaser, type RootChaserDeps } from "./chase.js";
 import { encodeCheckpoint } from "../checkpoint/codec.js";
 import { bundleCid } from "../crdt/codec.js";
 import { makeVerdictCache } from "../verify/cache.js";
-import type { BundleVerifier } from "../verify/types.js";
+import type { PendingBundle } from "../verify/background.js";
 import type { VotesBundle } from "../schema/votes.js";
 
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
@@ -20,9 +20,6 @@ function bundle(address: string, blockNumber = 1): VotesBundle {
     };
 }
 
-const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
-const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
-
 /** Encode `winners` into checkpoint blocks and return the root, chunk index, and a block-map getBlock. */
 async function checkpointOf(winners: VotesBundle[]) {
     const { root, chunks, blocks } = await encodeCheckpoint(winners);
@@ -37,18 +34,24 @@ async function checkpointOf(winners: VotesBundle[]) {
 
 /**
  * A chaser whose `limit` captures each chase's completion promise, so a test can await the
- * fire-and-forget run deterministically.
+ * fire-and-forget run deterministically. Offline verification passes by default; the deferred
+ * network checks are captured per `deferVerify` batch (the background verifier is stubbed —
+ * its real behaviour is unit-tested in verify/background.test.ts).
  */
 function harness(over: Partial<RootChaserDeps> & Pick<RootChaserDeps, "getBlock">) {
-    const admitted: CID[] = [];
+    const admitted: Array<{ cid: CID; verified: boolean }> = [];
+    const deferred: PendingBundle[][] = [];
     const runs: Promise<unknown>[] = [];
     let mergedCalls = 0;
     const chaser = makeRootChaser({
-        verifier: okVerifier,
+        verifyOffline: async () => ({ valid: true }),
         cache: makeVerdictCache(),
         hasBundle: async () => false,
-        admit: async ({ cid }) => {
-            admitted.push(cid);
+        admit: async ({ cid, verified }) => {
+            admitted.push({ cid, verified });
+        },
+        deferVerify: (entries) => {
+            deferred.push(entries);
         },
         onMerged: () => {
             mergedCalls++;
@@ -65,17 +68,22 @@ function harness(over: Partial<RootChaserDeps> & Pick<RootChaserDeps, "getBlock"
         // A run may queue further work; settle every captured promise (they never reject upward).
         await Promise.allSettled(runs);
     };
-    return { chaser, admitted, settle, merged: () => mergedCalls };
+    return { chaser, admitted, deferred, settle, merged: () => mergedCalls };
 }
 
 describe("makeRootChaser", () => {
-    it("pulls a root's blocks, verifies every inlined bundle, and admits the survivors", async () => {
+    it("pulls a root's blocks, admits offline-valid bundles provisionally, and defers their chain checks", async () => {
         const winners = [bundle("0x1"), bundle("0x2")];
         const { root, getBlock } = await checkpointOf(winners);
         const h = harness({ getBlock });
         h.chaser.chase(root);
         await h.settle();
         expect(h.admitted).toHaveLength(2);
+        // Offline-only admits are provisional; the whole root's batch defers in ONE call so the
+        // background verifier can batch the gate reads per sample block.
+        expect(h.admitted.every((a) => !a.verified)).toBe(true);
+        expect(h.deferred).toHaveLength(1);
+        expect(h.deferred[0]).toHaveLength(2);
         expect(h.merged()).toBe(1);
         expect(h.chaser.inFlight()).toBe(0);
     });
@@ -112,41 +120,56 @@ describe("makeRootChaser", () => {
         const h = harness({
             getBlock,
             hasBundle: async () => true,
-            verifier: {
-                verify: async () => {
-                    verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
-                }
+            verifyOffline: async () => {
+                verifies++;
+                return { valid: true };
             }
         });
         h.chaser.chase(root);
         await h.settle();
         expect(h.admitted).toHaveLength(0);
+        expect(h.deferred).toHaveLength(0);
         expect(verifies).toBe(0);
         expect(h.merged()).toBe(0);
     });
 
-    it("drops a liar's invalid bundle but keeps the honest one (per-bundle trust)", async () => {
+    it("drops a liar's offline-invalid bundle before admit but keeps the honest one (per-bundle trust)", async () => {
         const good = bundle("0x1");
         const forged = bundle("0xbad");
         const { root, getBlock } = await checkpointOf([good, forged]);
         const goodCid = await bundleCid(good);
+        const forgedCid = await bundleCid(forged);
+        const cache = makeVerdictCache();
         const h = harness({
             getBlock,
-            verifier: {
-                verify: async (b) =>
-                    b.address === forged.address
-                        ? { valid: false, disposition: "reject", reason: "forged" }
-                        : { valid: true, ruleScore: 1n, resolvedNames: {} }
-            }
+            cache,
+            verifyOffline: async (b) =>
+                b.address === forged.address ? { valid: false, disposition: "reject", reason: "forged" } : { valid: true }
         });
         h.chaser.chase(root);
         await h.settle();
         expect(h.admitted).toHaveLength(1);
-        expect(h.admitted[0].equals(goodCid)).toBe(true);
+        expect(h.admitted[0].cid.equals(goodCid)).toBe(true);
+        // A provable offline reject is terminal — cached so a re-served copy short-circuits.
+        expect(cache.get(forgedCid)).toMatchObject({ valid: false, disposition: "reject" });
     });
 
-    it("skips a cached-reject bundle without re-verifying, and admits a cached-valid one", async () => {
+    it("does not cache a transient offline `ignore`", async () => {
+        const flaky = bundle("0x1");
+        const { root, getBlock } = await checkpointOf([flaky]);
+        const cache = makeVerdictCache();
+        const h = harness({
+            getBlock,
+            cache,
+            verifyOffline: async () => ({ valid: false, disposition: "ignore", reason: "transient" })
+        });
+        h.chaser.chase(root);
+        await h.settle();
+        expect(h.admitted).toHaveLength(0);
+        expect(cache.get(await bundleCid(flaky))).toBeUndefined();
+    });
+
+    it("skips a cached-reject bundle without re-verifying, and admits a cached-valid one as settled", async () => {
         const rejected = bundle("0x1");
         const known = bundle("0x2");
         const { root, getBlock } = await checkpointOf([rejected, known]);
@@ -157,18 +180,19 @@ describe("makeRootChaser", () => {
         const h = harness({
             getBlock,
             cache,
-            verifier: {
-                verify: async () => {
-                    verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
-                }
+            verifyOffline: async () => {
+                verifies++;
+                return { valid: true };
             }
         });
         h.chaser.chase(root);
         await h.settle();
         expect(verifies).toBe(0);
         expect(h.admitted).toHaveLength(1);
-        expect(h.admitted[0].equals(await bundleCid(known))).toBe(true);
+        expect(h.admitted[0].cid.equals(await bundleCid(known))).toBe(true);
+        // The cached terminal verdict covers the FULL pipeline — no deferred work remains.
+        expect(h.admitted[0].verified).toBe(true);
+        expect(h.deferred).toHaveLength(0);
     });
 
     it("skips a not-yet-evaluable bundle (future-head guard) without verifying", async () => {
@@ -178,11 +202,9 @@ describe("makeRootChaser", () => {
         const h = harness({
             getBlock,
             isEvaluableNow: async () => false,
-            verifier: {
-                verify: async () => {
-                    verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
-                }
+            verifyOffline: async () => {
+                verifies++;
+                return { valid: true };
             }
         });
         h.chaser.chase(root);

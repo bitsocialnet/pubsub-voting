@@ -2,7 +2,7 @@
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
-> **Status: engine, reactive facade, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, and the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap) are all implemented — so the reactive `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) facade is live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. **Keeping a live vote from decaying is the consuming client's job** — this library publishes each vote once and exposes `republishIntervalBuckets` so the client can schedule its own refreshes (see [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys)). What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
+> **Status: engine, reactive facade, and live-delta transport implemented and unit-tested.** The zod schemas, canonical dag-cbor encoding, topic derivation, the verify pipeline (signature + constraints + on-chain gate + community-name resolution), the LWW winner-set CRDT with its binary bundle codec, the tally, the transport's **validate-before-forward gossip gate** over **inline bundle deltas**, and the **root-record checkpoint sync** (on-demand encode, suppressed 10-minute topic heartbeat, libp2p-fetch pull, divergent roots chased via directed bitswap) are all implemented — so the reactive `PubsubVoter` / `Contest` (`createContest`) / `ContestVote` (`createContestVote`) facade is live. The gate runs the full validity pipeline on the message bytes in an async gossipsub topic validator *before* re-forwarding, so an invalid bundle (bad signature, wallet the gate rejects, squatted name) is never propagated and `reject` scores the sender. Cold-join checkpoint bundles instead admit on the synchronous offline checks and settle their **deferred chain checks in the background, batched via multicall3** — the tally renders immediately with per-row `chainVerified`/`nameResolved` flags and refines as they land, and a node's own checkpoint only ever serves fully verified bundles (see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification)). **Keeping a live vote from decaying is the consuming client's job** — this library publishes each vote once and exposes `republishIntervalBuckets` so the client can schedule its own refreshes (see [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-the-clients-job-not-this-librarys)). What remains is host-side (pkc-js registering gossipsub + `@libp2p/fetch` on the shared node) — see [ROADMAP.md](./ROADMAP.md), [DESIGN.md](./DESIGN.md), the [Transport gate](./DESIGN.md#transport-gossipsub-topic--validation), and [open questions](./DESIGN.md#open-questions).
 
 ## What it is for
 
@@ -37,7 +37,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`) and a `blockstore` (else `MissingBlockstoreError`) |
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
-| `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); the tally verifies each vote's `community.name` claim through them and drops bundles whose name does not resolve to the claimed `publicKey` |
+| `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 
 A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists.
 
@@ -63,12 +63,31 @@ Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingF
 ```ts
 const contest = await voter.createContest({ criteria });  // criteria: the contest's full document (strictly validated here)
 contest.on("update", () => render(contest.tally));        // tally rides the object; recomputed before each emit
-contest.on("error", (err) => showConnectivityWarning(err)); // e.g. the tally's chain read failed
+contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed, or the background verifier's RPC/resolver is down (retrying)
 await contest.update();                                   // join the topic, cold-start, begin emitting
-const winner = contest.tally?.ranking[0]?.community;      // { name?: string, publicKey: string } — identity is publicKey
 // const fresh = await contest.getTally();                // or force a fresh read, bypassing the cache
 // await contest.stop();                                  // leave the topic
 ```
+
+Each ranking row carries one flag **per deferred verification operation** (mirroring pkc-js's
+`nameResolved`), and every background settlement re-fires `update` — so a leaderboard can render
+provisional rows immediately and refine them in place:
+
+```ts
+contest.on("update", () => {
+    for (const row of contest.tally?.ranking ?? []) {
+        // row.community: { name?: string, publicKey: string } — identity is ALWAYS publicKey.
+        // Show the name only once it has been checked against the registry.
+        const label = row.community.name && row.nameResolved ? row.community.name : row.community.publicKey;
+        // row.chainVerified: true once EVERY contributing vote's on-chain gate read confirmed.
+        // false means "still being read in the background", never "failed" — a vote that fails
+        // a deferred check is evicted and the row recounted instead.
+        renderRow(label, row.weight, row.chainVerified ? "verified" : "verifying…");
+    }
+});
+```
+
+A cold join **renders fast and refines**: checkpoint bundles are admitted after the synchronous offline checks (signature + constraints), so the first tally arrives with `chainVerified: false` rows, and the background verifier then batches the deferred gate reads (one multicall per bucket) and name resolutions — each settlement re-fires `update` with the flags flipped. See [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification).
 
 Repeated `createContest` calls with byte-identical criteria return the same `Contest` (engines are keyed by topic, the criteria CID).
 
@@ -85,7 +104,7 @@ const { bundle, recipientCount } = await vote.publish();          // the signed 
 await (await voter.createContestVote({ criteria, votes: [] })).publish();
 ```
 
-A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
+A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, the name is resolved through the injected `nameResolvers` (inline at the forward-gate for live votes, in the background verifier for cold-join admits), and any bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
 
 `recipientCount` is the peer-reach hint gossipsub reports: how many peers it sent the vote *directly* to at publish time (first-hop fan-out, filtered for send failures) — **not** total network reach, and **not** an acceptance confirmation, since each recipient still runs the forward-gate before re-forwarding. Treat it as a coarse "did this reach anyone?" signal. Note that gossipsub *rejects* the publish with `NoPeersSubscribedToTopic` when it would reach zero peers (common right after joining, before the mesh grafts), unless the host enables `allowPublishToZeroTopicPeers` — so a resolved `recipientCount === 0` only occurs under that host setting; otherwise a no-reach publish surfaces as a thrown error (and a `failed` state).
 

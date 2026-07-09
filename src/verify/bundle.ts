@@ -66,15 +66,21 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
     const ruleOptions = rule.optionsSchema.parse(criteria.rule);
     const ruleChain = chainFor(tickerForRef(criteria, criteria.rule, ruleOptions));
 
-    return {
-        async verify(bundle: VotesBundle): Promise<BundleVerdict> {
-            // 1. Signature (free) — a forged/tampered bundle drops before any chain/network read.
-            const signature = await verifyBundleSignature({ bundle, criteriaCid, chainId });
-            if (!signature.valid) return signature;
+    // Stage 1, shared by `verify` and `verifyOffline`: signature + constraints, local and µs.
+    const verifyOffline = async (bundle: VotesBundle) => {
+        // 1. Signature (free) — a forged/tampered bundle drops before any chain/network read.
+        const signature = await verifyBundleSignature({ bundle, criteriaCid, chainId });
+        if (!signature.valid) return signature;
 
-            // 2. Criteria constraints (free) — cap + vote range.
-            const constraints = checkBundleConstraints(bundle, criteria);
-            if (!constraints.valid) return constraints;
+        // 2. Criteria constraints (free) — cap + vote range.
+        return checkBundleConstraints(bundle, criteria);
+    };
+
+    return {
+        verifyOffline,
+        async verify(bundle: VotesBundle): Promise<BundleVerdict> {
+            const offline = await verifyOffline(bundle);
+            if (!offline.valid) return offline;
 
             // 3. Gate (chain) — read the `rule` at the bucket's sample block. The score is a pure
             //    function of a pinned historical block, so it is memoized per `(wallet, sampleBlock)`:

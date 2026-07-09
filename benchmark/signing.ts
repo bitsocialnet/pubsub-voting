@@ -1,3 +1,5 @@
+import { createPublicClient, http } from "viem";
+import { base } from "viem/chains";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import type { ChainClient, ChainClientFactory } from "../dist/chain/types.js";
 import type { VoteSigner } from "../dist/signer/types.js";
@@ -69,8 +71,12 @@ export function benchDirectoryCriteria(m: number): Criteria[] {
 /**
  * A chain factory that answers instantly with no network: `getBlockNumber` fixes the head (so the
  * current bucket is stable), `getBlock` supplies the tie-break block hash, and `readContract`
- * returns `min` so the `erc721-min-balance` gate passes for every wallet. This makes chain reads
- * ~0ms so the benchmark measures p2p latency, not RPC round-trips.
+ * returns `min` so the `erc721-min-balance` gate passes for every wallet.
+ *
+ * Used only where chain latency is SETUP, not the measurement: the seeder (its 1000 gate reads
+ * while seeding are not the cold join under test). The measured COLD JOINER instead talks to the
+ * mock ETH gateway through a real viem client — see {@link benchGatewayChains} — so its gate
+ * reads cost realistic RPC round trips.
  */
 export function benchChains(): ChainClientFactory {
     const client = {
@@ -78,6 +84,18 @@ export function benchChains(): ChainClientFactory {
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
         readContract: async () => 1n
     };
+    return () => client as unknown as ChainClient;
+}
+
+/**
+ * The measured joiner's chain factory: a REAL `createPublicClient` with viem's default `http`
+ * transport (one POST per read, `retryCount: 3`, no transport batching) pointed at the mock ETH
+ * gateway (`benchmark/rpc-gateway.ts`). `chain: base` matches the bench criteria's chainId 8453
+ * and — crucially — carries base's multicall3 deployment, so `erc721-min-balance.evaluateMany`
+ * takes the one-aggregate3-per-batch path exactly as it would against the real chain.
+ */
+export function benchGatewayChains(gatewayUrl: string): ChainClientFactory {
+    const client = createPublicClient({ chain: base, transport: http(gatewayUrl) });
     return () => client as unknown as ChainClient;
 }
 

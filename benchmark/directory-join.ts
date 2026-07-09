@@ -2,7 +2,8 @@ import { PubsubVoter, type Contest } from "../dist/client/voter.js";
 import { criteriaCid } from "../dist/topic.js";
 import { makeHostNode, type HostNode } from "./host-node.js";
 import { startRouter, type RouterProvider, type RunningRouter } from "./router.js";
-import { benchChains, benchDirectoryCriteria } from "./signing.js";
+import { startRpcGateway, type RunningGateway } from "./rpc-gateway.js";
+import { benchGatewayChains, benchDirectoryCriteria } from "./signing.js";
 
 /**
  * Directory-load benchmark — COLD JOINER side (runs locally).
@@ -133,13 +134,18 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
     const providers = new Map(cids.map((cid) => [cid.toString(), provider] as const));
 
     let router: RunningRouter | undefined;
+    let gateway: RunningGateway | undefined;
     let node: HostNode | undefined;
     let voter: PubsubVoter | undefined;
     try {
         router = await startRouter({ providers, latencyMs: args.routerLatencyMs ?? 1000 });
+        // The mock ETH gateway (see rpc-gateway.ts): tally-ready below is RENDER-ready — the chase
+        // admits on the offline checks — so the RPC latency shapes only the background gate reads
+        // that batch behind it, not the measured convergence curve.
+        gateway = await startRpcGateway({ latencyMs: Number(process.env.BENCH_RPC_LATENCY_MS ?? 270) });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchChains() });
+        voter = new PubsubVoter({ helia: node.helia, chains: benchGatewayChains(gateway.url) });
 
         const networks: Contest[] = await Promise.all(criteria.map((c) => voter!.createContest({ criteria: c })));
 
@@ -248,6 +254,7 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
     } finally {
         await voter?.stop().catch(() => {});
         await node?.stop().catch(() => {});
+        await gateway?.stop().catch(() => {});
         await router?.stop().catch(() => {});
     }
 }

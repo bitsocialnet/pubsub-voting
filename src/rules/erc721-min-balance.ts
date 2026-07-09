@@ -21,6 +21,11 @@ export const Erc721MinBalanceOptionsSchema = z.object({
 
 export type Erc721MinBalanceOptions = z.infer<typeof Erc721MinBalanceOptionsSchema>;
 
+/** Score from one balance: the holding when it meets `min`, else `0n` (does not qualify). */
+function scoreOf(balance: bigint, min: number): bigint {
+    return balance >= BigInt(min) ? balance : 0n;
+}
+
 export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
     type: "erc721-min-balance",
     optionsSchema: Erc721MinBalanceOptionsSchema,
@@ -32,6 +37,27 @@ export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
             args: [getAddress(walletAddress)],
             blockNumber: BigInt(ctx.blockNumber)
         });
-        return { score: balance >= BigInt(options.min) ? balance : 0n };
+        return { score: scoreOf(balance, options.min) };
+    },
+    async evaluateMany({ options, walletAddresses, ctx }) {
+        const contract = getAddress(options.contract);
+        // One multicall3 `aggregate3` eth_call covers every wallet — the batched path the
+        // background chain verifier rides on a cold join (N wallets, ~1 RPC round trip). It
+        // needs the client to know its chain's multicall3 deployment; a client built without a
+        // `chain` (or on a chain without multicall3) takes the per-wallet fallback below.
+        if (typeof ctx.chain.multicall === "function" && ctx.chain.chain?.contracts?.multicall3) {
+            const balances = await ctx.chain.multicall({
+                contracts: walletAddresses.map((wallet) => ({
+                    address: contract,
+                    abi: erc721Abi,
+                    functionName: "balanceOf" as const,
+                    args: [getAddress(wallet)] as const
+                })),
+                allowFailure: false,
+                blockNumber: BigInt(ctx.blockNumber)
+            });
+            return balances.map((balance) => ({ score: scoreOf(balance, options.min) }));
+        }
+        return Promise.all(walletAddresses.map((walletAddress) => this.evaluate({ options, walletAddress, ctx })));
     }
 };

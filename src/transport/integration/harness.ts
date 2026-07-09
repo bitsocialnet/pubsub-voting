@@ -156,8 +156,15 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
     const cache = makeVerdictCache();
 
     // The injected verifier, swappable per test. The gate and the chaser share this reference.
+    // The chaser's offline stage runs the same swapped implementation, so a test that makes the
+    // verifier fail still sees the chase drop the bundle BEFORE admit (the two-node assertions
+    // pin admission, not which stage deferred — deferred checks are unit-tested in
+    // verify/background.test.ts).
     let verifyImpl: (bundle: VotesBundle) => Promise<BundleVerdict> = async () => okVerifier();
-    const verifier: BundleVerifier = { verify: (bundle) => verifyImpl(bundle) };
+    const verifier: BundleVerifier = {
+        verify: (bundle) => verifyImpl(bundle),
+        verifyOffline: (bundle) => verifyImpl(bundle)
+    };
 
     const admit = async ({ cid, bytes }: { cid: CID; bytes: Uint8Array; bundle: VotesBundle }): Promise<void> => {
         await blockstore.put(cid, bytes);
@@ -189,10 +196,13 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
                 return undefined;
             }
         },
-        verifier,
+        verifyOffline: (bundle) => verifier.verifyOffline(bundle),
         cache,
         hasBundle: (cid) => store.has(cid),
         admit,
+        // The harness runs the whole swapped pipeline in `verifyOffline` above, so nothing is
+        // left deferred; the background verifier has its own unit tests.
+        deferVerify: () => {},
         limit: (fn) => chaseLimit(fn),
         timeoutMs: 30_000
     });

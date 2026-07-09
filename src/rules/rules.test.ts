@@ -33,6 +33,44 @@ describe("erc721-min-balance (gate via score > 0)", () => {
         const { score } = await erc721MinBalance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc721: 1n }) });
         expect(score).toBe(0n);
     });
+
+    it("evaluateMany batches every wallet into ONE multicall when the client supports it", async () => {
+        const wallets = ["0x000000000000000000000000000000000000aaaa", "0x000000000000000000000000000000000000bbbb", "0x000000000000000000000000000000000000cccc"];
+        const balances = [3n, 1n, 2n]; // above min, below min, at min
+        let multicalls = 0;
+        let reads = 0;
+        const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
+        // A client whose `chain` knows its multicall3 deployment takes the batched path.
+        (chain as { chain?: unknown }).chain = { contracts: { multicall3: { address: "0xca11bde05977b3631167028862be2a173976ca11" } } };
+        chain.multicall = (async ({ contracts }: { contracts: unknown[] }) => {
+            multicalls++;
+            expect(contracts).toHaveLength(wallets.length);
+            return balances;
+        }) as unknown as ChainClient["multicall"];
+        chain.readContract = (async () => {
+            reads++;
+            return 0n;
+        }) as ChainClient["readContract"];
+
+        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        expect(results.map((r) => r.score)).toEqual([3n, 0n, 2n]); // same semantics as mapped evaluate
+        expect(multicalls).toBe(1);
+        expect(reads).toBe(0);
+    });
+
+    it("evaluateMany falls back to per-wallet reads on a client without multicall3", async () => {
+        const wallets = ["0x000000000000000000000000000000000000aaaa", "0x000000000000000000000000000000000000bbbb"];
+        let reads = 0;
+        const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
+        chain.readContract = (async () => {
+            reads++;
+            return 5n;
+        }) as ChainClient["readContract"];
+
+        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        expect(results.map((r) => r.score)).toEqual([5n, 5n]);
+        expect(reads).toBe(2);
+    });
 });
 
 describe("constant", () => {

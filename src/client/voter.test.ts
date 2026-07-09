@@ -12,7 +12,7 @@ import {
     type RootRecord
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
-import type { ChainClient, ChainClientFactory } from "../chain/types.js";
+import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
     MissingBlockstoreError,
@@ -51,6 +51,47 @@ function advancingChains(currentBlock: () => bigint): ChainClientFactory {
         readContract: async () => 1n
     };
     return () => client as unknown as ChainClient;
+}
+
+/**
+ * A chain factory whose `readContract` (the gate's balance read) blocks until `release()`, so a
+ * test can observe the provisional (chainVerified: false) window deterministically before the
+ * background verifier settles it.
+ */
+function gatedChains(): { chains: ChainClientFactory; release: () => void } {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const client = {
+        getBlockNumber: async () => 43200n,
+        getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+        readContract: async () => {
+            await gate;
+            return 1n;
+        }
+    };
+    return { chains: () => client as unknown as ChainClient, release };
+}
+
+/**
+ * A `.bso` resolver whose `resolve` blocks until `release()`, so a test can observe the
+ * provisional (nameResolved: false) window deterministically before the background verifier
+ * settles the name check.
+ */
+function gatedResolver(publicKey: string): { resolver: NameResolver; release: () => void } {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    return {
+        resolver: {
+            key: "gated",
+            provider: "test",
+            canResolve: ({ name }) => name.endsWith(".bso"),
+            resolve: async () => {
+                await gate;
+                return { publicKey };
+            }
+        },
+        release
+    };
 }
 
 /**
@@ -219,6 +260,112 @@ describe("Contest read view + tally", () => {
         expect(tally.ranking).toHaveLength(1);
         expect(tally.ranking[0].community.publicKey).toBe(VALID_KEY);
         expect(tally.ranking[0].weight).toBe(1n); // constant weight, 1 pass = 1 vote
+    });
+
+    it("admits an own vote provisionally: chainVerified flips once the background gate read lands", async () => {
+        const { chains, release } = gatedChains();
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains, signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+
+        // The vote counts immediately (render fast), but its gate read has not landed yet.
+        const before = await contest.getTally();
+        expect(before.ranking).toHaveLength(1);
+        expect(before.ranking[0].chainVerified).toBe(false);
+
+        release(); // the RPC answers — the background verifier settles the gate check
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+    });
+
+    it("emits an update event when a row's chainVerified flips after the background gate read lands", async () => {
+        const { chains, release } = gatedChains();
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains, signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        // Record the row's flag at every update emit: the flip must arrive AS AN EVENT, not
+        // only via a forced getTally().
+        const flags: Array<boolean | undefined> = [];
+        contest.on("update", () => flags.push(contest.tally?.ranking[0]?.chainVerified));
+        await contest.update();
+
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await vi.waitFor(() => expect(flags).toContain(false)); // the provisional render emitted
+
+        release(); // the gate read lands in the background
+        await vi.waitFor(() => expect(flags).toContain(true)); // the settlement re-emitted update
+        expect(contest.tally?.ranking[0]?.chainVerified).toBe(true);
+        await contest.stop();
+    });
+
+    it("emits an update event when a row's nameResolved flips after the background resolution lands", async () => {
+        const { resolver, release } = gatedResolver(VALID_KEY);
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: stubChains(), // instant gate — isolates the name check as the pending stage
+            signer: fakeSigner(),
+            nameResolvers: [resolver]
+        });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const flags: Array<boolean | undefined> = [];
+        contest.on("update", () => flags.push(contest.tally?.ranking[0]?.nameResolved));
+        await contest.update();
+
+        const named = [{ community: { name: "memes.bso", publicKey: VALID_KEY }, vote: 1 }];
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: named })).publish();
+        await vi.waitFor(() => expect(flags).toContain(false)); // name still pending at render
+
+        release(); // the resolution lands in the background
+        await vi.waitFor(() => expect(flags).toContain(true));
+        expect(contest.tally?.ranking[0]?.community.name).toBe("memes.bso");
+        expect(contest.tally?.ranking[0]?.nameResolved).toBe(true);
+        await contest.stop();
+    });
+
+    it("evicts an own vote whose wallet fails the gate (score 0n), recounting the tally", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        // The local tally converges to the network's view: an ineligible vote does not stick.
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking).toEqual([]));
+    });
+
+    it("serves only verified bundles in its checkpoint (a pending own vote is withheld)", async () => {
+        const { chains, release } = gatedChains();
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains, signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = (await voter.createContest({ criteria: bizCriteria() })) as unknown as {
+            rootRecord(): Promise<{ count: number }>;
+        };
+
+        expect((await contest.rootRecord()).count).toBe(0); // pending — never re-served
+        release();
+        await vi.waitFor(async () => expect((await contest.rootRecord()).count).toBe(1));
+    });
+
+    it("surfaces a background infra failure through the contest error event; the vote stays pending", async () => {
+        const client = {
+            getBlockNumber: async () => 43200n,
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => {
+                throw new Error("RPC down");
+            }
+        };
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: () => client as unknown as ChainClient,
+            signer: fakeSigner()
+        });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const errors: unknown[] = [];
+        contest.on("error", (e) => errors.push(e));
+        await contest.update();
+
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
+        // Infra is nobody's verdict: not evicted, still counted, flagged unverified.
+        const tally = await contest.getTally();
+        expect(tally.ranking).toHaveLength(1);
+        expect(tally.ranking[0].chainVerified).toBe(false);
+        await voter.stop(); // clears the background retry timer with the topic leave
     });
 
     it("update() emits an initial update and a fresh tally when a later vote is published", async () => {

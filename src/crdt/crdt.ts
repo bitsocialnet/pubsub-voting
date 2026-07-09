@@ -45,11 +45,19 @@ export interface VoteCrdtDeps {
     voteExpiryBuckets: number;
     /** Conflict resolver; defaults to {@link lwwResolve}. */
     resolve?: LwwResolve;
+    /**
+     * True while a bundle's deferred chain/name checks are still pending (see
+     * verify/background.ts). `prune` keeps a superseded bundle whose superseder is provisional —
+     * the fallback winner if the provisional bundle is later evicted. Omitted ⇒ nothing is
+     * provisional (prior behaviour).
+     */
+    isProvisional?: (cid: CID) => boolean;
 }
 
 export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
     const { store, bucketMath, voteExpiryBuckets } = deps;
     const resolve = deps.resolve ?? lwwResolve;
+    const isProvisional = deps.isProvisional ?? (() => false);
 
     // The working set of integrated bundles, keyed by CID string, mirrored from the store for
     // fast reduction.
@@ -76,10 +84,11 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
         bundles.set(key, { cid, bundle });
     }
 
-    /** LWW winner per wallet across the working set. */
-    function winnersByWallet(): Map<string, { cid: CID; bundle: VotesBundle }> {
+    /** LWW winner per wallet across the working set; `eligible` restricts the reduction. */
+    function winnersByWallet(eligible?: (cid: CID) => boolean): Map<string, { cid: CID; bundle: VotesBundle }> {
         const winners = new Map<string, { cid: CID; bundle: VotesBundle }>();
         for (const entry of bundles.values()) {
+            if (eligible && !eligible(entry.cid)) continue;
             const wallet = entry.bundle.address.toLowerCase();
             const prev = winners.get(wallet);
             if (!prev) {
@@ -95,6 +104,16 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
         return winners;
     }
 
+    /**
+     * One winner per wallet (LWW, optionally restricted to `eligible` bundles), minus expired
+     * winners. A winning empty-votes bundle is the withdrawal form and is returned as-is; the
+     * tally treats it as "no vote". A winner past its expiry window drops the wallet entirely —
+     * the read-time filter that keeps a decayed vote out of the tally and the checkpoint.
+     */
+    function currentEntries(currentBucket: number, eligible?: (cid: CID) => boolean): Array<{ cid: CID; bundle: VotesBundle }> {
+        return [...winnersByWallet(eligible).values()].filter((e) => !isExpired(e.bundle, currentBucket));
+    }
+
     return {
         async add(bundle) {
             const cid = await store.put(bundle);
@@ -107,13 +126,13 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
         },
 
         current(currentBucket) {
-            // One bundle per wallet (LWW). A winning empty-votes bundle is the withdrawal
-            // form and is returned as-is; the tally treats it as "no vote". A winner past its
-            // expiry window drops the wallet entirely — the read-time filter that keeps a
-            // decayed vote out of the tally.
-            return [...winnersByWallet().values()]
-                .filter((e) => !isExpired(e.bundle, currentBucket))
-                .map((e) => e.bundle);
+            return currentEntries(currentBucket).map((e) => e.bundle);
+        },
+
+        currentEntries,
+
+        remove(cid: CID) {
+            bundles.delete(cid.toString());
         },
 
         nodeCount() {
@@ -122,14 +141,23 @@ export function makeVoteCrdt(deps: VoteCrdtDeps): VoteCrdt {
 
         async prune(currentBucket: number) {
             const winners = winnersByWallet();
+            const removed: CID[] = [];
             for (const [key, entry] of bundles) {
                 const wallet = entry.bundle.address.toLowerCase();
-                const isWinner = winners.get(wallet) === entry;
+                const winner = winners.get(wallet);
+                const isWinner = winner === entry;
                 const bundleBucket = bucketMath.bucketForBlock(entry.bundle.blockNumber);
                 const expired = currentBucket > bundleBucket + voteExpiryBuckets;
-                // Drop superseded (non-winning) bundles and any bundle past its expiry window.
-                if (!isWinner || expired) bundles.delete(key);
+                // Drop superseded (non-winning) bundles and any bundle past its expiry window —
+                // EXCEPT a superseded bundle whose superseder is still provisional: it is the
+                // fallback winner if that bundle's deferred check evicts it.
+                const shieldedByProvisionalWinner = !isWinner && !expired && winner !== undefined && isProvisional(winner.cid);
+                if ((!isWinner || expired) && !shieldedByProvisionalWinner) {
+                    bundles.delete(key);
+                    removed.push(entry.cid);
+                }
             }
+            return removed;
         }
     };
 }

@@ -4,23 +4,27 @@ import type { Criteria } from "../schema/criteria.js";
 import type { VotesBundle } from "../schema/votes.js";
 import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath } from "../chain/types.js";
+import type { BundleChecks } from "../verify/types.js";
 import { tickerForRef } from "../chain/ticker.js";
 import { UnknownRuleError } from "../errors.js";
-import type { Tally, TallyOptions, ContestTally, CommunityTally } from "./types.js";
+import type { Tally, ContestTally, CommunityTally } from "./types.js";
 
 /**
- * Deterministic per-contest aggregation over the CRDT's current (already validity-gated)
- * bundles. Because the forward-gate verified signature + gate (`rule`) + name before any
- * bundle was stored, the tally never re-does that work: it only sums *weight magnitude*
- * per community and orders the rows. In v1 the weight rule is `constant`, so this does
- * ZERO chain reads (see DESIGN.md "Tally"). The reserved balance-derived weight path
- * (`erc20-balance`) is where the lazy ceiling/floor early-stop would live; v1 has a trivial
- * `1` ceiling per vote, so the common case simply sums.
+ * Deterministic per-contest aggregation over the CRDT's current bundles. Every aggregated
+ * bundle passed the synchronous offline checks (signature, constraints) at admission; each
+ * entry's {@link BundleChecks} says where its two deferred NETWORK checks stand (the on-chain
+ * gate read and name resolution — run inline by the forward-gate for live gossip, in the
+ * background chain verifier for cold-join admits). The tally never re-does verification: it
+ * sums *weight magnitude* per community, folds each entry's check state into the row's
+ * `chainVerified` / `nameResolved` flags, and orders the rows. In v1 the weight rule is
+ * `constant`, so this does ZERO chain reads (see DESIGN.md "Tally"). The reserved
+ * balance-derived weight path (`erc20-balance`) is where the lazy ceiling/floor early-stop
+ * would live; v1 has a trivial `1` ceiling per vote, so the common case simply sums.
  *
- * Rows are keyed by `community.publicKey`, so votes carrying different (but registry-verified)
- * names for the same key fold into one row. Ties are broken by the rolling seed
- * `sha256(bucketBlockHash ‖ publicKey)` — ungrindable because a future block hash cannot be
- * predicted — and the one block-hash read happens only when an actual tie must be broken.
+ * Rows are keyed by `community.publicKey`, so votes carrying different names for the same key
+ * fold into one row. Ties are broken by the rolling seed `sha256(bucketBlockHash ‖ publicKey)`
+ * — ungrindable because a future block hash cannot be predicted — and the one block-hash read
+ * happens only when an actual tie must be broken.
  */
 
 export interface TallyDeps {
@@ -28,8 +32,11 @@ export interface TallyDeps {
     registry: RuleRegistry;
     chainFor: (ticker: string) => ChainClient;
     bucketMath: BucketMath;
-    /** The CRDT's current bundles (one per wallet, LWW-resolved); empty-votes bundles are withdrawals. */
-    current: () => VotesBundle[];
+    /**
+     * The CRDT's current bundles (one per wallet, LWW-resolved; empty-votes bundles are
+     * withdrawals), each with its deferred-check state (see verify/types.ts `BundleChecks`).
+     */
+    current: () => Array<{ bundle: VotesBundle; checks: BundleChecks }>;
     /**
      * Hash of the current bucket boundary block on the criteria's chain, for the rolling tie
      * seed. Invoked at most once per `compute`, and only when a tie must actually be broken —
@@ -78,17 +85,24 @@ export function makeTally(deps: TallyDeps): Tally {
     };
 
     return {
-        async compute(_options?: TallyOptions): Promise<ContestTally> {
-            // Aggregate weight per community.publicKey; fold registry-verified names into one row.
-            const rows = new Map<string, { name?: string; weight: bigint }>();
-            for (const bundle of current()) {
+        async compute(): Promise<ContestTally> {
+            // Aggregate weight per community.publicKey, folding each contribution's deferred-check
+            // state into the row: `chainVerified` only once EVERY contributing bundle's gate read
+            // confirmed, and the shown name prefers (and reports) a registry-resolved one.
+            const rows = new Map<string, { name?: string; nameResolved?: boolean; weight: bigint; chainVerified: boolean }>();
+            for (const { bundle, checks } of current()) {
                 if (bundle.votes.length === 0) continue; // withdrawal — expresses no vote
                 const w = await weightFor(bundle.address, bundle.blockNumber);
                 for (const v of bundle.votes) {
                     const pk = v.community.publicKey;
-                    const row = rows.get(pk) ?? { weight: 0n };
+                    const row = rows.get(pk) ?? { weight: 0n, chainVerified: true };
                     row.weight += w;
-                    if (!row.name && v.community.name) row.name = v.community.name;
+                    row.chainVerified &&= checks.chainVerified;
+                    // Prefer a resolved name over a still-pending one; never downgrade to pending.
+                    if (v.community.name && row.nameResolved !== true) {
+                        row.name = v.community.name;
+                        row.nameResolved = checks.nameResolved === true;
+                    }
                     rows.set(pk, row);
                 }
             }
@@ -96,7 +110,8 @@ export function makeTally(deps: TallyDeps): Tally {
             const list: CommunityTally[] = [...rows.entries()].map(([publicKey, row]) => ({
                 community: row.name ? { name: row.name, publicKey } : { publicKey },
                 weight: row.weight,
-                verified: true // every contributing bundle was validity-gated before storage
+                chainVerified: row.chainVerified,
+                ...(row.name ? { nameResolved: row.nameResolved } : {})
             }));
 
             // Order by weight desc. Only if two rows tie on weight do we read the boundary

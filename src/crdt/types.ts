@@ -43,11 +43,32 @@ export interface VoteCrdt {
     current(currentBucket: number): VotesBundle[];
 
     /**
+     * {@link current} with each winner's CID alongside its bundle — the CID is the key the
+     * engine's per-bundle check state ({@link BundleChecks}) is tracked under. The optional
+     * `eligible` predicate restricts the LWW reduction to bundles it admits: the checkpoint
+     * encoder passes "fully verified", so a provisionally admitted winner does not HIDE its
+     * verified predecessor from the served checkpoint — the reduction falls back to the newest
+     * bundle that IS eligible. No predicate reduces over everything (the tally's view).
+     */
+    currentEntries(currentBucket: number, eligible?: (cid: CID) => boolean): Array<{ cid: CID; bundle: VotesBundle }>;
+
+    /**
+     * Drop one bundle from the working set — the eviction path for a provisionally admitted
+     * bundle whose deferred chain/name check failed (see verify/background.ts). Local
+     * housekeeping of an invalid admit, not a protocol subtract: the union/LWW semantics over
+     * VALID bundles are untouched, and the block bytes may stay in the blockstore.
+     */
+    remove(cid: CID): void;
+
+    /**
      * Drop bundles older than `voteExpiryBuckets` and those superseded per wallet from the
      * in-memory working set, bounding memory. Correctness does not depend on it — `current`
-     * filters expiry at read time — so this is housekeeping, not the guarantee.
+     * filters expiry at read time — so this is housekeeping, not the guarantee. A superseded
+     * bundle whose superseder is still provisional (per the injected `isProvisional`) is KEPT:
+     * it is the fallback winner if the provisional bundle's deferred check evicts it. Returns
+     * the removed CIDs so the engine can drop their per-bundle check state.
      */
-    prune(currentBucket: number): Promise<void>;
+    prune(currentBucket: number): Promise<CID[]>;
 
     /** Size of the in-memory working set — lets callers/tests observe that `prune` shrinks it. */
     nodeCount(): number;

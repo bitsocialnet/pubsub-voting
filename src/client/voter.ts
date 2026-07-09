@@ -31,12 +31,14 @@ import type { VoteCrdt } from "../crdt/types.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
 import { makeGateResultCache } from "../verify/gate-result-cache.js";
+import { makeBackgroundVerifier, type BackgroundChainVerifier } from "../verify/background.js";
+import type { BundleChecks } from "../verify/types.js";
 import { makeAcceptedDedup } from "../transport/accepted-dedup.js";
 import { encodeCheckpoint } from "../checkpoint/codec.js";
 import { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
 import { makeTally } from "../tally/tally.js";
-import type { ContestTally, TallyOptions } from "../tally/types.js";
+import type { ContestTally } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
@@ -121,12 +123,21 @@ export interface Contest {
     /** Stop syncing and leave the topic. Does not stop the host node. Idempotent. */
     stop(): Promise<void>;
 
-    /** Compute the current contest ranking fresh (verified lazily top-down), bypassing the cache. */
-    getTally(options?: TallyOptions): Promise<ContestTally>;
+    /** Compute the current contest ranking fresh, bypassing the cache. */
+    getTally(): Promise<ContestTally>;
 
-    /** Fired when incoming votes change the state; `tally` carries the freshly recomputed ranking. */
+    /**
+     * Fired when incoming votes change the state; `tally` carries the freshly recomputed
+     * ranking. Background check settlements fire it too: a cold join emits a first tally with
+     * `chainVerified: false` rows immediately, then re-emits as the batched gate reads and name
+     * resolutions land (see DESIGN.md "Background chain verification").
+     */
     on(event: "update", cb: () => void): void;
-    /** Fired on a contest-level failure (e.g. the tally's chain read throws). */
+    /**
+     * Fired on a contest-level failure: the tally's chain read throws, or the background chain
+     * verifier hits an infra-class failure (RPC/resolver down — its bundles stay pending and
+     * retry, but the degradation is surfaced here instead of silently stalling).
+     */
     on(event: "error", cb: (error: unknown) => void): void;
 }
 
@@ -407,8 +418,18 @@ class ContestEngine {
 
         this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
         const store = makeBlockstoreBundleStore(deps.blockstore);
-        this.#crdt = makeVoteCrdt({ store, bucketMath: this.#bucketMath, voteExpiryBuckets: criteria.voteExpiryBuckets });
+        // The CRDT keeps a superseded bundle alive while its superseder's deferred checks are
+        // pending — the fallback winner if the background verifier evicts the newer bundle.
+        this.#crdt = makeVoteCrdt({
+            store,
+            bucketMath: this.#bucketMath,
+            voteExpiryBuckets: criteria.voteExpiryBuckets,
+            isProvisional: (cid) => this.#isPending(cid)
+        });
 
+        // One gate-result cache shared between the inline forward-gate verifier and the
+        // background chain verifier, so neither re-reads a (wallet, sampleBlock) the other settled.
+        const gateResultCache = makeGateResultCache();
         const verifier = makeBundleVerifier({
             criteria,
             criteriaCid: criteriaCidBytes,
@@ -417,21 +438,38 @@ class ContestEngine {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            gateResultCache: makeGateResultCache()
+            gateResultCache
         });
-        // The gate/transport are (re)built on join(); the store, crdt, caches, and verifier are
-        // stable per contest, so they survive re-joins of the topic.
+        // The gate/transport are (re)built on join(); the store, crdt, caches, verifier, and
+        // background verifier are stable per contest, so they survive re-joins of the topic.
         this.#store = store;
         this.#cache = makeVerdictCache();
         this.#acceptedDedup = makeAcceptedDedup(this.#bucketMath);
         this.#verifier = verifier;
+        this.#background = makeBackgroundVerifier({
+            criteria,
+            registry: deps.registry,
+            chainFor: (ticker) => this.#chainFor(ticker),
+            bucketMath: this.#bucketMath,
+            nameResolvers: deps.nameResolvers,
+            gateResultCache,
+            cache: this.#cache,
+            onGateVerified: (cid) => this.#settleCheck(cid, "chainVerified"),
+            onNameResolved: (cid) => this.#settleCheck(cid, "nameResolved"),
+            onEvict: (cid) => this.#evictBundle(cid),
+            onError: (error) => this.#emitError(error),
+            limit: (fn) => this.#backgroundLimit(fn)
+        });
 
         this.#tally = makeTally({
             criteria,
             registry: deps.registry,
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
-            current: () => this.#crdt.current(this.#currentBucketCache),
+            current: () =>
+                this.#crdt
+                    .currentEntries(this.#currentBucketCache)
+                    .map(({ cid, bundle }) => ({ bundle, checks: this.#checksFor(cid, bundle) })),
             bucketBlockHash: () => this.#bucketBlockHash()
         });
     }
@@ -440,6 +478,71 @@ class ContestEngine {
     readonly #cache: ReturnType<typeof makeVerdictCache>;
     readonly #acceptedDedup: ReturnType<typeof makeAcceptedDedup>;
     readonly #verifier: ReturnType<typeof makeBundleVerifier>;
+    /** Deferred network checks for provisionally admitted bundles (see verify/background.ts). */
+    readonly #background: BackgroundChainVerifier;
+    /** Bounds the background verifier's un-batched RPC fallbacks (per-wallet reads, name lookups). */
+    readonly #backgroundLimit = pLimit(GATE_CONCURRENCY);
+    /**
+     * Per-bundle deferred-check state, keyed by bundle CID string. Written at every admit
+     * (settled for a gate-verified live bundle or a cached-verdict hit; pending for a chased
+     * checkpoint bundle or this wallet's own publish), flipped by the background verifier's
+     * settlements, dropped on evict/prune. The tally folds it into each row's
+     * `chainVerified` / `nameResolved`, and the checkpoint encoder serves only fully
+     * settled bundles (never re-serve what we have not verified).
+     */
+    readonly #checks = new Map<string, BundleChecks>();
+
+    /** Does any vote in the bundle carry a `community.name` claim (needing resolution)? */
+    #carriesName(bundle: VotesBundle): boolean {
+        return bundle.votes.some((v) => v.community.name !== undefined);
+    }
+
+    /** Record a bundle's deferred-check state at admit: fully settled, or pending both checks. */
+    #recordChecks(cid: CID, bundle: VotesBundle, settled: boolean): void {
+        this.#checks.set(
+            cid.toString(),
+            this.#carriesName(bundle) ? { chainVerified: settled, nameResolved: settled } : { chainVerified: settled }
+        );
+    }
+
+    /** The bundle's check state, pessimistic (all pending) if somehow unrecorded. */
+    #checksFor(cid: CID, bundle: VotesBundle): BundleChecks {
+        return (
+            this.#checks.get(cid.toString()) ??
+            (this.#carriesName(bundle) ? { chainVerified: false, nameResolved: false } : { chainVerified: false })
+        );
+    }
+
+    /** Admitted but at least one deferred network check unsettled (the CRDT's prune shield). */
+    #isPending(cid: CID): boolean {
+        const checks = this.#checks.get(cid.toString());
+        return checks !== undefined && (!checks.chainVerified || checks.nameResolved === false);
+    }
+
+    /** Every deferred check settled — the bundle may be served in our checkpoint. */
+    #isFullyVerified(cid: CID): boolean {
+        const checks = this.#checks.get(cid.toString());
+        return checks !== undefined && checks.chainVerified && checks.nameResolved !== false;
+    }
+
+    /** A background check confirmed: flip the flag, re-encode the checkpoint, recount the tally. */
+    #settleCheck(cid: CID, key: "chainVerified" | "nameResolved"): void {
+        const checks = this.#checks.get(cid.toString());
+        if (!checks) return; // evicted or pruned while its check was in flight
+        checks[key] = true;
+        this.#onStateChanged();
+    }
+
+    /** A deferred check failed: drop the bundle (its verified predecessor, if any, wins again). */
+    #evictBundle(cid: CID): void {
+        this.#crdt.remove(cid);
+        this.#checks.delete(cid.toString());
+        this.#onStateChanged();
+    }
+
+    #emitError(error: unknown): void {
+        for (const cb of [...this.#errorListeners]) cb(error);
+    }
 
     #chainFor(ticker: string): ChainClient {
         const client = this.#chainClients[ticker];
@@ -510,15 +613,18 @@ class ContestEngine {
     }
 
     /** Compute the current ranking fresh (refreshing the bucket + pruning when state is present). */
-    async computeTally(options?: TallyOptions): Promise<ContestTally> {
+    async computeTally(): Promise<ContestTally> {
         // With state present, refresh the bucket so the tally's `current()` filters expiry against
-        // the live block, then prune the now-decayed nodes. Empty state needs neither, so an
-        // empty tally reads no chain (the constant-weight "zero chain reads" property).
+        // the live block, then prune the now-decayed nodes (dropping their check state with them).
+        // Empty state needs neither, so an empty tally reads no chain (the constant-weight "zero
+        // chain reads" property).
         if (this.#crdt.nodeCount() > 0) {
             await this.#refreshBucket();
-            await this.#crdt.prune(this.#currentBucketCache);
+            for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
+                this.#checks.delete(removed.toString());
+            }
         }
-        return this.#tally.compute(options);
+        return this.#tally.compute();
     }
 
     /** Compute the tally once, cache it, and emit `update`; on failure emit `error` instead. */
@@ -528,7 +634,7 @@ class ContestEngine {
         try {
             tally = await this.computeTally();
         } catch (error) {
-            for (const cb of [...this.#errorListeners]) cb(error);
+            this.#emitError(error);
             return;
         }
         this.#cachedTally = tally;
@@ -589,9 +695,11 @@ class ContestEngine {
             cache: this.#cache,
             acceptedDedup: this.#acceptedDedup,
             // Store the sender's exact block bytes (byte-identity with its CID), then merge.
-            admit: async ({ cid, bytes }) => {
+            // The forward-gate ran the FULL pipeline inline, so the checks arrive settled.
+            admit: async ({ cid, bytes, bundle }) => {
                 await this.#deps.blockstore.put(cid, bytes);
                 await this.#crdt.merge([cid]);
+                this.#recordChecks(cid, bundle, true);
             },
             limit: (fn) => limit(fn),
             allowBundlePeer: makeRateLimiter(GATE_RATE),
@@ -617,15 +725,20 @@ class ContestEngine {
                     return undefined;
                 }
             },
-            verifier: this.#verifier,
+            verifyOffline: (bundle) => this.#verifier.verifyOffline(bundle),
             cache: this.#cache,
             isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
             hasBundle: (cid) => this.#store.has(cid),
-            admit: async ({ cid, bytes }) => {
+            // `verified: false` is a provisional admit (offline checks only) whose deferred gate
+            // read + name resolution ride `deferVerify`; `true` means a cached terminal verdict
+            // already covers the full pipeline.
+            admit: async ({ cid, bytes, bundle, verified }) => {
                 await this.#deps.blockstore.put(cid, bytes);
                 await this.#crdt.merge([cid]);
+                this.#recordChecks(cid, bundle, verified);
                 this.#markStateChanged();
             },
+            deferVerify: (entries) => this.#background.enqueue(entries),
             onMerged: () => this.#onStateChanged(),
             limit: (fn) => chaseLimit(fn),
             timeoutMs: CHASE_TIMEOUT_MS
@@ -637,6 +750,8 @@ class ContestEngine {
         });
         await this.#transport.start();
         this.#joined = true;
+        // Re-kick any deferred checks a previous leave() paused (their bundles are still pending).
+        this.#background.resume();
         // Notify the voter of the real join transition (drives lazy responder registration):
         // a node that participates in a topic serves its root record, symmetric with the
         // heartbeat it broadcasts there.
@@ -768,6 +883,8 @@ class ContestEngine {
     async leave(): Promise<void> {
         if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
         this.#heartbeatTimer = undefined;
+        // Pause the background verifier's retry timer; pending state survives for a re-join.
+        this.#background.stop();
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         this.#chaser = undefined;
@@ -798,7 +915,13 @@ class ContestEngine {
         const address = await signer.address();
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
-        await this.#crdt.add(bundle);
+        const cid = await this.#crdt.add(bundle);
+        // Own bundles take the same deferred path as a chased checkpoint's: admitted
+        // provisionally, then confirmed (or evicted) by the background gate read — so an
+        // ineligible wallet's local tally does not silently disagree with the network's, and
+        // our checkpoint never serves a vote we have not verified (even our own).
+        this.#recordChecks(cid, bundle, false);
+        this.#background.enqueue([{ cid, bundle }]);
         this.#onStateChanged();
         return { bundle, encoded: encodeBundle(bundle) };
     }
@@ -828,7 +951,10 @@ class ContestEngine {
         const bucket = this.#currentBucketCache;
         const cached = this.#rootRecordCache;
         if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
-        const winners = this.#crdt.current(bucket);
+        // Serve only fully verified bundles: a provisional admit must not propagate through our
+        // checkpoint, and the eligibility-filtered LWW reduction falls back to a wallet's newest
+        // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts).
+        const winners = this.#crdt.currentEntries(bucket, (cid) => this.#isFullyVerified(cid)).map((e) => e.bundle);
         const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
         const record: FetchRootRecord = {
@@ -949,8 +1075,8 @@ class ContestView implements Contest {
         await this.#engine.leave();
     }
 
-    getTally(options?: TallyOptions): Promise<ContestTally> {
-        return this.#engine.computeTally(options);
+    getTally(): Promise<ContestTally> {
+        return this.#engine.computeTally();
     }
 
     /**

@@ -176,3 +176,77 @@ describe("makeVoteCrdt — prune bounds the working set", () => {
         expect(current[0].blockNumber).toBe(BLOCKS_PER_BUCKET);
     });
 });
+
+describe("makeVoteCrdt — provisional admits (deferred verification)", () => {
+    function crdtWithProvisional(provisional: Set<string>) {
+        return makeVoteCrdt({
+            store: makeMemoryBundleStore(),
+            bucketMath: makeBucketMath(BLOCKS_PER_BUCKET),
+            voteExpiryBuckets: 2,
+            isProvisional: (cid) => provisional.has(cid.toString())
+        });
+    }
+
+    it("currentEntries with an eligibility filter falls back to the newest ELIGIBLE bundle per wallet", async () => {
+        const c = crdt();
+        const verifiedCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_A }, vote: 1 }], 0));
+        const pendingCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_B }, vote: 1 }], BLOCKS_PER_BUCKET));
+
+        // Unfiltered (the tally view): the newest bundle wins regardless of verification state.
+        const all = c.currentEntries(1);
+        expect(all).toHaveLength(1);
+        expect(all[0].cid.equals(pendingCid)).toBe(true);
+
+        // Filtered (the checkpoint view): with the pending winner ineligible, the wallet's newest
+        // VERIFIED bundle is served instead of the wallet vanishing from the checkpoint.
+        const verifiedOnly = c.currentEntries(1, (cid) => cid.equals(verifiedCid));
+        expect(verifiedOnly).toHaveLength(1);
+        expect(verifiedOnly[0].cid.equals(verifiedCid)).toBe(true);
+    });
+
+    it("remove() evicts a failed provisional bundle and its verified predecessor wins again", async () => {
+        const c = crdt();
+        const oldCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_A }, vote: 1 }], 0));
+        const newCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_B }, vote: 1 }], BLOCKS_PER_BUCKET));
+        expect(c.currentEntries(1)[0].cid.equals(newCid)).toBe(true);
+
+        c.remove(newCid); // the deferred gate read failed — evict
+        const current = c.currentEntries(1);
+        expect(current).toHaveLength(1);
+        expect(current[0].cid.equals(oldCid)).toBe(true);
+    });
+
+    it("prune keeps a superseded bundle while its superseder is provisional, drops it once settled", async () => {
+        const provisional = new Set<string>();
+        const c = crdtWithProvisional(provisional);
+        await c.add(bundle(WALLET, [{ community: { publicKey: KEY_A }, vote: 1 }], 0));
+        const pendingCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_B }, vote: 1 }], BLOCKS_PER_BUCKET));
+        provisional.add(pendingCid.toString());
+
+        // While the winner is provisional, its superseded predecessor is shielded from prune —
+        // it is the fallback if the deferred check evicts the winner.
+        expect(await c.prune(1)).toHaveLength(0);
+        expect(c.nodeCount()).toBe(2);
+
+        // Once the winner settles, the predecessor is prunable again (and reported as removed).
+        provisional.delete(pendingCid.toString());
+        const removed = await c.prune(1);
+        expect(removed).toHaveLength(1);
+        expect(c.nodeCount()).toBe(1);
+        expect(c.currentEntries(1)[0].cid.equals(pendingCid)).toBe(true);
+    });
+
+    it("prune still drops an EXPIRED superseded bundle even under a provisional winner", async () => {
+        const provisional = new Set<string>();
+        const c = crdtWithProvisional(provisional);
+        await c.add(bundle(WALLET, [{ community: { publicKey: KEY_A }, vote: 1 }], 0)); // bucket 0
+        const pendingCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_B }, vote: 1 }], 4 * BLOCKS_PER_BUCKET));
+        provisional.add(pendingCid.toString());
+
+        // At bucket 4 the bucket-0 bundle is past expiry (0 + 2 < 4): an expired fallback is
+        // useless (current() would filter it anyway), so the shield does not apply.
+        const removed = await c.prune(4);
+        expect(removed).toHaveLength(1);
+        expect(c.nodeCount()).toBe(1);
+    });
+});

@@ -2,16 +2,29 @@ import type { CID } from "multiformats/cid";
 import type { VotesBundle } from "../schema/votes.js";
 import { decodeCheckpoint } from "../checkpoint/codec.js";
 import { encodeBundle, bundleCidForBytes } from "../crdt/codec.js";
-import { isCacheableVerdict, type VerdictCache } from "../verify/cache.js";
-import type { BundleVerifier } from "../verify/types.js";
+import type { VerdictCache } from "../verify/cache.js";
+import type { VerifyResult } from "../verify/types.js";
+import type { PendingBundle } from "../verify/background.js";
 
 /**
  * The divergence chase: act on an advertised checkpoint root that differs from our own (a
  * heartbeat or fetch-protocol hint — see DESIGN.md "Checkpoints", "Block pull"). Pull the
  * blocks behind the root by CID (directed bitswap at the connected advertisers, through the
- * injected `getBlock`), verify every inlined bundle **through the same verifier the gate
- * uses**, and admit the survivors — so a single liar cannot inject a bad vote (each bundle
- * self-verifies) nor hide an honest one (union-only merge).
+ * injected `getBlock`) and admit each inlined bundle in two stages:
+ *
+ *   1. **Offline, synchronous, before admit** (µs each): signature + criteria constraints via
+ *      `verifyOffline` — a forged or malformed bundle dies here and is never admitted.
+ *   2. **Network, deferred**: the on-chain gate read and name resolution run in the background
+ *      chain verifier (`deferVerify`, one batch per chased root so the gate reads batch into
+ *      as few RPC round trips as the rule allows), which confirms or evicts each bundle after
+ *      the fact. This is what keeps a cold join non-blocking: a 100-vote checkpoint admits in
+ *      milliseconds instead of serializing 100 chain reads (see DESIGN.md "Background chain
+ *      verification").
+ *
+ * So a single liar cannot inject a forged vote (offline check) nor hide an honest one
+ * (union-only merge); an *ineligible-wallet* bundle it injects is admitted provisionally,
+ * surfaces only as a `chainVerified: false` tally row, is never re-served in our checkpoint,
+ * and is evicted as soon as its batched gate read lands.
  *
  * Bounded like everything at the gate: a shared concurrency cap (`limit`), a per-root
  * deadline whose `AbortSignal` cancels in-flight block wants, and in-flight dedup so a spray
@@ -26,16 +39,23 @@ export interface RootChaserDeps {
      * throw means unavailable. `signal` aborts the want when the per-root deadline fires.
      */
     getBlock: (cid: CID, signal: AbortSignal) => Promise<Uint8Array | undefined>;
-    /** The full validity pipeline for one bundle — the SAME one the forward-gate runs. */
-    verifier: BundleVerifier;
+    /** Stage 1 only — signature + constraints, local and synchronous (the gate's same stage). */
+    verifyOffline: (bundle: VotesBundle) => Promise<VerifyResult>;
     /** The gate's per-CID verdict cache, shared so chased bundles reuse (and feed) it. */
     cache: VerdictCache;
     /** The gate's freshness guard (see gossip-validator.ts); omitted ⇒ no check. */
     isEvaluableNow?: (bundle: VotesBundle) => Promise<boolean>;
     /** Skip bundles we already hold (their CID is in the store) without re-verifying. */
     hasBundle: (cid: CID) => Promise<boolean>;
-    /** Store a verified bundle's block bytes and admit its CID into the CRDT (idempotent). */
-    admit: (args: { cid: CID; bytes: Uint8Array; bundle: VotesBundle }) => Promise<void>;
+    /**
+     * Store an offline-valid bundle's block bytes and admit its CID into the CRDT (idempotent).
+     * `verified: true` means a cached terminal verdict already covers the FULL pipeline (the
+     * bundle was verified before, e.g. by the forward-gate); `verified: false` is a provisional
+     * admit whose deferred checks ride `deferVerify`.
+     */
+    admit: (args: { cid: CID; bytes: Uint8Array; bundle: VotesBundle; verified: boolean }) => Promise<void>;
+    /** Hand one chased root's provisionally admitted bundles to the background chain verifier. */
+    deferVerify: (entries: PendingBundle[]) => void;
     /** Called once per chase that admitted at least one bundle (drives tally updates). */
     onMerged?: () => void;
     /** Concurrency limiter shared across chases (a root spray queues, never floods). */
@@ -62,7 +82,7 @@ export interface RootChaser {
 }
 
 export function makeRootChaser(deps: RootChaserDeps): RootChaser {
-    const { getBlock, verifier, cache, isEvaluableNow, hasBundle, admit, onMerged, limit, timeoutMs } = deps;
+    const { getBlock, verifyOffline, cache, isEvaluableNow, hasBundle, admit, deferVerify, onMerged, limit, timeoutMs } = deps;
     const inFlight = new Set<string>();
 
     async function runChase(root: CID, chunks?: CID[]): Promise<void> {
@@ -91,6 +111,7 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
             if (winners === undefined) return; // deadline hit — the hint contributed nothing
 
             let merged = false;
+            const pending: PendingBundle[] = [];
             for (const bundle of winners) {
                 if (controller.signal.aborted) break;
                 // Re-encoding the decoded bundle reproduces the exact block bytes (the codec is
@@ -101,17 +122,26 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
                 const cached = cache.get(cid);
                 if (cached) {
                     if (!cached.valid) continue; // known bad — skip
-                    await admit({ cid, bytes, bundle });
+                    await admit({ cid, bytes, bundle, verified: true }); // full pipeline already passed
                     merged = true;
                     continue;
                 }
                 if (isEvaluableNow && !(await isEvaluableNow(bundle))) continue; // transient, uncached
-                const verdict = await verifier.verify(bundle);
-                if (isCacheableVerdict(verdict)) cache.set(cid, verdict);
-                if (!verdict.valid) continue; // a liar's injected bundle dies here; honest ones survive
-                await admit({ cid, bytes, bundle });
+                const offline = await verifyOffline(bundle);
+                if (!offline.valid) {
+                    // A liar's forged/malformed bundle dies here, before admit. A provable
+                    // offline reject (bad signature, constraints) is terminal — cache it so a
+                    // re-served copy short-circuits; a transient `ignore` stays uncached.
+                    if (offline.disposition === "reject") cache.set(cid, offline);
+                    continue;
+                }
+                await admit({ cid, bytes, bundle, verified: false });
+                pending.push({ cid, bundle });
                 merged = true;
             }
+            // One batch per chased root: the background verifier groups these by sample block
+            // and batches the gate reads (see verify/background.ts).
+            if (pending.length > 0) deferVerify(pending);
             if (merged) onMerged?.();
         } finally {
             clearTimeout(timer);

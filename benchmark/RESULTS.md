@@ -11,9 +11,13 @@ seeder on a **remote WAN host (~270 ms round-trip)** and the cold joiner local, 
 version tunnelled the data path through an SSH port-forward; that is TCP-over-TCP, and its extra
 buffering/retransmit inflated every round-trip — most of all bitswap, the chattiest step. Dropping
 the tunnel roughly **halved** cold join, and these numbers are the true network path. SSH is now used
-only to launch the remote seeder process.) Chain reads use an instant fake (the `erc721-min-balance`
-gate passes for every wallet), so the numbers isolate peer-to-peer latency; a real chain RPC would add
-its own round-trips on top at verify time.
+only to launch the remote seeder process.) The joiner's chain reads go through the **mock ETH gateway**
+([rpc-gateway.ts](./rpc-gateway.ts)): a real JSON-RPC HTTP server behind a real default-config viem
+client (one POST per read, `retryCount: 3`, multicall3 served), **270 ms charged per RPC round trip**
+(`BENCH_RPC_LATENCY_MS`) — so the deferred, batched gate reads are measured, not free. The seeder keeps
+the instant fake chain (its seeding-time reads are setup, not the join under test). Two end-to-end
+milestones come out: **START→TALLY** (render-ready — the chase admits on offline checks, rows may still
+be `chainVerified: false`) and **START→VERIFIED** (every deferred gate read landed).
 
 **Discovery model:** peers are discovered via an **HTTP content router** (Delegated Routing V1, no
 DHT — the pkc-js pattern), simulated locally with a **~1 s lookup latency paid once**; after that
@@ -29,40 +33,47 @@ Run it yourself: `BENCH_HOST=<ssh-host> npm run bench:cold-join` (see [run.mjs](
 `N` is the number of **voters** (distinct wallets, one ballot each) in the contest's checkpoint. All
 voters vote for one community, so the tally is one community of weight `N`.
 
-| N (voters) | router | connect | fetch | bitswap | verify+merge | **START→TALLY** |
-|-----------:|-------:|--------:|------:|--------:|-------------:|----------------:|
-| 1          | 1.00s  | 1.92s   | 0.90s | 0.93s   | 0.03s        | **3.88s**       |
-| 5          | 1.00s  | 1.93s   | 0.86s | 0.98s   | 0.04s        | **3.91s**       |
-| 10         | 1.00s  | 1.85s   | 0.84s | 0.87s   | 0.05s        | **3.58s**       |
-| 100        | 1.00s  | 1.92s   | 0.91s | 1.33s   | 0.19s        | **4.07s**       |
-| 1000       | 1.00s  | 1.87s   | 0.83s | 1.53s   | 1.45s        | **5.64s**       |
-| 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | **18.95s**      |
+| N (voters) | router | connect | fetch | bitswap | verify+merge | gate-RPC | **START→TALLY** | **START→VERIFIED** |
+|-----------:|-------:|--------:|------:|--------:|-------------:|---------:|----------------:|-------------------:|
+| 1          | 1.00s  | 1.61s   | 0.58s | 0.59s   | 0.32s        | 2        | **3.43s**       | **3.68s**          |
+| 5          | 1.00s  | 1.60s   | 0.59s | 0.59s   | 0.32s        | 2        | **3.12s**       | **3.42s**          |
+| 10         | 1.00s  | 1.61s   | 0.40s | 0.61s   | 0.32s        | 2        | **2.97s**       | **3.28s**          |
+| 100        | 1.00s  | 1.60s   | 0.44s | 0.58s   | 0.47s        | 5        | **3.14s**       | **3.45s**          |
+| 1000       | 1.00s  | 1.61s   | 0.58s | 1.01s   | 2.11s        | 38       | **5.48s**       | **5.48s**          |
+| 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | —        | **18.95s**      | —                  |
 
-*Measured 2026-07-08 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
+*Measured 2026-07-09 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
 large enough that 3 repeats gave unstable per-op medians, so this baseline uses 5). Columns are
 wall-clock timings of each operation but they **overlap** and do not sum to the total — `connect` is
 measured from the `start()` call and already contains the 1 s router wait, and verify runs as blocks
-arrive. `START→TALLY` is the true end-to-end figure.*
+arrive. `START→TALLY` / `START→VERIFIED` are the true end-to-end figures.*
 
-*†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate, later single-contest
-run — a realistic **hot board**: 10,000 distinct voters, each a single-vote bundle, so a 10k-weight
-tally over a ~2.3 MB checkpoint. It is the point where the load stops being network-bound: **verify+merge
-(~12 s, 10k secp256k1 recoveries ≈ 1.2 ms each) and the checkpoint payload (bitswap ~9 s, bandwidth-bound)
+*†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
+the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
+gateway and background chain verification existed, hence no gate-RPC/VERIFIED values) — a realistic
+**hot board**: 10,000 distinct voters, each a single-vote bundle, so a 10k-weight tally over a ~2.3 MB
+checkpoint. It is the point where the load stops being network-bound: **verify+merge (~12 s, 10k
+secp256k1 recoveries ≈ 1.2 ms each) and the checkpoint payload (bitswap ~9 s, bandwidth-bound)
 dominate**, while the flat network terms (router, connect, fetch) stay ~1–2 s. Below ~1000 voters a board
-is network-bound (~4–6 s); a hot board is verify/payload-bound. Recovery parallelism (web workers) or
-rendering from the seeder checkpoint first and verifying lazily are the levers there. Seeding 10k bundles
-required draining the seeder between feeders (it verifies each bundle synchronously, so an un-drained
-backlog starves gossipsub mesh formation) — a benchmark-harness detail, not a client cost.*
+is network-bound (~3–5.5 s); a hot board is verify/payload-bound. Recovery parallelism (web workers) is
+the lever there. Seeding 10k bundles required draining the seeder between feeders (it verifies each
+bundle synchronously, so an un-drained backlog starves gossipsub mesh formation) — a benchmark-harness
+detail, not a client cost.*
 
-**Change since the previous baseline (bitswap chunk-index piggyback).** The checkpoint block pull now
-costs **one** directed-bitswap round-trip instead of two. The fetch-protocol root record carries the
-checkpoint's **chunk-CID index** (`FetchRootRecord.chunks`), which the joiner verifies against the
-root locally and uses to pull every chunk **in parallel** — skipping the root-manifest fetch that
-previously had to complete first just to learn the chunk CIDs (see DESIGN.md "The root record",
-"Block pull"). `bitswap` roughly halved (e.g. `1.72s → 0.93s` at N=1, `3.72s → 1.33s` at N=100), and
-`START→TALLY` fell at every N (`4.59s → 3.88s` at N=1; `8.35s → 4.07s` at N=100; `8.71s → 5.64s` at
-N=1000). At N=1000 the bitswap column is dominated by the ~235 KB payload transfer (one chunk), which
-is bandwidth/jitter-bound, so removing one round-trip helps less there in relative terms.
+**Change since the previous baseline (background chain verification + the mock ETH gateway).** Two
+things changed at once: the joiner's gate reads became *real* (270 ms per RPC round trip through a
+default-config viem client against [rpc-gateway.ts](./rpc-gateway.ts) — previously an instant in-process
+fake, ~0 ms, so the old numbers had **zero** chain-read cost), and the chase stopped verifying them
+inline — bundles admit on the offline checks and the background verifier batches the deferred gate reads
+per bucket sample block via multicall3 `aggregate3` (DESIGN.md "Background chain verification").
+Measured effect: despite the new 270 ms-per-round-trip chain cost, `START→TALLY` *fell* at every N
+(`3.88s → 3.43s` at N=1; `4.07s → 3.14s` at N=100; `5.64s → 5.48s` at N=1000), and the verified tally
+costs only **one extra RPC round trip after render** (`+0.25–0.31s` at N ≤ 100) — at N=1000 the batched
+reads (37 parallel multicall chunks, viem's default 1,024-byte calldata chunking) finish while later
+checkpoint chunks are still merging, so `START→VERIFIED == START→TALLY`. For scale: verifying those
+1000 wallets inline and serially — what the old chase did, invisibly, against the free fake chain —
+would cost 1000 × 270 ms ≈ **270 s** of gate reads before the first tally; the batched background path
+pays **38** round trips, off the render path entirely.
 
 ### Signature verification cost (isolated microbenchmark)
 
@@ -78,25 +89,26 @@ secp256k1), isolated from chain reads and merge, single-threaded on the joiner:
 
 This is the floor under the `verify+merge` column above (the extra there is bundle decode + LWW merge).
 **v1 expectation: ≤ ~1,000 voters per contest**, so per-contest signature verify is **≤ ~1.1 s** — not a
-bottleneck at v1 sizes. It is embarrassingly parallel (web workers) and the tally verifies lazily
-top-down (only enough to lock the ranking), so both the wall-clock and the count verified are typically
-lower; it becomes a visible cost only on much larger boards (10k+ voters ≈ 11 s single-threaded).
+bottleneck at v1 sizes. It is embarrassingly parallel (web workers) and runs synchronously before admit
+(the chase's offline stage); the chain reads it used to be lumped with are deferred and batched instead
+(DESIGN.md "Background chain verification"). It becomes a visible cost only on much larger boards
+(10k+ voters ≈ 11 s single-threaded).
 
 ### Fetch sub-phase split (median of 5)
 
 The root-record fetch was instrumented into its two RTT-bound sub-phases — the `connection.newStream`
-multistream-select negotiation vs the request write→response read — to find where its ~0.9 s goes:
+multistream-select negotiation vs the request write→response read — to find where its ~0.4–0.6 s goes:
 
 | N (voters) | fetch | negotiate (mss) | write→read |
 |-----------:|------:|----------------:|-----------:|
-| 1          | 0.90s | 0.60s           | 0.32s      |
-| 5          | 0.86s | 0.56s           | 0.31s      |
-| 10         | 0.84s | 0.56s           | 0.28s      |
-| 100        | 0.91s | 0.59s           | 0.28s      |
-| 1000       | 0.83s | 0.54s           | 0.28s      |
+| 1          | 0.58s | 0.38s           | 0.20s      |
+| 5          | 0.59s | 0.37s           | 0.21s      |
+| 10         | 0.40s | 0.19s           | 0.20s      |
+| 100        | 0.44s | 0.21s           | 0.19s      |
+| 1000       | 0.58s | 0.38s           | 0.21s      |
 
-**The multistream-select negotiation (~0.55 s, ~2 RTT) dominates the fetch, not the actual
-request/response (~0.3 s, ~1 RTT).** This is the `mss.select` handshake `connection.newStream` runs
+**The multistream-select negotiation (~0.2–0.4 s, ~1–2 RTT) dominates the fetch, not the actual
+request/response (~0.2 s, ~1 RTT).** This is the `mss.select` handshake `connection.newStream` runs
 before the fetch stream is usable. libp2p exposes an optimistic 0-RTT path (`newStream({
 negotiateFully: false })`) that would cut ~1 RTT here, but it is a **no-op in the host's pinned stack**
 (libp2p `3.3.4` + yamux `8.0.1`): yamux ignores the early single-protocol hint, so full negotiation
@@ -112,30 +124,41 @@ host muxer/libp2p upgrade and is tracked as deferred pkc-js work (DESIGN.md, "De
 | `connect` | Dial the named provider + noise/yamux/identify handshake (from `start()`, so it includes the 1 s router wait). |
 | `fetch` | Pull the tiny root record over the libp2p **fetch** protocol. |
 | `bitswap` | Pull the checkpoint chunk blocks over directed **bitswap** — **one** round-trip, since the chunk-CID index rides the fetch response (chunks pulled in parallel, root manifest skipped). |
-| `verify+merge` | Recover every ballot's EIP-712 signature, run the gate, LWW-merge into the winner-set. |
-| `START→TALLY` | End-to-end: `start()` → `getTally()` reflects all `N` voters. |
+| `verify+merge` | Recover every ballot's EIP-712 signature offline, LWW-merge into the winner-set (residual: tally-ready minus the last network op; the deferred gate reads run in the background and do not block it). |
+| `gate-RPC` | HTTP round trips to the mock ETH gateway during the join — the head read plus the background verifier's batched gate reads (multicall3 `aggregate3` chunks, sent in parallel). |
+| `START→TALLY` | End-to-end to render-ready: `start()` → `getTally()` reflects all `N` voters (rows may still be `chainVerified: false`). |
+| `START→VERIFIED` | End-to-end to trust-ready: the ranking row reads `chainVerified: true` (every deferred gate read landed). |
 
 ### Reading the numbers
 
-- **Cold join is ~3.6–4.1 s for a small contest and ~5.6 s at 1000 voters** over a real
-  intercontinental link. Small-`N` joins are network-bound and flat (~3.6–4.1 s); at 1000 the
-  per-voter verify work starts to dominate.
+- **Cold join renders in ~3.0–3.4 s for a small contest and ~5.5 s at 1000 voters** over a real
+  intercontinental link, and **chain-verifies one RPC round trip later (~+0.3 s at N ≤ 100, +0 s at
+  N=1000)**. Small-`N` joins are network-bound and flat; at 1000 the per-voter offline verify work
+  starts to dominate.
+- **The gate reads never gate the render.** `gate-RPC` grows with distinct wallets (2 round trips at
+  N ≤ 10, 5 at N=100, 38 at N=1000 — viem chunks one logical multicall into parallel ~1 KB `aggregate3`
+  posts) but runs in the background; unbatched-and-serial the N=1000 reads alone would be ~270 s.
 - **The router is not the bottleneck** — a fixed 1 s, paid once. The remaining cost is RTT-bound
-  steps: the connection **handshake (~1.9 s)**, the root-record **fetch (~0.9 s)**, and **bitswap
-  (~0.9–1.5 s, now one block round-trip)**. WAN jitter is real at this RTT — individual repeats still
-  spike (a single N=1000 bitswap hit 4.5 s), which is why this baseline takes the median of 5.
-- **bitswap is now one round-trip, not two** (the chunk-index piggyback above), so it is no longer the
+  steps: the connection **handshake (~1.6 s)**, the root-record **fetch (~0.4–0.6 s)**, and **bitswap
+  (~0.6–1.0 s, one block round-trip)**. WAN jitter is real at this RTT — individual repeats still
+  spike (a single N=1 fetch hit 1.5 s), which is why this baseline takes the median of 5.
+- **bitswap is one round-trip, not two** (the chunk-index piggyback), so it is no longer the
   dominant small-contest lever. The remaining avoidable network cost is the **fetch's
-  multistream-select negotiation** (~2 RTT of its ~0.9 s — see the sub-phase table), but removing it
-  needs a host muxer/libp2p change, not a library change.
-- **verify scales with `N`** as expected (0.03 s → ~1.45 s for 1000 signature recoveries) and is the
-  dominant term only at 1000.
+  multistream-select negotiation** (~1–2 RTT of its ~0.4–0.6 s — see the sub-phase table), but removing
+  it needs a host muxer/libp2p change, not a library change.
+- **verify+merge scales with `N`** as expected (~0.3 s flat floor → ~2.1 s at 1000: signature
+  recoveries plus decode/merge, all offline) and is the dominant term only at 1000.
 
 ## For contrast
 
 - **Loopback floor (~0 ms RTT):** the same cold join runs in **~1.1 s** (dominated by the simulated
-  1 s router latency). The ~3.6–5.6 s WAN figure is almost entirely round-trip cost — exactly what
+  1 s router latency). The ~3.0–5.5 s WAN figure is almost entirely round-trip cost — exactly what
   loopback would have hidden.
+- **Instant-fake chain, inline chase verification (superseded, the previous baseline):** gate reads
+  cost ~0 ms and ran inline in the chase, so `START→TALLY` (3.6–4.1 s small-N, 5.6 s at N=1000) was
+  the only milestone and silently assumed free chain reads. The current baseline pays a realistic
+  270 ms per RPC round trip and still renders *faster*, because the reads moved off the render path
+  and batch via multicall3.
 - **Two-round-trip bitswap (superseded, the previous baseline):** before the chunk-index piggyback,
   the checkpoint pull fetched the root manifest and then its chunks sequentially (**bitswap
   1.7–3.7 s**, **START→TALLY 4.6–8.7 s**). Carrying the chunk index on the fetch response collapsed
@@ -157,7 +180,9 @@ leaderboards **at once**, every one provided by the SAME shared seeder (the bits
 and waits until EVERY contest has a usable tally. Where the single-contest benchmark above measures
 one board, this measures what happens when a directory of boards loads together over **one reused
 connection**. Same rig: seeder on the ~270 ms-RTT WAN host, joiner local, dialed directly (no tunnel),
-fake-instant chain. `N` is voters **per contest**; every contest is a distinct synthetic criteria doc
+chain reads through the mock ETH gateway (270 ms per RPC round trip; tally-ready here is
+**render-ready** — the deferred gate reads batch in the background and never gate the convergence
+curve). `N` is voters **per contest**; every contest is a distinct synthetic criteria doc
 (distinct CID/topic) that inherits the `/biz/` gate — the real 5chan directory is **63 contests**
 (`5chan-directory-criteria.jsonc`).
 
@@ -181,9 +206,13 @@ aggregate and `START→ALL-TALLIES` is the true wall-clock to every board being 
 | M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** |
 |-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|
 | | *(amortized once)* | *(once)* | *(once)* | *(per contest)* | *(per contest)* | *(aggregate)* | *(wall-clock)* |
-| 1            | 1.00s  | 2.02s   | 3.01s    | 1.12s    | 1.36s      | 0.12s        | **5.76s** |
-| 10           | 1.00s  | 0.88s   | 1.45s    | 0.89s    | 0.95s      | 0.17s        | **3.26s** |
-| **63**       | 1.00s  | 0.87s   | 1.42s    | 0.81s    | 1.41s      | 0.20s        | **5.45s** |
+| 1            | 1.00s  | 1.65s   | 2.01s    | 0.55s    | 0.59s      | 0.39s        | **3.26s** |
+| 10           | 1.00s  | 0.60s   | 0.98s    | 0.56s    | 0.63s      | 0.25s        | **2.33s** |
+| **63**       | 1.00s  | 0.59s   | 0.98s    | 0.74s    | 1.44s      | 0.29s        | **5.04s** |
+
+*Measured 2026-07-09 (same run family as the single-contest baseline above: mock ETH gateway, background
+chain verification — the previous directory baseline, 2026-07-08 with the instant fake chain and inline
+chase verification, read 5.76s / 3.26s / 5.45s respectively).*
 
 ## Parallelism + convergence (N=10 voters/contest, median of 5)
 
@@ -193,23 +222,25 @@ directory that fills in progressively is visible.
 
 | M (contests) | conns | converged | fetches | Σfetch | Σbitswap | payload | conv-p50 | conv-p90 | **START→ALL** |
 |-------------:|------:|:---------:|--------:|-------:|---------:|--------:|---------:|---------:|--------------:|
-| 1            | 1     | 1/1       | 1       | 0.92s  | 0.98s    | 4 KiB   | 4.77s    | 4.77s    | **5.76s** |
-| 10           | 1     | 10/10     | 10      | 8.95s  | 9.46s    | 43 KiB  | 2.79s    | 3.26s    | **3.26s** |
-| **63**       | 1     | **63/63** | 63      | 51.23s | 88.82s   | 271 KiB | 3.50s    | 4.84s    | **5.45s** |
+| 1            | 1     | 1/1       | 1       | 0.55s  | 0.59s    | 4 KiB   | 3.26s    | 3.26s    | **3.26s** |
+| 10           | 1     | 10/10     | 10      | 5.63s  | 6.32s    | 43 KiB  | 2.32s    | 2.33s    | **2.33s** |
+| **63**       | 1     | **63/63** | 63      | 46.47s | 90.59s   | 271 KiB | 3.32s    | 4.29s    | **5.04s** |
 
 ### Reading the numbers
 
-- **The full 63-board directory cold-loads in ~5.5s** and converges 63/63; going 1→10→63 boards barely
-  moves the wall-clock. `conns=1` at every `M` — all root-record fetches + checkpoint pulls ride one
-  connection, so `connect`/`identify` are paid once and the per-board fetch/bitswap overlap.
+- **The full 63-board directory cold-loads (render-ready) in ~5s** and converges 63/63; going 1→10→63
+  boards barely moves the wall-clock. `conns=1` at every `M` — all root-record fetches + checkpoint
+  pulls ride one connection, so `connect`/`identify` are paid once and the per-board fetch/bitswap
+  overlap.
 - **`Σfetch`/`Σbitswap` grow with `M` but the total does not** — the ops run concurrently, so the sum
-  of 63 overlapping fetches (51s) collapses to a ~5.5s wall-clock. The per-contest cost is flat
-  (~0.8–1.4s fetch, ~1–1.4s bitswap) regardless of directory size.
-- **Verify is negligible at N=10** (≤0.2s for up to 630 recoveries). It scales with total ballots
-  (~1.5 ms/recovery single-threaded), so it becomes the dominant term only for a mature directory
-  (hundreds of voters × 63 boards).
+  of 63 overlapping fetches (46s) collapses to a ~5s wall-clock. The per-contest cost is flat
+  (~0.55–0.75s fetch, ~0.6–1.4s bitswap) regardless of directory size.
+- **Verify is negligible at N=10** (≤0.4s for up to 630 recoveries — all offline; the boards' gate
+  reads batch in the background behind one shared gateway and never gate the convergence curve). It
+  scales with total ballots (~1.5 ms/recovery single-threaded), so it becomes the dominant term only
+  for a mature directory (hundreds of voters × 63 boards).
 - Numbers taken against a **default** libp2p node (fetch handler `maxInboundStreams = 32`); the
   cold-start fetch retry rides out that cap so the naive all-at-once join converges fully. WAN jitter
-  is large at this RTT — individual reps spike (one M=63 rep hit 21s), hence median-of-5. See DESIGN.md
+  is large at this RTT — individual reps spike (one M=63 rep hit 7.9s), hence median-of-5. See DESIGN.md
   ("Checkpoints → pull", "Deferred pkc-js work") for why the naive join needs the retry and the
   optional host-side stream-cap speedup.

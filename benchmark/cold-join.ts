@@ -2,7 +2,8 @@ import { PubsubVoter } from "../dist/client/voter.js";
 import { TOPIC_PREFIX } from "../dist/topic.js";
 import { makeHostNode, waitFor, type HostNode } from "./host-node.js";
 import { startRouter, type RunningRouter } from "./router.js";
-import { benchChains, benchCriteria } from "./signing.js";
+import { startRpcGateway, type RunningGateway } from "./rpc-gateway.js";
+import { benchGatewayChains, benchCriteria } from "./signing.js";
 
 /**
  * Cold-join benchmark — COLD JOINER side (runs locally; discovers the remote seeder via an HTTP
@@ -22,9 +23,15 @@ import { benchChains, benchCriteria } from "./signing.js";
  * network ops are timed by wrapping the injected `blockstore.get` + `fetch` seams (no production
  * changes); the router lookup shares this process's `performance.now()` clock.
  *
+ * The joiner's chain client is a REAL default-config viem client against the local mock ETH
+ * gateway (rpc-gateway.ts), each RPC round trip charged `BENCH_RPC_LATENCY_MS` — so the deferred
+ * gate reads (batched into multicalls by the background verifier) are measured, not free. Two
+ * total milestones come out: `start->tally` (render-ready, rows possibly `chainVerified: false`)
+ * and `start->verified` (every deferred gate read landed).
+ *
  * Usage: `node benchmark/cold-join.js <providerAddr> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
  *   `<providerAddr>` is the seeder's full dialable multiaddr, e.g. `/ip4/1.2.3.4/tcp/41000/p2p/<id>`.
- * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000).
+ * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000), `BENCH_RPC_LATENCY_MS` (default 270).
  */
 
 /** One timed operation on the cold-join path, in ms relative to the `start()` call (t0). */
@@ -67,8 +74,20 @@ export interface ColdJoinMilestones {
     firstUpdateMs: number | null;
     /** Residual verify+merge+decode time: tallyReady − (end of the last network op), ms. */
     verifyMergeMs: number | null;
-    /** `start()` call → `getTally()` reflects all N voters (the UI-ready signal) — end-to-end, ms. */
+    /**
+     * `start()` call → `getTally()` reflects all N voters (the UI-ready signal) — end-to-end, ms.
+     * Provisional: the row may still be `chainVerified: false` here (the batched background gate
+     * reads land after render — see DESIGN.md "Background chain verification").
+     */
     tallyReadyMs: number;
+    /** `start()` call → the ranking row reads `chainVerified: true` (every gate read landed), ms. */
+    verifiedTallyMs: number;
+    /**
+     * Gate-read RPC traffic against the mock ETH gateway (t0-relative requests only): HTTP
+     * round trips paid, split by shape, plus the inner reads a multicall carried. This is the
+     * column that makes the one-read-per-wallet cliff (or the batched fix) visible.
+     */
+    gateRpc: { requests: number; ethCalls: number; multicallReads: number; latencyMs: number };
     /** Every timed network op, t0-relative, for a full waterfall if needed. */
     ops: OpTiming[];
 }
@@ -81,6 +100,8 @@ export interface ColdJoinArgs {
     expectedN: number;
     /** Simulated HTTP-router latency (ms). Default 1000. */
     routerLatencyMs?: number;
+    /** Simulated ETH-gateway latency per RPC round trip (ms). Default 270 (the bench WAN's RTT). */
+    rpcLatencyMs?: number;
     /** Overall ceiling for the whole join (ms); a hung join throws instead of hanging forever. */
     timeoutMs?: number;
 }
@@ -172,6 +193,7 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
     // The local HTTP content router: names the seeder as the provider of the criteria CID, after a
     // realistic ~1s lookup latency. This is the ONLY way the cold node learns about the seeder.
     let router: RunningRouter | undefined;
+    let gateway: RunningGateway | undefined;
     let node: HostNode | undefined;
     let voter: PubsubVoter | undefined;
     try {
@@ -179,9 +201,14 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             providers: new Map([[cidString, { id: args.seederPeerId, addrs: [providerAddr] }]]),
             latencyMs: args.routerLatencyMs ?? 1000
         });
+        // The mock ETH gateway: the joiner's gate reads go through a REAL default-config viem
+        // client to this JSON-RPC server, each HTTP round trip charged `rpcLatencyMs` — so the
+        // background verifier's batched (or unbatched) chain reads cost what they would against
+        // a public endpoint (see rpc-gateway.ts).
+        gateway = await startRpcGateway({ latencyMs: args.rpcLatencyMs ?? 270 });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchChains() });
+        voter = new PubsubVoter({ helia: node.helia, chains: benchGatewayChains(gateway.url) });
         const network = await voter.createContest({ criteria: benchCriteria() });
         if (network.topic !== args.topic) {
             throw new Error(`derived topic ${network.topic} != seeder topic ${args.topic} (criteria mismatch)`);
@@ -213,7 +240,9 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             if (firstUpdateAbs === null) firstUpdateAbs = performance.now();
         });
 
-        // Poll the tally until every seeded voter is pulled, verified, and merged.
+        // Poll the tally until every seeded voter is pulled, offline-verified, and merged — the
+        // render-ready milestone. The row is typically still `chainVerified: false` here: the
+        // chase admits on the offline checks and defers the gate reads.
         const target = BigInt(args.expectedN);
         await waitFor(
             async () => {
@@ -224,6 +253,28 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             `tally to reflect all ${args.expectedN} voters`
         );
         const tallyReadyMs = performance.now() - t0;
+
+        // Then until the background verifier settles every deferred gate read (batched into
+        // multicalls) and the row flips `chainVerified: true` — the trust-ready milestone.
+        await waitFor(
+            async () => {
+                const tally = await network.getTally();
+                return (tally.ranking[0]?.weight ?? 0n) >= target && tally.ranking[0]!.chainVerified;
+            },
+            timeoutMs,
+            `all ${args.expectedN} voters to chain-verify`
+        );
+        const verifiedTallyMs = performance.now() - t0;
+
+        // Gate-read RPC traffic paid during the join (requests arriving after t0).
+        const rpcJoined = gateway.requests.filter((r) => r.atMs >= t0);
+        const rpcEthCalls = rpcJoined.filter((r) => r.method === "eth_call");
+        const gateRpc = {
+            requests: rpcJoined.length,
+            ethCalls: rpcEthCalls.length,
+            multicallReads: rpcEthCalls.reduce((sum, r) => sum + (r.reads > 1 ? r.reads : 0), 0),
+            latencyMs: args.rpcLatencyMs ?? 270
+        };
 
         // --- assemble the per-operation breakdown (t0-relative) ---
         const ops: OpTiming[] = events
@@ -275,11 +326,14 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             firstUpdateMs: firstUpdateAbs === null ? null : firstUpdateAbs - t0,
             verifyMergeMs: lastNetEndMs > 0 ? tallyReadyMs - lastNetEndMs : null,
             tallyReadyMs,
+            verifiedTallyMs,
+            gateRpc,
             ops
         };
     } finally {
         await voter?.stop().catch(() => {});
         await node?.stop().catch(() => {});
+        await gateway?.stop().catch(() => {});
         await router?.stop().catch(() => {});
     }
 }
@@ -293,7 +347,8 @@ async function main(): Promise<void> {
         throw new Error("usage: cold-join.js <providerAddr> <seederPeerId> <topic> <N>");
     }
     const routerLatencyMs = process.env.BENCH_ROUTER_LATENCY_MS ? Number(process.env.BENCH_ROUTER_LATENCY_MS) : 1000;
-    const r = await measureColdJoin({ providerAddr, seederPeerId, topic, expectedN, routerLatencyMs });
+    const rpcLatencyMs = process.env.BENCH_RPC_LATENCY_MS ? Number(process.env.BENCH_RPC_LATENCY_MS) : 270;
+    const r = await measureColdJoin({ providerAddr, seederPeerId, topic, expectedN, routerLatencyMs, rpcLatencyMs });
     const s = (ms: number | null): string => (ms === null ? "n/a" : `${(ms / 1000).toFixed(2)}s`);
     process.stderr.write(
         `[cold-join] N=${r.n}\n` +
@@ -301,7 +356,9 @@ async function main(): Promise<void> {
             `  cold-start:  fetch=${s(r.fetch.totalMs)} (${r.fetch.count}x, negotiate=${s(r.fetchPhases.negotiateMs)} write→read=${s(r.fetchPhases.writeReadMs)}) ` +
             `bitswap=${s(r.blockGets.totalMs)} (${r.blockGets.networkCount} net/${r.blockGets.count} gets, max ${s(r.blockGets.maxMs)}) ` +
             `verify+merge=${s(r.verifyMergeMs)}\n` +
-            `  total:       start->tally=${s(r.tallyReadyMs)}  (first-update ${s(r.firstUpdateMs)})\n`
+            `  gate rpc:    ${r.gateRpc.requests} round trips @${r.gateRpc.latencyMs}ms (${r.gateRpc.ethCalls} eth_call, ` +
+            `${r.gateRpc.multicallReads} reads via multicall)\n` +
+            `  total:       start->tally=${s(r.tallyReadyMs)}  start->verified=${s(r.verifiedTallyMs)}  (first-update ${s(r.firstUpdateMs)})\n`
     );
     process.stdout.write(`RESULT ${JSON.stringify(r)}\n`);
 }

@@ -71,4 +71,28 @@ export type BundleVerdict = BundleVerdictValid | VerifyFail;
 /** Runs the full validity pipeline for one already-fetched, schema-parsed bundle. */
 export interface BundleVerifier {
     verify(bundle: VotesBundle): Promise<BundleVerdict>;
+    /**
+     * Stage 1 only: signature + criteria constraints — local, µs, no chain read and no name
+     * resolution. This is what admits a bundle *provisionally* on the cold-join chase path; the
+     * deferred network checks (gate chain read, name resolution) then run in the background
+     * chain verifier and either confirm the bundle or evict it (see verify/background.ts and
+     * DESIGN.md "Background chain verification").
+     */
+    verifyOffline(bundle: VotesBundle): Promise<VerifyResult>;
+}
+
+/**
+ * The per-bundle record of the two deferred *network* checks. The offline checks (signature,
+ * constraints) are never recorded here — they are synchronous preconditions for admission, so
+ * an admitted bundle has always passed them.
+ *
+ *   - `chainVerified`: the gate `rule` scored the wallet `> 0n` at the bucket block. `false`
+ *     means "not yet read", never "failed" — a failed gate evicts the bundle instead.
+ *   - `nameResolved`: `undefined` when the bundle carries no `community.name`; `false` while
+ *     the carried name is unresolved; `true` once it resolved to the claimed `publicKey`. A
+ *     name that resolves to a DIFFERENT key evicts the bundle (it is never counted unchecked).
+ */
+export interface BundleChecks {
+    chainVerified: boolean;
+    nameResolved?: boolean;
 }
