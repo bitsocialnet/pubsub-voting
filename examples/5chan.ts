@@ -81,7 +81,8 @@ if (!voter.readOnly) {
         votes: [{ community: { name: "bizfinance.bso", publicKey: "12D3KooW...someCommunityKey" }, vote: 1 }]
     });
     vote.on("publishingstatechange", (state) => console.log(`biz vote: ${state}`));
-    const bundle = await vote.publish();
+    const { bundle, recipientCount } = await vote.publish();
+    console.log(`biz vote sent directly to ${recipientCount} peer(s)`); // first-hop reach, not total propagation
 
     // Keeping it alive is 5chan's job: it schedules a refresh before the vote expires. A vote
     // sampled at bucket b expires once the current bucket exceeds b + voteExpiryBuckets; the

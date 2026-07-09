@@ -34,7 +34,7 @@ function fakePubsub() {
         topicValidators,
         publish: async (topic, data) => {
             published.push({ topic, data });
-            return undefined;
+            return { recipients: [fakePeer("recipient1"), fakePeer("recipient2")] };
         },
         subscribe: (t) => {
             subscribed.add(t);
@@ -111,7 +111,8 @@ describe("makeVoteTransport", () => {
 
     it("publishes a bundle as an inline live delta", async () => {
         const h = await harness();
-        await h.transport.publishBundle(encodeBundle(h.bundle));
+        const { recipientCount } = await h.transport.publishBundle(encodeBundle(h.bundle));
+        expect(recipientCount).toBe(2); // gossipsub's `recipients.length` surfaced to the caller
         expect(h.published).toHaveLength(1);
         expect(h.published[0].topic).toBe(TOPIC);
         const message = decodeVoteMessage(h.published[0].data);

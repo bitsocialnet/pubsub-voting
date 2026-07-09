@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { CID } from "multiformats/cid";
+import type { PeerId } from "@libp2p/interface";
 import { PubsubVoter, republishIntervalBuckets, type PublishingState } from "./voter.js";
 import {
     decodeVoteMessage,
@@ -71,7 +72,7 @@ function dupContestIdManifest(): unknown {
  * publish/heartbeat calls `publishBundle`/`publishRootRecord` → `publish`. Otherwise a no-op node.
  */
 function spyableHelia(): { helia: HeliaInstance; publish: ReturnType<typeof vi.fn> } {
-    const publish = vi.fn(async () => undefined);
+    const publish = vi.fn(async () => ({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] }));
     const pubsub = {
         publish,
         subscribe: () => {},
@@ -189,10 +190,11 @@ describe("createContestVote (publish path)", () => {
         vote.on("publishingstatechange", (s) => states.push(s));
         expect(vote.publishingState).toBe("stopped");
 
-        const bundle = await vote.publish();
+        const { bundle, recipientCount } = await vote.publish();
         expect(states).toEqual(["signing", "publishing", "succeeded"]);
         expect(vote.publishingState).toBe("succeeded");
         expect(vote.bundle).toBe(bundle);
+        expect(recipientCount).toBe(1); // gossipsub `recipients.length`, surfaced through the facade
         expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
         // blockNumber is the bucket boundary: bucketForBlock(43200)=1, sampleBlockForBucket(1)=43200.
         expect(bundle.blockNumber).toBe(43200);

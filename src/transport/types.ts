@@ -45,8 +45,17 @@ export type TopicValidatorResult = "accept" | "reject" | "ignore";
  * (topic validators, fetch protocol) is design-only and may widen this as it lands.
  */
 export interface PubsubService {
-    /** Broadcast bytes to a topic mesh. */
-    publish(topic: string, data: Uint8Array): Promise<unknown>;
+    /**
+     * Broadcast bytes to a topic mesh. gossipsub resolves to `{ recipients }` — the peers it
+     * *directly sent the RPC to* at publish time (first-hop fan-out, filtered for send failures),
+     * NOT total network reach and NOT an acceptance confirmation (each recipient still runs the
+     * forward-gate). With the host's default `floodPublish`, that's every connected topic peer
+     * above the publish score threshold. Typed loosely (`recipients` optional) so a non-gossipsub
+     * pubsub still satisfies it; the transport reads `recipients?.length ?? 0`. Note gossipsub
+     * *rejects* with `NoPeersSubscribedToTopic` when it would send to zero peers unless the host
+     * sets `allowPublishToZeroTopicPeers`.
+     */
+    publish(topic: string, data: Uint8Array): Promise<{ recipients?: readonly PeerId[] }>;
     /** Join a topic; received messages arrive via the "message" event. */
     subscribe(topic: string): void;
     /** Leave a topic. */
@@ -137,8 +146,13 @@ export interface VoteTransport {
     start(): Promise<void>;
     stop(): Promise<void>;
 
-    /** Publish one bundle's exact binary block bytes as a live delta (a new vote, a client re-publish, or a withdrawal). */
-    publishBundle(blockBytes: Uint8Array): Promise<void>;
+    /**
+     * Publish one bundle's exact binary block bytes as a live delta (a new vote, a client
+     * re-publish, or a withdrawal). Resolves `recipientCount`: how many peers gossipsub sent the
+     * message directly to (see {@link PubsubService.publish} for what that number does and does not
+     * mean).
+     */
+    publishBundle(blockBytes: Uint8Array): Promise<{ recipientCount: number }>;
 
     /** Publish a root-record heartbeat (see DESIGN.md "Checkpoints"). */
     publishRootRecord(record: RootRecord): Promise<void>;

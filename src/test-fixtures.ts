@@ -1,5 +1,6 @@
 import { createPublicClient, http } from "viem";
 import type { Criteria } from "./schema/criteria.js";
+import type { PeerId } from "@libp2p/interface";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./transport/types.js";
 import type { ChainClient, ChainClientFactory } from "./chain/types.js";
 import type { VoteSigner } from "./signer/types.js";
@@ -37,7 +38,8 @@ export function bizCriteria(): Criteria {
 /** A no-op gossipsub service carrying an (empty) topic-validator map, as gossipsub exposes. */
 function fakePubsub(): PubsubService {
     return {
-        publish: async () => undefined,
+        // Report a single recipient, as gossipsub resolves `{ recipients }` for a delivered message.
+        publish: async () => ({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] }),
         subscribe: () => {},
         unsubscribe: () => {},
         getSubscribers: () => [],

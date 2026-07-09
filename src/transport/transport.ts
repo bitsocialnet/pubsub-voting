@@ -50,7 +50,10 @@ export function makeVoteTransport(deps: VoteTransportDeps): VoteTransport {
         },
 
         async publishBundle(blockBytes: Uint8Array) {
-            await pubsub.publish(topic, encodeBundleMessage(blockBytes));
+            // gossipsub resolves `{ recipients }`; a non-gossipsub pubsub may resolve nothing —
+            // fall back to 0 rather than assume the shape.
+            const result = await pubsub.publish(topic, encodeBundleMessage(blockBytes));
+            return { recipientCount: result?.recipients?.length ?? 0 };
         },
 
         async publishRootRecord(record: RootRecord) {

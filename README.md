@@ -79,13 +79,15 @@ const winner = contest.tally?.ranking[0]?.community;      // { name?: string, pu
 ```ts
 const vote = await voter.createContestVote({ contestId: "biz", votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
 vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → succeeded (or failed)
-const bundle = await vote.publish();                             // resolves the signed VotesBundle
+const { bundle, recipientCount } = await vote.publish();          // the signed VotesBundle + how many peers gossipsub sent it directly to
 
 // Withdraw (active): publish an empty ballot; it supersedes the prior vote under LWW.
 await (await voter.createContestVote({ contestId: "biz", votes: [] })).publish();
 ```
 
 A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, and at tally time the name is resolved through the injected `nameResolvers` and any bundle whose name does not resolve to the claimed `publicKey` is dropped. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
+
+`recipientCount` is the peer-reach hint gossipsub reports: how many peers it sent the vote *directly* to at publish time (first-hop fan-out, filtered for send failures) — **not** total network reach, and **not** an acceptance confirmation, since each recipient still runs the forward-gate before re-forwarding. Treat it as a coarse "did this reach anyone?" signal. Note that gossipsub *rejects* the publish with `NoPeersSubscribedToTopic` when it would reach zero peers (common right after joining, before the mesh grafts), unless the host enables `allowPublishToZeroTopicPeers` — so a resolved `recipientCount === 0` only occurs under that host setting; otherwise a no-reach publish surfaces as a thrown error (and a `failed` state).
 
 `publish()` on a voter built without a `signer` throws `ReadOnlyError` (and emits an `error`).
 

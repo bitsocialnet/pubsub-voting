@@ -92,6 +92,21 @@ export function republishIntervalBuckets(criteria: Criteria): number {
 /** A vote publication's lifecycle, walked by {@link ContestVote.publish}. */
 export type PublishingState = "stopped" | "signing" | "publishing" | "succeeded" | "failed";
 
+/** What {@link ContestVote.publish} resolves: the signed bundle plus a peer-reach hint. */
+export interface PublishOutcome {
+    /** The signed bundle; its `blockNumber` drives the client's own refresh schedule. */
+    readonly bundle: VotesBundle;
+    /**
+     * How many peers gossipsub sent this vote *directly* to — first-hop fan-out, not total network
+     * reach and not an acceptance confirmation (each recipient still runs the forward-gate before
+     * re-forwarding). Handy as a coarse "did this reach anyone?" signal: `0` means the message went
+     * nowhere. Note gossipsub instead *rejects* the publish with `NoPeersSubscribedToTopic` when it
+     * would reach zero peers, unless the host enables `allowPublishToZeroTopicPeers` — so a
+     * resolved `recipientCount === 0` only happens under that host setting.
+     */
+    readonly recipientCount: number;
+}
+
 /** One contest's reactive read view: subscribe, keep the tally in sync, read it. */
 export interface Contest {
     /** The criteria document this contest runs (already validated). */
@@ -137,13 +152,14 @@ export interface ContestVote {
 
     /**
      * Sign the votes into a bundle for the current bucket, add it to the local CRDT, and broadcast
-     * it once as a live delta. Joins the topic first if needed. Resolves the `VotesBundle` (whose
-     * `blockNumber` the client uses to schedule its own refresh — see
-     * {@link republishIntervalBuckets}). Emits `publishingstatechange` as it goes; throws (and emits
-     * `error`) on failure, and `ReadOnlyError` with no signer. This library does not re-publish: to
-     * keep the vote alive, call `publish()` again before it expires.
+     * it once as a live delta. Joins the topic first if needed. Resolves a {@link PublishOutcome}:
+     * the `VotesBundle` (whose `blockNumber` the client uses to schedule its own refresh — see
+     * {@link republishIntervalBuckets}) plus `recipientCount`, the number of peers gossipsub sent
+     * the vote directly to. Emits `publishingstatechange` as it goes; throws (and emits `error`) on
+     * failure, and `ReadOnlyError` with no signer. This library does not re-publish: to keep the
+     * vote alive, call `publish()` again before it expires.
      */
-    publish(): Promise<VotesBundle>;
+    publish(): Promise<PublishOutcome>;
 
     /** Fired on each `publishingState` transition. */
     on(event: "publishingstatechange", cb: (state: PublishingState) => void): void;
@@ -789,9 +805,12 @@ class ContestEngine {
         return { bundle, encoded: encodeBundle(bundle) };
     }
 
-    /** Broadcast an encoded bundle inline as a live delta (this wallet's own delta, never the set). */
-    async broadcastBundle(encoded: Uint8Array): Promise<void> {
-        await this.#transport?.publishBundle(encoded);
+    /**
+     * Broadcast an encoded bundle inline as a live delta (this wallet's own delta, never the set).
+     * Returns how many peers gossipsub sent it directly to (0 if there is no live transport).
+     */
+    async broadcastBundle(encoded: Uint8Array): Promise<{ recipientCount: number }> {
+        return (await this.#transport?.publishBundle(encoded)) ?? { recipientCount: 0 };
     }
 
     /** Invalidate the on-demand checkpoint cache: the winner-set changed (publish/merge/chase). */
@@ -993,7 +1012,7 @@ class ContestVotePublication implements ContestVote {
         for (const cb of [...this.#errorCbs]) cb(error);
     }
 
-    async publish(): Promise<VotesBundle> {
+    async publish(): Promise<PublishOutcome> {
         // Fail before joining a read-only voter needlessly to the topic.
         if (this.#engine.readOnly) {
             const error = new ReadOnlyError();
@@ -1006,9 +1025,9 @@ class ContestVotePublication implements ContestVote {
             const { bundle, encoded } = await this.#engine.signVote([...this.votes]);
             this.#bundle = bundle;
             this.#setState("publishing");
-            await this.#engine.broadcastBundle(encoded);
+            const { recipientCount } = await this.#engine.broadcastBundle(encoded);
             this.#setState("succeeded");
-            return bundle;
+            return { bundle, recipientCount };
         } catch (error) {
             this.#fail(error);
             throw error;
