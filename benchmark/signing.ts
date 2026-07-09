@@ -51,6 +51,30 @@ export function benchManifest(): DirectoryManifest {
 }
 
 /**
+ * The synthetic contestId for slot `i` in the directory-load benchmark (`c0`, `c1`, …). Kept as a
+ * pure function so the seeder and the cold joiner derive the SAME criteria CID (hence the same
+ * pubsub topic) for slot `i` without exchanging anything but `M`.
+ */
+export function benchContestId(i: number): string {
+    return `c${i}`;
+}
+
+/**
+ * A synthetic **directory manifest** of `m` contests for the directory-load benchmark — a 5chan-style
+ * cold load where one shared seeder provides many contest topics at once. Every slot inherits the
+ * same `/biz/` gate/weight/expiry from `defaults` (so all `m` derived documents are valid criteria),
+ * and differs only in `contestId` (`c0`…`c{m-1}`), which makes each one a DISTINCT canonical document
+ * → distinct CID → distinct topic. This mirrors the real 5chan directory's shape (one topic per
+ * contest, shared seeder) without pinning the real 5chan CIDs.
+ */
+export function benchDirectoryManifest(m: number): DirectoryManifest {
+    if (!Number.isInteger(m) || m < 1) throw new Error(`bad contest count M: ${m}`);
+    const { name: _name, contestId: _contestId, ...defaults } = benchCriteria();
+    const contests = Array.from({ length: m }, (_, i) => ({ contestId: benchContestId(i), name: `bench contest ${benchContestId(i)}` }));
+    return DirectoryManifestSchema.parse({ name: "bench-directory", defaults, contests });
+}
+
+/**
  * A chain factory that answers instantly with no network: `getBlockNumber` fixes the head (so the
  * current bucket is stable), `getBlock` supplies the tie-break block hash, and `readContract`
  * returns `min` so the `erc721-min-balance` gate passes for every wallet. This makes chain reads

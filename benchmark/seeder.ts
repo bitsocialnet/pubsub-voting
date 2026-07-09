@@ -25,12 +25,16 @@ const FEED_CHUNK = 240;
 
 async function seedVoters(seeder: HostNode, topic: string, network: VoteNetwork, count: number): Promise<void> {
     const ctx = await makeSigningContext(benchCriteria());
-    const feeders: HostNode[] = [];
     let published = 0;
+    // One feeder per chunk, DRAINED before the next: publish a chunk, wait for the seeder to
+    // verify+merge everything so far, then drop the feeder and spin the next. The seeder verifies
+    // each bundle synchronously (secp256k1 recovery blocks the event loop), so if feeders keep
+    // arriving while a verify backlog drains, the next feeder's gossipsub mesh formation starves and
+    // times out — which is exactly how large seeds (N≥10k) died. Draining keeps the event loop free
+    // when each new feeder meshes, at the cost of a serial seed.
     for (let offset = 0; offset < count; offset += FEED_CHUNK) {
         const chunk = Math.min(FEED_CHUNK, count - offset);
         const feeder = await makeHostNode({ host: "127.0.0.1" });
-        feeders.push(feeder);
         feeder.subscribe(topic);
         await connectPeers(feeder, seeder, topic);
         for (let i = 0; i < chunk; i++) {
@@ -38,22 +42,16 @@ async function seedVoters(seeder: HostNode, topic: string, network: VoteNetwork,
             await feeder.publish(topic, encodeBundleMessage(encodeBundle(bundle)));
             published++;
         }
-        process.stderr.write(`[seeder] published ${published}/${count} voters via ${feeders.length} feeder(s)\n`);
+        const target = BigInt(published);
+        await waitFor(
+            async () => ((await network.getTally()).ranking[0]?.weight ?? 0n) >= target,
+            120_000,
+            `seeder to merge ${published} voters`
+        );
+        await feeder.stop();
+        process.stderr.write(`[seeder] merged ${published}/${count} voters\n`);
     }
-
-    // Wait for the seeder's own gate to verify + merge every published voter into its tally.
-    const target = BigInt(count);
-    await waitFor(
-        async () => {
-            const tally = await network.getTally();
-            return (tally.ranking[0]?.weight ?? 0n) >= target;
-        },
-        120_000,
-        `seeder to merge all ${count} voters`
-    );
-    // Feeders have done their job; drop them so only the seeder answers cold-join pulls.
-    await Promise.all(feeders.map((f) => f.stop()));
-    // Let the mesh settle after the feeders disconnect before we advertise readiness.
+    // Let the mesh settle after the last feeder disconnects before we advertise readiness.
     await delay(500);
 }
 

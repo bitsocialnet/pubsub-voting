@@ -36,12 +36,23 @@ voters vote for one community, so the tally is one community of weight `N`.
 | 10         | 1.00s  | 1.85s   | 0.84s | 0.87s   | 0.05s        | **3.58s**       |
 | 100        | 1.00s  | 1.92s   | 0.91s | 1.33s   | 0.19s        | **4.07s**       |
 | 1000       | 1.00s  | 1.87s   | 0.83s | 1.53s   | 1.45s        | **5.64s**       |
+| 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | **18.95s**      |
 
 *Measured 2026-07-08 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
 large enough that 3 repeats gave unstable per-op medians, so this baseline uses 5). Columns are
 wall-clock timings of each operation but they **overlap** and do not sum to the total — `connect` is
 measured from the `start()` call and already contains the 1 s router wait, and verify runs as blocks
 arrive. `START→TALLY` is the true end-to-end figure.*
+
+*†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate, later single-contest
+run — a realistic **hot board**: 10,000 distinct voters, each a single-vote bundle, so a 10k-weight
+tally over a ~2.3 MB checkpoint. It is the point where the load stops being network-bound: **verify+merge
+(~12 s, 10k secp256k1 recoveries ≈ 1.2 ms each) and the checkpoint payload (bitswap ~9 s, bandwidth-bound)
+dominate**, while the flat network terms (router, connect, fetch) stay ~1–2 s. Below ~1000 voters a board
+is network-bound (~4–6 s); a hot board is verify/payload-bound. Recovery parallelism (web workers) or
+rendering from the seeder checkpoint first and verifying lazily are the levers there. Seeding 10k bundles
+required draining the seeder between feeders (it verifies each bundle synchronously, so an un-drained
+backlog starves gossipsub mesh formation) — a benchmark-harness detail, not a client cost.*
 
 **Change since the previous baseline (bitswap chunk-index piggyback).** The checkpoint block pull now
 costs **one** directed-bitswap round-trip instead of two. The fetch-protocol root record carries the
@@ -52,6 +63,24 @@ previously had to complete first just to learn the chunk CIDs (see DESIGN.md "Th
 `START→TALLY` fell at every N (`4.59s → 3.88s` at N=1; `8.35s → 4.07s` at N=100; `8.71s → 5.64s` at
 N=1000). At N=1000 the bitswap column is dominated by the ~235 KB payload transfer (one chunk), which
 is bandwidth/jitter-bound, so removing one round-trip helps less there in relative terms.
+
+### Signature verification cost (isolated microbenchmark)
+
+Per-bundle EIP-712 signature recovery (`verifyBundleSignature` → viem `recoverTypedDataAddress`, pure-JS
+secp256k1), isolated from chain reads and merge, single-threaded on the joiner:
+
+| | |
+|---|---|
+| per signature | **1.12 ms** (~900/s, single-threaded) |
+| 100 voters | ~0.11 s |
+| 1,000 voters | ~1.1 s |
+| 10,000 voters | ~11 s |
+
+This is the floor under the `verify+merge` column above (the extra there is bundle decode + LWW merge).
+**v1 expectation: ≤ ~1,000 voters per contest**, so per-contest signature verify is **≤ ~1.1 s** — not a
+bottleneck at v1 sizes. It is embarrassingly parallel (web workers) and the tally verifies lazily
+top-down (only enough to lock the ranking), so both the wall-clock and the count verified are typically
+lower; it becomes a visible cost only on much larger boards (10k+ voters ≈ 11 s single-threaded).
 
 ### Fetch sub-phase split (median of 5)
 
@@ -118,3 +147,69 @@ host muxer/libp2p upgrade and is tracked as deferred pkc-js work (DESIGN.md, "De
   join waited for subscription gossip to propagate (~5 s over the WAN link) before it could even
   start fetching, for **~11–16 s** end-to-end. HTTP-router discovery replaces that ~5 s wait with the
   1 s router lookup.
+
+---
+
+# Directory cold-load — many contests, one shared seeder
+
+**What this measures:** a **5chan.app-style cold load** — a fresh peer with no data joins `M` contest
+leaderboards **at once**, every one provided by the SAME shared seeder (the bitsocial-seeder pattern),
+and waits until EVERY contest has a usable tally. Where the single-contest benchmark above measures
+one board, this measures what happens when a directory of boards loads together over **one reused
+connection**. Same rig: seeder on the ~270 ms-RTT WAN host, joiner local, dialed directly (no tunnel),
+fake-instant chain. `N` is voters **per contest**; every contest is a distinct synthetic criteria doc
+(distinct CID/topic) that inherits the `/biz/` gate — the real 5chan directory is **63 contests**
+(`5chan-directory-criteria.jsonc`).
+
+Each voter is one wallet signing one **single-vote** bundle (the `/biz/` gate is `maxVotesPerAddress:
+1`, `voteSchema: {min:1,max:1}`), so **N voters = N bundles = tally weight N** (1:1:1). The bundle
+counts below are therefore just the per-contest voter counts. Network cost is flat in `N`; only
+verify+merge and the checkpoint payload scale with it — the per-board scaling up to a realistic hot
+board (10k voters) is the single-contest table above.
+
+Run it: `BENCH_HOST=<ssh-host> npm run bench:directory-load` (sweeps `BENCH_MS` contests × `BENCH_N`
+voters/contest — either can be a comma list). The joiner takes `BENCH_JOIN_CONCURRENCY` (sliding-window
+batch size) and `BENCH_JOIN_TIMEOUT_MS`; the seeder takes `BENCH_SEED_CONCURRENCY`.
+
+## Per-operation latency (N=10 voters/contest, median of 5)
+
+All `M` contests are joined at once (naive), over one shared connection. `router`/`connect`/`identify`
+are paid a single time across the whole directory; `fetch`/`bitswap` are shown **per contest** (the
+cost of one board's op — they overlap, so they do NOT sum to the total); `verify+merge` is the
+aggregate and `START→ALL-TALLIES` is the true wall-clock to every board being ready.
+
+| M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** |
+|-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|
+| | *(amortized once)* | *(once)* | *(once)* | *(per contest)* | *(per contest)* | *(aggregate)* | *(wall-clock)* |
+| 1            | 1.00s  | 2.02s   | 3.01s    | 1.12s    | 1.36s      | 0.12s        | **5.76s** |
+| 10           | 1.00s  | 0.88s   | 1.45s    | 0.89s    | 0.95s      | 0.17s        | **3.26s** |
+| **63**       | 1.00s  | 0.87s   | 1.42s    | 0.81s    | 1.41s      | 0.20s        | **5.45s** |
+
+## Parallelism + convergence (N=10 voters/contest, median of 5)
+
+`Σfetch`/`Σbitswap` are the sum across the `M` concurrent ops (not wall-clock); `conv-p50`/`conv-p90`
+are the convergence curve — when the median / 90th-percentile board's tally became ready — so a
+directory that fills in progressively is visible.
+
+| M (contests) | conns | converged | fetches | Σfetch | Σbitswap | payload | conv-p50 | conv-p90 | **START→ALL** |
+|-------------:|------:|:---------:|--------:|-------:|---------:|--------:|---------:|---------:|--------------:|
+| 1            | 1     | 1/1       | 1       | 0.92s  | 0.98s    | 4 KiB   | 4.77s    | 4.77s    | **5.76s** |
+| 10           | 1     | 10/10     | 10      | 8.95s  | 9.46s    | 43 KiB  | 2.79s    | 3.26s    | **3.26s** |
+| **63**       | 1     | **63/63** | 63      | 51.23s | 88.82s   | 271 KiB | 3.50s    | 4.84s    | **5.45s** |
+
+### Reading the numbers
+
+- **The full 63-board directory cold-loads in ~5.5s** and converges 63/63; going 1→10→63 boards barely
+  moves the wall-clock. `conns=1` at every `M` — all root-record fetches + checkpoint pulls ride one
+  connection, so `connect`/`identify` are paid once and the per-board fetch/bitswap overlap.
+- **`Σfetch`/`Σbitswap` grow with `M` but the total does not** — the ops run concurrently, so the sum
+  of 63 overlapping fetches (51s) collapses to a ~5.5s wall-clock. The per-contest cost is flat
+  (~0.8–1.4s fetch, ~1–1.4s bitswap) regardless of directory size.
+- **Verify is negligible at N=10** (≤0.2s for up to 630 recoveries). It scales with total ballots
+  (~1.5 ms/recovery single-threaded), so it becomes the dominant term only for a mature directory
+  (hundreds of voters × 63 boards).
+- Numbers taken against a **default** libp2p node (fetch handler `maxInboundStreams = 32`); the
+  cold-start fetch retry rides out that cap so the naive all-at-once join converges fully. WAN jitter
+  is large at this RTT — individual reps spike (one M=63 rep hit 21s), hence median-of-5. See DESIGN.md
+  ("Checkpoints → pull", "Deferred pkc-js work") for why the naive join needs the retry and the
+  optional host-side stream-cap speedup.

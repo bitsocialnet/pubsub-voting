@@ -64,6 +64,14 @@ export interface HostNodeOptions {
      * queries the router — which is how the cold joiner discovers the seeder.
      */
     routerUrls?: string[];
+    /**
+     * Override the libp2p **fetch** service's `maxInboundStreams`/`maxOutboundStreams`. libp2p 3.3.4
+     * defaults every protocol handler to 32 inbound (registrar.js `DEFAULT_MAX_INBOUND_STREAMS`), so a
+     * shared seeder rejects the 33rd concurrent root-record fetch — which strands a big directory that
+     * cold-joins all its contests at once. Raising this on the SEEDER lets a naive all-at-once join
+     * pull every checkpoint. Models the host-side (pkc-js) config that would ship in production.
+     */
+    fetchMaxStreams?: number;
 }
 
 /** Build one real libp2p + Helia node with gossipsub + fetch, ready to back a `PubsubVoter`. */
@@ -81,7 +89,11 @@ export async function makeHostNode(options: HostNodeOptions = {}): Promise<HostN
         services: {
             ...routers,
             identify: identify(),
-            fetch: fetchService(),
+            fetch: fetchService(
+                options.fetchMaxStreams !== undefined
+                    ? { maxInboundStreams: options.fetchMaxStreams, maxOutboundStreams: options.fetchMaxStreams }
+                    : {}
+            ),
             pubsub: gossipsub({
                 allowPublishToZeroTopicPeers: true,
                 ...(options.heartbeatInterval !== undefined ? { heartbeatInterval: options.heartbeatInterval } : {}),

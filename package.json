@@ -21,7 +21,8 @@
     "test:watch": "vitest",
     "test:integration": "vitest run -c vitest.integration.config.ts",
     "build:bench": "tsc -p benchmark/tsconfig.json",
-    "bench:cold-join": "node benchmark/run.mjs"
+    "bench:cold-join": "node benchmark/run.mjs",
+    "bench:directory-load": "node benchmark/run-directory.mjs"
   },
   "dependencies": {
     "@ipld/dag-cbor": "9.2.7",
