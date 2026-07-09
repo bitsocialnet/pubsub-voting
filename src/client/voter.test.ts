@@ -20,7 +20,8 @@ import {
     MissingManifestError,
     MissingPubsubError,
     ReadOnlyError,
-    UnknownContestError
+    UnknownContestError,
+    VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
 import {
@@ -312,6 +313,62 @@ describe("PubsubVoter lifecycle", () => {
         await voter.createContest({ contestId: "biz" });
         await expect(voter.stop()).resolves.toBeUndefined();
     });
+
+    it("stop() lets a pre-existing contest update() again (client stays reusable)", async () => {
+        const voter = new PubsubVoter({ helia: fakeHelia(), chains: fakeChains(), manifest: bizManifest() });
+        const contest = await voter.createContest({ contestId: "biz" });
+        let updates = 0;
+        contest.on("update", () => {
+            updates += 1;
+        });
+        await contest.update();
+        expect(updates).toBe(1);
+
+        await voter.stop();
+        // Reusable: the same contest object re-joins and re-emits its initial tally after stop().
+        await expect(contest.update()).resolves.toBeUndefined();
+        expect(updates).toBe(2);
+        expect(contest.tally).toEqual({ contestId: "biz", ranking: [] });
+        await voter.stop();
+    });
+
+    it("destroy() is terminal: create + start paths reject afterward", async () => {
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: fakeChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest()
+        });
+        await voter.destroy();
+        await expect(voter.createContest({ contestId: "biz" })).rejects.toThrow(VoterDestroyedError);
+        await expect(voter.createContestVote({ contestId: "biz", votes: VOTE })).rejects.toThrow(VoterDestroyedError);
+        await expect(voter.start()).rejects.toThrow(VoterDestroyedError);
+    });
+
+    it("destroy() stops pre-existing contests and forbids re-update / re-publish", async () => {
+        const voter = new PubsubVoter({
+            helia: fakeHelia(),
+            chains: fakeChains(),
+            signer: fakeSigner(),
+            manifest: bizManifest()
+        });
+        const contest = await voter.createContest({ contestId: "biz" });
+        const vote = await voter.createContestVote({ contestId: "biz", votes: VOTE });
+        await contest.update(); // live before teardown
+        await voter.destroy();
+
+        // A contest obtained before destroy can no longer update.
+        await expect(contest.update()).rejects.toThrow(VoterDestroyedError);
+
+        // A ballot obtained before destroy can no longer publish: it emits `error` and ends failed.
+        let errored: unknown;
+        vote.on("error", (error) => {
+            errored = error;
+        });
+        await expect(vote.publish()).rejects.toThrow(VoterDestroyedError);
+        expect(errored).toBeInstanceOf(VoterDestroyedError);
+        expect(vote.publishingState).toBe("failed");
+    });
 });
 
 describe("checkpoint root record (on-demand encode + cache)", () => {
@@ -418,6 +475,16 @@ describe("root-record heartbeat", () => {
         // stop() disarms the timer: no further heartbeats.
         await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3);
         expect(rootPublishes(h.publish)).toBe(2);
+    });
+
+    it("destroy() disarms the heartbeat (all contests stopped)", async () => {
+        const h = await heartbeatHarness();
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+        expect(rootPublishes(h.publish)).toBe(1);
+        await h.voter.destroy();
+        // Terminal teardown clears the timer just like stop(): no further heartbeats.
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS * 3);
+        expect(rootPublishes(h.publish)).toBe(1);
     });
 
     it("suppresses its heartbeat when a matching root was heard this interval", async () => {

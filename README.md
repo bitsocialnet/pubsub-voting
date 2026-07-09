@@ -113,13 +113,13 @@ const contests = await Promise.all(voter.contestIds.map((contestId) => voter.cre
 
 ### Whole-directory lifecycle (`start` / `stop` / `destroy`)
 
-For a seeder or full host that wants to participate in and serve *every* contest at once, `voter.start()` joins all of them and registers the checkpoint fetch responder; a light client can skip it and just `createContest`/`createContestVote` the slots it cares about. `stop()` leaves the topics (reusable); `destroy()` is the discard path (there is no store to dispose — republishing is the client's concern — so it mirrors `stop`).
+For a seeder or full host that wants to participate in and serve *every* contest at once, `voter.start()` joins all of them and registers the checkpoint fetch responder; a light client can skip it and just `createContest`/`createContestVote` the slots it cares about. `stop()` leaves the topics but keeps the voter **reusable** — each `Contest` can `update()` again and you can `start()`/`createContest` afterward. `destroy()` is **terminal** (like pkc-js): it leaves every topic, unregisters the responder, and marks the voter and its contests dead — any later `createContest`/`createContestVote`/`start`, or a pre-existing `Contest.update()`/`ContestVote.publish()`, throws `VoterDestroyedError`. Construct a new `PubsubVoter` to participate again. (There is no store to dispose — republishing is the client's concern.)
 
 ```ts
 const voter = new PubsubVoter({ helia, chains, signer, manifest }); // manifest owned by the voter
 await voter.start();     // join + serve every contest
 // … app runs …
-await voter.destroy();   // leave all topics, unregister the responder
+await voter.destroy();   // terminal: leave all topics, unregister the responder, forbid reuse
 ```
 
 ### Pure helpers (no node, no network)

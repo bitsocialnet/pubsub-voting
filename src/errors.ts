@@ -150,6 +150,24 @@ export class UnknownContestError extends Error {
     }
 }
 
+/**
+ * Thrown once a voter has been `destroy()`ed and something tries to keep using it. Unlike `stop()`
+ * (which leaves every topic but keeps the client reusable), `destroy()` is terminal: every contest
+ * is stopped and can no longer update or publish. Surfaced by `createContest` / `createContestVote`
+ * / `start`, and by a pre-existing `Contest.update()` / `ContestVote.publish()`. Construct a new
+ * `PubsubVoter` to participate again.
+ */
+export class VoterDestroyedError extends Error {
+    constructor() {
+        super(
+            "This voter has been destroyed: its contests are stopped and can no longer update or " +
+                "publish. `destroy()` is terminal (unlike the reusable `stop()`). Construct a new " +
+                "PubsubVoter to participate again."
+        );
+        this.name = "VoterDestroyedError";
+    }
+}
+
 /** Thrown when a publish (vote/withdraw) is attempted on a voter constructed without a signer. */
 export class ReadOnlyError extends Error {
     constructor() {

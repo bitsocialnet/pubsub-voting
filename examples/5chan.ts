@@ -93,5 +93,7 @@ if (!voter.readOnly) {
     await (await voter.createContestVote({ contestId: "biz", votes: [] })).publish();
 }
 
-// On shutdown: leave all topics and unregister the fetch responder.
+// On shutdown: terminal teardown — leave all topics, unregister the fetch responder, and forbid
+// reuse (a later create/update/publish throws VoterDestroyedError). Use voter.stop() to leave
+// topics but keep the voter reusable.
 await voter.destroy();

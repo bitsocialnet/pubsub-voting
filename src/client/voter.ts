@@ -41,7 +41,14 @@ import type { VoteSigner } from "../signer/types.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import { deriveCriteria, type DirectoryManifest } from "../manifest/manifest.js";
-import { DuplicateContestIdError, MissingManifestError, ReadOnlyError, UnknownContestError, UnknownRuleError } from "../errors.js";
+import {
+    DuplicateContestIdError,
+    MissingManifestError,
+    ReadOnlyError,
+    UnknownContestError,
+    UnknownRuleError,
+    VoterDestroyedError
+} from "../errors.js";
 
 /**
  * The recommended cadence, in buckets, at which a client should re-publish a live vote to keep
@@ -170,14 +177,20 @@ export interface VoteClient {
      * cares about. Idempotent to the extent engines join idempotently.
      */
     start(): Promise<void>;
-    /** Leave every topic and unregister the fetch responder. The client stays reusable. */
+    /**
+     * Leave every topic and unregister the fetch responder, resetting each read view so it can
+     * `update()` again. The client stays fully reusable — call `start()` / `createContest` after.
+     */
     stop(): Promise<void>;
-    /** Leave every contest this client joined (no responder change). */
+    /** Leave every contest this client joined and reset its read views (no responder change). */
     stopAll(): Promise<void>;
     /**
-     * Full teardown: leave every topic and unregister the fetch responder. There is no store to
-     * dispose (republishing / persistence is the client's concern), so this currently mirrors
-     * `stop`; it stays as the discard path for symmetry and forward-compatibility.
+     * Terminal teardown (mirrors pkc-js `destroy`): leave every topic, unregister the fetch
+     * responder, and mark the voter and all its contests destroyed. Unlike `stop`, this is NOT
+     * reusable — every subsequent `createContest` / `createContestVote` / `start`, and any
+     * pre-existing `Contest.update()` / `ContestVote.publish()`, throws `VoterDestroyedError`.
+     * Construct a new `PubsubVoter` to participate again. There is no store to dispose
+     * (republishing / persistence is the client's concern).
      */
     destroy(): Promise<void>;
 }
@@ -332,6 +345,11 @@ class ContestEngine {
     #transport: VoteTransport | undefined;
     /** True between `join()` and `leave()`; makes both idempotent so views + `start()` compose. */
     #joined = false;
+    /**
+     * True once the owning voter was `destroy()`ed. Terminal: {@link join} then throws, so no view
+     * or publication over this engine can go live again (see DESIGN.md / `VoterDestroyedError`).
+     */
+    #destroyed = false;
 
     /** Subscribers to state changes; a Contest view registers one of each. Tally recompute is gated on these. */
     readonly #updateListeners: Array<() => void> = [];
@@ -545,7 +563,13 @@ class ContestEngine {
         this.#kickTallyRefresh();
     }
 
+    /** Mark this engine terminal: a subsequent {@link join} (update/publish) throws. Sync; leave separately. */
+    markDestroyed(): void {
+        this.#destroyed = true;
+    }
+
     async join(): Promise<void> {
+        if (this.#destroyed) throw new VoterDestroyedError();
         if (this.#joined) return;
         const limit = pLimit(GATE_CONCURRENCY);
         const gate = makeGossipGate({
@@ -1022,6 +1046,8 @@ export class PubsubVoter implements VoteClient {
     readonly #criteriaById: Map<string, Criteria>;
     /** True once the fetch responder is registered (by `start()`), so teardown can unregister once. */
     #responderRegistered = false;
+    /** True once `destroy()` ran. Terminal: every create/start path then throws (mirrors pkc-js). */
+    #destroyed = false;
 
     constructor(options: PubsubVoterOptions) {
         // Fail fast: the node must expose a gossipsub service, a blockstore, and a libp2p
@@ -1059,7 +1085,13 @@ export class PubsubVoter implements VoteClient {
         return [...this.#criteriaById.keys()];
     }
 
+    /** Guard the create/start paths after {@link destroy}: a destroyed voter is terminal. */
+    #assertLive(): void {
+        if (this.#destroyed) throw new VoterDestroyedError();
+    }
+
     async createContest(args: { contestId: string }): Promise<Contest> {
+        this.#assertLive();
         const engine = await this.#engineFor(this.#criteriaOrThrow(args.contestId));
         const existing = this.#views.get(engine.topic);
         if (existing) return existing;
@@ -1069,6 +1101,7 @@ export class PubsubVoter implements VoteClient {
     }
 
     async createContestVote(args: { contestId: string; votes: Vote[] }): Promise<ContestVote> {
+        this.#assertLive();
         const engine = await this.#engineFor(this.#criteriaOrThrow(args.contestId));
         return new ContestVotePublication(engine, args.contestId, args.votes);
     }
@@ -1111,6 +1144,7 @@ export class PubsubVoter implements VoteClient {
     };
 
     async start(): Promise<void> {
+        this.#assertLive();
         const engines = await Promise.all([...this.#criteriaById.values()].map((criteria) => this.#engineFor(criteria)));
         // One responder for every contest this voter serves, keyed by the shared topic prefix.
         if (!this.#responderRegistered) {
@@ -1127,10 +1161,21 @@ export class PubsubVoter implements VoteClient {
     }
 
     async stopAll(): Promise<void> {
+        // Reset each read view (detach its engine listeners, clear `#subscribed`) so it can
+        // `update()` again — this is what keeps `stop()` reusable. Then leave any engine with no
+        // view (created via `createContestVote` / `start`); `leave()` is idempotent, so
+        // double-leaving a view's engine is a no-op.
+        await Promise.all([...this.#views.values()].map((view) => view.stop()));
         await Promise.all([...this.#engines.values()].map((engine) => engine.leave()));
     }
 
     async destroy(): Promise<void> {
+        // Terminal, mirroring pkc-js: mark the voter and every engine destroyed BEFORE tearing
+        // down, so any create/start path and any pre-existing view/publication (whose `update()` /
+        // `publish()` funnels through `engine.join()`) now throws `VoterDestroyedError`. `stopAll()`
+        // then resets the views and leaves every topic. Unlike `stop()`, the client does not come back.
+        this.#destroyed = true;
+        for (const engine of this.#engines.values()) engine.markDestroyed();
         this.#unregisterResponder();
         await this.stopAll();
     }
