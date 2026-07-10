@@ -206,13 +206,14 @@ aggregate and `START→ALL-TALLIES` is the true wall-clock to every board being 
 | M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** |
 |-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|
 | | *(amortized once)* | *(once)* | *(once)* | *(per contest)* | *(per contest)* | *(aggregate)* | *(wall-clock)* |
-| 1            | 1.00s  | 1.65s   | 2.01s    | 0.55s    | 0.59s      | 0.39s        | **3.26s** |
-| 10           | 1.00s  | 0.60s   | 0.98s    | 0.56s    | 0.63s      | 0.25s        | **2.33s** |
-| **63**       | 1.00s  | 0.59s   | 0.98s    | 0.74s    | 1.44s      | 0.29s        | **5.04s** |
+| 1            | 1.00s  | 1.59s   | 1.97s    | 0.56s    | 0.58s      | 0.43s        | **3.26s** |
+| 10           | 1.00s  | 0.60s   | 0.97s    | 0.57s    | 0.62s      | 0.24s        | **2.51s** |
+| **63**       | 1.00s  | 0.60s   | 1.02s    | 0.54s    | 1.01s      | 0.21s        | **3.87s** |
 
-*Measured 2026-07-09 (same run family as the single-contest baseline above: mock ETH gateway, background
-chain verification — the previous directory baseline, 2026-07-08 with the instant fake chain and inline
-chase verification, read 5.76s / 3.26s / 5.45s respectively).*
+*Measured 2026-07-10 (voter-wide per-peer cold-start fetch budget + shuffled subscriber selection —
+cold-start fetches queue client-side at ≤24 concurrent per peer instead of tripping the seeder's
+32-inbound-stream default and retrying, see DESIGN.md "Checkpoints → pull"; the previous baseline,
+2026-07-09 retry-only, read 3.26s / 2.33s / 5.04s respectively).*
 
 ## Parallelism + convergence (N=10 voters/contest, median of 5)
 
@@ -222,25 +223,26 @@ directory that fills in progressively is visible.
 
 | M (contests) | conns | converged | fetches | Σfetch | Σbitswap | payload | conv-p50 | conv-p90 | **START→ALL** |
 |-------------:|------:|:---------:|--------:|-------:|---------:|--------:|---------:|---------:|--------------:|
-| 1            | 1     | 1/1       | 1       | 0.55s  | 0.59s    | 4 KiB   | 3.26s    | 3.26s    | **3.26s** |
-| 10           | 1     | 10/10     | 10      | 5.63s  | 6.32s    | 43 KiB  | 2.32s    | 2.33s    | **2.33s** |
-| **63**       | 1     | **63/63** | 63      | 46.47s | 90.59s   | 271 KiB | 3.32s    | 4.29s    | **5.04s** |
+| 1            | 1     | 1/1       | 1       | 0.56s  | 0.58s    | 4 KiB   | 3.26s    | 3.26s    | **3.26s** |
+| 10           | 1     | 10/10     | 10      | 5.67s  | 6.17s    | 43 KiB  | 2.27s    | 2.51s    | **2.51s** |
+| **63**       | 1     | **63/63** | 63      | 34.24s | 63.63s   | 271 KiB | 3.20s    | 3.87s    | **3.87s** |
 
 ### Reading the numbers
 
-- **The full 63-board directory cold-loads (render-ready) in ~5s** and converges 63/63; going 1→10→63
-  boards barely moves the wall-clock. `conns=1` at every `M` — all root-record fetches + checkpoint
-  pulls ride one connection, so `connect`/`identify` are paid once and the per-board fetch/bitswap
-  overlap.
+- **The full 63-board directory cold-loads (render-ready) in ~3.9s** and converges 63/63; going
+  1→10→63 boards barely moves the wall-clock. `conns=1` at every `M` — all root-record fetches +
+  checkpoint pulls ride one connection, so `connect`/`identify` are paid once and the per-board
+  fetch/bitswap overlap.
 - **`Σfetch`/`Σbitswap` grow with `M` but the total does not** — the ops run concurrently, so the sum
-  of 63 overlapping fetches (46s) collapses to a ~5s wall-clock. The per-contest cost is flat
-  (~0.55–0.75s fetch, ~0.6–1.4s bitswap) regardless of directory size.
+  of 63 overlapping fetches (34s) collapses to a ~3.9s wall-clock. The per-contest cost is flat
+  (~0.54–0.57s fetch, ~0.6–1.0s bitswap) regardless of directory size.
 - **Verify is negligible at N=10** (≤0.4s for up to 630 recoveries — all offline; the boards' gate
   reads batch in the background behind one shared gateway and never gate the convergence curve). It
   scales with total ballots (~1.5 ms/recovery single-threaded), so it becomes the dominant term only
   for a mature directory (hundreds of voters × 63 boards).
 - Numbers taken against a **default** libp2p node (fetch handler `maxInboundStreams = 32`); the
-  cold-start fetch retry rides out that cap so the naive all-at-once join converges fully. WAN jitter
-  is large at this RTT — individual reps spike (one M=63 rep hit 7.9s), hence median-of-5. See DESIGN.md
-  ("Checkpoints → pull", "Deferred pkc-js work") for why the naive join needs the retry and the
-  optional host-side stream-cap speedup.
+  voter-wide per-peer fetch budget (≤24 concurrent per peer) keeps the naive all-at-once join under
+  that cap with zero resets — the cold-start retry remains only as the safety net for streams the
+  budget cannot see. WAN jitter is large at this RTT — individual reps spike (one M=1 rep hit 9.3s
+  on a connect stall), hence median-of-5. See DESIGN.md ("Checkpoints → pull", "Deferred pkc-js
+  work") for the budget, the retry, and the optional host-side stream-cap speedup.

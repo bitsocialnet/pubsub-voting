@@ -802,6 +802,82 @@ describe("root-record fetch protocol", () => {
         await voter.stop();
     });
 
+    it("budgets concurrent cold-start fetches per peer across ALL contests, so a directory-wide join never trips a peer's inbound-stream cap by itself", async () => {
+        // 40 contests on one voter all cold-start against the SAME peer. Without a voter-wide
+        // budget that opens 40 concurrent fetch streams — past libp2p's default 32-inbound cap on
+        // the responder, which would reset the excess (the failure the retry rides out). The
+        // budget must instead hold at most 24 in flight and queue the rest.
+        const CONTESTS = 40;
+        const BUDGET = 24; // COLD_START_PEER_FETCH_LIMIT
+        let inFlight = 0;
+        let peak = 0;
+        const pending: Array<() => void> = [];
+        const fetchService: FetchServiceLike = {
+            fetch: async () => {
+                inFlight += 1;
+                peak = Math.max(peak, inFlight);
+                await new Promise<void>((resolve) => pending.push(resolve));
+                inFlight -= 1;
+                return undefined; // definitive "no record" — no retry, no chase
+            },
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [{ toString: () => "seeder" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
+        const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
+        const voter = new PubsubVoter({ helia, chains: fakeChains() });
+
+        const contests = await Promise.all(
+            Array.from({ length: CONTESTS }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+        );
+        await Promise.all(contests.map((contest) => contest.update())); // joins fire-and-forget the cold-start pulls
+
+        // Demand (40) exceeds the budget (24): the budget saturates at exactly 24 in flight...
+        await vi.waitFor(() => expect(pending.length).toBe(BUDGET));
+        expect(peak).toBe(BUDGET);
+        // ...and releasing slots drains the queue — every contest gets served, still never above budget.
+        let released = 0;
+        while (released < CONTESTS) {
+            await vi.waitFor(() => expect(pending.length).toBeGreaterThan(0));
+            while (pending.length > 0) {
+                pending.shift()!();
+                released += 1;
+            }
+        }
+        await vi.waitFor(() => expect(inFlight).toBe(0));
+        expect(released).toBe(CONTESTS);
+        expect(peak).toBe(BUDGET);
+        await voter.stop();
+    });
+
+    it("randomizes which subscribers a cold start asks, so a directory join spreads across serving peers instead of always the first listed", async () => {
+        // 8 subscribers, 12 contests: a deterministic slice would send every contest to the same
+        // first 4 peers (funnelling the whole directory through their stream caps while the other
+        // 4 idle). With the shuffle, the odds that 12 independent picks all land on one fixed
+        // 4-subset are (1/70)^11 — so seeing a 5th peer is a safe assertion.
+        const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        const h = fetchSpyHelia(new Map(Array.from({ length: 8 }, (_, i) => [`peer${i}`, record])));
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+        const contests = await Promise.all(
+            Array.from({ length: 12 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+        );
+        await Promise.all(contests.map((contest) => contest.update()));
+
+        await vi.waitFor(() => expect(h.fetchCalls.length).toBe(12 * 4)); // each contest still asks COLD_START_PEERS peers
+        expect(new Set(h.fetchCalls.map((call) => call.peer)).size).toBeGreaterThan(4);
+        await voter.stop();
+    });
+
     it("cold-joins via the HTTP content router even with NO topic subscribers: finds the provider of the criteria CID, dials it, fetches, and chases", async () => {
         // The pkc-js discovery path: gossipsub knows no subscribers yet, but the content router
         // names a provider of the criteria CID. The library must dial + fetch it immediately.

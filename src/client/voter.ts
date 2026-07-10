@@ -262,6 +262,13 @@ interface ResolvedDeps {
      */
     onTopicJoined: () => void;
     onTopicLeft: () => void;
+    /**
+     * Voter-wide per-peer budget for cold-start root fetches: runs `task` once fewer than
+     * {@link COLD_START_PEER_FETCH_LIMIT} fetches to `peerId` are in flight across ALL engines,
+     * so a directory-wide join never trips a peer's per-protocol inbound-stream cap by itself.
+     * Lives on the voter (not the engine) because the cap it protects is per peer, not per topic.
+     */
+    fetchBudget: <T>(peerId: string, task: () => Promise<T>) => Promise<T>;
 }
 
 /** Hard per-message validation deadline (ms): the 10s budget for the verify pipeline in the gate. */
@@ -309,6 +316,25 @@ const HEARTBEAT_INTERVAL_MS = 600_000;
 const COLD_START_FETCH_DEADLINE_MS = 30_000;
 const COLD_START_FETCH_BACKOFF_MS = 400;
 const COLD_START_FETCH_BACKOFF_CAP_MS = 4_000;
+/**
+ * Per-peer budget for concurrent cold-start root fetches, shared across ALL contests on one
+ * voter (see {@link ResolvedDeps.fetchBudget}). The retry above rides out a saturated responder,
+ * but a directory-wide join should not be the one saturating it: this budget caps how many fetch
+ * streams *we* hold open to any single peer, under libp2p's default per-protocol caps (32 inbound
+ * on the responder, 64 outbound on us — both enforced PER CONNECTION per direction, so one
+ * connection's budget is exactly the scope of the remote cap; other users of a shared seeder
+ * arrive on their own connections and do not eat these slots). 24 rather than the full 32
+ * because running at the cliff still resets: our slot frees when the response lands, but the
+ * responder only decrements its count when it sees the stream *close*, so back-to-back reuse
+ * races that bookkeeping — and the same connection can carry fetch streams this budget cannot
+ * see (the host's own IPNS-over-pubsub record fetches ride the same protocol; so would a second
+ * voter on the shared node). The retry covers those residuals. Excess contests queue per peer
+ * instead of getting reset — and because cold-start also shuffles which peers it asks (see the
+ * shuffle in `#coldStart`), a multi-peer topic spreads a directory join across serving peers
+ * instead of funnelling every contest through the same first-listed peer's cap while the
+ * others idle.
+ */
+const COLD_START_PEER_FETCH_LIMIT = 24;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
@@ -320,6 +346,39 @@ const CHASE_CONCURRENCY = 2;
  * future-dated bundles.
  */
 const HEAD_BUCKET_TTL_MS = 1_000;
+
+/**
+ * The {@link ResolvedDeps.fetchBudget} factory: one `pLimit(limitPerPeer)` per peer id, created on
+ * first use and dropped once its queue drains, so a long-lived voter does not accumulate limiters
+ * for every peer it ever cold-started against.
+ */
+function makePerPeerBudget(limitPerPeer: number): <T>(peerId: string, task: () => Promise<T>) => Promise<T> {
+    const limiters = new Map<string, ReturnType<typeof pLimit>>();
+    return async (peerId, task) => {
+        let limiter = limiters.get(peerId);
+        if (limiter === undefined) {
+            limiter = pLimit(limitPerPeer);
+            limiters.set(peerId, limiter);
+        }
+        try {
+            return await limiter(task);
+        } finally {
+            if (limiter.activeCount === 0 && limiter.pendingCount === 0) limiters.delete(peerId);
+        }
+    };
+}
+
+/** Fisher–Yates copy-shuffle (cold-start peer selection; see `#coldStart`). */
+function shuffled<T>(items: readonly T[]): T[] {
+    const out = [...items];
+    for (let i = out.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const swap = out[i]!;
+        out[i] = out[j]!;
+        out[j] = swap;
+    }
+    return out;
+}
 
 /** Lowercase `0x`-hex to bytes (for the bucket boundary block hash). */
 function hexToBytes(hex: string): Uint8Array {
@@ -774,9 +833,10 @@ class ContestEngine {
      * The cold-join pull (DESIGN.md "Checkpoints"): ask up to {@link COLD_START_PEERS} peers, over
      * the libp2p **fetch protocol**, for their current root record, and chase every root that
      * differs from our own. Peers come from **two sources raced concurrently, neither blocking the
-     * other**: the gossipsub subscribers of this topic, and the providers of the criteria CID from
-     * the host's HTTP content router. Roots are **unioned, never quorum'd** — a record served by a
-     * single peer is still chased, so a colluding majority cannot hide a vote.
+     * other**: a random {@link COLD_START_PEERS} of the gossipsub subscribers of this topic, and
+     * the providers of the criteria CID from the host's HTTP content router. Roots are **unioned,
+     * never quorum'd** — a record served by a single peer is still chased, so a colluding majority
+     * cannot hide a vote.
      */
     async #coldStart(): Promise<void> {
         const seen = new Set<string>();
@@ -801,7 +861,10 @@ class ContestEngine {
                 // live gossip still converge.
             }
         };
-        const fromSubscribers = this.#deps.pubsub.getSubscribers(this.topic).slice(0, COLD_START_PEERS).map(pull);
+        // Shuffle before slicing: a deterministic first-N pick would funnel a whole directory
+        // join through the same peers' stream caps while other subscribers idle; a random N
+        // spreads contests across the topic's serving peers (see COLD_START_PEER_FETCH_LIMIT).
+        const fromSubscribers = shuffled(this.#deps.pubsub.getSubscribers(this.topic)).slice(0, COLD_START_PEERS).map(pull);
         await Promise.allSettled([...fromSubscribers, this.#discoverProviders(pull)]);
     }
 
@@ -809,7 +872,10 @@ class ContestEngine {
      * Pull one peer's root record over the fetch protocol, retrying a THROWN fetch with full-jittered
      * exponential backoff until {@link COLD_START_FETCH_DEADLINE_MS} (see the constant's note for the
      * measured seeder-reset failure this rides out). A *definitive* answer never retries; bails if the
-     * contest was left mid-retry (`#chaser` is cleared by `leave()`).
+     * contest was left mid-retry (`#chaser` is cleared by `leave()`). Each attempt — not the whole
+     * retry loop, so a backoff sleep never holds a slot — passes through the voter-wide per-peer
+     * budget, which keeps our own concurrent streams to this peer under its inbound cap; queue wait
+     * counts against the same deadline.
      */
     async #fetchRootWithRetry(peer: PeerId): Promise<Uint8Array | undefined | null> {
         const deadline = Date.now() + COLD_START_FETCH_DEADLINE_MS;
@@ -822,7 +888,7 @@ class ContestEngine {
                 if (this.#chaser === undefined) return undefined; // left mid-backoff — abandon quietly
             }
             try {
-                return await this.#deps.fetch.fetch(peer, rootFetchKey(this.topic));
+                return await this.#deps.fetchBudget(peer.toString(), () => this.#deps.fetch.fetch(peer, rootFetchKey(this.topic)));
             } catch (error) {
                 lastError = error; // transient (e.g. seeder over its inbound-stream cap) — back off and retry
             }
@@ -1207,7 +1273,8 @@ export class PubsubVoter implements VoteClient {
             registry: resolveRegistry(options.rules),
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
-            onTopicLeft: this.#onTopicLeft
+            onTopicLeft: this.#onTopicLeft,
+            fetchBudget: makePerPeerBudget(COLD_START_PEER_FETCH_LIMIT)
         };
     }
 
