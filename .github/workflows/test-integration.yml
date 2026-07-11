@@ -1,0 +1,38 @@
+name: Integration
+on:
+  push:
+    paths:
+      [
+        "src/**",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "vitest.integration.config.ts",
+        ".github/**",
+      ]
+  pull_request:
+    paths:
+      [
+        "src/**",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "vitest.integration.config.ts",
+        ".github/**",
+      ]
+
+# Runs the two-node gossipsub integration test (real libp2p + Helia on
+# loopback). Deliberately a separate workflow: the Release workflow watches
+# only "CI", so a slow or flaky integration run never blocks a release.
+jobs:
+  test-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+      - run: npm ci
+      - run: npm run test:integration
