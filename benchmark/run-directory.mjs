@@ -172,7 +172,7 @@ async function measureOne(m, n, i) {
                 `[bench] M=${m} N=${n} rep ${r + 1}/${REPEATS}: conns=${parsed.seederConnections} converged=${parsed.readyCount}/${m} ` +
                     `connect=${s(parsed.connectMs)} fetch=${s(parsed.fetch.totalMs)} (${parsed.fetch.count}x) ` +
                     `bitswap=${s(parsed.blockGets.totalMs)} (${(parsed.blockGets.bytes / 1024).toFixed(0)}KiB) ` +
-                    `verify+merge=${s(parsed.verifyMergeMs)} start→all=${s(parsed.allTalliesReadyMs)}`
+                    `verify+merge=${s(parsed.verifyMergeMs)} start→all=${s(parsed.allTalliesReadyMs)} start→all-verified=${s(parsed.allVerifiedMs)}`
             );
         }
     } finally {
@@ -204,7 +204,8 @@ async function measureOne(m, n, i) {
         verifyMergeMs: med((r) => r.verifyMergeMs),
         p50Ms: med((r) => pct(r.readyAtMs, 0.5)),
         p90Ms: med((r) => pct(r.readyAtMs, 0.9)),
-        allTalliesReadyMs: med((r) => r.allTalliesReadyMs)
+        allTalliesReadyMs: med((r) => r.allTalliesReadyMs),
+        allVerifiedMs: med((r) => r.allVerifiedMs)
     };
 }
 
@@ -239,7 +240,7 @@ async function main() {
     // cost of one contest's op — they overlap, so they do NOT sum to the total); verify+merge and
     // START→ALL-TALLIES are the aggregate + true wall-clock. `N` = voters = bundles per contest.
     console.log(`\nDirectory cold-load — per-operation latency — shared seeder on ${HOST} (dialed at ${DIAL_HOST}), median of ${REPEATS} (times → s)`);
-    console.log("M(contests)  N/ct  bundles   router   connect   identify   fetch/ct   bitswap/ct   verify+merge   START→ALL-TALLIES");
+    console.log("M(contests)  N/ct  bundles   router   connect   identify   fetch/ct   bitswap/ct   verify+merge   START→ALL-TALLIES   START→ALL-VERIFIED");
     for (const r of rows) {
         if (!r.ok) {
             console.log(`${String(r.m).padEnd(12) } ${n(r.n, 4)}  ${b(r.m, r.n)}   (no successful cold join)`);
@@ -247,7 +248,7 @@ async function main() {
         }
         console.log(
             `${String(r.m).padEnd(12)} ${n(r.n, 4)}  ${b(r.m, r.n)}   ${s(r.routerMs)}   ${s(r.connectMs)}   ${s(r.identifyMs)}     ` +
-                `${s(r.fetchPerContestMs)}     ${s(r.bitswapPerContestMs)}      ${s(r.verifyMergeMs)}          ${s(r.allTalliesReadyMs)}`
+                `${s(r.fetchPerContestMs)}     ${s(r.bitswapPerContestMs)}      ${s(r.verifyMergeMs)}          ${s(r.allTalliesReadyMs)}              ${s(r.allVerifiedMs)}`
         );
     }
 

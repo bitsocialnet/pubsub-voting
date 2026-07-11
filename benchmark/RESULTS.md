@@ -201,21 +201,24 @@ batch size) and `BENCH_JOIN_TIMEOUT_MS`; the seeder takes `BENCH_SEED_CONCURRENC
 All `M` contests are joined at once (naive), over one shared connection. `router`/`connect`/`identify`
 are paid a single time across the whole directory; `fetch`/`bitswap` are shown **per contest** (the
 cost of one board's op — they overlap, so they do NOT sum to the total); `verify+merge` is the
-aggregate and `START→ALL-TALLIES` is the true wall-clock to every board being ready.
+aggregate. Two end-to-end milestones, both from the `start()` call: `START→ALL-TALLIES` (every board
+render-ready — rows may still be `chainVerified: false`) and `START→ALL-VERIFIED` (every board's
+ranking row reads `chainVerified: true`, i.e. every deferred gate read landed — the directory
+analogue of the single-contest `START→VERIFIED`).
 
-| M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** |
-|-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|
-| | *(amortized once)* | *(once)* | *(once)* | *(per contest)* | *(per contest)* | *(aggregate)* | *(wall-clock)* |
-| 1            | 1.00s  | 1.59s   | 1.96s    | 0.54s    | 0.58s      | 0.52s        | **3.26s** |
-| 10           | 1.00s  | 0.59s   | 0.81s    | 0.46s    | 0.59s      | 0.28s        | **2.27s** |
-| **63**       | 1.00s  | 0.60s   | 0.97s    | 0.48s    | 0.85s      | 1.07s        | **3.27s** |
+| M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** | **START→ALL-VERIFIED** |
+|-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|-----------------------:|
+| 1            | 1.00s  | 1.59s   | 1.97s    | 0.54s    | 0.58s      | 0.49s        | **3.26s** | **3.52s** |
+| 10           | 1.00s  | 0.59s   | 0.96s    | 0.46s    | 0.59s      | 0.28s        | **2.26s** | **2.52s** |
+| **63**       | 1.00s  | 0.59s   | 0.97s    | 0.51s    | 0.76s      | 0.45s        | **3.97s** | **4.24s** |
 
-*Measured 2026-07-10 (**batched root pull**: same-peer cold-start pulls coalesce into one fetch
-stream carrying a batch key, so the whole directory's root records ride 1–2 streams instead of one
-per contest — see DESIGN.md "Checkpoints → pull". A single-contest join keeps the per-topic key,
-hence M=1 is byte-identical on the wire. Previous baselines: same-day per-peer budget + shuffled
-subscriber selection read 3.26s / 2.51s / 3.87s; 2026-07-09 retry-only read 3.26s / 2.33s /
-5.04s.)*
+*Measured 2026-07-11 (**batched root pull + voter-wide chase pacing**: same-peer cold-start pulls
+coalesce into one fetch stream carrying a batch key, and at most 48 root chases run concurrently
+across the voter — see DESIGN.md "Checkpoints → pull" and the trade-off note below. A
+single-contest join keeps the per-topic key, hence M=1 is byte-identical on the wire. Previous
+baselines: 2026-07-10 per-peer budget + shuffled subscriber selection read 3.26s / 2.51s / 3.87s
+START→ALL-TALLIES, re-measured same-window as this run at 3.59s for M=63; 2026-07-09 retry-only
+read 3.26s / 2.33s / 5.04s.)*
 
 ## Parallelism + convergence (N=10 voters/contest, median of 5)
 
@@ -226,28 +229,36 @@ directory that fills in progressively is visible.
 | M (contests) | conns | converged | fetches | Σfetch | Σbitswap | payload | conv-p50 | conv-p90 | **START→ALL** |
 |-------------:|------:|:---------:|--------:|-------:|---------:|--------:|---------:|---------:|--------------:|
 | 1            | 1     | 1/1       | 1       | 0.54s  | 0.58s    | 4 KiB   | 3.26s    | 3.26s    | **3.26s** |
-| 10           | 1     | 10/10     | **2**   | 0.93s  | 5.88s    | 43 KiB  | 2.27s    | 2.27s    | **2.27s** |
-| **63**       | 1     | **63/63** | **2**   | 0.96s  | 53.53s   | 271 KiB | 3.27s    | 3.27s    | **3.27s** |
+| 10           | 1     | 10/10     | **2**   | 0.91s  | 5.85s    | 43 KiB  | 2.26s    | 2.26s    | **2.26s** |
+| **63**       | 1     | **63/63** | **2**   | 1.01s  | 47.99s   | 271 KiB | 3.00s    | 3.97s    | **3.97s** |
 
 ### Reading the numbers
 
-- **The full 63-board directory cold-loads (render-ready) in ~3.3s** and converges 63/63 — all at
-  once (`conv-p50 == conv-p90 == START→ALL`: the whole directory's roots arrive in one batch
-  response, so boards stop filling in progressively and instead land together). `conns=1` at every
-  `M` — everything rides one connection, so `connect`/`identify` are paid once.
+- **End-to-end: the full 63-board directory is render-ready in ~4.0s and fully chain-verified in
+  ~4.2s** from a cold start (router lookup, dial, and identify included — the clock starts before
+  any network op). At M=10 those read ~2.3s / ~2.5s. The verified milestone lands **+0.25–0.5s
+  after render at every M** — one batched multicall round trip per board, off the render path.
 - **`fetches` no longer grows with `M`** — 63 boards' root records ride **2** batch streams (one
   per discovery-source window: gossipsub subscribers at join, router-discovered providers ~1s
-  later), so `Σfetch` collapses from 34s of overlapping per-board fetches (previous baseline) to
-  ~1s total. `Σbitswap` still grows with `M` (one chunk pull per board) but overlaps into a flat
-  wall-clock.
-- **Verify is negligible at N=10** (≤0.4s for up to 630 recoveries — all offline; the boards' gate
-  reads batch in the background behind one shared gateway and never gate the convergence curve). It
-  scales with total ballots (~1.5 ms/recovery single-threaded), so it becomes the dominant term only
-  for a mature directory (hundreds of voters × 63 boards).
+  later), so `Σfetch` collapses from 30–46s of overlapping per-board fetches (previous baselines)
+  to ~1s total, and the fetch phase is flat in directory size.
+- **The batch's root burst needed pacing (the honest trade-off at M=63/N=10).** Delivering all 63
+  roots in one response starts every board's chunk pull + synchronous verify in the same instant;
+  un-paced, that herd destabilized the shared muxed connection (Σbitswap 52s → up to 256s across
+  reps, START→ALL erratic 3.2–9.2s). A voter-wide chase cap restores pacing: measured ladder
+  cap=16 → 5.21s, cap=32 → 4.13s, cap=48 → **3.97s** (stable, ±0.15s). A same-window A/B against
+  the budget-only baseline (63 per-topic fetches, arrival naturally staggered) read **3.59s** — so
+  at M=63/N=10 the batch currently trades ~0.4s of median for a flat-in-M fetch phase, 2 streams
+  instead of 63, and a clear win at M=10 (2.26s vs 2.83s same-window). The win grows with M (the
+  per-topic fetch phase scales linearly; the batch does not); the residual gap is the two-wave
+  chase structure.
+- **Verify is negligible at N=10** (≤0.5s for 630 recoveries — all offline; the boards' gate reads
+  batch in the background behind one shared gateway and never gate the convergence curve). It
+  scales with total ballots (~1.5 ms/recovery single-threaded), so it becomes the dominant term
+  only for a mature directory (hundreds of voters × 63 boards).
 - Numbers taken against a **default** libp2p node (fetch handler `maxInboundStreams = 32`); with
   the batched pull that cap is moot on the primary path (2 streams ≪ 32), and the voter-wide
   per-peer budget (≤24 concurrent) plus retry-to-deadline still guard the per-topic fallback
-  (old responders, malformed batch answers). WAN jitter is large at this RTT — individual reps
-  spike (one M=63 rep hit 6.1s on a bitswap stall), hence median-of-5. See DESIGN.md
-  ("Checkpoints → pull", "Deferred pkc-js work") for the batch key, budget, retry, and the
-  optional host-side stream-cap speedup.
+  (old responders, malformed batch answers). WAN jitter is real at this RTT — hence median-of-5.
+  See DESIGN.md ("Checkpoints → pull", "Deferred pkc-js work") for the batch key, budget, chase
+  pacing, retry, and the optional host-side stream-cap speedup.

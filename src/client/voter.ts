@@ -270,6 +270,11 @@ interface ResolvedDeps {
      * window, the stream budget — is per PEER, not per topic.
      */
     pullRoot: RootPuller["pull"];
+    /**
+     * Voter-wide chase pacing ({@link VOTER_CHASE_CONCURRENCY}): at most N whole-root chases in
+     * flight across ALL engines, composed under each engine's own {@link CHASE_CONCURRENCY}.
+     */
+    chaseLimit: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
 /** Hard per-message validation deadline (ms): the 10s budget for the verify pipeline in the gate. */
@@ -300,8 +305,20 @@ const COLD_START_ROUTER_TIMEOUT_MS = 10_000;
 const HEARTBEAT_INTERVAL_MS = 600_000;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
-/** Concurrent root chases; a spray of divergent roots queues, never floods. */
+/** Concurrent root chases per contest; a spray of divergent roots queues, never floods. */
 const CHASE_CONCURRENCY = 2;
+/**
+ * Concurrent root chases across ALL contests on one voter (see {@link ResolvedDeps.chaseLimit}).
+ * The batched root pull delivers a whole directory's roots in ONE response, which would
+ * otherwise start every board's chunk pull + synchronous verify burst in the same instant —
+ * measured on the ~270ms-RTT WAN rig at M=63, that herd destabilizes the shared muxed
+ * connection (Σbitswap 52s → up to 256s across reps, START→ALL 3.6s → 5.5–9s). This voter-wide
+ * cap restores the arrival pacing the per-peer fetch waves used to provide, without giving back
+ * the batched fetch win; it also flattens a cross-contest divergent-root spray for free. Sized
+ * empirically: 16 over-serializes (M=63 stable but ~5.2s — four sequential chase waves), 32 is
+ * stable at ~4.1s, while the un-capped herd is the measured instability above.
+ */
+const VOTER_CHASE_CONCURRENCY = 48;
 /**
  * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
  * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
@@ -741,7 +758,9 @@ class ContestEngine {
             },
             deferVerify: (entries) => this.#background.enqueue(entries),
             onMerged: () => this.#onStateChanged(),
-            limit: (fn) => chaseLimit(fn),
+            // Per-engine cap composed under the voter-wide one: a directory-wide root burst
+            // (one batch response = every board diverges at once) paces instead of stampeding.
+            limit: (fn) => chaseLimit(() => this.#deps.chaseLimit(fn)),
             timeoutMs: CHASE_TIMEOUT_MS
         });
         this.#transport = makeVoteTransport({
@@ -1191,7 +1210,8 @@ export class PubsubVoter implements VoteClient {
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
             onTopicLeft: this.#onTopicLeft,
-            pullRoot: makeRootPuller(fetch).pull
+            pullRoot: makeRootPuller(fetch).pull,
+            chaseLimit: pLimit(VOTER_CHASE_CONCURRENCY)
         };
     }
 
