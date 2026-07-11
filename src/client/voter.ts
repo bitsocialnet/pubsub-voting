@@ -30,7 +30,12 @@ import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
-import { makeGateResultCache } from "../verify/gate-result-cache.js";
+import { makePersistentGateResultCache, purgeExpiredGateResults } from "../verify/gate-result-cache.js";
+import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
+import { makeStorage } from "../storage/node.js";
+import type { LruStorage } from "../storage/types.js";
+import { encode as encodeDagCbor } from "@ipld/dag-cbor";
+import { sha256 } from "viem";
 import { makeBackgroundVerifier, type BackgroundChainVerifier } from "../verify/background.js";
 import type { BundleChecks } from "../verify/types.js";
 import { makeAcceptedDedup } from "../transport/accepted-dedup.js";
@@ -238,6 +243,15 @@ export interface PubsubVoterOptions {
      * the claim cannot be verified and the bundle is dropped (never counted unchecked).
      */
     nameResolvers?: NameResolver[];
+    /**
+     * Directory for the voter's persistent caches (gate results, name resolutions), the
+     * pkc-js `dataPath` equivalent. On Node the caches are better-sqlite3 databases under
+     * `{dataPath}/lru-storage/`; in the browser the path is ignored and the caches live in
+     * IndexedDB (via localforage) either way. Defaults to `{cwd}/.bitsocial-pubsub-votes`
+     * on Node. Pass `false` for in-memory-only caches (no disk, no IndexedDB — the pkc-js
+     * `noData` equivalent): nothing survives the process, but nothing is written either.
+     */
+    dataPath?: string | false;
 }
 
 interface ResolvedDeps {
@@ -269,8 +283,25 @@ interface ResolvedDeps {
      * Lives on the voter (not the engine) because the cap it protects is per peer, not per topic.
      */
     fetchBudget: <T>(peerId: string, task: () => Promise<T>) => Promise<T>;
+    /**
+     * The voter's persisted gate results, shared across ALL contests (keys carry each
+     * contest's rule hash, so two contests over one gate — a 5chan-style directory — share
+     * each other's reads; different rules cannot collide). See verify/gate-result-cache.ts.
+     */
+    gateStore: LruStorage;
+    /** The voter's persisted name resolutions, shared across all contests (pkc-js rule). */
+    nameResolutionCache: NameResolutionCache;
 }
 
+/**
+ * LRU bound for the voter's persisted gate results (all contests share the store; entries are a
+ * short key + a decimal score, so this is single-digit MB at worst). Deliberately far above the
+ * name cache's pkc-js-parity 5000: one directory join can write `boards × wallets` entries in a
+ * bucket, and the deterministic sample-block purge (not this bound) is the intended eviction.
+ */
+const GATE_RESULTS_MAX_ITEMS = 50_000;
+/** LRU bound for persisted name resolutions — pkc-js's `CACHE_MAX_ITEMS` for the same cache. */
+const NAME_RESOLUTIONS_MAX_ITEMS = 5_000;
 /** Hard per-message validation deadline (ms): the 10s budget for the verify pipeline in the gate. */
 const GATE_TIMEOUT_MS = 10_000;
 /** Concurrent in-flight verifications across the gate (chain reads + name resolution are RPC). */
@@ -487,8 +518,13 @@ class ContestEngine {
         });
 
         // One gate-result cache shared between the inline forward-gate verifier and the
-        // background chain verifier, so neither re-reads a (wallet, sampleBlock) the other settled.
-        const gateResultCache = makeGateResultCache();
+        // background chain verifier, so neither re-reads a (wallet, sampleBlock) the other
+        // settled — layered over the voter's persistent store, keyed under this contest's rule
+        // hash: the gate score is a pure function of (rule, chainId, wallet, sampleBlock), so
+        // hashing the canonical rule document + chainId is exactly the sharing boundary (two
+        // contests over one gate share reads; different gates cannot collide).
+        this.#ruleHash = sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.rule }));
+        const gateResultCache = makePersistentGateResultCache({ store: deps.gateStore, ruleHash: this.#ruleHash });
         const verifier = makeBundleVerifier({
             criteria,
             criteriaCid: criteriaCidBytes,
@@ -497,7 +533,8 @@ class ContestEngine {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            gateResultCache
+            gateResultCache,
+            nameResolutionCache: deps.nameResolutionCache
         });
         // The gate/transport are (re)built on join(); the store, crdt, caches, verifier, and
         // background verifier are stable per contest, so they survive re-joins of the topic.
@@ -512,6 +549,7 @@ class ContestEngine {
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
             gateResultCache,
+            nameResolutionCache: deps.nameResolutionCache,
             cache: this.#cache,
             onGateVerified: (cid) => this.#settleCheck(cid, "chainVerified"),
             onNameResolved: (cid) => this.#settleCheck(cid, "nameResolved"),
@@ -534,6 +572,8 @@ class ContestEngine {
     }
 
     readonly #store: ReturnType<typeof makeBlockstoreBundleStore>;
+    /** Hash of the canonical gate rule + chainId — this contest's keyspace in the shared gate store. */
+    readonly #ruleHash: string;
     readonly #cache: ReturnType<typeof makeVerdictCache>;
     readonly #acceptedDedup: ReturnType<typeof makeAcceptedDedup>;
     readonly #verifier: ReturnType<typeof makeBundleVerifier>;
@@ -614,7 +654,30 @@ class ContestEngine {
         const head = await this.#ruleChain.getBlockNumber();
         this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
         this.#headReadMs = Date.now();
+        this.#maybePurgeGateResults();
         return this.#currentBucketCache;
+    }
+
+    /** True once this engine's persisted-gate-result purge ran (once per engine lifetime). */
+    #gateResultsPurged = false;
+
+    /**
+     * Drop this rule's persisted gate results older than the oldest admissible sample block —
+     * provably dead: a score at bucket B is only ever consulted while bundles from B are within
+     * `voteExpiryBuckets` of head (see verify/gate-result-cache.ts `purgeExpiredGateResults`).
+     * Piggybacks on the first head read the engine does anyway (join-with-state, publish,
+     * tally), so an idle engine costs no chain read and no purge. Fire-and-forget by design.
+     */
+    #maybePurgeGateResults(): void {
+        if (this.#gateResultsPurged) return;
+        this.#gateResultsPurged = true;
+        const oldestBucket = this.#currentBucketCache - this.criteria.voteExpiryBuckets;
+        if (oldestBucket <= 0) return;
+        void purgeExpiredGateResults({
+            store: this.#deps.gateStore,
+            ruleHash: this.#ruleHash,
+            oldestSampleBlock: this.#bucketMath.sampleBlockForBucket(oldestBucket)
+        });
     }
 
     /** `Date.now()` of the last gating-chain head read, memoizing {@link #nowBucket}. */
@@ -1020,6 +1083,12 @@ class ContestEngine {
         // Serve only fully verified bundles: a provisional admit must not propagate through our
         // checkpoint, and the eligibility-filtered LWW reduction falls back to a wallet's newest
         // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts).
+        //
+        // Consume the dirty flag HERE, in the same synchronous window as the winner snapshot —
+        // not after the encode. The encode below awaits, and a state change landing mid-encode
+        // (e.g. a background settlement) re-dirties the flag; clearing it after the awaits would
+        // silently clobber that invalidation and pin this record until the next state change.
+        this.#checkpointDirty = false;
         const winners = this.#crdt.currentEntries(bucket, (cid) => this.#isFullyVerified(cid)).map((e) => e.bundle);
         const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
@@ -1034,7 +1103,6 @@ class ContestEngine {
             sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
         };
         this.#rootRecordCache = { record, bucket };
-        this.#checkpointDirty = false;
         return record;
     }
 
@@ -1257,12 +1325,19 @@ export class PubsubVoter implements VoteClient {
     #joinedEngines = 0;
     /** True once `destroy()` ran. Terminal: every create path then throws (mirrors pkc-js). */
     #destroyed = false;
+    /** The voter's persistent caches (see {@link PubsubVoterOptions.dataPath}); closed on destroy. */
+    readonly #storage: ReturnType<typeof makeStorage>;
 
     constructor(options: PubsubVoterOptions) {
         // Fail fast: the node must expose a gossipsub service, a blockstore, and a libp2p
         // fetch service. Throws MissingPubsubError / MissingBlockstoreError / MissingFetchError
         // at construction (not a lazy failure on the first publish/fetch) and narrows the handles.
         const { pubsub, blockstore, fetch } = requireHeliaServices(options.helia);
+        // Persistent caches, opened lazily (no disk is touched until a contest verifies): the
+        // gate-result store and the name-resolution cache, both shared across every contest on
+        // this voter. sqlite under dataPath on Node, IndexedDB in the browser, in-memory for
+        // `dataPath: false` — see src/storage/.
+        this.#storage = makeStorage({ dataPath: options.dataPath });
         this.#deps = {
             helia: options.helia,
             pubsub,
@@ -1274,7 +1349,11 @@ export class PubsubVoter implements VoteClient {
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
             onTopicLeft: this.#onTopicLeft,
-            fetchBudget: makePerPeerBudget(COLD_START_PEER_FETCH_LIMIT)
+            fetchBudget: makePerPeerBudget(COLD_START_PEER_FETCH_LIMIT),
+            gateStore: this.#storage.openLru({ cacheName: "gate-results", maxItems: GATE_RESULTS_MAX_ITEMS }),
+            nameResolutionCache: makeNameResolutionCache(
+                this.#storage.openLru({ cacheName: "name-resolutions", maxItems: NAME_RESOLUTIONS_MAX_ITEMS })
+            )
         };
     }
 
@@ -1387,6 +1466,10 @@ export class PubsubVoter implements VoteClient {
         for (const engine of this.#engines.values()) engine.markDestroyed();
         this.#unregisterResponder();
         await this.stop();
+        // Close the persistent caches last (Node: the sqlite handles) — engines are already
+        // terminal, so nothing can race a write. `stop()` deliberately leaves them open: a
+        // stopped voter is reusable and its caches stay warm.
+        await this.#storage.destroy();
     }
 
     #unregisterResponder(): void {

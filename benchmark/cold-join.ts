@@ -208,7 +208,7 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         gateway = await startRpcGateway({ latencyMs: args.rpcLatencyMs ?? 270 });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchGatewayChains(gateway.url) });
+        voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: benchGatewayChains(gateway.url) });
         const network = await voter.createContest({ criteria: benchCriteria() });
         if (network.topic !== args.topic) {
             throw new Error(`derived topic ${network.topic} != seeder topic ${args.topic} (criteria mismatch)`);

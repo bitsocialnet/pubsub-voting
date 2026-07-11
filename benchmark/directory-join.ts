@@ -155,7 +155,7 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         gateway = await startRpcGateway({ latencyMs: Number(process.env.BENCH_RPC_LATENCY_MS ?? 270) });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchGatewayChains(gateway.url) });
+        voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: benchGatewayChains(gateway.url) });
 
         const networks: Contest[] = await Promise.all(criteria.map((c) => voter!.createContest({ criteria: c })));
 
