@@ -1,17 +1,26 @@
 import { describe, it, expect } from "vitest";
 import { CID } from "multiformats/cid";
+import { base64url } from "multiformats/bases/base64";
+import * as dagCbor from "@ipld/dag-cbor";
 import {
+    batchRootsFetchKey,
+    decodeBatchRootsKey,
+    decodeBatchRootsResponse,
     decodeVoteMessage,
+    encodeBatchRootsResponse,
     encodeBundleMessage,
     encodeRootMessage,
     encodeRootRecord,
     decodeRootRecord,
     maxBundleMessageBytes,
+    rootFetchKey,
+    MAX_BATCH_ROOT_KEYS,
     MAX_ROOT_MESSAGE_BYTES,
     ROOT_RECORD_VERSION,
     type RootRecord,
     type FetchRootRecord
 } from "./messages.js";
+import { TOPIC_PREFIX } from "../topic.js";
 import { encodeBundle, bundleCidForBytes } from "../crdt/codec.js";
 import type { VotesBundle } from "../schema/votes.js";
 
@@ -75,6 +84,45 @@ describe("pubsub message codec (two-kind union)", () => {
         expect(() =>
             encodeRootMessage({ ...RECORD, count: -1 } as RootRecord)
         ).toThrow();
+    });
+
+    it("pins the batch key and batch response bytes (fixed vectors)", async () => {
+        // Cross-client spec: one fetch stream answering many topics (see DESIGN.md "Checkpoints").
+        // The key carries its own manifest (the requested criteria CIDs), so requester and
+        // responder never pre-agree on a contest set; the response aligns to request order.
+        const topicA = TOPIC_PREFIX + ROOT.toString();
+        const topicB = TOPIC_PREFIX + "bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4";
+        expect(batchRootsFetchKey([topicA, topicB])).toBe(
+            "bitsocial-votes/roots/gtgqWCUAAXESIK3vbC66A0nDp7AEqPnVGnuiEFthEK9QR8adi1jKqv6v2CpYJQABcRIg2daj2iWWVkbnp6HmF969YAwDGGzl2ateB8RRQl1e5R8"
+        );
+        const cid = await bundleCidForBytes(encodeBatchRootsResponse([FETCH_RECORD, null]));
+        expect(cid.toString()).toBe("bafyreibfa47otrdxzcua2low6iqjim743blowzum7vdxuuavt5v52lvzgq");
+    });
+
+    it("round-trips the batch key (order preserved) and the batch response (null = no record)", () => {
+        const topicA = TOPIC_PREFIX + ROOT.toString();
+        const topicB = TOPIC_PREFIX + "bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4";
+        expect(decodeBatchRootsKey(batchRootsFetchKey([topicB, topicA]))).toEqual([topicB, topicA]);
+        const records = decodeBatchRootsResponse(encodeBatchRootsResponse([null, FETCH_RECORD]));
+        expect(records[0]).toBeNull();
+        expect(records[1]).toEqual(FETCH_RECORD);
+    });
+
+    it("rejects foreign key shapes, garbage, empty and over-cap batches", () => {
+        const topicA = TOPIC_PREFIX + ROOT.toString();
+        // A per-topic key and undecodable payloads are "not a batch request", never a throw.
+        expect(decodeBatchRootsKey(rootFetchKey(topicA))).toBeUndefined();
+        expect(decodeBatchRootsKey(`${TOPIC_PREFIX}roots/!not-base64url!`)).toBeUndefined();
+        // Requester-side bounds are programming errors and throw...
+        expect(() => batchRootsFetchKey([])).toThrow();
+        expect(() => batchRootsFetchKey(Array.from({ length: MAX_BATCH_ROOT_KEYS + 1 }, () => topicA))).toThrow();
+        expect(() => batchRootsFetchKey(["not-a-topic"])).toThrow();
+        // ...but a hand-built over-cap key answers nothing (the responder's work stays bounded).
+        const overCap =
+            `${TOPIC_PREFIX}roots/` +
+            base64url.baseEncode(dagCbor.encode(Array.from({ length: MAX_BATCH_ROOT_KEYS + 1 }, () => ROOT)));
+        expect(decodeBatchRootsKey(overCap)).toBeUndefined();
+        expect(() => decodeBatchRootsResponse(new Uint8Array([0xff]))).toThrow();
     });
 
     it("derives the per-message bundle cap from the criteria alone", () => {

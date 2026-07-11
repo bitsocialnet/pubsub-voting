@@ -3,8 +3,12 @@ import { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
 import { PubsubVoter, republishIntervalBuckets, type PublishingState } from "./voter.js";
 import {
+    batchRootsFetchKey,
+    decodeBatchRootsKey,
+    decodeBatchRootsResponse,
     decodeVoteMessage,
     decodeRootRecord,
+    encodeBatchRootsResponse,
     encodeRootMessage,
     encodeRootRecord,
     rootFetchKey,
@@ -651,7 +655,17 @@ describe("root-record fetch protocol", () => {
         const fetchService: FetchServiceLike = {
             fetch: async (peer, key) => {
                 fetchCalls.push({ peer: peer.toString(), key });
-                return peerAnswers.get(peer.toString());
+                const answer = peerAnswers.get(peer.toString());
+                const batch = decodeBatchRootsKey(key);
+                if (batch === undefined || answer === undefined) return answer;
+                // A batch key gets this peer's canned record for every requested topic — and a
+                // garbage peer stays garbage for a batch too (an undecodable batch answer).
+                try {
+                    const record = decodeRootRecord(answer);
+                    return encodeBatchRootsResponse(batch.map(() => record));
+                } catch {
+                    return answer;
+                }
             },
             registerLookupFunction: (prefix, lookup) => {
                 counts.register += 1;
@@ -802,18 +816,21 @@ describe("root-record fetch protocol", () => {
         await voter.stop();
     });
 
-    it("budgets concurrent cold-start fetches per peer across ALL contests, so a directory-wide join never trips a peer's inbound-stream cap by itself", async () => {
-        // 40 contests on one voter all cold-start against the SAME peer. Without a voter-wide
-        // budget that opens 40 concurrent fetch streams — past libp2p's default 32-inbound cap on
-        // the responder, which would reset the excess (the failure the retry rides out). The
-        // budget must instead hold at most 24 in flight and queue the rest.
+    it("falls back to per-topic keys against an old responder, budgeted at 24 concurrent per peer so the fan-out never trips its inbound-stream cap", async () => {
+        // 40 contests on one voter all cold-start against the SAME peer — a responder that
+        // predates the batch key (answers NOT_FOUND for it), so the puller degrades to one
+        // per-topic fetch per contest. Without the voter-wide budget that fan-out opens 40
+        // concurrent streams — past libp2p's default 32-inbound cap on the responder, which
+        // would reset the excess (the failure the retry rides out). The budget must instead
+        // hold at most 24 in flight and queue the rest.
         const CONTESTS = 40;
         const BUDGET = 24; // COLD_START_PEER_FETCH_LIMIT
         let inFlight = 0;
         let peak = 0;
         const pending: Array<() => void> = [];
         const fetchService: FetchServiceLike = {
-            fetch: async () => {
+            fetch: async (_peer, key) => {
+                if (decodeBatchRootsKey(key) !== undefined) return undefined; // old node: batch key unknown (NOT_FOUND)
                 inFlight += 1;
                 peak = Math.max(peak, inFlight);
                 await new Promise<void>((resolve) => pending.push(resolve));
@@ -873,8 +890,99 @@ describe("root-record fetch protocol", () => {
         );
         await Promise.all(contests.map((contest) => contest.update()));
 
-        await vi.waitFor(() => expect(h.fetchCalls.length).toBe(12 * 4)); // each contest still asks COLD_START_PEERS peers
+        // Each contest still asks COLD_START_PEERS peers; same-peer pulls coalesce into batch
+        // keys, so count requested topics across calls, not the calls themselves.
+        await vi.waitFor(() => {
+            const requested = h.fetchCalls.flatMap((call) => decodeBatchRootsKey(call.key) ?? [call.key]);
+            expect(requested.length).toBe(12 * 4);
+        });
         expect(new Set(h.fetchCalls.map((call) => call.peer)).size).toBeGreaterThan(4);
+        await voter.stop();
+    });
+
+    it("coalesces same-peer cold-start pulls into one batch fetch stream that answers every contest", async () => {
+        const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        const h = fetchSpyHelia(new Map([["seeder", record]]));
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+        const contests = await Promise.all(
+            Array.from({ length: 3 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+        );
+        await Promise.all(contests.map((contest) => contest.update()));
+
+        // Every contest's divergent root is chased — off a SINGLE fetch stream carrying all three topics.
+        await vi.waitFor(() => expect(h.chased.filter((cid) => cid === root.toString()).length).toBe(3));
+        expect(h.fetchCalls.length).toBe(1);
+        expect(decodeBatchRootsKey(h.fetchCalls[0]!.key)).toEqual(contests.map((contest) => contest.topic));
+        await voter.stop();
+    });
+
+    it("falls back to per-topic keys when a responder answers the batch key with garbage — degraded, never silent", async () => {
+        const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        const keys: string[] = [];
+        const chased: string[] = [];
+        const fetchService: FetchServiceLike = {
+            fetch: async (_peer, key) => {
+                keys.push(key);
+                if (decodeBatchRootsKey(key) !== undefined) return new Uint8Array([0xff]); // hostile/buggy batch answer
+                return record;
+            },
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [{ toString: () => "seeder" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = {
+            get: async (cid: CID) => {
+                chased.push(cid.toString());
+                throw new Error("no block");
+            },
+            put: async (cid: CID) => cid,
+            has: async () => false
+        };
+        const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
+        const voter = new PubsubVoter({ helia, chains: fakeChains() });
+        const contests = await Promise.all(
+            Array.from({ length: 2 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+        );
+        await Promise.all(contests.map((contest) => contest.update()));
+
+        // Both contests still converge on the per-topic path after the malformed batch answer.
+        await vi.waitFor(() => expect(chased.filter((cid) => cid === root.toString()).length).toBe(2));
+        expect(keys.filter((key) => decodeBatchRootsKey(key) !== undefined).length).toBe(1); // the one poisoned batch
+        expect(keys.filter((key) => key.endsWith("/root")).length).toBe(2); // one per-topic fallback each
+        await voter.stop();
+    });
+
+    it("answers a batch key with one entry per requested topic, in order — a record for joined contests, null otherwise", async () => {
+        const h = fetchSpyHelia(new Map());
+        const voter = new PubsubVoter({ helia: h.helia, chains: fakeChains() });
+        const joined = await voter.createContest({ criteria: bizCriteria() });
+        await joined.update();
+        // An engine that exists but never joined (ballot created, never published)...
+        const bystander = { ...bizCriteria(), contestId: "pol" };
+        await voter.createContestVote({ criteria: bystander, votes: [] });
+        // ...and a topic this node has never heard of at all.
+        const unknownTopic = await topicFor({ ...bizCriteria(), contestId: "unknown" });
+
+        const lookup = h.lookups.get(TOPIC_PREFIX);
+        const asKey = (s: string): Uint8Array => new TextEncoder().encode(s);
+        const key = batchRootsFetchKey([unknownTopic, joined.topic, await topicFor(bystander)]);
+        const answer = await lookup!(asKey(key));
+        expect(answer).toBeDefined();
+        const records = decodeBatchRootsResponse(answer!);
+        expect(records).toHaveLength(3);
+        expect(records[0]).toBeNull(); // never heard of — but the batch still answers
+        expect(records[1]?.version).toBe(ROOT_RECORD_VERSION); // the joined contest's record
+        expect(records[2]).toBeNull(); // engine exists but never joined: no view to serve
         await voter.stop();
     });
 

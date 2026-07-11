@@ -1,7 +1,9 @@
 import { CID } from "multiformats/cid";
+import { base64url } from "multiformats/bases/base64";
 import * as dagCbor from "@ipld/dag-cbor";
 import { z } from "zod";
 import { encodeCanonical } from "../encoding/canonical.js";
+import { TOPIC_PREFIX } from "../topic.js";
 import type { Criteria } from "../schema/criteria.js";
 
 /**
@@ -130,6 +132,80 @@ export function encodeRootRecord(record: FetchRootRecord): Uint8Array {
 /** Decode a fetch-protocol root-record value (with its chunk index); throws on malformed. */
 export function decodeRootRecord(bytes: Uint8Array): FetchRootRecord {
     return FetchRootRecordSchema.parse(dagCbor.decode(bytes));
+}
+
+/**
+ * Batched root pull (see DESIGN.md "Checkpoints"): one fetch stream carries many contests' root
+ * records, so a directory-scale cold join pays the per-stream multistream-select negotiation
+ * once per peer instead of once per contest. The key needs no prior agreement between requester
+ * and responder — it carries its own manifest (the requested criteria CIDs, dag-cbor'd and
+ * base64url'd into the key itself), and the responder answers entry-by-entry from whatever it
+ * participates in: a topic it does not serve answers `null`, aligned to the request order. A
+ * responder that predates the batch key sees an unknown key shape and answers nothing
+ * (NOT_FOUND), which the requester treats as "fall back to per-topic keys".
+ */
+export const BATCH_ROOTS_VERSION = 1;
+/**
+ * Requested-topics ceiling per batch key: bounds the responder's per-request work (decode + K
+ * cache lookups) and the key/response size. A requester wanting more chunks its batches.
+ */
+export const MAX_BATCH_ROOT_KEYS = 64;
+/**
+ * The batch key marker under {@link TOPIC_PREFIX}. It cannot collide with a per-topic key:
+ * topics are `TOPIC_PREFIX + <CIDv1 base32>` (always starting `b`), never the literal `roots`,
+ * and base64url carries no `/`, so a batch key also never ends in the `/root` suffix a
+ * per-topic responder matches on.
+ */
+const BATCH_ROOTS_KEY_PREFIX = `${TOPIC_PREFIX}roots/`;
+
+/** The requested criteria CIDs as carried inside a batch key (dag-cbor CID links). */
+const BatchRootsKeySchema = z.array(CidSchema).min(1).max(MAX_BATCH_ROOT_KEYS);
+
+/** The batch response: one entry per requested topic, in request order; `null` = "no record". */
+const BatchRootsResponseSchema = z.strictObject({
+    v: z.literal(BATCH_ROOTS_VERSION),
+    records: z.array(z.union([FetchRootRecordSchema, z.null()])).max(MAX_BATCH_ROOT_KEYS)
+});
+
+/**
+ * Build the fetch-protocol key requesting many topics' root records in one stream. Throws on an
+ * empty list, more than {@link MAX_BATCH_ROOT_KEYS} topics, or a string that is not a contest
+ * topic — all requester-side programming errors, never wire conditions.
+ */
+export function batchRootsFetchKey(topics: readonly string[]): string {
+    if (topics.length === 0 || topics.length > MAX_BATCH_ROOT_KEYS) {
+        throw new Error(`batch key must carry 1..${MAX_BATCH_ROOT_KEYS} topics, got ${topics.length}`);
+    }
+    const cids = topics.map((topic) => {
+        if (!topic.startsWith(TOPIC_PREFIX)) throw new Error(`not a contest topic: ${topic}`);
+        return CID.parse(topic.slice(TOPIC_PREFIX.length));
+    });
+    return BATCH_ROOTS_KEY_PREFIX + base64url.baseEncode(dagCbor.encode(cids));
+}
+
+/**
+ * Parse a fetch key as a batch-roots request, returning the requested topics in request order,
+ * or `undefined` for anything else — a non-batch key shape, undecodable payload, or an over-cap
+ * list (the responder answers nothing, which the requester reads as "use per-topic keys").
+ */
+export function decodeBatchRootsKey(key: string): string[] | undefined {
+    if (!key.startsWith(BATCH_ROOTS_KEY_PREFIX)) return undefined;
+    try {
+        const bytes = base64url.baseDecode(key.slice(BATCH_ROOTS_KEY_PREFIX.length));
+        return BatchRootsKeySchema.parse(dagCbor.decode(bytes)).map((cid) => TOPIC_PREFIX + cid.toString());
+    } catch {
+        return undefined;
+    }
+}
+
+/** Encode the batch response — entry `i` answers requested topic `i`; `null` = "no record". */
+export function encodeBatchRootsResponse(records: ReadonlyArray<FetchRootRecord | null>): Uint8Array {
+    return encodeCanonical(BatchRootsResponseSchema.parse({ v: BATCH_ROOTS_VERSION, records }));
+}
+
+/** Decode a batch response; throws on malformed (the requester falls back to per-topic keys). */
+export function decodeBatchRootsResponse(bytes: Uint8Array): (FetchRootRecord | null)[] {
+    return BatchRootsResponseSchema.parse(dagCbor.decode(bytes)).records;
 }
 
 /**
