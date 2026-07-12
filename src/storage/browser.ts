@@ -54,7 +54,13 @@ class LocalForageLruStorage implements LruStorage {
                 inactive: () => inactive,
                 grow: async () => {
                     activeSize += 1;
-                    if (activeSize >= this.#maxItems) await swap();
+                    if (activeSize >= this.#maxItems) {
+                        // removeItem/clear never decrement the counter, so it only ever
+                        // over-counts — reconcile at the threshold so a purge-heavy session
+                        // cannot swap (and clear) before the active half is actually full.
+                        activeSize = await active.length();
+                        if (activeSize >= this.#maxItems) await swap();
+                    }
                 },
                 swap
             };
