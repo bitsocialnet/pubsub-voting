@@ -21,8 +21,11 @@ be `chainVerified: false`) and **START→VERIFIED** (every deferred gate read la
 
 **Discovery model:** peers are discovered via an **HTTP content router** (Delegated Routing V1, no
 DHT — the pkc-js pattern), simulated locally with a **~1 s lookup latency paid once**; after that
-bitswap's IWANT takes over peer-to-peer. `#coldStart` races this against `getSubscribers(topic)` and
-fetches from whichever names a peer first.
+bitswap's IWANT takes over peer-to-peer. The router's provider records are **announced by the
+seeder for real** (`PubsubVoterOptions.httpRouterUrls`, reaching the local router over an SSH
+reverse tunnel — out-of-band of the measured join path), so the bench exercises
+announce → router → `findProviders` → dial end-to-end. `#coldStart` races this against
+`getSubscribers(topic)` and fetches from whichever names a peer first.
 
 Run it yourself: `BENCH_HOST=<ssh-host> npm run bench:cold-join` (see [run.mjs](./run.mjs)).
 
@@ -35,18 +38,22 @@ voters vote for one community, so the tally is one community of weight `N`.
 
 | N (voters) | router | connect | fetch | bitswap | verify+merge | gate-RPC | **START→TALLY** | **START→VERIFIED** |
 |-----------:|-------:|--------:|------:|--------:|-------------:|---------:|----------------:|-------------------:|
-| 1          | 1.00s  | 1.61s   | 0.58s | 0.59s   | 0.32s        | 2        | **3.43s**       | **3.68s**          |
-| 5          | 1.00s  | 1.60s   | 0.59s | 0.59s   | 0.32s        | 2        | **3.12s**       | **3.42s**          |
-| 10         | 1.00s  | 1.61s   | 0.40s | 0.61s   | 0.32s        | 2        | **2.97s**       | **3.28s**          |
-| 100        | 1.00s  | 1.60s   | 0.44s | 0.58s   | 0.47s        | 5        | **3.14s**       | **3.45s**          |
-| 1000       | 1.00s  | 1.61s   | 0.58s | 1.01s   | 2.11s        | 38       | **5.48s**       | **5.48s**          |
+| 1          | 1.00s  | 1.57s   | 0.53s | 0.55s   | 0.31s        | 2        | **3.08s**       | **3.38s**          |
+| 5          | 1.00s  | 1.54s   | 0.54s | 0.60s   | 0.31s        | 2        | **3.00s**       | **3.31s**          |
+| 10         | 1.00s  | 1.55s   | 0.49s | 0.56s   | 0.33s        | 2        | **2.94s**       | **3.24s**          |
+| 100        | 1.00s  | 1.55s   | 0.52s | 0.58s   | 0.48s        | 5        | **3.11s**       | **3.41s**          |
+| 1000       | 1.00s  | 1.55s   | 0.53s | 1.21s   | 2.07s        | 38       | **5.38s**       | **5.44s**          |
 | 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | —        | **18.95s**      | —                  |
 
-*Measured 2026-07-09 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
-large enough that 3 repeats gave unstable per-op medians, so this baseline uses 5). Columns are
-wall-clock timings of each operation but they **overlap** and do not sum to the total — `connect` is
-measured from the `start()` call and already contains the 1 s router wait, and verify runs as blocks
-arrive. `START→TALLY` / `START→VERIFIED` are the true end-to-end figures.*
+*Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
+large enough that 3 repeats gave unstable per-op medians, so this baseline uses 5). This run's
+provider records were **announced by the seeder for real** (`httpRouterUrls` → `ssh -R`-tunneled
+router), not hardcoded; every column matched the 2026-07-09 hardcoded-record baseline within jitter
+(e.g. `START→TALLY` 3.43s → 3.08s at N=1, 5.48s → 5.38s at N=1000), confirming announcing is
+seeder-side only. Columns are wall-clock timings of each operation but they **overlap** and do not
+sum to the total — `connect` is measured from the `start()` call and already contains the 1 s router
+wait, and verify runs as blocks arrive. `START→TALLY` / `START→VERIFIED` are the true end-to-end
+figures.*
 
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
@@ -101,11 +108,11 @@ multistream-select negotiation vs the request write→response read — to find 
 
 | N (voters) | fetch | negotiate (mss) | write→read |
 |-----------:|------:|----------------:|-----------:|
-| 1          | 0.58s | 0.38s           | 0.20s      |
-| 5          | 0.59s | 0.37s           | 0.21s      |
-| 10         | 0.40s | 0.19s           | 0.20s      |
-| 100        | 0.44s | 0.21s           | 0.19s      |
-| 1000       | 0.58s | 0.38s           | 0.21s      |
+| 1          | 0.53s | 0.35s           | 0.18s      |
+| 5          | 0.54s | 0.35s           | 0.18s      |
+| 10         | 0.49s | 0.30s           | 0.18s      |
+| 100        | 0.52s | 0.35s           | 0.18s      |
+| 1000       | 0.53s | 0.35s           | 0.18s      |
 
 **The multistream-select negotiation (~0.2–0.4 s, ~1–2 RTT) dominates the fetch, not the actual
 request/response (~0.2 s, ~1 RTT).** This is the `mss.select` handshake `connection.newStream` runs

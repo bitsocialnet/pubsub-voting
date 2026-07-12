@@ -34,6 +34,8 @@ import { makePersistentGateResultCache, purgeExpiredGateResults } from "../verif
 import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
 import { makeStorage } from "../storage/node.js";
 import type { LruStorage } from "../storage/types.js";
+import { makeAnnouncer } from "../transport/announce/node.js";
+import type { Announcer } from "../transport/announce/types.js";
 import { encode as encodeDagCbor } from "@ipld/dag-cbor";
 import { sha256 } from "viem";
 import { makeBackgroundVerifier, type BackgroundChainVerifier } from "../verify/background.js";
@@ -244,6 +246,20 @@ export interface PubsubVoterOptions {
      */
     nameResolvers?: NameResolver[];
     /**
+     * Delegated Routing V1 router base URLs to ANNOUNCE provider records to (one unsigned
+     * `PUT /routing/v1/providers` per router, `Keys` batched across all joined contests:
+     * each contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced
+     * on checkpoint/root changes, and on `self:peer:update` address changes). Absent or empty
+     * means never announce — the default, correct for plain clients: only a publicly dialable
+     * node (a seeder) should set this, and the browser build never announces regardless (the
+     * announcer is a Node-only module, stubbed inert by the package.json `browser` remap).
+     * QUERYING needs no URLs here — `#discoverProviders` rides the injected node's
+     * `libp2p.contentRouting`, which the host wires its routers into; this option exists only
+     * because the pinned js stack has no working announce path (`provide()` is a noop). See
+     * DESIGN.md "Deferred pkc-js work", provider-record announces.
+     */
+    httpRouterUrls?: string[];
+    /**
      * Directory for the voter's persistent caches (gate results, name resolutions), the
      * pkc-js `dataPath` equivalent. On Node the caches are better-sqlite3 databases under
      * `{dataPath}/lru-storage/`; in the browser the path is ignored and the caches live in
@@ -276,6 +292,14 @@ interface ResolvedDeps {
      */
     onTopicJoined: () => void;
     onTopicLeft: () => void;
+    /**
+     * Engine → voter notification that the checkpoint winner-set changed (any merge, publish,
+     * chase admit, or background settlement — the same transitions that dirty the on-demand
+     * encode cache). Drives the provider-record announcer's debounced re-announce, so router
+     * records track the current root without polling. A cheap no-op when no announcer is
+     * configured.
+     */
+    onCheckpointChanged: () => void;
     /**
      * Voter-wide per-peer budget for cold-start root fetches: runs `task` once fewer than
      * {@link COLD_START_PEER_FETCH_LIMIT} fetches to `peerId` are in flight across ALL engines,
@@ -1070,6 +1094,9 @@ class ContestEngine {
     /** Invalidate the on-demand checkpoint cache: the winner-set changed (publish/merge/chase). */
     #markStateChanged(): void {
         this.#checkpointDirty = true;
+        // The same transition the encode cache invalidates on is what makes router provider
+        // records stale, so the announcer's debounced re-announce rides it (see ResolvedDeps).
+        this.#deps.onCheckpointChanged();
     }
 
     /**
@@ -1331,6 +1358,14 @@ export class PubsubVoter implements VoteClient {
     #destroyed = false;
     /** The voter's persistent caches (see {@link PubsubVoterOptions.dataPath}); closed on destroy. */
     readonly #storage: ReturnType<typeof makeStorage>;
+    /**
+     * The provider-record announcer, present only when {@link PubsubVoterOptions.httpRouterUrls}
+     * names at least one router (and inert in the browser build regardless — see
+     * `src/transport/announce/`). Started with the first joined topic and stopped with the last,
+     * the same transitions that drive the lazy fetch responder: a node announces records for
+     * exactly the contests it participates in, for exactly as long as it participates.
+     */
+    readonly #announcer: Announcer | undefined;
 
     constructor(options: PubsubVoterOptions) {
         // Fail fast: the node must expose a gossipsub service, a blockstore, and a libp2p
@@ -1353,13 +1388,48 @@ export class PubsubVoter implements VoteClient {
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
             onTopicLeft: this.#onTopicLeft,
+            onCheckpointChanged: () => this.#announcer?.notifyChange(),
             fetchBudget: makePerPeerBudget(COLD_START_PEER_FETCH_LIMIT),
             gateStore: this.#storage.openLru({ cacheName: "gate-results", maxItems: GATE_RESULTS_MAX_ITEMS }),
             nameResolutionCache: makeNameResolutionCache(
                 this.#storage.openLru({ cacheName: "name-resolutions", maxItems: NAME_RESOLUTIONS_MAX_ITEMS })
             )
         };
+        // The announcer touches libp2p (peer id, addresses, address events) only when routers are
+        // configured, so a host that never announces pays nothing and injects nothing extra.
+        if (options.httpRouterUrls !== undefined && options.httpRouterUrls.length > 0) {
+            this.#announcer = makeAnnouncer({
+                routerUrls: [...options.httpRouterUrls],
+                libp2p: options.helia.libp2p,
+                keys: this.#announceKeys
+            });
+        }
     }
+
+    /**
+     * The CIDs the announcer publishes, collected fresh per tick and batched into one record:
+     * every JOINED contest's criteria CID (the discovery key — a provider record for it means
+     * "I run this contest") plus its current checkpoint root + chunk CIDs (what the chase-time
+     * parallel router lookup finds; converged seeders share identical chunk CIDs, so any of
+     * them can serve a block). `rootRecord()` is the same on-demand, cached encode the fetch
+     * responder serves — an encode failure still announces the criteria key alone.
+     */
+    readonly #announceKeys = async (): Promise<string[]> => {
+        const keys: string[] = [];
+        for (const engine of this.#engines.values()) {
+            if (!engine.joined) continue;
+            keys.push(engine.topic.slice(TOPIC_PREFIX.length));
+            try {
+                const record = await engine.rootRecord();
+                keys.push(record.root.toString());
+                for (const chunk of record.chunks) keys.push(chunk.toString());
+            } catch {
+                // Encode failure — best-effort: the criteria CID (the discovery key) still goes out.
+            }
+        }
+        // Contests can share CIDs (e.g. two vote-less contests share the empty-checkpoint root).
+        return [...new Set(keys)];
+    };
 
     get readOnly(): boolean {
         return this.#deps.signer === undefined;
@@ -1439,6 +1509,11 @@ export class PubsubVoter implements VoteClient {
      */
     readonly #onTopicJoined = (): void => {
         this.#joinedEngines += 1;
+        // A join adds a criteria CID to the announced key set (and the first join starts the
+        // announcer's timers/listeners) — the debounce coalesces a directory-wide join into one
+        // announce per router.
+        this.#announcer?.start();
+        this.#announcer?.notifyChange();
         if (this.#responderRegistered) return;
         this.#deps.fetch.registerLookupFunction(TOPIC_PREFIX, this.#rootLookup);
         this.#responderRegistered = true;
@@ -1446,7 +1521,12 @@ export class PubsubVoter implements VoteClient {
 
     readonly #onTopicLeft = (): void => {
         this.#joinedEngines -= 1;
-        if (this.#joinedEngines <= 0) this.#unregisterResponder();
+        // Last topic left: stop refreshing records; what is already written ages out by the
+        // router's TTL (there is no un-announce), symmetric with the responder unregistering.
+        if (this.#joinedEngines <= 0) {
+            this.#announcer?.stop();
+            this.#unregisterResponder();
+        }
     };
 
     async stop(): Promise<void> {
@@ -1468,6 +1548,7 @@ export class PubsubVoter implements VoteClient {
         // Unlike `stop()`, the client does not come back.
         this.#destroyed = true;
         for (const engine of this.#engines.values()) engine.markDestroyed();
+        this.#announcer?.stop();
         this.#unregisterResponder();
         await this.stop();
         // Close the persistent caches last (Node: the sqlite handles) — engines are already
