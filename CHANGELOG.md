@@ -1,20 +1,6 @@
 # Changelog
 
-## [0.1.2](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.1...v0.1.2) (2026-07-12)
-
-## [0.1.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.0...v0.1.1) (2026-07-12)
-
-### Features
-
-* **bench:** measure START→ALL-VERIFIED in the directory cold-load bench ([943b12f](https://github.com/bitsocialnet/pubsub-voting/commit/943b12f1c78432bb350298998f89937acd0604e4))
-* **client:** persist gate results and name resolutions under dataPath ([fe97719](https://github.com/bitsocialnet/pubsub-voting/commit/fe97719c5b53a0a7bb5d8bade5d043fede589da5))
-
-### Bug Fixes
-
-* **client:** re-purge persisted gate results as the expiry horizon advances ([f0c346d](https://github.com/bitsocialnet/pubsub-voting/commit/f0c346dfd279ff644447130ce2d19ab4a96d0d7a))
-* **storage:** reconcile the browser LRU's size counter before swapping ([ff12a19](https://github.com/bitsocialnet/pubsub-voting/commit/ff12a19116cbb8026c06b1c4edb49acd1fe994ab))
-
-## 0.1.0 (2026-07-11)
+## 0.0.1 (2026-07-12)
 
 ### ⚠ BREAKING CHANGES
 
@@ -33,11 +19,13 @@ removed CIDs. No wire change — bundle, message, and checkpoint layouts
 ### Features
 
 * **api:** type PubsubVoter manifest option as DirectoryManifest ([86097cc](https://github.com/bitsocialnet/pubsub-voting/commit/86097ccd06ecc3a9a7da1a6bb75c17c135abcb01))
+* **bench:** measure START→ALL-VERIFIED in the directory cold-load bench ([943b12f](https://github.com/bitsocialnet/pubsub-voting/commit/943b12f1c78432bb350298998f89937acd0604e4))
 * board is { name?, publicKey }; strict B58 IPNS identity ([2e451eb](https://github.com/bitsocialnet/pubsub-voting/commit/2e451eb2bc288d245eff7573f4b89cdcc67ddaec))
 * board names are verified claims; pairwise-distinct boards per bundle ([5ebdc76](https://github.com/bitsocialnet/pubsub-voting/commit/5ebdc761a3a8daaf90a7f377ca20a1d908f5a269)), closes [bso-resolver#3](https://github.com/bitsocialnet/bso-resolver/issues/3)
 * **checkpoint:** on-demand encode + root heartbeat + directed-bitswap chase ([aaac950](https://github.com/bitsocialnet/pubsub-voting/commit/aaac9503699cad9bc7fac6c36568e5727fba817c))
 * **client:** implement republish scheduler, durable persistence, and withdrawal semantics ([e85c80d](https://github.com/bitsocialnet/pubsub-voting/commit/e85c80db74b1b85defa8226a1587ba6f16f68e9f))
 * **client:** make voter.destroy() terminal, mirroring pkc-js ([47e7558](https://github.com/bitsocialnet/pubsub-voting/commit/47e755856b9b80c978a7db339698acae5938fc8f)), closes [#engines](https://github.com/bitsocialnet/pubsub-voting/issues/engines)
+* **client:** persist gate results and name resolutions under dataPath ([fe97719](https://github.com/bitsocialnet/pubsub-voting/commit/fe97719c5b53a0a7bb5d8bade5d043fede589da5))
 * **client:** require manifest, rename contest→contestId, add getContest ([1afbea5](https://github.com/bitsocialnet/pubsub-voting/commit/1afbea5b865b8d87e158c1e236da53d0b4ec651c))
 * **client:** surface publish peer-reach as recipientCount ([9f559f2](https://github.com/bitsocialnet/pubsub-voting/commit/9f559f220f3863030c9c45e1322d95c763228aa4))
 * **crdt:** read-time expiry filter so decayed votes can't pollute heads ([eb7ed97](https://github.com/bitsocialnet/pubsub-voting/commit/eb7ed976a6d409ea692bcd7f3197c5f8fe3820d8))
@@ -60,8 +48,10 @@ removed CIDs. No wire change — bundle, message, and checkpoint layouts
 ### Bug Fixes
 
 * **client:** fetch responder answers only joined topics ([a8156ef](https://github.com/bitsocialnet/pubsub-voting/commit/a8156ef9fd717f4f5fd0c6c70ab584ce075587bd))
+* **client:** re-purge persisted gate results as the expiry horizon advances ([f0c346d](https://github.com/bitsocialnet/pubsub-voting/commit/f0c346dfd279ff644447130ce2d19ab4a96d0d7a))
 * **client:** retry cold-start root-record fetch until a deadline ([2285f5e](https://github.com/bitsocialnet/pubsub-voting/commit/2285f5e70bb998f2af9e0fc5977e13c73e4f1ec5)), closes [#fetchRootWithRetry](https://github.com/bitsocialnet/pubsub-voting/issues/fetchRootWithRetry)
 * **gate:** split forward-gate verdicts into reject vs ignore ([505eced](https://github.com/bitsocialnet/pubsub-voting/commit/505ecedf4794c2fb1d2f0232862fde15d4c12eb1))
+* **storage:** reconcile the browser LRU's size counter before swapping ([ff12a19](https://github.com/bitsocialnet/pubsub-voting/commit/ff12a19116cbb8026c06b1c4edb49acd1fe994ab))
 
 ### Performance Improvements
 
