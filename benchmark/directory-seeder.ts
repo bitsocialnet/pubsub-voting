@@ -108,7 +108,7 @@ async function main(): Promise<void> {
     // defaults to 32), to test whether that alone lets a naive all-at-once directory join converge.
     const fetchMaxStreams = process.env.BENCH_FETCH_MAX_STREAMS ? Number(process.env.BENCH_FETCH_MAX_STREAMS) : undefined;
     const seeder = await makeHostNode({ port, ...(fetchMaxStreams !== undefined ? { fetchMaxStreams } : {}) });
-    const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains() });
+    const voter = new PubsubVoter({ dataPath: false, helia: seeder.helia, chains: benchChains() });
 
     // Build each contest's criteria (for its signing context) in the SAME order the joiner will.
     const criteria = benchDirectoryCriteria(m);

@@ -6,6 +6,7 @@ import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
 import { UnknownRuleError } from "../errors.js";
 import type { GateResultCache } from "./gate-result-cache.js";
+import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
 import type { VerdictCache } from "./cache.js";
 import type { VerifyFail } from "./types.js";
 
@@ -52,6 +53,8 @@ export interface BackgroundVerifierDeps {
     nameResolvers: NameResolver[];
     /** Shared `(wallet, sampleBlock)` gate scores — batch results land here, hits skip the read. */
     gateResultCache: GateResultCache;
+    /** Shared persistent name-resolution cache (pkc-js rule, 1h max-age); omitted ⇒ resolve live. */
+    nameResolutionCache?: NameResolutionCache;
     /** The gate's per-CID verdict cache — a settled bundle's terminal verdict is stored here. */
     cache: VerdictCache;
     /** The bundle's gate read confirmed `> 0n` (flip `chainVerified`, kick the tally). */
@@ -95,7 +98,7 @@ interface QueueItem extends PendingBundle {
 }
 
 export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): BackgroundChainVerifier {
-    const { criteria, registry, chainFor, bucketMath, nameResolvers, gateResultCache, cache, limit } = deps;
+    const { criteria, registry, chainFor, bucketMath, nameResolvers, gateResultCache, nameResolutionCache, cache, limit } = deps;
     const retryBaseMs = deps.retryBaseMs ?? RETRY_BASE_MS;
     const retryCapMs = deps.retryCapMs ?? RETRY_CAP_MS;
 
@@ -149,7 +152,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             const wallets: string[] = [];
             for (const item of group) {
                 const wallet = item.bundle.address;
-                if (gateResultCache.get(wallet, sampleBlock) === undefined && !wallets.includes(wallet)) {
+                if ((await gateResultCache.get(wallet, sampleBlock)) === undefined && !wallets.includes(wallet)) {
                     wallets.push(wallet);
                 }
             }
@@ -163,7 +166,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 wallets.forEach((wallet, i) => gateResultCache.set(wallet, sampleBlock, results[i]!.score));
             }
             for (const item of group) {
-                item.ruleScore = gateResultCache.get(item.bundle.address, sampleBlock)!;
+                item.ruleScore = (await gateResultCache.get(item.bundle.address, sampleBlock))!;
                 item.gateDone = true;
             }
         }
@@ -190,7 +193,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             }
             let resolution = resolutions.get(name);
             if (!resolution) {
-                resolution = limit(() => resolver.resolve({ name }));
+                resolution = limit(() => resolveNameThroughCache({ resolver, name, cache: nameResolutionCache }));
                 resolutions.set(name, resolution);
             }
             const record = await resolution;

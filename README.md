@@ -38,6 +38,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
+| `dataPath` | `string \| false` | no | directory for the voter's persistent caches (gate results + name resolutions), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-votes` (better-sqlite3 under `{dataPath}/lru-storage/`); in the browser the path is ignored and the caches live in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC |
 
 A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists.
 
@@ -50,7 +51,8 @@ const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
   chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
   signer: mySigner,             // optional; omit → read-only voter
-  nameResolvers: [bsoResolver]  // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
+  nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
+  dataPath: "/path/to/data"     // optional; persistent-cache directory (default {cwd}/.bitsocial-pubsub-votes; false → in-memory)
 });
 ```
 

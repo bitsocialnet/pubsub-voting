@@ -52,6 +52,16 @@ export interface DirectoryJoinMilestones {
     readyAtMs: number[];
     /** `start()` → EVERY one of the M contests' tally reflects all N voters — end-to-end, ms. */
     allTalliesReadyMs: number;
+    /** Did ALL M contests also chain-verify before the timeout? */
+    allVerified: boolean;
+    /** How many of the M contests' ranking rows read `chainVerified: true` (== M when allVerified). */
+    verifiedCount: number;
+    /**
+     * `start()` → EVERY contest's ranking row reads `chainVerified: true` (every deferred gate
+     * read landed) — the trust-ready end-to-end, the directory analogue of the single-contest
+     * bench's `start→verified`. `allTalliesReadyMs` is the render-ready milestone before it.
+     */
+    allVerifiedMs: number;
 }
 
 /** The subset of a Helia blockstore we monkey-patch to time bitswap pulls. */
@@ -145,7 +155,7 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         gateway = await startRpcGateway({ latencyMs: Number(process.env.BENCH_RPC_LATENCY_MS ?? 270) });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ helia: node.helia, chains: benchGatewayChains(gateway.url) });
+        voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: benchGatewayChains(gateway.url) });
 
         const networks: Contest[] = await Promise.all(criteria.map((c) => voter!.createContest({ criteria: c })));
 
@@ -173,7 +183,9 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         const concurrency = Math.max(1, Math.min(args.startConcurrency ?? args.m, args.m));
         const target = BigInt(args.expectedN);
         const readyAtMs: number[] = [];
+        const verifiedAtMs: number[] = [];
         const ready = new Array<boolean>(networks.length).fill(false);
+        const verified = new Array<boolean>(networks.length).fill(false);
         const started = new Array<boolean>(networks.length).fill(false);
         const t0 = performance.now();
         // Admit up to `concurrency` un-started contests into the window (fire-and-forget cold-start).
@@ -197,25 +209,38 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         // where it stalled, not just "timed out". This is the diagnostic the M=63 cliff needs.
         const deadline = performance.now() + timeoutMs;
         for (;;) {
-            const tallies = await Promise.all(networks.map((net, i) => (ready[i] ? null : net.getTally())));
+            // Keep polling a ready-but-unverified board: tally-ready (render) and chain-verified
+            // (trust) are two milestones per board, mirroring the single-contest bench.
+            const tallies = await Promise.all(networks.map((net, i) => (verified[i] ? null : net.getTally())));
             const now = performance.now();
             for (let i = 0; i < networks.length; i++) {
-                if (!ready[i] && (tallies[i]!.ranking[0]?.weight ?? 0n) >= target) {
+                const top = tallies[i]?.ranking[0];
+                if (top === undefined) continue;
+                if (!ready[i] && top.weight >= target) {
                     ready[i] = true;
                     readyAtMs.push(now - t0);
                 }
+                if (!verified[i] && ready[i] && top.chainVerified) {
+                    verified[i] = true;
+                    verifiedAtMs.push(now - t0);
+                }
             }
             pump(); // a freed slot admits the next batch
-            if (readyAtMs.length === networks.length) break;
+            if (verifiedAtMs.length === networks.length) break;
             if (now >= deadline) {
-                process.stderr.write(`[dir-join] TIMEOUT: ${readyAtMs.length}/${networks.length} contests converged in ${(timeoutMs / 1000).toFixed(0)}s (concurrency=${concurrency})\n`);
+                process.stderr.write(
+                    `[dir-join] TIMEOUT: ${readyAtMs.length}/${networks.length} tallies ready, ${verifiedAtMs.length}/${networks.length} verified in ${(timeoutMs / 1000).toFixed(0)}s (concurrency=${concurrency})\n`
+                );
                 break;
             }
             await new Promise((r) => setTimeout(r, 250));
         }
         readyAtMs.sort((a, b) => a - b);
+        verifiedAtMs.sort((a, b) => a - b);
         const converged = readyAtMs.length === networks.length;
         const allTalliesReadyMs = converged ? readyAtMs[readyAtMs.length - 1]! : performance.now() - t0;
+        const allVerified = verifiedAtMs.length === networks.length;
+        const allVerifiedMs = allVerified ? verifiedAtMs[verifiedAtMs.length - 1]! : performance.now() - t0;
 
         // --- assemble the aggregate breakdown (t0-relative) ---
         const ops = events.filter((e) => e.end >= t0);
@@ -249,7 +274,10 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
             converged,
             readyCount: readyAtMs.length,
             readyAtMs,
-            allTalliesReadyMs
+            allTalliesReadyMs,
+            allVerified,
+            verifiedCount: verifiedAtMs.length,
+            allVerifiedMs
         };
     } finally {
         await voter?.stop().catch(() => {});

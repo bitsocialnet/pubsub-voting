@@ -7,6 +7,7 @@ import { UnknownRuleError } from "../errors.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
 import type { GateResultCache } from "./gate-result-cache.js";
+import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
 import type { BundleVerifier, BundleVerdict } from "./types.js";
 
 /**
@@ -53,10 +54,18 @@ export interface BundleVerifierDeps {
      * historical reads. Omitted ⇒ every novel bundle pays its own gate read (prior behaviour).
      */
     gateResultCache?: GateResultCache;
+    /**
+     * Optional persistent cache of name resolutions (the pkc-js rule — see
+     * verify/name-resolution-cache.ts). When present, a carried name is resolved live at most
+     * once per {@link NAME_RESOLUTION_MAX_AGE_SECONDS} per resolver. Omitted ⇒ every verify
+     * resolves live (prior behaviour; unit tests).
+     */
+    nameResolutionCache?: NameResolutionCache;
 }
 
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
-    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, gateResultCache } = deps;
+    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, gateResultCache, nameResolutionCache } =
+        deps;
 
     // Resolve the gate `rule`, its options, and its chain client once. The rule reads at the
     // bundle's bucket block, but which rule/chain to use is fixed by the criteria, so it need
@@ -88,7 +97,7 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             //    the same wallet, whether it is ineligible (`0n`, a `reject`) or eligible (`> 0n`,
             //    re-signing / cycling choices within one bucket).
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
-            let score = gateResultCache?.get(bundle.address, sampleBlock);
+            let score = await gateResultCache?.get(bundle.address, sampleBlock);
             if (score === undefined) {
                 ({ score } = await rule.evaluate({
                     options: ruleOptions,
@@ -109,14 +118,17 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             //    where honest peers disagree — see DESIGN.md "Tally"/"Open questions"). Penalizing
             //    the sender for that would punish honest relayers; the drop still stops propagation.
             //    (Once pinned-block resolution lands, a steady-state mismatch becomes provable
-            //    `reject`.) The gossip gate therefore does NOT cache these verdicts.
+            //    `reject`.) The gossip gate therefore does NOT cache these verdicts. Successful
+            //    resolutions DO go through the shared name-resolution cache (the pkc-js rule,
+            //    1-hour max-age) — bounding the RPC cost, while a re-point is still honored
+            //    within the hour and a failed resolution is never negatively cached.
             const resolvedNames: Record<string, string> = {};
             for (const v of bundle.votes) {
                 const name = v.community.name;
                 if (!name) continue;
                 const resolver = nameResolvers.find((r) => r.canResolve({ name }));
                 if (!resolver) return { valid: false, disposition: "ignore", reason: `no resolver handles community name "${name}"` };
-                const record = await resolver.resolve({ name });
+                const record = await resolveNameThroughCache({ resolver, name, cache: nameResolutionCache });
                 if (!record) return { valid: false, disposition: "ignore", reason: `community name "${name}" does not resolve` };
                 if (record.publicKey !== v.community.publicKey) {
                     return {

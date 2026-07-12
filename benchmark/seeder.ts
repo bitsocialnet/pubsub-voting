@@ -62,7 +62,7 @@ async function main(): Promise<void> {
     if (!Number.isInteger(port) || port <= 0) throw new Error(`bad PORT: ${process.argv[3]}`);
 
     const seeder = await makeHostNode({ port });
-    const voter = new PubsubVoter({ helia: seeder.helia, chains: benchChains() });
+    const voter = new PubsubVoter({ dataPath: false, helia: seeder.helia, chains: benchChains() });
     const network = await voter.createContest({ criteria: benchCriteria() });
     await network.update(); // join + serve: installs the gate and registers the fetch responder
 

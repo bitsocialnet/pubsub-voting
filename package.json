@@ -17,6 +17,9 @@
       "import": "./dist/index.js"
     }
   },
+  "browser": {
+    "./dist/storage/node.js": "./dist/storage/browser.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -40,7 +43,9 @@
   "dependencies": {
     "@ipld/dag-cbor": "9.2.7",
     "@libp2p/interface": "3.2.4",
+    "better-sqlite3": "12.9.0",
     "helia": "6.1.4",
+    "localforage": "1.10.0",
     "multiformats": "13.4.2",
     "p-limit": "6.2.0",
     "viem": "2.54.0",
@@ -59,6 +64,7 @@
     "@multiformats/multiaddr": "13.0.3",
     "@pkcprotocol/pkc-js": "0.0.63",
     "@release-it/conventional-changelog": "10.0.6",
+    "@types/better-sqlite3": "7.6.13",
     "commitizen": "4.3.1",
     "cz-conventional-changelog": "3.3.0",
     "husky": "9.1.7",

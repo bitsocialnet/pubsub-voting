@@ -180,9 +180,11 @@ leaderboards **at once**, every one provided by the SAME shared seeder (the bits
 and waits until EVERY contest has a usable tally. Where the single-contest benchmark above measures
 one board, this measures what happens when a directory of boards loads together over **one reused
 connection**. Same rig: seeder on the ~270 ms-RTT WAN host, joiner local, dialed directly (no tunnel),
-chain reads through the mock ETH gateway (270 ms per RPC round trip; tally-ready here is
-**render-ready** — the deferred gate reads batch in the background and never gate the convergence
-curve). `N` is voters **per contest**; every contest is a distinct synthetic criteria doc
+chain reads through the mock ETH gateway (270 ms per RPC round trip). Two end-to-end milestones,
+mirroring the single-contest bench: **START→ALL-TALLIES** (render-ready — every board's tally
+reflects all `N` voters; rows may still read `chainVerified: false`) and **START→ALL-VERIFIED**
+(trust-ready — every board's ranking row reads `chainVerified: true`, i.e. every deferred gate
+read landed). `N` is voters **per contest**; every contest is a distinct synthetic criteria doc
 (distinct CID/topic) that inherits the `/biz/` gate — the real 5chan directory is **63 contests**
 (`5chan-directory-criteria.jsonc`).
 
@@ -203,17 +205,20 @@ are paid a single time across the whole directory; `fetch`/`bitswap` are shown *
 cost of one board's op — they overlap, so they do NOT sum to the total); `verify+merge` is the
 aggregate and `START→ALL-TALLIES` is the true wall-clock to every board being ready.
 
-| M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** |
-|-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|
-| | *(amortized once)* | *(once)* | *(once)* | *(per contest)* | *(per contest)* | *(aggregate)* | *(wall-clock)* |
-| 1            | 1.00s  | 1.59s   | 1.97s    | 0.56s    | 0.58s      | 0.43s        | **3.26s** |
-| 10           | 1.00s  | 0.60s   | 0.97s    | 0.57s    | 0.62s      | 0.24s        | **2.51s** |
-| **63**       | 1.00s  | 0.60s   | 1.02s    | 0.54s    | 1.01s      | 0.21s        | **3.87s** |
+| M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** | **START→ALL-VERIFIED** |
+|-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|-----------------------:|
+| | *(amortized once)* | *(once)* | *(once)* | *(per contest)* | *(per contest)* | *(aggregate)* | *(wall-clock)* | *(wall-clock)* |
+| 1            | 1.00s  | 1.62s   | 2.02s    | 0.58s    | 0.64s      | 0.40s        | **3.26s** | **3.51s** |
+| 10           | 1.00s  | 0.60s   | 0.98s    | 0.74s    | 0.93s      | 0.25s        | **2.76s** | **3.26s** |
+| **63**       | 1.00s  | 0.60s   | 0.99s    | 0.53s    | 0.99s      | 0.43s        | **4.17s** | **4.42s** |
 
-*Measured 2026-07-10 (voter-wide per-peer cold-start fetch budget + shuffled subscriber selection —
-cold-start fetches queue client-side at ≤24 concurrent per peer instead of tripping the seeder's
-32-inbound-stream default and retrying, see DESIGN.md "Checkpoints → pull"; the previous baseline,
-2026-07-09 retry-only, read 3.26s / 2.33s / 5.04s respectively).*
+*Measured 2026-07-11 (persistent gate-result/name-resolution caches landed — the bench passes
+`dataPath: false`, so joins stay genuinely cold and the render path is unchanged; the new
+START→ALL-VERIFIED column is the directory trust-ready milestone, landing **+0.25–0.5s after
+render** at every M. The 2026-07-10 baseline — voter-wide per-peer cold-start fetch budget +
+shuffled subscriber selection, see DESIGN.md "Checkpoints → pull" — read 3.26s / 2.51s / 3.87s
+ALL-TALLIES respectively; this run's deltas are within this link's rep-to-rep jitter (M=63 reps
+spanned 3.69–5.92s). The 2026-07-09 retry-only baseline read 3.26s / 2.33s / 5.04s.)*
 
 ## Parallelism + convergence (N=10 voters/contest, median of 5)
 
@@ -223,19 +228,19 @@ directory that fills in progressively is visible.
 
 | M (contests) | conns | converged | fetches | Σfetch | Σbitswap | payload | conv-p50 | conv-p90 | **START→ALL** |
 |-------------:|------:|:---------:|--------:|-------:|---------:|--------:|---------:|---------:|--------------:|
-| 1            | 1     | 1/1       | 1       | 0.56s  | 0.58s    | 4 KiB   | 3.26s    | 3.26s    | **3.26s** |
-| 10           | 1     | 10/10     | 10      | 5.67s  | 6.17s    | 43 KiB  | 2.27s    | 2.51s    | **2.51s** |
-| **63**       | 1     | **63/63** | 63      | 34.24s | 63.63s   | 271 KiB | 3.20s    | 3.87s    | **3.87s** |
+| 1            | 1     | 1/1       | 1       | 0.58s  | 0.64s    | 4 KiB   | 3.26s    | 3.26s    | **3.26s** |
+| 10           | 1     | 10/10     | 10      | 7.38s  | 9.31s    | 43 KiB  | 2.76s    | 2.76s    | **2.76s** |
+| **63**       | 1     | **63/63** | 63      | 33.37s | 62.28s   | 271 KiB | 3.43s    | 4.17s    | **4.17s** |
 
 ### Reading the numbers
 
-- **The full 63-board directory cold-loads (render-ready) in ~3.9s** and converges 63/63; going
-  1→10→63 boards barely moves the wall-clock. `conns=1` at every `M` — all root-record fetches +
-  checkpoint pulls ride one connection, so `connect`/`identify` are paid once and the per-board
-  fetch/bitswap overlap.
+- **The full 63-board directory cold-loads (render-ready) in ~4.2s and is trust-ready
+  (all-verified) ~0.25s later**, converging 63/63; going 1→10→63 boards barely moves the
+  wall-clock. `conns=1` at every `M` — all root-record fetches + checkpoint pulls ride one
+  connection, so `connect`/`identify` are paid once and the per-board fetch/bitswap overlap.
 - **`Σfetch`/`Σbitswap` grow with `M` but the total does not** — the ops run concurrently, so the sum
-  of 63 overlapping fetches (34s) collapses to a ~3.9s wall-clock. The per-contest cost is flat
-  (~0.54–0.57s fetch, ~0.6–1.0s bitswap) regardless of directory size.
+  of 63 overlapping fetches (33s) collapses to a ~4.2s wall-clock. The per-contest cost is flat
+  (~0.53–0.74s fetch, ~0.6–1.0s bitswap) regardless of directory size.
 - **Verify is negligible at N=10** (≤0.4s for up to 630 recoveries — all offline; the boards' gate
   reads batch in the background behind one shared gateway and never gate the convergence curve). It
   scales with total ballots (~1.5 ms/recovery single-threaded), so it becomes the dominant term only
