@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.0...v0.1.1) (2026-07-12)
+
+### Features
+
+* **bench:** measure START→ALL-VERIFIED in the directory cold-load bench ([943b12f](https://github.com/bitsocialnet/pubsub-voting/commit/943b12f1c78432bb350298998f89937acd0604e4))
+* **client:** persist gate results and name resolutions under dataPath ([fe97719](https://github.com/bitsocialnet/pubsub-voting/commit/fe97719c5b53a0a7bb5d8bade5d043fede589da5))
+
+### Bug Fixes
+
+* **client:** re-purge persisted gate results as the expiry horizon advances ([f0c346d](https://github.com/bitsocialnet/pubsub-voting/commit/f0c346dfd279ff644447130ce2d19ab4a96d0d7a))
+* **storage:** reconcile the browser LRU's size counter before swapping ([ff12a19](https://github.com/bitsocialnet/pubsub-voting/commit/ff12a19116cbb8026c06b1c4edb49acd1fe994ab))
+
 ## 0.1.0 (2026-07-11)
 
 ### ⚠ BREAKING CHANGES
