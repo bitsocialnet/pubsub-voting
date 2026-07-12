@@ -315,6 +315,35 @@ describe("Contest read view + tally", () => {
         await voterB.destroy();
     });
 
+    it("re-purges persisted gate results when the expiry horizon advances past the last purge", async () => {
+        const { mkdtempSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        const { makeStorage } = await import("../storage/node.js");
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-voter-test-"));
+
+        // Head starts at bucket 40, so the first head read already purges (boundary: bucket 10).
+        let block = 43200n * 40n;
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: advancingChains(() => block), signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+
+        // The settled gate read persisted a score keyed to bucket 40's sample block (WAL mode
+        // admits this second read-only connection alongside the voter's own).
+        const reader = makeStorage({ dataPath }).openLru({ cacheName: "gate-results", maxItems: 50_000 });
+        const bucket40Key = (keys: string[]) => keys.find((k) => k.endsWith(`:${43200 * 40}`));
+        await vi.waitFor(async () => expect(bucket40Key(await reader.keys())).toBeDefined());
+
+        // The head advances to bucket 71: bucket 40 falls out of the 30-bucket expiry window,
+        // so the head read piggybacked on this tally must purge again — not only once per
+        // engine lifetime — and drop the now-dead entry.
+        block = 43200n * 71n;
+        await contest.getTally();
+        await vi.waitFor(async () => expect(bucket40Key(await reader.keys())).toBeUndefined());
+        await voter.destroy();
+    });
+
     it("emits an update event when a row's chainVerified flips after the background gate read lands", async () => {
         const { chains, release } = gatedChains();
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });

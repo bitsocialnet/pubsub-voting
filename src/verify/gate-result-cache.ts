@@ -107,8 +107,9 @@ export function makePersistentGateResultCache(opts: {
  * Deterministic expiry purge for one rule's persisted gate results — better than LRU here
  * because staleness is *provable*: a score at bucket B's sample block is only ever consulted
  * while bundles from B are admissible (within `voteExpiryBuckets` of head), so anything older
- * than the oldest admissible sample block can never be read again. Run per contest join, after
- * the first head read; the store's LRU bound stays as the backstop for rules never purged.
+ * than the oldest admissible sample block can never be read again. Run per contest whenever a
+ * head read advances the expiry boundary (see the engine's `#maybePurgeGateResults`); the
+ * store's LRU bound stays as the backstop for rules never purged.
  */
 export async function purgeExpiredGateResults(opts: {
     store: LruStorage;

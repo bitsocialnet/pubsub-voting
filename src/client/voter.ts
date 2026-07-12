@@ -658,25 +658,29 @@ class ContestEngine {
         return this.#currentBucketCache;
     }
 
-    /** True once this engine's persisted-gate-result purge ran (once per engine lifetime). */
-    #gateResultsPurged = false;
+    /** The last purge's expiry boundary (oldest admissible sample block); 0 = never purged. */
+    #purgedSampleBlock = 0;
 
     /**
      * Drop this rule's persisted gate results older than the oldest admissible sample block —
      * provably dead: a score at bucket B is only ever consulted while bundles from B are within
      * `voteExpiryBuckets` of head (see verify/gate-result-cache.ts `purgeExpiredGateResults`).
-     * Piggybacks on the first head read the engine does anyway (join-with-state, publish,
-     * tally), so an idle engine costs no chain read and no purge. Fire-and-forget by design.
+     * Piggybacks on the head reads the engine does anyway (join-with-state, publish, tally)
+     * and re-runs only when the boundary advances past the last purged one — so an idle
+     * engine costs no chain read and no purge, and a steady head costs no key scan, but a
+     * long-lived engine still sheds entries as they expire instead of leaving them to the
+     * LRU backstop. Fire-and-forget by design.
      */
     #maybePurgeGateResults(): void {
-        if (this.#gateResultsPurged) return;
-        this.#gateResultsPurged = true;
         const oldestBucket = this.#currentBucketCache - this.criteria.voteExpiryBuckets;
         if (oldestBucket <= 0) return;
+        const oldestSampleBlock = this.#bucketMath.sampleBlockForBucket(oldestBucket);
+        if (oldestSampleBlock <= this.#purgedSampleBlock) return;
+        this.#purgedSampleBlock = oldestSampleBlock;
         void purgeExpiredGateResults({
             store: this.#deps.gateStore,
             ruleHash: this.#ruleHash,
-            oldestSampleBlock: this.#bucketMath.sampleBlockForBucket(oldestBucket)
+            oldestSampleBlock
         });
     }
 
