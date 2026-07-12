@@ -23,7 +23,7 @@ import { readFileSync } from "node:fs";
 import stripJsonComments from "strip-json-comments";
 import {
     PubsubVoter,
-    deriveDirectoryCriteria,
+    CriteriaSchema,
     republishIntervalBuckets,
     type Criteria,
     type HeliaInstance,
@@ -33,15 +33,15 @@ import {
 } from "@bitsocial/pubsub-votes";
 
 // 5chan's authoring manifest is JSONC (commented for human readers) and is NOT a protocol
-// object — it is never encoded or published. `deriveDirectoryCriteria` derives one
-// complete, standalone criteria document per slot ({ ...defaults, ...entry }, shallow) and
-// validates each against the real schema. Two clients must end up with byte-identical
-// documents to share a topic, which is why every consumer (this app, a seeder) derives
-// through the same exported helper instead of re-implementing the merge.
+// object — it is never encoded or published. The app derives one complete, standalone
+// criteria document per slot by shallow-merging each entry over the shared defaults, then
+// validates it against the real schema. Two clients must end up with byte-identical
+// documents to share a topic, which is why the simplest interchange is the derived
+// documents themselves.
 const manifest = JSON.parse(
     stripJsonComments(readFileSync(new URL("../5chan-directory-criteria.jsonc", import.meta.url), "utf8"))
-) as unknown;
-const allCriteria: Criteria[] = deriveDirectoryCriteria(manifest);
+) as { defaults: Record<string, unknown>; contests: Record<string, unknown>[] };
+const allCriteria: Criteria[] = manifest.contests.map((entry) => CriteriaSchema.parse({ ...manifest.defaults, ...entry }));
 
 // Host-provided seams. 5chan wires these from pkc + viem in its own code. The name
 // resolvers are the same instances 5chan already gives pkc-js (e.g. @bitsocial/
