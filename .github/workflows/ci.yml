@@ -10,6 +10,7 @@ on:
         "tsconfig.json",
         "tsconfig.examples.json",
         "vitest.config.ts",
+        "vitest.integration.config.ts",
         ".github/**",
       ]
   pull_request:
@@ -22,13 +23,14 @@ on:
         "tsconfig.json",
         "tsconfig.examples.json",
         "vitest.config.ts",
+        "vitest.integration.config.ts",
         ".github/**",
       ]
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -40,3 +42,6 @@ jobs:
       - run: npm run typecheck:examples
       - run: npm run build
       - run: npm test
+      # Two-node gossipsub integration test (real libp2p + Helia on loopback),
+      # excluded from the unit suite. Runs here so releases gate on it too.
+      - run: npm run test:integration
