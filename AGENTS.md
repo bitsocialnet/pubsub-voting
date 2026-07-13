@@ -16,7 +16,7 @@ Trustless pubsub voting library that runs on a host's shared libp2p/Helia node. 
 
 ## Documentation
 
-- **MUST** update [README.md](./README.md) (the "Usage" section) in the same change whenever the public API changes — anything exported from [src/index.ts](./src/index.ts): the `PubsubVoter` constructor/options, the injected seams (`HeliaInstance`, `ChainClientFactory`, `VoteSigner`), the `Contest`/`ContestVote`/`VoteClient` methods, or the pure helpers (`topicFor`, `republishIntervalBuckets`, `deriveDirectoryCriteria`). README usage snippets must stay copy-pasteable and match the real types. Keep [examples/](./examples/) in sync too.
+- **MUST** update [README.md](./README.md) (the "Usage" section) in the same change whenever the public API changes — anything exported from [src/index.ts](./src/index.ts): the `PubsubVoter` constructor/options, the injected seams (`HeliaInstance`, `ChainClientFactory`, `VoteSigner`), the `Contest`/`ContestVote`/`VoteClient` methods, or the pure helpers (`topicFor`, `republishIntervalBuckets`). README usage snippets must stay copy-pasteable and match the real types. Keep [examples/](./examples/) in sync too.
 
 ## Dependencies
 

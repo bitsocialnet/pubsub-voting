@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.2](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.1...v0.0.2) (2026-07-12)
+
+### Reverts
+
+* Revert "feat(schema): export deriveDirectoryCriteria for directory manifests" ([b28dc1a](https://github.com/bitsocialnet/pubsub-voting/commit/b28dc1a40c4d769cedd36cc33c1fdd97082f7469))
+
 ## 0.0.1 (2026-07-12)
 
 ### ⚠ BREAKING CHANGES

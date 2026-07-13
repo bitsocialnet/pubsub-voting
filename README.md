@@ -128,15 +128,9 @@ See [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-th
 
 ### Many contests (a 5chan-style directory)
 
-One criteria document is one contest (one topic). A directory is conveniently authored as a single manifest of shared `defaults` plus one entry per slot — as in [5chan-directory-criteria.jsonc](./5chan-directory-criteria.jsonc) and [examples/5chan.ts](./examples/5chan.ts) — and `deriveDirectoryCriteria` derives the finished documents (`{ ...defaults, ...entry }`, shallow — an override replaces that whole field) and validates each one. What participants must share **byte-identically** is the derived documents (the topic is their CID), which is why every consumer of the same directory should derive through this one helper rather than re-implement the merge. The manifest is JSONC by convention; strip comments before parsing:
+One criteria document is one contest (one topic). A directory host authors its documents however it likes — e.g. a local JSONC manifest of shared defaults merged per slot, as in [5chan-directory-criteria.jsonc](./5chan-directory-criteria.jsonc) and [examples/5chan.ts](./examples/5chan.ts) — but what participants must share **byte-identically** is the finished documents themselves (the topic is their CID), so distribute those, not an authoring format. Then create each contest:
 
 ```ts
-import { deriveDirectoryCriteria } from "@bitsocial/pubsub-votes";
-import stripJsonComments from "strip-json-comments";
-
-const manifest = JSON.parse(stripJsonComments(manifestJsonc)) as unknown;
-const allCriteria = deriveDirectoryCriteria(manifest); // → Criteria[], throws on invalid entries or duplicate contestIds
-
 const contests = await Promise.all(allCriteria.map((criteria) => voter.createContest({ criteria }))); // → Contest[]
 for (const contest of contests) await contest.update(); // a full host joins + serves the whole directory
 ```
@@ -156,10 +150,9 @@ await voter.destroy();   // terminal: leave all topics, unregister the responder
 ### Pure helpers (no node, no network)
 
 ```ts
-import { topicFor, deriveDirectoryCriteria } from "@bitsocial/pubsub-votes";
+import { topicFor } from "@bitsocial/pubsub-votes";
 
-const topic = await topicFor(criteria);            // "bitsocial-votes/" + CID(dag-cbor(criteria))
-const allCriteria = deriveDirectoryCriteria(json); // directory manifest → validated Criteria[] (see above)
+const topic = await topicFor(criteria);       // "bitsocial-votes/" + CID(dag-cbor(criteria))
 ```
 
 Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a read-only consumer are in [examples/](./examples/).

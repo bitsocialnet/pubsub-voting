@@ -117,22 +117,6 @@ export class VoterDestroyedError extends Error {
     }
 }
 
-/**
- * Thrown by `deriveDirectoryCriteria` when two manifest entries derive the same `contestId`.
- * One directory slot decided by two topics is an authoring bug in the manifest: either the
- * duplicate entry is a copy-paste mistake, or the slot's electorate would be split.
- */
-export class DuplicateContestIdError extends Error {
-    constructor(readonly contestId: string) {
-        super(
-            `Directory manifest derives contestId "${contestId}" twice. Each directory slot must ` +
-                `be decided by exactly one contest (one criteria document, one topic); remove or ` +
-                `rename the duplicate entry.`
-        );
-        this.name = "DuplicateContestIdError";
-    }
-}
-
 /** Thrown when a publish (vote/withdraw) is attempted on a voter constructed without a signer. */
 export class ReadOnlyError extends Error {
     constructor() {
