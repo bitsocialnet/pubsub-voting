@@ -58,6 +58,55 @@ describe("erc721-min-balance (gate via score > 0)", () => {
         expect(reads).toBe(0);
     });
 
+    it("evaluateMany chunks a big batch (200/aggregate3, viem re-chunking disabled), ≤2 in flight, order preserved", async () => {
+        // 450 wallets → 3 chunks (200, 200, 50). Wallet i's balance is i+2n, so an order slip
+        // in results is visible. min=2 ⇒ every wallet qualifies with score i+2n.
+        const wallets = Array.from({ length: 450 }, (_, i) => `0x${(i + 1).toString(16).padStart(40, "0")}`);
+        const chunkSizes: number[] = [];
+        let inFlight = 0;
+        let maxInFlight = 0;
+        const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
+        (chain as { chain?: unknown }).chain = { contracts: { multicall3: { address: "0xca11bde05977b3631167028862be2a173976ca11" } } };
+        chain.multicall = (async ({ contracts, batchSize }: { contracts: Array<{ args: readonly [string] }>; batchSize?: number }) => {
+            expect(batchSize).toBe(0); // one aggregate3 per chunk — viem must not re-chunk at 1KB
+            chunkSizes.push(contracts.length);
+            inFlight++;
+            maxInFlight = Math.max(maxInFlight, inFlight);
+            await new Promise((r) => setTimeout(r, 5)); // overlap window so concurrency is observable
+            inFlight--;
+            return contracts.map(({ args }) => BigInt(parseInt(args[0].slice(2), 16)) + 1n);
+        }) as unknown as ChainClient["multicall"];
+
+        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        expect(chunkSizes).toEqual([200, 200, 50]);
+        expect(maxInFlight).toBeLessThanOrEqual(2);
+        expect(results.map((r) => r.score)).toEqual(wallets.map((_, i) => BigInt(i) + 2n));
+    });
+
+    it("evaluateMany retries ONLY the failed chunk, keeping completed chunks' reads", async () => {
+        const wallets = Array.from({ length: 400 }, (_, i) => `0x${(i + 1).toString(16).padStart(40, "0")}`);
+        const calls: number[] = []; // first wallet index of each multicall, in call order
+        let failedOnce = false;
+        const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
+        (chain as { chain?: unknown }).chain = { contracts: { multicall3: { address: "0xca11bde05977b3631167028862be2a173976ca11" } } };
+        chain.multicall = (async ({ contracts }: { contracts: Array<{ args: readonly [string] }> }) => {
+            const first = parseInt(contracts[0]!.args[0].slice(2), 16) - 1;
+            calls.push(first);
+            if (first === 200 && !failedOnce) {
+                failedOnce = true;
+                throw new Error("429 too many requests");
+            }
+            return contracts.map(() => 5n);
+        }) as unknown as ChainClient["multicall"];
+
+        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        expect(results).toHaveLength(400);
+        expect(results.every((r) => r.score === 5n)).toBe(true);
+        // Chunk 0 read once; chunk 1 (wallet 200) failed once then retried — never chunk 0 again.
+        expect(calls.filter((first) => first === 0)).toHaveLength(1);
+        expect(calls.filter((first) => first === 200)).toHaveLength(2);
+    });
+
     it("evaluateMany falls back to per-wallet reads on a client without multicall3", async () => {
         const wallets = ["0x000000000000000000000000000000000000aaaa", "0x000000000000000000000000000000000000bbbb"];
         let reads = 0;
