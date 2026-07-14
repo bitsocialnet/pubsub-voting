@@ -251,3 +251,104 @@ directory that fills in progressively is visible.
   budget cannot see. WAN jitter is large at this RTT — individual reps spike (one M=1 rep hit 9.3s
   on a connect stall), hence median-of-5. See DESIGN.md ("Checkpoints → pull", "Deferred pkc-js
   work") for the budget, the retry, and the optional host-side stream-cap speedup.
+
+---
+
+# Real chain — Base mainnet, production conditions
+
+**What this measures:** the same two benches run against the **real chain** instead of the mock ETH
+gateway: `BENCH_RPC_URL=https://mainnet.base.org npm run bench:cold-join` (and
+`bench:directory-load`). Real head, ballots signed at the **real bucket sample block** (up to
+`blocksPerBucket` = 43,200 blocks ≈ 24 h behind head — the endpoint must serve historical state at
+that depth; `mainnet.base.org` does, publicnode's free tier refuses), real multicall3, real
+(**measured**, not simulated) RPC latency, and the endpoint's **real rate limiting**. The gate
+contract is a real deployed ERC-721 on Base ("Base Day One" — the 5chan Pass is not deployed yet);
+a probe rule shadows `erc721-min-balance` through the supported `rules` override, performing the
+builtin's exact reads and only relaxing admission (bench wallets hold nothing on a real chain) —
+see `signing.ts` "REAL-CHAIN MODE". Same rig otherwise: seeder on the ~270 ms-RTT WAN host, joiner
+local, dialed directly. Every JSON-RPC round trip the joiner pays is attributed to the operation
+that caused it (`gateRpc.byOp`): `head` = `eth_blockNumber` (bucket derivation), `block` =
+tie-break block-hash read, `multicall` = the batched gate reads, `direct` = single-wallet gate
+reads, plus HTTP/JSON-RPC error counts.
+
+These runs are the acceptance test for the **rate-limit-safe read policy** (DESIGN.md "Background
+chain verification"): 200-read `aggregate3` chunks, ≤2 in flight per client, and the voter-level
+read coalescer that merges parallel contests' pinned-block reads into shared round trips.
+
+## Cold join (single contest) — measured 2026-07-14, median of 5
+
+| N (voters) | router | connect | fetch | bitswap | verify+merge | gate-RPC | **START→TALLY** | **START→VERIFIED** |
+|-----------:|-------:|--------:|------:|--------:|-------------:|---------:|----------------:|-------------------:|
+| 1          | 1.00s  | 1.62s   | 0.56s | 0.78s   | 0.49s        | 2        | **3.43s**       | **3.83s**          |
+| 5          | 1.00s  | 1.60s   | 0.57s | 0.86s   | 0.68s        | 2        | **3.71s**       | **4.30s**          |
+| 10         | 1.00s  | 1.72s   | 0.56s | 0.59s   | 0.51s        | 2        | **3.35s**       | **3.75s**          |
+| 100        | 1.00s  | 1.60s   | 0.56s | 0.77s   | 0.66s        | 2        | **3.64s**       | **4.19s**          |
+| 1000       | 1.00s  | 1.59s   | 0.57s | 1.09s   | 2.38s        | 8.5      | **5.53s**       | **8.22s**          |
+
+### Gate-RPC round trips per operation (median; `reads` = multicall inner reads)
+
+| N (voters) | total | head | block | multicall | reads | direct | http-err | rpc-err | measured latency |
+|-----------:|------:|-----:|------:|----------:|------:|-------:|---------:|--------:|-----------------:|
+| 1          | 2     | 1    | 0     | 1         | 1     | 0      | 0        | 0       | 457ms            |
+| 5          | 2     | 1    | 0     | 1         | 5     | 0      | 0        | 0       | 641ms            |
+| 10         | 2     | 1    | 0     | 1         | 10    | 0      | 0        | 0       | 458ms            |
+| 100        | 2     | 1    | 0     | 1         | 100   | 0      | 0        | 0       | 512ms            |
+| 1000       | 8.5   | 3.5  | 0     | 5         | 1000  | 0      | 0        | 0       | 687ms            |
+
+- **A real-chain cold join costs 2 RPC round trips up to N=100** (one head read + ONE `aggregate3`
+  carrying every gate read) **and 8–9 at N=1000** (5 multicall chunks of ≤200 + head re-reads over
+  the longer join), with **zero throttling errors at every N** on the free public endpoint.
+- **N=1000 renders in 5.5s and is fully chain-verified in 8.2s** over the real internet against
+  the real chain. One rep absorbed a transient 429 pair via the chunk retry (verified 8.9s).
+- The tie-break `block` read never appears: the bench tally is a single community, so the
+  ranking has no tie to break.
+- Measured per-round-trip latency to `mainnet.base.org` from this joiner: ~0.46–0.69s median per
+  request (larger multicalls and endpoint queueing push it above the raw ~0.3s RTT), which is what
+  the mock gateway's fixed 270 ms charge stood in for — the mock's numbers above remain the
+  controlled-latency baseline.
+
+## Directory cold-load — measured 2026-07-14, median of 5 (N=10 voters/contest)
+
+| M (contests) | router | connect | identify | fetch/ct | bitswap/ct | verify+merge | **START→ALL-TALLIES** | **START→ALL-VERIFIED** |
+|-------------:|-------:|--------:|---------:|---------:|-----------:|-------------:|----------------------:|-----------------------:|
+| 1            | 1.00s  | 1.60s   | 1.98s    | 0.58s    | 0.61s      | 0.56s        | **3.51s** | **3.76s** |
+| 10           | 1.00s  | 0.60s   | 0.98s    | 0.56s    | 0.59s      | 0.94s        | **2.93s** | **3.69s** |
+| 63           | 1.00s  | 0.67s   | 1.90s    | 0.68s    | 0.94s      | 1.31s        | **8.74s** | **10.06s** |
+
+### Gate-RPC round trips per operation (median)
+
+| M (contests) | total | head | block | multicall | reads | direct | http-err | rpc-err | measured latency |
+|-------------:|------:|-----:|------:|----------:|------:|-------:|---------:|--------:|-----------------:|
+| 1            | 2     | 1    | 0     | 1         | 10    | 0      | 0        | 0       | 438ms            |
+| 10           | 2     | 1    | 0     | 1         | 100   | 0      | 0        | 0       | 995ms            |
+| 63           | 7     | 3    | 0     | 4         | 630   | 0      | 0        | 0       | 783ms            |
+
+- **The read coalescer collapses the whole directory's chain verification into a handful of round
+  trips**: 10 boards' gate reads ride ONE `aggregate3` (2 round trips total for the join); all 63
+  boards' 630 reads ride 4 (the boards admit over ~2 s, so they fill a few 25 ms coalescing
+  windows). Per-board verification cost at the RPC is effectively gone.
+- **Median run: zero throttling errors and all-verified ~0.3–1.3 s after render** at every M.
+- **Tail (2 of 5 M=63 reps):** a mid-join WAN reconnect (`conns=2`) dragged the join out; the
+  scattered admits produced 35–88 small multicalls whose sustained stream the endpoint throttled
+  (22–66 429'd round trips), and all-verified stretched to 44–61 s — but the directory still
+  converged 63/63 and every board eventually chain-verified. Render (`START→ALL-TALLIES`) stayed
+  8.7–17.8 s; only the background trust milestone pays for the degraded link.
+- The M=63 render medians (8.74 s vs the mock run's 4.17 s) also reflect a generally worse link
+  during this run (identify 1.90 s vs 0.99 s) — the real-chain deltas to compare are the RPC
+  columns and the render→verified gap, which are flat.
+
+## For contrast — the same joins before the read policy (all measured, same rig)
+
+- **Burst shape (superseded):** viem's default multicall chunking sent a 1000-wallet batch as ~38
+  concurrent ~27-read `aggregate3` posts. Probed directly against `mainnet.base.org`: **33 of 38
+  answered HTTP 429 `-32016 over rate limit`** (survivors queued ~3 s). The replacement shape — 5
+  chunks of 200 at concurrency 2 — probed clean: 1000 reads, 0 errors, 2.4 s wall-clock.
+- **Cold join, pre-chunking (2026-07-14, first real-chain run):** N ≤ 10 matched the current
+  numbers (2 round trips), but N=100 paid a median **16 round trips** (429 retries) for
+  START→VERIFIED **7.39 s**, and **N=1000 never chain-verified** within the 60 s rep ceiling in
+  any of 5 reps (START→TALLY was unaffected at ~5.5–6 s — the render path never touches the gate
+  reads).
+- **Directory, post-chunking but pre-coalescer-decomposition (2026-07-14):** each board's
+  `evaluateMany` still went to the wire separately — M=10 paid **38–74 round trips** (10 separate
+  small multicalls + head reads, then 20–42 429'd retries) for all-verified **11.9–30.5 s**. With
+  pinned multicalls decomposed into the shared pool: **2 round trips, 0 errors, 3.69 s**.
