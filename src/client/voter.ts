@@ -667,6 +667,11 @@ class ContestEngine {
         for (const cb of [...this.#errorListeners]) cb(error);
     }
 
+    /** Surface a voter-level failure (e.g. a provider announce) through this contest's error event. */
+    emitError(error: unknown): void {
+        this.#emitError(error);
+    }
+
     #chainFor(ticker: string): ChainClient {
         const client = this.#chainClients[ticker];
         if (!client) throw new Error(`no chain client configured for chain "${ticker}"`);
@@ -1401,7 +1406,20 @@ export class PubsubVoter implements VoteClient {
             this.#announcer = makeAnnouncer({
                 routerUrls: [...options.httpRouterUrls],
                 libp2p: options.helia.libp2p,
-                keys: this.#announceKeys
+                keys: this.#announceKeys,
+                // An announce failure is a discoverability degradation for every joined contest,
+                // so it surfaces through each one's error event (observational, like the announce
+                // itself: never retried, never thrown) — a silent announce failure otherwise looks
+                // exactly like a healthy seeder that nobody can find.
+                onError: (url, error) => {
+                    const announceError = new Error(
+                        `provider announce to router ${url} failed: ${error instanceof Error ? error.message : String(error)}`,
+                        { cause: error }
+                    );
+                    for (const engine of this.#engines.values()) {
+                        if (engine.joined) engine.emitError(announceError);
+                    }
+                }
             });
         }
     }
