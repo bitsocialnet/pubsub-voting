@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { CID } from "multiformats/cid";
-import { makeRootChaser, type RootChaserDeps } from "./chase.js";
+import type { PeerId } from "@libp2p/interface";
+import { makeRootChaser, type ChaseSession, type RootChaserDeps } from "./chase.js";
 import { encodeCheckpoint } from "../checkpoint/codec.js";
 import { bundleCid } from "../crdt/codec.js";
 import { makeVerdictCache } from "../verify/cache.js";
@@ -29,7 +30,30 @@ async function checkpointOf(winners: VotesBundle[]) {
         fetched.push(cid.toString());
         return map.get(cid.toString());
     };
-    return { root, chunks, getBlock, fetched };
+    return { root, chunks, getBlock, fetched, map };
+}
+
+/** A structurally sufficient PeerId stand-in (the chaser only ever stringifies it). */
+const peerId = (id: string) => ({ toString: () => id }) as unknown as PeerId;
+
+/** A recording {@link ChaseSession} serving from `map` (an empty map ⇒ every want misses). */
+function fakeSession(map: Map<string, Uint8Array>) {
+    const gets: string[] = [];
+    const added: string[] = [];
+    let closed = 0;
+    const session: ChaseSession = {
+        get: async (cid) => {
+            gets.push(cid.toString());
+            return map.get(cid.toString());
+        },
+        addPeer: (peer) => {
+            added.push(peer.toString());
+        },
+        close: () => {
+            closed++;
+        }
+    };
+    return { session, gets, added, closed: () => closed };
 }
 
 /**
@@ -257,5 +281,98 @@ describe("makeRootChaser", () => {
         await h.settle();
         expect(limited).toBe(1);
         expect(h.admitted).toHaveLength(1); // chased once, admitted once
+    });
+
+    it("pulls through a session seeded with the root's advertisers, never touching the broadcast path", async () => {
+        const { root, map, getBlock, fetched } = await checkpointOf([bundle("0x1"), bundle("0x2")]);
+        const s = fakeSession(map);
+        const opened: Array<{ root: string; providers: string[] }> = [];
+        const h = harness({
+            getBlock,
+            openSession: (r, providers) => {
+                opened.push({ root: r.toString(), providers: providers.map((p) => p.toString()) });
+                return s.session;
+            }
+        });
+        h.chaser.chase(root, undefined, [peerId("peer-a")]);
+        await h.settle();
+        expect(opened).toEqual([{ root: root.toString(), providers: ["peer-a"] }]);
+        expect(s.gets.length).toBeGreaterThan(0); // every block came through the session…
+        expect(fetched).toHaveLength(0); // …and the broadcast want was never fired
+        expect(h.admitted).toHaveLength(2);
+        expect(s.closed()).toBe(1); // released with the chase
+    });
+
+    it("never opens an unseeded session — a provider-less hint broadcasts as before", async () => {
+        const { root, getBlock, fetched } = await checkpointOf([bundle("0x1")]);
+        let opens = 0;
+        const h = harness({
+            getBlock,
+            openSession: () => {
+                opens++;
+                return fakeSession(new Map()).session;
+            }
+        });
+        h.chaser.chase(root); // heartbeat-style hint with no advertiser thread-through
+        await h.settle();
+        expect(opens).toBe(0);
+        expect(fetched.length).toBeGreaterThan(0);
+        expect(h.admitted).toHaveLength(1);
+    });
+
+    it("falls back to the broadcast want when the session cannot serve, paying for it only once", async () => {
+        const { root, map, getBlock, fetched } = await checkpointOf([bundle("0x1"), bundle("0x2")]);
+        const s = fakeSession(new Map()); // the advertiser dropped — every session want misses
+        const h = harness({ getBlock, openSession: () => s.session });
+        h.chaser.chase(root, undefined, [peerId("peer-a")]);
+        await h.settle();
+        expect(s.gets).toHaveLength(1); // one miss marks the session dead…
+        expect(fetched.length).toBe(map.size); // …and every block rides the broadcast fallback
+        expect(h.admitted).toHaveLength(2); // the chase still converges
+        expect(s.closed()).toBe(1);
+    });
+
+    it("adds a late advertiser of an in-flight root to the running session, deduped", async () => {
+        const { root, map } = await checkpointOf([bundle("0x1")]);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const added: string[] = [];
+        const session: ChaseSession = {
+            get: async (cid) => {
+                await gate; // hold the chase in flight while the late hints arrive
+                return map.get(cid.toString());
+            },
+            addPeer: (peer) => {
+                added.push(peer.toString());
+            },
+            close: () => {}
+        };
+        const h = harness({ getBlock: async () => undefined, openSession: () => session });
+        h.chaser.chase(root, undefined, [peerId("peer-a")]);
+        expect(h.chaser.inFlight()).toBe(1);
+        h.chaser.chase(root, undefined, [peerId("peer-b")]); // late advertiser → joins the session
+        h.chaser.chase(root, undefined, [peerId("peer-a")]); // already seeded → dropped
+        h.chaser.chase(root, undefined, [peerId("peer-b")]); // already added → dropped
+        release();
+        await h.settle();
+        expect(added).toEqual(["peer-b"]);
+        expect(h.admitted).toHaveLength(1);
+    });
+
+    it("closes the session at the deadline even when its want hangs", async () => {
+        const { root } = await checkpointOf([bundle("0x1")]);
+        let closed = 0;
+        const session: ChaseSession = {
+            get: () => new Promise(() => {}), // never settles, ignores the abort — worst case
+            addPeer: () => {},
+            close: () => {
+                closed++;
+            }
+        };
+        const h = harness({ getBlock: async () => undefined, openSession: () => session, timeoutMs: 30 });
+        h.chaser.chase(root, undefined, [peerId("peer-a")]);
+        await h.settle();
+        expect(closed).toBe(1);
+        expect(h.chaser.inFlight()).toBe(0);
     });
 });

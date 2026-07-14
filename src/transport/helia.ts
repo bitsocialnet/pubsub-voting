@@ -1,4 +1,5 @@
 import type { CID } from "multiformats/cid";
+import type { PeerId } from "@libp2p/interface";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./types.js";
 import { MissingBlockstoreError, MissingFetchError, MissingPubsubError } from "../errors.js";
 
@@ -40,6 +41,15 @@ interface RawBlockstore {
     get(cid: CID, options?: { signal?: AbortSignal }): AsyncIterable<Uint8Array> | Promise<Uint8Array>;
     put(cid: CID, block: Uint8Array, options?: { signal?: AbortSignal }): Promise<CID>;
     has(cid: CID, options?: { signal?: AbortSignal }): Promise<boolean>;
+    /** Helia's `Blocks.createSession` (a provider-scoped session blockstore); plain blockstores lack it. */
+    createSession?(root: CID, options?: { providers?: PeerId[]; maxProviders?: number }): RawBlockSession;
+}
+
+/** The raw session surface (Helia's `SessionBlockstore`); `get` streams like the parent store's. */
+interface RawBlockSession {
+    get(cid: CID, options?: { signal?: AbortSignal }): AsyncIterable<Uint8Array> | Promise<Uint8Array>;
+    addPeer(peer: PeerId): Promise<void> | void;
+    close(): void;
 }
 
 /** Does `value` look like a blockstore we can fetch/store blocks through? */
@@ -66,26 +76,43 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
  * injected node the same way.
  */
 export function adaptBlockstore(raw: RawBlockstore): BlockstoreLike {
-    return {
-        async get(cid, options) {
-            const result = raw.get(cid, options);
-            if (!isAsyncIterable(result)) return result; // a plain Promise<Uint8Array> blockstore
-            const chunks: Uint8Array[] = [];
-            for await (const chunk of result) chunks.push(chunk);
-            if (chunks.length === 1) return chunks[0]!;
-            if (chunks.length === 0) throw new Error(`block ${cid.toString()} yielded no bytes`);
-            const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-            const out = new Uint8Array(total);
-            let offset = 0;
-            for (const chunk of chunks) {
-                out.set(chunk, offset);
-                offset += chunk.length;
-            }
-            return out;
-        },
+    const adapted: BlockstoreLike = {
+        get: (cid, options) => readBlock(raw.get(cid, options), cid),
         put: (cid, block) => raw.put(cid, block),
         has: (cid) => raw.has(cid)
     };
+    // Feature-detected, not assumed: only Helia's `Blocks` makes sessions; the unit tests' plain
+    // blockstores don't, and their absence here is what tells the chase to broadcast instead.
+    // Dispatched dynamically (like `get`/`put`/`has` above) so a wrapper installed on the raw
+    // store after adaptation — e.g. the benchmark's timing instrumentation — is still honoured.
+    if (typeof raw.createSession === "function") {
+        adapted.createSession = (root, options) => {
+            const session = raw.createSession!(root, options);
+            return {
+                get: (cid, opts) => readBlock(session.get(cid, opts), cid),
+                addPeer: (peer) => session.addPeer(peer),
+                close: () => session.close()
+            };
+        };
+    }
+    return adapted;
+}
+
+/** Normalise one raw `get` result (promise or stream — see {@link RawBlockstore}) to the block's bytes. */
+async function readBlock(result: AsyncIterable<Uint8Array> | Promise<Uint8Array>, cid: CID): Promise<Uint8Array> {
+    if (!isAsyncIterable(result)) return result; // a plain Promise<Uint8Array> blockstore
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of result) chunks.push(chunk);
+    if (chunks.length === 1) return chunks[0]!;
+    if (chunks.length === 0) throw new Error(`block ${cid.toString()} yielded no bytes`);
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
 }
 
 /** Does `value` look like a libp2p fetch service (the request + responder registration)? */

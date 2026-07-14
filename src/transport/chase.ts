@@ -1,4 +1,5 @@
 import type { CID } from "multiformats/cid";
+import type { PeerId } from "@libp2p/interface";
 import type { VotesBundle } from "../schema/votes.js";
 import { decodeCheckpoint } from "../checkpoint/codec.js";
 import { encodeBundle, bundleCidForBytes } from "../crdt/codec.js";
@@ -9,8 +10,10 @@ import type { PendingBundle } from "../verify/background.js";
 /**
  * The divergence chase: act on an advertised checkpoint root that differs from our own (a
  * heartbeat or fetch-protocol hint — see DESIGN.md "Checkpoints", "Block pull"). Pull the
- * blocks behind the root by CID (directed bitswap at the connected advertisers, through the
- * injected `getBlock`) and admit each inlined bundle in two stages:
+ * blocks behind the root by CID — through a bitswap session seeded with the root's advertisers
+ * when the `openSession` seam is present (targeted wants, one provider lookup per root), the
+ * broadcast `getBlock` otherwise or on session failure — and admit each inlined bundle in two
+ * stages:
  *
  *   1. **Offline, synchronous, before admit** (µs each): signature + criteria constraints via
  *      `verifyOffline` — a forged or malformed bundle dies here and is never admitted.
@@ -33,12 +36,35 @@ import type { PendingBundle } from "../verify/background.js";
  * trusted. No libp2p import; pure seams, unit-testable offline.
  */
 
+/**
+ * A directed block-pull session for one chased root, seeded with the peers that advertised it
+ * (see DESIGN.md "Block pull"). The chase tries it before the broadcast `getBlock` and falls
+ * back on any failure, so a session is an optimisation, never a correctness dependency.
+ */
+export interface ChaseSession {
+    /** Fetch one block through the session; `undefined` or a throw falls back to `getBlock`. */
+    get(cid: CID, signal: AbortSignal): Promise<Uint8Array | undefined>;
+    /** Seed a late advertiser of the same root into the running pull. MUST NOT throw. */
+    addPeer(peer: PeerId): void;
+    /** Abort the session's in-flight wants and release it. MUST NOT throw. */
+    close(): void;
+}
+
 export interface RootChaserDeps {
     /**
      * Fetch one checkpoint block by CID (blockstore + directed bitswap); `undefined` or a
      * throw means unavailable. `signal` aborts the want when the per-root deadline fires.
      */
     getBlock: (cid: CID, signal: AbortSignal) => Promise<Uint8Array | undefined>;
+    /**
+     * Open a bitswap session for one chased root, seeded with `providers` — the advertisers of
+     * that exact root, who provably hold its blocks. Optional twice over: absent when the host
+     * blockstore cannot make sessions (plain blockstores, unit-test mocks), and a call may
+     * return `undefined` to decline. NEVER invoked with zero providers — nothing announces
+     * these CIDs to routing yet, so an unseeded session would fail-fast where the broadcast
+     * `getBlock` succeeds via any connected topic peer.
+     */
+    openSession?: (root: CID, providers: PeerId[]) => ChaseSession | undefined;
     /** Stage 1 only — signature + constraints, local and synchronous (the gate's same stage). */
     verifyOffline: (bundle: VotesBundle) => Promise<VerifyResult>;
     /** The gate's per-CID verdict cache, shared so chased bundles reuse (and feed) it. */
@@ -75,35 +101,78 @@ export interface RootChaser {
      * the root-manifest bitswap round-trip and pulls the chunks directly. A heartbeat hint (no
      * index) omits it and takes the manifest-fetch path. The index is verified against `root`,
      * so a bad one simply falls back — never a trust vector.
+     *
+     * `providers` are the peers known to have advertised this exact root (the triggering
+     * sender plus any prior advertisers still connected — see the voter's peer-root map); the
+     * chase pulls through a bitswap session seeded with them when the `openSession` seam is
+     * present, broadcasting only as fallback. A provider hint for a root already in flight is
+     * added to the running session instead of dropped.
      */
-    chase(root: CID, chunks?: CID[]): void;
+    chase(root: CID, chunks?: CID[], providers?: readonly PeerId[]): void;
     /** Roots currently being chased (for tests/introspection). */
     inFlight(): number;
 }
 
-export function makeRootChaser(deps: RootChaserDeps): RootChaser {
-    const { getBlock, verifyOffline, cache, isEvaluableNow, hasBundle, admit, deferVerify, onMerged, limit, timeoutMs } = deps;
-    const inFlight = new Set<string>();
+/** One in-flight chase's session state, shared between `chase()` (addPeer hints) and its run. */
+interface Flight {
+    /** Peer ids already seeded (dedups repeat hints across the chase's lifetime). */
+    seeded: Set<string>;
+    /** Providers accumulated before the run opens its session. */
+    queued: PeerId[];
+    session: ChaseSession | undefined;
+    /** The run made its open-or-not decision; late hints past this point need `session`. */
+    started: boolean;
+}
 
-    async function runChase(root: CID, chunks?: CID[]): Promise<void> {
+export function makeRootChaser(deps: RootChaserDeps): RootChaser {
+    const { getBlock, openSession, verifyOffline, cache, isEvaluableNow, hasBundle, admit, deferVerify, onMerged, limit, timeoutMs } = deps;
+    const inFlight = new Map<string, Flight>();
+
+    function addProviders(flight: Flight, providers: readonly PeerId[]): void {
+        for (const peer of providers) {
+            const id = peer.toString();
+            if (flight.seeded.has(id)) continue;
+            flight.seeded.add(id);
+            if (flight.session !== undefined) flight.session.addPeer(peer);
+            else if (!flight.started) flight.queued.push(peer);
+            // started with no session (seam absent/declined): a late hint cannot help — drop it.
+        }
+    }
+
+    async function runChase(flight: Flight, root: CID, chunks?: CID[]): Promise<void> {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+        // Open the session only now (not at enqueue): hints that arrived while queued behind the
+        // concurrency cap are all in `queued`, so they seed the session instead of dialing addPeer.
+        if (flight.queued.length > 0) flight.session = openSession?.(root, flight.queued.splice(0));
+        flight.started = true;
+        // One failed session want marks the whole session dead (a converged advertiser holds all
+        // blocks or none) — the remaining blocks skip straight to the broadcast fallback instead
+        // of paying a doomed session attempt each.
+        let sessionDead = false;
+        const fetchBlock = async (cid: CID): Promise<Uint8Array | undefined> => {
+            if (controller.signal.aborted) return undefined;
+            if (flight.session !== undefined && !sessionDead) {
+                try {
+                    const bytes = await flight.session.get(cid, controller.signal);
+                    if (bytes !== undefined) return bytes;
+                } catch {
+                    // fall through to the broadcast path
+                }
+                sessionDead = true;
+                if (controller.signal.aborted) return undefined; // deadline, not a session miss
+            }
+            try {
+                return await getBlock(cid, controller.signal);
+            } catch {
+                return undefined; // unfetchable/aborted — decode throws "unavailable", chase yields nothing
+            }
+        };
         try {
             // Race the decode against the deadline so even a `getBlock` that ignores its abort
             // signal cannot pin this chase slot past `timeoutMs` — the slot is always freed.
             const winners = await Promise.race([
-                decodeCheckpoint(
-                    root,
-                    async (cid) => {
-                        if (controller.signal.aborted) return undefined;
-                        try {
-                            return await getBlock(cid, controller.signal);
-                        } catch {
-                            return undefined; // unfetchable/aborted — decode throws "unavailable", chase yields nothing
-                        }
-                    },
-                    chunks
-                ),
+                decodeCheckpoint(root, fetchBlock, chunks),
                 new Promise<undefined>((resolve) => {
                     controller.signal.addEventListener("abort", () => resolve(undefined), { once: true });
                 })
@@ -145,15 +214,24 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
             if (merged) onMerged?.();
         } finally {
             clearTimeout(timer);
+            flight.session?.close();
         }
     }
 
     return {
-        chase(root: CID, chunks?: CID[]): void {
+        chase(root: CID, chunks?: CID[], providers?: readonly PeerId[]): void {
             const key = root.toString();
-            if (inFlight.has(key)) return; // the in-flight run covers this hint (chunks derive from root)
-            inFlight.add(key);
-            void limit(() => runChase(root, chunks))
+            const existing = inFlight.get(key);
+            if (existing !== undefined) {
+                // The in-flight run covers this hint (chunks derive from root) — but a new
+                // advertiser joins its session rather than being dropped on the floor.
+                if (providers !== undefined) addProviders(existing, providers);
+                return;
+            }
+            const flight: Flight = { seeded: new Set(), queued: [], session: undefined, started: false };
+            if (providers !== undefined) addProviders(flight, providers);
+            inFlight.set(key, flight);
+            void limit(() => runChase(flight, root, chunks))
                 .catch(() => {}) // a failed chase contributes nothing; the hint was never trusted
                 .finally(() => inFlight.delete(key));
         },

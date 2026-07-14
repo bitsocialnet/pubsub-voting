@@ -395,6 +395,20 @@ const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
 const CHASE_CONCURRENCY = 2;
 /**
+ * Chase-session provider slots above the advertiser seeds: the headroom keeps the session's
+ * background provider discovery running, so the HTTP routers are queried ONCE per chased root —
+ * in parallel with the seeded wants, instead of once per block — and a provider found there
+ * (a seeder announcing root/chunk records need not be a topic subscriber) joins the pull if the
+ * advertiser drops mid-chase. See DESIGN.md "Block pull".
+ */
+const CHASE_SESSION_PROVIDER_HEADROOM = 1;
+/**
+ * Bound on the per-contest peer→last-advertised-root map that seeds chase sessions (insertion-
+ * refreshed, oldest evicted): enough for any real topic mesh, small enough that a peer-id spray
+ * cannot grow memory.
+ */
+const PEER_ROOTS_MAX = 256;
+/**
  * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
  * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
  * consults the head, and this TTL caps that to ≤1 `getBlockNumber` per window under a flood of
@@ -502,6 +516,13 @@ class ContestEngine {
     #checkpointDirty = true;
     /** Live once joined; chases advertised roots that differ from our own. */
     #chaser: RootChaser | undefined;
+    /**
+     * Peer id → last root that peer advertised (heartbeat, divergence response, or cold-start
+     * pull), bounded by {@link PEER_ROOTS_MAX}. Chasing root R seeds its bitswap session with
+     * every still-connected peer whose entry is R — the subscribers who provably converged on
+     * the state being pulled — not just the hint's sender. See DESIGN.md "Block pull".
+     */
+    #peerRoots = new Map<string, string>();
     /** The armed heartbeat timer (jittered; see {@link #armHeartbeat}), cleared by `leave()`. */
     #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
     /** True when a heartbeat matching our own root was heard this interval (suppression). */
@@ -857,8 +878,10 @@ class ContestEngine {
             onAccept: () => this.#onStateChanged(),
             // Root records surface as unverifiable hints: compare to our own root, chase a
             // divergence lazily, answer it once per interval. Never awaited by the validator.
-            onRootRecord: (record) => {
-                void this.#handleRootRecord(record).catch(() => {});
+            // `from` seeds the chase's bitswap session — the sender provably holds the
+            // advertised root's blocks (see DESIGN.md "Block pull").
+            onRootRecord: (record, from) => {
+                void this.#handleRootRecord(record, from).catch(() => {});
             },
             maxBundleMessageBytes: maxBundleMessageBytes(this.criteria),
             maxRootMessageBytes: MAX_ROOT_MESSAGE_BYTES,
@@ -866,14 +889,46 @@ class ContestEngine {
         });
         const chaseLimit = pLimit(CHASE_CONCURRENCY);
         this.#chaser = makeRootChaser({
+            // The broadcast fallback: a plain want that any connected topic peer can answer.
+            // The seeded session below is tried first when the blockstore can make one.
             getBlock: async (cid, signal) => {
                 try {
-                    // Blockstore + bitswap: the advertisers are connected topic peers that
-                    // provably hold these blocks, so the want resolves against them directly.
                     return await this.#deps.blockstore.get(cid, { signal });
                 } catch {
                     return undefined;
                 }
+            },
+            // A directed session per chased root, seeded with its advertisers: wants go to the
+            // peers that provably hold the blocks instead of every connection, and the routers
+            // are queried once per root (the headroom slot) instead of once per block. Absent
+            // `createSession` (a plain blockstore) declines, and the chase broadcasts as before.
+            openSession: (root, providers) => {
+                const createSession = this.#deps.blockstore.createSession?.bind(this.#deps.blockstore);
+                if (createSession === undefined) return undefined;
+                const session = createSession(root, {
+                    providers,
+                    maxProviders: providers.length + CHASE_SESSION_PROVIDER_HEADROOM
+                });
+                return {
+                    get: async (cid, signal) => {
+                        try {
+                            return await session.get(cid, { signal });
+                        } catch {
+                            return undefined; // the chase falls back to the broadcast want
+                        }
+                    },
+                    addPeer: (peer) => {
+                        // A bad late hint (undialable, session at capacity) must never surface.
+                        void Promise.resolve(session.addPeer(peer)).catch(() => {});
+                    },
+                    close: () => {
+                        try {
+                            session.close();
+                        } catch {
+                            // releasing a finished session must not fail the chase
+                        }
+                    }
+                };
             },
             verifyOffline: (bundle) => this.#verifier.verifyOffline(bundle),
             cache: this.#cache,
@@ -944,9 +999,13 @@ class ContestEngine {
                 if (value === undefined || value === null) return;
                 const record = decodeRootRecord(value); // throws on garbage — caught, contributes nothing
                 const own = await (ownRoot ??= this.rootRecord());
+                this.#notePeerRoot(id, record.root);
                 // Hand the piggybacked chunk index to the chase: verified against `record.root`, it
-                // skips the root-manifest bitswap round-trip (see DESIGN.md "Block pull").
-                if (!record.root.equals(own.root)) this.#chaser?.chase(record.root, record.chunks);
+                // skips the root-manifest bitswap round-trip (see DESIGN.md "Block pull"). The
+                // pulled peer seeds the chase's session — it provably holds what it just served.
+                if (!record.root.equals(own.root)) {
+                    this.#chaser?.chase(record.root, record.chunks, this.#sessionProvidersFor(record.root, peer));
+                }
             } catch {
                 // Peer offline, no record, or malformed answer — best-effort; the other source and
                 // live gossip still converge.
@@ -1045,6 +1104,8 @@ class ContestEngine {
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         this.#chaser = undefined;
+        // Advertised roots go stale the moment we stop hearing heartbeats; a re-join re-learns.
+        this.#peerRoots.clear();
         const wasJoined = this.#joined;
         this.#joined = false;
         await this.#transport?.stop();
@@ -1150,17 +1211,55 @@ class ContestEngine {
      * matching our own root ⇒ note it for heartbeat suppression; differing ⇒ chase it lazily and
      * answer with our own record at most once per interval. See DESIGN.md "Checkpoints".
      */
-    async #handleRootRecord(record: RootRecord): Promise<void> {
+    async #handleRootRecord(record: RootRecord, from?: string): Promise<void> {
+        if (from !== undefined) this.#notePeerRoot(from, record.root);
         const own = await this.rootRecord();
         if (own.root.equals(record.root)) {
             this.#heardMatchingRoot = true;
             return;
         }
-        this.#chaser?.chase(record.root);
+        this.#chaser?.chase(record.root, undefined, this.#sessionProvidersFor(record.root));
         if (!this.#publishedRootThisInterval) {
             this.#publishedRootThisInterval = true;
             await this.#transport?.publishRootRecord(own);
         }
+    }
+
+    /** Note `peerId`'s latest advertised root (see {@link #peerRoots}); refreshes its eviction slot. */
+    #notePeerRoot(peerId: string, root: CID): void {
+        if (this.#peerRoots.has(peerId)) {
+            this.#peerRoots.delete(peerId); // re-insert to refresh insertion order
+        } else if (this.#peerRoots.size >= PEER_ROOTS_MAX) {
+            const oldest = this.#peerRoots.keys().next().value;
+            if (oldest !== undefined) this.#peerRoots.delete(oldest);
+        }
+        this.#peerRoots.set(peerId, root.toString());
+    }
+
+    /**
+     * The session seeds for chasing `root`: every still-connected peer whose last advertised
+     * root is exactly `root` (see {@link #peerRoots}) — resolved against the node's live
+     * connections both to recover the `PeerId` handle (the gate surfaces senders as strings)
+     * and because seeding a gone peer is a wasted dial. `known` (the cold-start pull peer,
+     * already in hand as a `PeerId`) is included unconditionally. Order is deterministic; the
+     * session fans wants across its providers itself.
+     */
+    #sessionProvidersFor(root: CID, known?: PeerId): PeerId[] {
+        const rootKey = root.toString();
+        const providers: PeerId[] = known !== undefined ? [known] : [];
+        const wanted = new Set<string>();
+        for (const [peer, advertised] of this.#peerRoots) {
+            if (advertised === rootKey && peer !== known?.toString()) wanted.add(peer);
+        }
+        if (wanted.size > 0) {
+            // Optional call: unit-test fakes inject a bare `libp2p` without connection APIs.
+            for (const connection of this.#deps.helia.libp2p.getConnections?.() ?? []) {
+                if (!wanted.delete(connection.remotePeer.toString())) continue;
+                providers.push(connection.remotePeer);
+                if (wanted.size === 0) break;
+            }
+        }
+        return providers;
     }
 
     /**

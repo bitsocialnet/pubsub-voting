@@ -127,6 +127,26 @@ export interface BlockstoreLike {
     get(cid: CID, options?: { signal?: AbortSignal }): Promise<Uint8Array>;
     put(cid: CID, block: Uint8Array): Promise<CID>;
     has(cid: CID): Promise<boolean>;
+    /**
+     * Open a provider-scoped bitswap session rooted at `root`: wants go to the session's
+     * providers as targeted session wants instead of a broadcast to every connected peer, and
+     * provider discovery runs once per session instead of once per block (see DESIGN.md "Block
+     * pull"). Optional — plain blockstores (and the unit tests' mocks) lack it; callers MUST
+     * feature-detect and fall back to the broadcast `get`.
+     */
+    createSession?(root: CID, options: { providers: PeerId[]; maxProviders?: number }): BlockSessionLike;
+}
+
+/**
+ * A session-scoped view of {@link BlockstoreLike.get}, mirroring Helia's `SessionBlockstore`.
+ * Blocks fetched through it still land in the underlying blockstore.
+ */
+export interface BlockSessionLike {
+    get(cid: CID, options?: { signal?: AbortSignal }): Promise<Uint8Array>;
+    /** Add a late-arriving provider to the running session (rejections are the caller's to swallow). */
+    addPeer(peer: PeerId): Promise<void> | void;
+    /** Abort the session's in-flight wants and release it. */
+    close(): void;
 }
 
 /**
