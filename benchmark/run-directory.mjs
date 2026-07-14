@@ -21,6 +21,9 @@
 //   BENCH_N=10                   voters per contest (fixed across the M sweep)
 //   BENCH_REPEATS=3              cold joins per M (median reported)
 //   BENCH_ROUTER_LATENCY_MS=1000 simulated HTTP-router lookup latency (paid once)
+//   BENCH_RPC_URL=<url>          REAL-CHAIN mode: real Base-mainnet JSON-RPC endpoint (must serve
+//                                historical state ~43k blocks back, e.g. https://mainnet.base.org);
+//                                see run.mjs and signing.ts "REAL-CHAIN MODE"
 //   BENCH_SKIP_SYNC=1            skip rsync+remote build (reuse an already-synced remote)
 //   BENCH_SKIP_BUILD=1           skip the local `npm run build`
 //
@@ -42,12 +45,20 @@ const BASE_PORT = Number(process.env.BENCH_BASE_PORT ?? "42000");
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const JOIN_JS = path.join(REPO, "benchmark/directory-join.js");
 
+// REAL-CHAIN mode: the same URL must reach BOTH sides — the local joiner inherits it from this
+// process's env; the remote seeder gets it prefixed onto its ssh command (validated so the
+// interpolation cannot smuggle shell metacharacters onto the remote).
+const RPC_URL = process.env.BENCH_RPC_URL;
+if (RPC_URL && !/^https?:\/\/[A-Za-z0-9._\-:/]+$/.test(RPC_URL)) throw new Error(`unsafe BENCH_RPC_URL: ${RPC_URL}`);
+const SEEDER_ENV = RPC_URL ? `BENCH_RPC_URL='${RPC_URL}' ` : "";
+
 // The public IP/DNS the cold joiner dials the seeder at (resolved once in main()).
 let DIAL_HOST;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const median = (xs) => {
     const s = [...xs].sort((a, b) => a - b);
+    if (s.length === 0) return null; // e.g. every rep's verified milestone timed out
     const m = Math.floor(s.length / 2);
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
@@ -146,7 +157,7 @@ async function measureOne(m, n, i) {
     const seedTimeout = 300_000 + m * n * 40;
     const { child: seeder, match } = await spawnUntil(
         "ssh",
-        ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && node benchmark/directory-seeder.js ${m} ${n} ${remotePort}`],
+        ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && ${SEEDER_ENV}node benchmark/directory-seeder.js ${m} ${n} ${remotePort}`],
         /SEEDER_READY peerId=(\S+) port=\d+ m=\d+ n=\d+/,
         seedTimeout,
         `dir-seeder(M=${m},N=${n})`
@@ -168,11 +179,17 @@ async function measureOne(m, n, i) {
             }
             const parsed = JSON.parse(line.slice("RESULT ".length));
             results.push(parsed);
+            const byOp = parsed.gateRpc?.byOp;
+            const rpcDetail = byOp
+                ? ` rpc=${parsed.gateRpc.requests}@${parsed.gateRpc.latencyMs}ms (head ${byOp.head}, block ${byOp.block}, mc ${byOp.gateMulticall}×→${parsed.gateRpc.multicallReads} reads, dir ${byOp.gateDirect}` +
+                  (parsed.gateRpc.httpErrors || parsed.gateRpc.rpcErrors ? `, ERR http ${parsed.gateRpc.httpErrors}/rpc ${parsed.gateRpc.rpcErrors}` : "") +
+                  `)`
+                : "";
             console.log(
                 `[bench] M=${m} N=${n} rep ${r + 1}/${REPEATS}: conns=${parsed.seederConnections} converged=${parsed.readyCount}/${m} ` +
                     `connect=${s(parsed.connectMs)} fetch=${s(parsed.fetch.totalMs)} (${parsed.fetch.count}x) ` +
                     `bitswap=${s(parsed.blockGets.totalMs)} (${(parsed.blockGets.bytes / 1024).toFixed(0)}KiB) ` +
-                    `verify+merge=${s(parsed.verifyMergeMs)} start→all=${s(parsed.allTalliesReadyMs)} start→all-verified=${s(parsed.allVerifiedMs)}`
+                    `verify+merge=${s(parsed.verifyMergeMs)}${rpcDetail} start→all=${s(parsed.allTalliesReadyMs)} start→all-verified=${s(parsed.allVerifiedMs)}`
             );
         }
     } finally {
@@ -205,7 +222,16 @@ async function measureOne(m, n, i) {
         p50Ms: med((r) => pct(r.readyAtMs, 0.5)),
         p90Ms: med((r) => pct(r.readyAtMs, 0.9)),
         allTalliesReadyMs: med((r) => r.allTalliesReadyMs),
-        allVerifiedMs: med((r) => r.allVerifiedMs)
+        allVerifiedMs: med((r) => r.allVerifiedMs),
+        rpcRequests: med((r) => r.gateRpc?.requests),
+        rpcLatencyMs: med((r) => r.gateRpc?.latencyMs),
+        rpcHead: med((r) => r.gateRpc?.byOp?.head),
+        rpcBlock: med((r) => r.gateRpc?.byOp?.block),
+        rpcMulticall: med((r) => r.gateRpc?.byOp?.gateMulticall),
+        rpcMulticallReads: med((r) => r.gateRpc?.multicallReads),
+        rpcDirect: med((r) => r.gateRpc?.byOp?.gateDirect),
+        rpcHttpErrors: med((r) => r.gateRpc?.httpErrors),
+        rpcRpcErrors: med((r) => r.gateRpc?.rpcErrors)
     };
 }
 
@@ -221,6 +247,11 @@ async function main() {
 
     DIAL_HOST = await resolveDialHost();
     console.log(`[bench] seeder dialed directly at ${DIAL_HOST} (no SSH tunnel); M=[${MS}] contests × N=[${NS}] voters/contest`);
+    console.log(
+        RPC_URL
+            ? `[bench] REAL-CHAIN mode: gate reads against ${RPC_URL} (measured latency, real bucket sample block)`
+            : `[bench] mock-gateway mode: gate reads charged ${process.env.BENCH_RPC_LATENCY_MS ?? 270}ms per round trip`
+    );
 
     // Sweep every (M contests, N voters/contest) pair — one table row each.
     const pairs = [];
@@ -262,6 +293,17 @@ async function main() {
         console.log(
             `${String(r.m).padEnd(12)} ${n(r.n, 4)}  ${b(r.m, r.n)}   ${n(r.seederConnections, 4)}  ${n(r.convergedCount, 3)}/${String(r.m).padEnd(3)}  ` +
                 `${n(r.fetchCount, 5)}   ${s(r.fetchMs)}  ${s(r.bitswapMs)}  ${n(r.bitswapKiB, 5)}   ${s(r.p50Ms)}    ${s(r.p90Ms)}    ${s(r.allTalliesReadyMs)}`
+        );
+    }
+
+    // Table 3 — gate-RPC round trips per operation (median across reps; reads = multicall inner reads).
+    console.log(`\nDirectory cold-load — gate-RPC per-op round trips — median of ${REPEATS}`);
+    console.log("M(contests)  N/ct  total  head  block  multicall  reads  direct  http-err  rpc-err  latency");
+    for (const r of rows) {
+        if (!r.ok) continue;
+        const c = (x) => String(x ?? "n/a").padStart(5);
+        console.log(
+            `${String(r.m).padEnd(12)} ${n(r.n, 4)}  ${c(r.rpcRequests)} ${c(r.rpcHead)} ${c(r.rpcBlock)}   ${c(r.rpcMulticall)}    ${c(r.rpcMulticallReads)}  ${c(r.rpcDirect)}    ${c(r.rpcHttpErrors)}    ${c(r.rpcRpcErrors)}   ${r.rpcLatencyMs == null ? "n/a" : Math.round(r.rpcLatencyMs) + "ms"}`
         );
     }
 }

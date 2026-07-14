@@ -2,8 +2,8 @@ import { PubsubVoter } from "../dist/client/voter.js";
 import { TOPIC_PREFIX } from "../dist/topic.js";
 import { makeHostNode, waitFor, type HostNode } from "./host-node.js";
 import { startRouter, type RunningRouter } from "./router.js";
-import { startRpcGateway, type RunningGateway } from "./rpc-gateway.js";
-import { benchGatewayChains, benchCriteria } from "./signing.js";
+import { formatRpcByOp, startRpcGateway, summarizeRpc, type GateRpcSummary, type GatewayRequest, type RunningGateway } from "./rpc-gateway.js";
+import { benchCriteria, benchGatewayChains, benchRpcUrl, benchRules, realJoinerChains } from "./signing.js";
 
 /**
  * Cold-join benchmark — COLD JOINER side (runs locally; discovers the remote seeder via an HTTP
@@ -25,13 +25,16 @@ import { benchGatewayChains, benchCriteria } from "./signing.js";
  *
  * The joiner's chain client is a REAL default-config viem client against the local mock ETH
  * gateway (rpc-gateway.ts), each RPC round trip charged `BENCH_RPC_LATENCY_MS` — so the deferred
- * gate reads (batched into multicalls by the background verifier) are measured, not free. Two
- * total milestones come out: `start->tally` (render-ready, rows possibly `chainVerified: false`)
- * and `start->verified` (every deferred gate read landed).
+ * gate reads (batched into multicalls by the background verifier) are measured, not free. With
+ * `BENCH_RPC_URL` set (REAL-CHAIN mode) the same client instead hits the real Base-mainnet
+ * endpoint — real head, real bucket sample block, real multicall3, measured (not simulated)
+ * RPC latency; see signing.ts. Two total milestones come out: `start->tally` (render-ready,
+ * rows possibly `chainVerified: false`) and `start->verified` (every deferred gate read landed).
  *
  * Usage: `node benchmark/cold-join.js <providerAddr> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
  *   `<providerAddr>` is the seeder's full dialable multiaddr, e.g. `/ip4/1.2.3.4/tcp/41000/p2p/<id>`.
- * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000), `BENCH_RPC_LATENCY_MS` (default 270).
+ * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000), `BENCH_RPC_LATENCY_MS` (default 270, mock mode),
+ *      `BENCH_RPC_URL` (real Base RPC — switches to REAL-CHAIN mode).
  */
 
 /** One timed operation on the cold-join path, in ms relative to the `start()` call (t0). */
@@ -80,14 +83,22 @@ export interface ColdJoinMilestones {
      * reads land after render — see DESIGN.md "Background chain verification").
      */
     tallyReadyMs: number;
-    /** `start()` call → the ranking row reads `chainVerified: true` (every gate read landed), ms. */
-    verifiedTallyMs: number;
     /**
-     * Gate-read RPC traffic against the mock ETH gateway (t0-relative requests only): HTTP
-     * round trips paid, split by shape, plus the inner reads a multicall carried. This is the
-     * column that makes the one-read-per-wallet cliff (or the batched fix) visible.
+     * `start()` call → the ranking row reads `chainVerified: true` (every gate read landed), ms.
+     * `null` when verification did not settle within the join timeout — the tally milestone above
+     * still stands (production renders with pending rows), and `gateRpc` then shows the traffic
+     * (retries, errors) of the stalled verification.
      */
-    gateRpc: { requests: number; ethCalls: number; multicallReads: number; latencyMs: number };
+    verifiedTallyMs: number | null;
+    /**
+     * Gate-read RPC traffic against the ETH endpoint (t0-relative requests only): HTTP round
+     * trips paid, split by the library operation that caused each (`byOp` — head reads,
+     * tie-break block reads, batched vs direct gate reads; see rpc-gateway.ts `GatewayOp`),
+     * plus the inner reads the multicalls carried and any error/retry traffic. This is the
+     * column that makes the one-read-per-wallet cliff (or the batched fix) visible. `latencyMs`
+     * is the mock gateway's fixed charge, or the measured median round trip in REAL-CHAIN mode.
+     */
+    gateRpc: GateRpcSummary;
     /** Every timed network op, t0-relative, for a full waterfall if needed. */
     ops: OpTiming[];
 }
@@ -201,14 +212,25 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             providers: new Map([[cidString, { id: args.seederPeerId, addrs: [providerAddr] }]]),
             latencyMs: args.routerLatencyMs ?? 1000
         });
-        // The mock ETH gateway: the joiner's gate reads go through a REAL default-config viem
-        // client to this JSON-RPC server, each HTTP round trip charged `rpcLatencyMs` — so the
+        // The joiner's chain client, per mode. Mock (default): a REAL default-config viem client
+        // against the mock ETH gateway, each HTTP round trip charged `rpcLatencyMs` — so the
         // background verifier's batched (or unbatched) chain reads cost what they would against
-        // a public endpoint (see rpc-gateway.ts).
-        gateway = await startRpcGateway({ latencyMs: args.rpcLatencyMs ?? 270 });
+        // a public endpoint (see rpc-gateway.ts). REAL-CHAIN (`BENCH_RPC_URL` set): the same
+        // client shape against the real Base-mainnet endpoint — real head, real bucket sample
+        // block, real multicall3 — instrumented to log every JSON-RPC request; the probe rule
+        // registry keeps the reads real while admitting the bench's empty wallets (signing.ts).
+        const rpcUrl = benchRpcUrl();
+        const realRpcLog: GatewayRequest[] = [];
+        if (!rpcUrl) gateway = await startRpcGateway({ latencyMs: args.rpcLatencyMs ?? 270 });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: benchGatewayChains(gateway.url) });
+        const rules = benchRules();
+        voter = new PubsubVoter({
+            dataPath: false,
+            helia: node.helia,
+            chains: rpcUrl ? realJoinerChains(rpcUrl, realRpcLog) : benchGatewayChains(gateway!.url),
+            ...(rules ? { rules } : {})
+        });
         const network = await voter.createContest({ criteria: benchCriteria() });
         if (network.topic !== args.topic) {
             throw new Error(`derived topic ${network.topic} != seeder topic ${args.topic} (criteria mismatch)`);
@@ -255,26 +277,29 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         const tallyReadyMs = performance.now() - t0;
 
         // Then until the background verifier settles every deferred gate read (batched into
-        // multicalls) and the row flips `chainVerified: true` — the trust-ready milestone.
-        await waitFor(
-            async () => {
-                const tally = await network.getTally();
-                return (tally.ranking[0]?.weight ?? 0n) >= target && tally.ranking[0]!.chainVerified;
-            },
-            timeoutMs,
-            `all ${args.expectedN} voters to chain-verify`
-        );
-        const verifiedTallyMs = performance.now() - t0;
+        // multicalls) and the row flips `chainVerified: true` — the trust-ready milestone. A
+        // timeout here does NOT void the rep: the render milestone stands (production renders
+        // with pending rows), the rep reports `verifiedTallyMs: null`, and the gateRpc summary
+        // still shows the stalled verification's traffic (retries, rate-limit errors).
+        let verifiedTallyMs: number | null = null;
+        try {
+            await waitFor(
+                async () => {
+                    const tally = await network.getTally();
+                    return (tally.ranking[0]?.weight ?? 0n) >= target && tally.ranking[0]!.chainVerified;
+                },
+                timeoutMs,
+                `all ${args.expectedN} voters to chain-verify`
+            );
+            verifiedTallyMs = performance.now() - t0;
+        } catch (err) {
+            process.stderr.write(`[cold-join] verified milestone NOT reached: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
 
-        // Gate-read RPC traffic paid during the join (requests arriving after t0).
-        const rpcJoined = gateway.requests.filter((r) => r.atMs >= t0);
-        const rpcEthCalls = rpcJoined.filter((r) => r.method === "eth_call");
-        const gateRpc = {
-            requests: rpcJoined.length,
-            ethCalls: rpcEthCalls.length,
-            multicallReads: rpcEthCalls.reduce((sum, r) => sum + (r.reads > 1 ? r.reads : 0), 0),
-            latencyMs: args.rpcLatencyMs ?? 270
-        };
+        // Gate-read RPC traffic paid during the join (requests arriving after t0), split per
+        // operation. In REAL-CHAIN mode `latencyMs` is the MEASURED median request→response
+        // duration instead of the mock gateway's fixed charge.
+        const gateRpc = summarizeRpc(rpcUrl ? realRpcLog : gateway!.requests, t0, rpcUrl ? undefined : args.rpcLatencyMs ?? 270);
 
         // --- assemble the per-operation breakdown (t0-relative) ---
         const ops: OpTiming[] = events
@@ -348,7 +373,16 @@ async function main(): Promise<void> {
     }
     const routerLatencyMs = process.env.BENCH_ROUTER_LATENCY_MS ? Number(process.env.BENCH_ROUTER_LATENCY_MS) : 1000;
     const rpcLatencyMs = process.env.BENCH_RPC_LATENCY_MS ? Number(process.env.BENCH_RPC_LATENCY_MS) : 270;
-    const r = await measureColdJoin({ providerAddr, seederPeerId, topic, expectedN, routerLatencyMs, rpcLatencyMs });
+    const timeoutMs = process.env.BENCH_JOIN_TIMEOUT_MS ? Number(process.env.BENCH_JOIN_TIMEOUT_MS) : undefined;
+    const r = await measureColdJoin({
+        providerAddr,
+        seederPeerId,
+        topic,
+        expectedN,
+        routerLatencyMs,
+        rpcLatencyMs,
+        ...(timeoutMs !== undefined ? { timeoutMs } : {})
+    });
     const s = (ms: number | null): string => (ms === null ? "n/a" : `${(ms / 1000).toFixed(2)}s`);
     process.stderr.write(
         `[cold-join] N=${r.n}\n` +
@@ -356,8 +390,7 @@ async function main(): Promise<void> {
             `  cold-start:  fetch=${s(r.fetch.totalMs)} (${r.fetch.count}x, negotiate=${s(r.fetchPhases.negotiateMs)} write→read=${s(r.fetchPhases.writeReadMs)}) ` +
             `bitswap=${s(r.blockGets.totalMs)} (${r.blockGets.networkCount} net/${r.blockGets.count} gets, max ${s(r.blockGets.maxMs)}) ` +
             `verify+merge=${s(r.verifyMergeMs)}\n` +
-            `  gate rpc:    ${r.gateRpc.requests} round trips @${r.gateRpc.latencyMs}ms (${r.gateRpc.ethCalls} eth_call, ` +
-            `${r.gateRpc.multicallReads} reads via multicall)\n` +
+            `  gate rpc:    ${r.gateRpc.requests} round trips @${r.gateRpc.latencyMs}ms — ${formatRpcByOp(r.gateRpc)}\n` +
             `  total:       start->tally=${s(r.tallyReadyMs)}  start->verified=${s(r.verifiedTallyMs)}  (first-update ${s(r.firstUpdateMs)})\n`
     );
     process.stdout.write(`RESULT ${JSON.stringify(r)}\n`);
