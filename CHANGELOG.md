@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.3](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.2...v0.0.3) (2026-07-14)
+
+### Features
+
+* **schema:** export deriveDirectoryCriteria for directory manifests ([be03365](https://github.com/bitsocialnet/pubsub-voting/commit/be03365ffc5f3b38c98e75657ecbfd71cd2d3c6e))
+* **transport:** announce provider records to HTTP routers from the seeder ([b472d2f](https://github.com/bitsocialnet/pubsub-voting/commit/b472d2f059d3c812e526117efbad569cc2d66b25)), closes [#6](https://github.com/bitsocialnet/pubsub-voting/issues/6)
+
 ## [0.0.2](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.1...v0.0.2) (2026-07-12)
 
 ### Reverts
