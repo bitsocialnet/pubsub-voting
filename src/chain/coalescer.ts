@@ -18,8 +18,11 @@ import type { ChainClient, ChainClientFactory } from "./types.js";
  *     `(block, contract, calldata)`, grouped per block (an `eth_call` reads ONE block, so
  *     different bucket sample blocks can never share a multicall), and flushed as multicall3
  *     `aggregate3` chunks of {@link CHAIN_READS_PER_MULTICALL} reads.
- *   - Explicit `multicall` calls (e.g. a rule's own `evaluateMany` batching) pass through
- *     unchanged but count against the SAME in-flight budget.
+ *   - Explicit pinned-block `multicall` calls (e.g. a rule's own `evaluateMany` batching) are
+ *     DECOMPOSED into that same pool, so parallel contests' per-contest batches merge into
+ *     shared round trips too (measured: without this, a 10-board directory join fired 10
+ *     separate small multicalls plus head reads and the sustained stream still tripped the
+ *     endpoint's rate limit). Unpinned/exotic multicalls pass through under the same budget.
  *   - At most {@link CHAIN_MULTICALL_CONCURRENCY} round trips are in flight per underlying
  *     client, across everything; a failed coalesced chunk retries once
  *     ({@link CHAIN_CHUNK_RETRY_DELAY_MS}) without re-reading completed chunks.
@@ -151,20 +154,17 @@ export function coalescingChainClient(client: ChainClient, options: CoalescerOpt
     };
 
     const rawReadContract = client.readContract.bind(client);
-    const readContract = (async (params: CoalescableRead & Record<string, unknown>) => {
-        const { address, abi, functionName, args, blockNumber, ...rest } = params;
-        // Coalesce only the plain pinned-block read shape; anything else (head reads, blockTag,
-        // account/state overrides, ...) keeps direct-call semantics through the raw client.
-        if (typeof blockNumber !== "bigint" || Object.keys(rest).length > 0 || !address || !abi || !functionName) {
-            return rawReadContract(params as Parameters<typeof rawReadContract>[0]);
-        }
+
+    /** Add one pinned read to its block's pending group (deduped); returns its shared promise. */
+    const enqueueRead = (contract: { address: `0x${string}`; abi: Abi; functionName: string; args?: readonly unknown[] | undefined }, blockNumber: bigint): Promise<unknown> => {
         let calldata: string;
         try {
-            calldata = encodeFunctionData({ abi, functionName, args } as Parameters<typeof encodeFunctionData>[0]);
+            calldata = encodeFunctionData({ abi: contract.abi, functionName: contract.functionName, args: contract.args } as Parameters<typeof encodeFunctionData>[0]);
         } catch {
-            return rawReadContract(params as Parameters<typeof rawReadContract>[0]);
+            // Un-encodable entry (exotic abi shape) — read it directly, keeping pinned semantics.
+            return rawReadContract({ ...contract, blockNumber } as Parameters<typeof rawReadContract>[0]);
         }
-        const key = `${blockNumber}:${address.toLowerCase()}:${calldata}`;
+        const key = `${blockNumber}:${contract.address.toLowerCase()}:${calldata}`;
         const existing = inFlight.get(key);
         if (existing) return existing.promise;
 
@@ -174,7 +174,13 @@ export function coalescingChainClient(client: ChainClient, options: CoalescerOpt
             resolve = res;
             reject = rej;
         });
-        const read: PendingRead = { contract: { address, abi, functionName, args: args ?? [] }, key, promise, resolve, reject };
+        const read: PendingRead = {
+            contract: { address: contract.address, abi: contract.abi, functionName: contract.functionName, args: contract.args ?? [] },
+            key,
+            promise,
+            resolve,
+            reject
+        };
         inFlight.set(key, read);
 
         const blockKey = blockNumber.toString();
@@ -186,16 +192,46 @@ export function coalescingChainClient(client: ChainClient, options: CoalescerOpt
         group.reads.push(read);
         if (group.reads.length >= readsPerCall) flushGroup(blockKey);
         return promise;
+    };
+
+    const readContract = (async (params: CoalescableRead & Record<string, unknown>) => {
+        const { address, abi, functionName, args, blockNumber, ...rest } = params;
+        // Coalesce only the plain pinned-block read shape; anything else (head reads, blockTag,
+        // account/state overrides, ...) keeps direct-call semantics through the raw client.
+        if (typeof blockNumber !== "bigint" || Object.keys(rest).length > 0 || !address || !abi || !functionName) {
+            return rawReadContract(params as Parameters<typeof rawReadContract>[0]);
+        }
+        return enqueueRead({ address, abi, functionName, args }, blockNumber);
     }) as ChainClient["readContract"];
 
     const rawMulticall = client.multicall.bind(client);
-    const multicall = (async (params: Parameters<typeof rawMulticall>[0]) => {
-        await acquire();
-        try {
-            return await rawMulticall(params);
-        } finally {
-            release();
+    const multicall = (async (params: {
+        contracts: ReadonlyArray<{ address: `0x${string}`; abi: Abi; functionName: string; args?: readonly unknown[] }>;
+        allowFailure?: boolean;
+        blockNumber?: unknown;
+    }) => {
+        // A pinned multicall DECOMPOSES into the shared pool: parallel contests' per-contest
+        // batches (each rule's evaluateMany) merge into the same aggregate3 round trips as
+        // coalesced single reads, and duplicate reads (one wallet voting on many boards at one
+        // sample block) collapse. Unpinned or exotic shapes pass through under the budget.
+        const { contracts, allowFailure = true, blockNumber } = params;
+        if (typeof blockNumber !== "bigint" || !Array.isArray(contracts)) {
+            await acquire();
+            try {
+                return await rawMulticall(params as Parameters<typeof rawMulticall>[0]);
+            } finally {
+                release();
+            }
         }
+        const settled = await Promise.allSettled(contracts.map((contract) => enqueueRead(contract, blockNumber)));
+        if (!allowFailure) {
+            const failed = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
+            if (failed) throw failed.reason;
+            return settled.map((s) => (s as PromiseFulfilledResult<unknown>).value);
+        }
+        return settled.map((s) =>
+            s.status === "fulfilled" ? { status: "success", result: s.value } : { status: "failure", error: s.reason, result: undefined }
+        );
     }) as ChainClient["multicall"];
 
     return { ...client, readContract, multicall } as ChainClient;

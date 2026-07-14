@@ -122,19 +122,47 @@ describe("coalescingChainClient", () => {
         expect(seenCalls).toHaveLength(1); // only the successful attempt reached the stub recorder
     });
 
-    it("explicit multicall calls count against the SAME in-flight budget as coalesced reads", async () => {
-        const { client, maxInFlight } = stubClient(() => 1n, { delayMs: 5 });
-        const chain = coalescingChainClient(client, { windowMs: 1, concurrency: 2 });
-        const explicit = Array.from({ length: 4 }, () =>
+    it("DECOMPOSES pinned explicit multicalls into the shared pool — contests' batches merge and dedupe", async () => {
+        const { client, seenCalls } = stubClient((w) => BigInt(parseInt(w.slice(2), 16)));
+        const chain = coalescingChainClient(client, { windowMs: 1 });
+        const batch = (wallets: Array<`0x${string}`>) =>
             chain.multicall({
-                contracts: [{ address: CONTRACT, abi: erc721Abi, functionName: "balanceOf" as const, args: [wallet(0)] as const }],
+                contracts: wallets.map((w) => ({ address: CONTRACT, abi: erc721Abi, functionName: "balanceOf" as const, args: [w] as const })),
                 allowFailure: false,
                 blockNumber: 100n
-            })
-        );
-        const coalesced = Array.from({ length: 5 }, (_, i) => readBalance(chain, wallet(i)));
-        await Promise.all([...explicit, ...coalesced]);
-        expect(maxInFlight()).toBeLessThanOrEqual(2);
+            }) as Promise<bigint[]>;
+        // Two "contests" batch-verify concurrently (one shared wallet) + a lone coalesced read.
+        const [a, b, single] = await Promise.all([batch([wallet(0), wallet(1)]), batch([wallet(1), wallet(2)]), readBalance(chain, wallet(3))]);
+        expect(seenCalls).toHaveLength(1); // ONE aggregate3 on the wire...
+        expect(seenCalls[0]!.contracts).toHaveLength(4); // ...with wallet(1) read once, not twice
+        expect(a).toEqual([1n, 2n]);
+        expect(b).toEqual([2n, 3n]);
+        expect(single).toBe(4n);
+    });
+
+    it("decomposed multicall keeps viem result semantics for both allowFailure modes", async () => {
+        const bad = wallet(1);
+        const { client } = stubClient((w) => {
+            if (w.toLowerCase() === bad.toLowerCase()) throw new Error("execution reverted");
+            return 3n;
+        });
+        const chain = coalescingChainClient(client, { windowMs: 1 });
+        const contracts = [wallet(0), bad].map((w) => ({ address: CONTRACT, abi: erc721Abi, functionName: "balanceOf" as const, args: [w] as const }));
+        // allowFailure: true → per-entry status objects, batchmates unaffected.
+        const soft = (await chain.multicall({ contracts, allowFailure: true, blockNumber: 100n })) as Array<{ status: string; result?: unknown }>;
+        expect(soft.map((r) => r.status)).toEqual(["success", "failure"]);
+        expect(soft[0]!.result).toBe(3n);
+        // allowFailure: false → the whole call rejects (the rule's chunk retry path).
+        await expect(chain.multicall({ contracts, allowFailure: false, blockNumber: 100n })).rejects.toThrow("execution reverted");
+    });
+
+    it("unpinned multicalls pass through but count against the SAME in-flight budget", async () => {
+        const { client, seenCalls, maxInFlight } = stubClient(() => 1n, { delayMs: 5 });
+        const chain = coalescingChainClient(client, { windowMs: 1, concurrency: 2 });
+        const contracts = [{ address: CONTRACT, abi: erc721Abi, functionName: "balanceOf" as const, args: [wallet(0)] as const }];
+        await Promise.all(Array.from({ length: 4 }, () => chain.multicall({ contracts, allowFailure: false }))); // no blockNumber
+        expect(seenCalls).toHaveLength(4); // head-block semantics: not merged...
+        expect(maxInFlight()).toBeLessThanOrEqual(2); // ...but budgeted
     });
 
     it("passes through reads it must not batch (no blockNumber / extra options) and bare clients", async () => {
