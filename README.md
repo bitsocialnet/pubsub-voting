@@ -39,6 +39,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 | `dataPath` | `string \| false` | no | directory for the voter's persistent caches (gate results + name resolutions), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-votes` (better-sqlite3 under `{dataPath}/lru-storage/`); in the browser the path is ignored and the caches live in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC |
+| `httpRouterUrls` | `string[]` | no | Delegated Routing V1 router base URLs to **announce provider records to** (one unsigned `PUT /routing/v1/providers` per router; `Keys` batches every joined contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced on root changes, and on address changes). **Seeders only**: absent/empty means never announce (the default — plain clients are not dialable), and the browser build never announces regardless. The node must be publicly dialable, with its dialable addresses in `libp2p` (listen/announce/AutoTLS): private, loopback, and link-local addrs are filtered client-side, and an announce with no surviving address is skipped. *Querying* needs no URLs here — cold-join discovery uses the injected node's `libp2p.contentRouting`, which the host wires its routers into |
 
 A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists.
 
@@ -52,7 +53,10 @@ const voter = new PubsubVoter({
   chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
-  dataPath: "/path/to/data"     // optional; persistent-cache directory (default {cwd}/.bitsocial-pubsub-votes; false → in-memory)
+  dataPath: "/path/to/data",    // optional; persistent-cache directory (default {cwd}/.bitsocial-pubsub-votes; false → in-memory)
+  httpRouterUrls: [             // optional, SEEDERS ONLY (publicly dialable node): announce provider
+    "https://routing.example"   // records (criteria CID + checkpoint root + chunks) so cold joiners
+  ]                             // can discover this node via the routers; clients omit this
 });
 ```
 

@@ -18,6 +18,16 @@ import { benchChains, benchCriteria, makeSigningContext, signRandomVoter } from 
  * feeder's window, so all `N` merge without touching any production constant.
  *
  * Usage: `node benchmark/seeder.js <N> <PORT>` (or env `BENCH_N`/`BENCH_PORT`), after `npm run build:bench`.
+ *
+ * Provider-record announcing (the real thing, no hardcoded router record):
+ *   `BENCH_ROUTER_URL`     — Delegated Routing V1 base URL to announce to; the orchestrator runs the
+ *                            router on the joiner's machine and reverse-tunnels it here (`ssh -R`),
+ *                            which is out-of-band of the measured join path. Sets the voter's
+ *                            `httpRouterUrls`, so the seeder PUTs its criteria CID + checkpoint
+ *                            root + chunk CIDs exactly as a production seeder would.
+ *   `BENCH_ANNOUNCE_ADDR`  — the seeder's public multiaddr (no `/p2p/`), set as libp2p's announce
+ *                            address so `getMultiaddrs()` (what the announcer publishes) names the
+ *                            address the joiner can actually dial, not the box's interface addrs.
  */
 
 /** Voter ballots published per feeder peer — safely under the gate's 256/10s per-peer bundle window. */
@@ -61,8 +71,15 @@ async function main(): Promise<void> {
     if (!Number.isInteger(n) || n < 0) throw new Error(`bad N: ${process.argv[2]}`);
     if (!Number.isInteger(port) || port <= 0) throw new Error(`bad PORT: ${process.argv[3]}`);
 
-    const seeder = await makeHostNode({ port });
-    const voter = new PubsubVoter({ dataPath: false, helia: seeder.helia, chains: benchChains() });
+    const routerUrl = process.env.BENCH_ROUTER_URL;
+    const announceAddr = process.env.BENCH_ANNOUNCE_ADDR;
+    const seeder = await makeHostNode({ port, ...(announceAddr ? { announce: [announceAddr] } : {}) });
+    const voter = new PubsubVoter({
+        dataPath: false,
+        helia: seeder.helia,
+        chains: benchChains(),
+        ...(routerUrl ? { httpRouterUrls: [routerUrl] } : {})
+    });
     const network = await voter.createContest({ criteria: benchCriteria() });
     await network.update(); // join + serve: installs the gate and registers the fetch responder
 

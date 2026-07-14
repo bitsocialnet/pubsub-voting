@@ -23,6 +23,13 @@ declare const criteria: Criteria;
 const voter = new PubsubVoter({ helia: hostHelia(), chains: viemChains() });
 console.log("read-only:", voter.readOnly); // true
 
+// A SEEDER — an always-online, publicly dialable read-only peer — additionally announces
+// provider records (each joined contest's criteria CID + checkpoint root + chunk CIDs) to the
+// network's Delegated Routing V1 routers, so cold joiners discover it without waiting for
+// gossipsub subscription propagation. Plain clients and browsers omit this (the default):
+//
+//   new PubsubVoter({ helia, chains, httpRouterUrls: ["https://routing.example"] });
+
 const contest = await voter.createContest({ criteria });
 const tally = await contest.getTally(); // allowed — reading needs no signer
 console.log(tally.ranking[0]?.community);

@@ -18,7 +18,8 @@
     }
   },
   "browser": {
-    "./dist/storage/node.js": "./dist/storage/browser.js"
+    "./dist/storage/node.js": "./dist/storage/browser.js",
+    "./dist/transport/announce/node.js": "./dist/transport/announce/browser.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

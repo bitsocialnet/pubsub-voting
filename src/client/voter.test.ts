@@ -1052,3 +1052,126 @@ describe("root-record fetch protocol", () => {
         });
     });
 });
+
+describe("provider-record announcer (httpRouterUrls)", () => {
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+    });
+
+    /** The announcer's change-coalescing window (ANNOUNCE_DEBOUNCE_MS in transport/announce/node.ts). */
+    const DEBOUNCE_MS = 10_000;
+    const PUBLIC_ADDR = "/ip4/203.0.113.5/tcp/4001";
+
+    /**
+     * A fake Helia whose libp2p also carries the announcer's surface (peer id, addresses,
+     * `self:peer:update` events), with the global `fetch` stubbed so announces are recorded
+     * instead of hitting the network (stubChains never reads over HTTP, so nothing else fetches).
+     */
+    function announcerHarness() {
+        vi.useFakeTimers();
+        const fetchSpy = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0) }));
+        vi.stubGlobal("fetch", fetchSpy);
+        const pubsub = {
+            publish: async () => ({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] }),
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [],
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        } satisfies PubsubService;
+        const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
+        const helia = {
+            libp2p: {
+                services: { pubsub, fetch: fakeFetchService() },
+                peerId: { toString: () => "12D3KooWSeeder" },
+                getMultiaddrs: () => [PUBLIC_ADDR, "/ip4/127.0.0.1/tcp/4001"].map((a) => ({ toString: () => a })),
+                addEventListener: () => {},
+                removeEventListener: () => {}
+            },
+            blockstore
+        } as unknown as HeliaInstance;
+        /** The JSON bodies fetch received, parsed. */
+        const bodies = () =>
+            fetchSpy.mock.calls.map((call) => {
+                const [url, init] = call as unknown as [string, { method: string; body: string }];
+                return { url, method: init.method, body: JSON.parse(init.body) as { Providers: Array<{ Payload: { ID: string; Addrs: string[]; Keys: string[] } }> } };
+            });
+        return { helia, fetchSpy, bodies };
+    }
+
+    it("announces every joined contest's criteria + root CIDs in one batched PUT per router", async () => {
+        const h = announcerHarness();
+        const voter = new PubsubVoter({
+            dataPath: false,
+            helia: h.helia,
+            chains: stubChains(),
+            httpRouterUrls: ["http://router-a.example/", "http://router-b.example"]
+        });
+        const a = await voter.createContest({ criteria: bizCriteria() });
+        const b = await voter.createContest({ criteria: { ...bizCriteria(), contestId: "g", name: "/g/" } });
+        await a.update();
+        await b.update();
+        expect(h.fetchSpy).not.toHaveBeenCalled(); // debounced: nothing goes out at join time
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+        expect(h.fetchSpy).toHaveBeenCalledTimes(2); // one PUT per router, both contests batched
+
+        const rootA = (await (a as unknown as { rootRecord(): Promise<RootRecord> }).rootRecord()).root.toString();
+        const criteriaCidOf = (topic: string) => topic.slice(TOPIC_PREFIX.length);
+        for (const put of h.bodies()) {
+            expect(put.url).toMatch(/^http:\/\/router-[ab]\.example\/routing\/v1\/providers$/);
+            expect(put.method).toBe("PUT");
+            const { ID, Addrs, Keys } = put.body.Providers[0]!.Payload;
+            expect(ID).toBe("12D3KooWSeeder");
+            expect(Addrs).toEqual([PUBLIC_ADDR]); // loopback filtered client-side
+            // Both criteria CIDs plus the (shared, deduped) empty-checkpoint root.
+            expect(Keys).toEqual(expect.arrayContaining([criteriaCidOf(a.topic), criteriaCidOf(b.topic), rootA]));
+            expect(Keys).toHaveLength(3);
+        }
+        await voter.stop();
+    });
+
+    it("a local publish (checkpoint change) triggers a debounced re-announce", async () => {
+        const h = announcerHarness();
+        const voter = new PubsubVoter({
+            dataPath: false,
+            helia: h.helia,
+            chains: stubChains(),
+            signer: fakeSigner(),
+            httpRouterUrls: ["http://router.example"]
+        });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+        expect(h.fetchSpy).toHaveBeenCalledTimes(1);
+
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+        // The publish (and its background settlement) re-announced at least once more.
+        expect(h.fetchSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+        await voter.stop();
+    });
+
+    it("stop() stops announcing (no periodic re-announce after the last topic leaves)", async () => {
+        const h = announcerHarness();
+        const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: stubChains(), httpRouterUrls: ["http://router.example"] });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+        expect(h.fetchSpy).toHaveBeenCalledTimes(1);
+        await voter.stop();
+        await vi.advanceTimersByTimeAsync(2 * 3_600_000); // two hourly ticks would have fired
+        expect(h.fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("no httpRouterUrls (or an empty list) never announces", async () => {
+        const h = announcerHarness();
+        const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: stubChains(), httpRouterUrls: [] });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.advanceTimersByTimeAsync(2 * 3_600_000);
+        expect(h.fetchSpy).not.toHaveBeenCalled();
+        await voter.stop();
+    });
+});

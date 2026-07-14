@@ -56,6 +56,14 @@ export interface HostNodeOptions {
     port?: number;
     /** Listen host; default 0.0.0.0 so a public seeder is dialable from off-box. */
     host?: string;
+    /**
+     * libp2p announce addresses (`addresses.announce`): what `getMultiaddrs()` — and therefore the
+     * provider-record announcer — advertises instead of the interface addrs. The bench seeder sets
+     * its public `/ip4|dns4/<host>/tcp/<port>` here, modelling a real deployment where the host
+     * configures its dialable address (a NATed box's interface addrs are private and would be
+     * filtered out of the announce entirely).
+     */
+    announce?: string[];
     /** gossipsub heartbeat (ms); omit to use gossipsub's own default (realistic mesh timing). */
     heartbeatInterval?: number;
     /**
@@ -82,7 +90,10 @@ export async function makeHostNode(options: HostNodeOptions = {}): Promise<HostN
         (options.routerUrls ?? []).map((url, i) => [`delegatedRouting${i}`, delegatedRoutingV1HttpApiClient({ url })])
     );
     const libp2p = await createLibp2p({
-        addresses: { listen: [`/ip4/${host}/tcp/${port}`] },
+        addresses: {
+            listen: [`/ip4/${host}/tcp/${port}`],
+            ...(options.announce !== undefined ? { announce: options.announce } : {})
+        },
         transports: [tcp()],
         connectionEncrypters: [noise()],
         streamMuxers: [yamux()],
