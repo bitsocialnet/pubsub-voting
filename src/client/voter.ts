@@ -22,7 +22,7 @@ import {
     type RootRecord,
     type FetchRootRecord
 } from "../transport/messages.js";
-import { makeRootChaser, type RootChaser } from "../transport/chase.js";
+import { makeRootChaser, toChaseSession, type RootChaser } from "../transport/chase.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../crdt/codec.js";
 import type { RuleRegistry } from "../rules/types.js";
 import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
@@ -905,30 +905,13 @@ class ContestEngine {
             openSession: (root, providers) => {
                 const createSession = this.#deps.blockstore.createSession?.bind(this.#deps.blockstore);
                 if (createSession === undefined) return undefined;
-                const session = createSession(root, {
-                    providers,
-                    maxProviders: providers.length + CHASE_SESSION_PROVIDER_HEADROOM
-                });
-                return {
-                    get: async (cid, signal) => {
-                        try {
-                            return await session.get(cid, { signal });
-                        } catch {
-                            return undefined; // the chase falls back to the broadcast want
-                        }
-                    },
-                    addPeer: (peer) => {
-                        // A bad late hint (undialable, session at capacity) must never surface.
-                        void Promise.resolve(session.addPeer(peer)).catch(() => {});
-                    },
-                    close: () => {
-                        try {
-                            session.close();
-                        } catch {
-                            // releasing a finished session must not fail the chase
-                        }
-                    }
-                };
+                // `toChaseSession` enforces the ChaseSession never-throw contracts on the raw session.
+                return toChaseSession(
+                    createSession(root, {
+                        providers,
+                        maxProviders: providers.length + CHASE_SESSION_PROVIDER_HEADROOM
+                    })
+                );
             },
             verifyOffline: (bundle) => this.#verifier.verifyOffline(bundle),
             cache: this.#cache,

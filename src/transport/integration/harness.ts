@@ -19,7 +19,7 @@ import { makeVerdictCache, type VerdictCache } from "../../verify/cache.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../../crdt/codec.js";
 import { encodeCheckpoint } from "../../checkpoint/codec.js";
 import { makeGossipGate } from "../gossip-validator.js";
-import { makeRootChaser, type RootChaser } from "../chase.js";
+import { makeRootChaser, toChaseSession, type RootChaser } from "../chase.js";
 import { makeVoteTransport } from "../transport.js";
 import type { PubsubService, VoteTransport } from "../types.js";
 import {
@@ -206,26 +206,7 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
             const createSession = blockstore.createSession?.bind(blockstore);
             if (createSession === undefined) return undefined;
             openedSessions.push({ root: root.toString(), providers: providers.map((p) => p.toString()) });
-            const session = createSession(root, { providers, maxProviders: providers.length + 1 });
-            return {
-                get: async (cid, signal) => {
-                    try {
-                        return await session.get(cid, { signal });
-                    } catch {
-                        return undefined;
-                    }
-                },
-                addPeer: (peer) => {
-                    void Promise.resolve(session.addPeer(peer)).catch(() => {});
-                },
-                close: () => {
-                    try {
-                        session.close();
-                    } catch {
-                        // releasing a finished session must not fail the chase
-                    }
-                }
-            };
+            return toChaseSession(createSession(root, { providers, maxProviders: providers.length + 1 }));
         },
         verifyOffline: (bundle) => verifier.verifyOffline(bundle),
         cache,

@@ -1,5 +1,6 @@
 import type { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
+import type { BlockSessionLike } from "./types.js";
 import type { VotesBundle } from "../schema/votes.js";
 import { decodeCheckpoint } from "../checkpoint/codec.js";
 import { encodeBundle, bundleCidForBytes } from "../crdt/codec.js";
@@ -48,6 +49,44 @@ export interface ChaseSession {
     addPeer(peer: PeerId): void;
     /** Abort the session's in-flight wants and release it. MUST NOT throw. */
     close(): void;
+}
+
+/**
+ * Wrap a raw block session into a {@link ChaseSession}, enforcing the contracts above at the one
+ * boundary where they can be violated: `get` maps any failure to `undefined` (the chase falls
+ * back to the broadcast want), and `addPeer`/`close` swallow synchronous throws as well as
+ * rejections — a late hint can race the chase deadline and land on an already-closed session,
+ * and nothing on that path guards again (`addProviders` relies on the MUST NOT throw contract,
+ * and `chase()` is a fire-and-forget API). Shared by the voter and the integration harness so
+ * the harness stays faithful to the production seam it mirrors.
+ */
+export function toChaseSession(session: BlockSessionLike): ChaseSession {
+    return {
+        get: async (cid, signal) => {
+            try {
+                return await session.get(cid, { signal });
+            } catch {
+                return undefined; // the chase falls back to the broadcast want
+            }
+        },
+        addPeer: (peer) => {
+            // A bad late hint (undialable, session at capacity, session already closed) must
+            // never surface. `Promise.resolve(...)` alone would miss a synchronous throw — it
+            // happens while evaluating the argument — so the call itself needs the try.
+            try {
+                void Promise.resolve(session.addPeer(peer)).catch(() => {});
+            } catch {
+                // same no-op as a rejection
+            }
+        },
+        close: () => {
+            try {
+                session.close();
+            } catch {
+                // releasing a finished session must not fail the chase
+            }
+        }
+    };
 }
 
 export interface RootChaserDeps {
@@ -144,7 +183,15 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         // Open the session only now (not at enqueue): hints that arrived while queued behind the
         // concurrency cap are all in `queued`, so they seed the session instead of dialing addPeer.
-        if (flight.queued.length > 0) flight.session = openSession?.(root, flight.queued.splice(0));
+        // A throwing factory degrades to the broadcast path exactly like an absent seam — a
+        // session is an optimisation, never something a chase may die on.
+        if (flight.queued.length > 0) {
+            try {
+                flight.session = openSession?.(root, flight.queued.splice(0));
+            } catch {
+                flight.session = undefined;
+            }
+        }
         flight.started = true;
         // One failed session want marks the whole session dead (a converged advertiser holds all
         // blocks or none) — the remaining blocks skip straight to the broadcast fallback instead

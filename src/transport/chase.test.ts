@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import type { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
-import { makeRootChaser, type ChaseSession, type RootChaserDeps } from "./chase.js";
+import { makeRootChaser, toChaseSession, type ChaseSession, type RootChaserDeps } from "./chase.js";
+import type { BlockSessionLike } from "./types.js";
 import { encodeCheckpoint } from "../checkpoint/codec.js";
 import { bundleCid } from "../crdt/codec.js";
 import { makeVerdictCache } from "../verify/cache.js";
@@ -374,5 +375,78 @@ describe("makeRootChaser", () => {
         await h.settle();
         expect(closed).toBe(1);
         expect(h.chaser.inFlight()).toBe(0);
+    });
+
+    it("degrades to the broadcast path when the session factory throws synchronously", async () => {
+        // Repro for a pre-fix bug: `openSession` ran outside `runChase`'s try, so a synchronously
+        // throwing factory (e.g. Helia's createSession on a stopping node) killed the whole chase
+        // instead of falling back to the broadcast want like an absent/declining seam does.
+        const { root, getBlock, fetched } = await checkpointOf([bundle("0x1")]);
+        const h = harness({
+            getBlock,
+            openSession: () => {
+                throw new Error("node stopped");
+            }
+        });
+        h.chaser.chase(root, undefined, [peerId("peer-a")]);
+        await h.settle();
+        expect(fetched.length).toBeGreaterThan(0); // every block rode the broadcast fallback
+        expect(h.admitted).toHaveLength(1); // the chase still converges
+        expect(h.chaser.inFlight()).toBe(0); // and the slot is freed
+    });
+
+    it("swallows a raw session addPeer that throws synchronously (toChaseSession contract)", async () => {
+        // Repro for a pre-fix bug: the voter/harness wrappers used
+        // `Promise.resolve(session.addPeer(peer)).catch(...)`, which misses a SYNCHRONOUS throw
+        // (it happens while evaluating the argument) — e.g. a late hint racing the chase
+        // deadline onto an already-closed session. The throw then rode the unguarded
+        // `addProviders` → out of the fire-and-forget `chase()` into the pubsub handler.
+        const { root, map } = await checkpointOf([bundle("0x1")]);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const raw: BlockSessionLike = {
+            get: async (cid) => {
+                await gate; // hold the chase in flight while the late hint arrives
+                const bytes = map.get(cid.toString());
+                if (bytes === undefined) throw new Error("miss");
+                return bytes;
+            },
+            addPeer: () => {
+                throw new Error("session closed"); // synchronous — not a rejection
+            },
+            close: () => {}
+        };
+        const h = harness({ getBlock: async () => undefined, openSession: () => toChaseSession(raw) });
+        h.chaser.chase(root, undefined, [peerId("peer-a")]);
+        expect(h.chaser.inFlight()).toBe(1);
+        // Pre-fix this late hint threw straight out of chase(); it must be a silent no-op.
+        expect(() => h.chaser.chase(root, undefined, [peerId("peer-b")])).not.toThrow();
+        release();
+        await h.settle();
+        expect(h.admitted).toHaveLength(1); // the chase itself was never derailed
+        expect(h.chaser.inFlight()).toBe(0);
+    });
+});
+
+describe("toChaseSession", () => {
+    it("maps every raw-session failure mode to the ChaseSession contract", async () => {
+        const { root } = await checkpointOf([bundle("0x1")]);
+        const raw: BlockSessionLike = {
+            get: async () => {
+                throw new Error("want failed");
+            },
+            addPeer: async () => {
+                throw new Error("undialable"); // async — a rejection this time
+            },
+            close: () => {
+                throw new Error("already released");
+            }
+        };
+        const session = toChaseSession(raw);
+        // `get` failure → undefined, so the chase falls back to the broadcast want.
+        await expect(session.get(root, new AbortController().signal)).resolves.toBeUndefined();
+        // `addPeer`/`close` MUST NOT throw, whether the raw session throws or rejects.
+        expect(() => session.addPeer(peerId("peer-a"))).not.toThrow();
+        expect(() => session.close()).not.toThrow();
     });
 });
