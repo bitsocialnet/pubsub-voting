@@ -165,6 +165,26 @@ describe("coalescingChainClient", () => {
         expect(maxInFlight()).toBeLessThanOrEqual(2); // ...but budgeted
     });
 
+    it("routes pinned multicalls with exotic options raw (viem semantics), while batchSize still decomposes", async () => {
+        const { client, seenCalls } = stubClient(() => 1n);
+        const chain = coalescingChainClient(client, { windowMs: 1 });
+        const contracts = [{ address: CONTRACT, abi: erc721Abi, functionName: "balanceOf" as const, args: [wallet(0)] as const }];
+        // stateOverride changes what the eth_call executes against — decomposing would drop it.
+        await chain.multicall({
+            contracts,
+            allowFailure: false,
+            blockNumber: 100n,
+            stateOverride: [{ address: CONTRACT, balance: 1n }]
+        } as unknown as Parameters<ChainClient["multicall"]>[0]);
+        expect(seenCalls).toHaveLength(1);
+        expect((seenCalls[0] as MulticallSeen & { stateOverride?: unknown }).stateOverride).toBeDefined(); // passed through whole, option intact
+        // batchSize is chunking config, not execution semantics: still decomposed into the pool.
+        await chain.multicall({ contracts, allowFailure: false, batchSize: 0, blockNumber: 100n });
+        expect(seenCalls).toHaveLength(2);
+        expect(seenCalls[1]!.batchSize).toBe(0); // the POOL's chunk params, not a raw passthrough
+        expect(seenCalls[1]!.allowFailure).toBe(true);
+    });
+
     it("passes through reads it must not batch (no blockNumber / extra options) and bare clients", async () => {
         const { client, seenCalls } = stubClient(() => 1n);
         let directReads = 0;

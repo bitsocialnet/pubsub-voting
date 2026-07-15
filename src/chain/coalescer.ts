@@ -208,14 +208,18 @@ export function coalescingChainClient(client: ChainClient, options: CoalescerOpt
     const multicall = (async (params: {
         contracts: ReadonlyArray<{ address: `0x${string}`; abi: Abi; functionName: string; args?: readonly unknown[] }>;
         allowFailure?: boolean;
+        batchSize?: number;
         blockNumber?: unknown;
-    }) => {
+    } & Record<string, unknown>) => {
         // A pinned multicall DECOMPOSES into the shared pool: parallel contests' per-contest
         // batches (each rule's evaluateMany) merge into the same aggregate3 round trips as
         // coalesced single reads, and duplicate reads (one wallet voting on many boards at one
-        // sample block) collapse. Unpinned or exotic shapes pass through under the budget.
-        const { contracts, allowFailure = true, blockNumber } = params;
-        if (typeof blockNumber !== "bigint" || !Array.isArray(contracts)) {
+        // sample block) collapse. `batchSize` is dropped on decomposition (the pool re-chunks at
+        // `readsPerCall` anyway); any OTHER extra option (`stateOverride`, `multicallAddress`,
+        // `deployless`, ...) changes viem's execution semantics, so — like unpinned calls —
+        // those shapes pass through raw under the budget.
+        const { contracts, allowFailure = true, batchSize: _batchSize, blockNumber, ...rest } = params;
+        if (typeof blockNumber !== "bigint" || !Array.isArray(contracts) || Object.keys(rest).length > 0) {
             await acquire();
             try {
                 return await rawMulticall(params as Parameters<typeof rawMulticall>[0]);
