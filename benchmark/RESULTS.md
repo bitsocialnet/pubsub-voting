@@ -55,6 +55,14 @@ sum to the total — `connect` is measured from the `start()` call and already c
 wait, and verify runs as blocks arrive. `START→TALLY` / `START→VERIFIED` are the true end-to-end
 figures.*
 
+*Re-measured 2026-07-14 (median of 5) with the **advertiser-seeded bitswap session chase** (DESIGN.md
+"Block pull" — targeted session wants at the advertisers, one router provider-query per root instead
+of one `findProviders` per block): every column matched this baseline within jitter (`START→TALLY`
+3.19s / 3.07s / 3.07s / 3.17s / 5.30s for N=1…1000 vs 3.08s / 3.00s / 2.94s / 3.11s / 5.38s above;
+`bitswap` 0.57–1.05s, `verify+merge` 0.31–1.99s). The change's win is off-column: router queries and
+per-peer WANT chatter, not wall-clock. The joiner instrumentation now wraps `blockstore.createSession`
+so the `bitswap` column times the session pull (which bypasses the plain instrumented `get`).*
+
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
 gateway and background chain verification existed, hence no gate-RPC/VERIFIED values) — a realistic
@@ -226,6 +234,12 @@ render** at every M. The 2026-07-10 baseline — voter-wide per-peer cold-start 
 shuffled subscriber selection, see DESIGN.md "Checkpoints → pull" — read 3.26s / 2.51s / 3.87s
 ALL-TALLIES respectively; this run's deltas are within this link's rep-to-rep jitter (M=63 reps
 spanned 3.69–5.92s). The 2026-07-09 retry-only baseline read 3.26s / 2.33s / 5.04s.)*
+
+*Re-measured 2026-07-14 with the **advertiser-seeded bitswap session chase** (DESIGN.md "Block
+pull"): ALL-TALLIES 3.26s / 2.56s / 3.66s (median of 3) — M=63 within-to-below this baseline, all
+63/63 converged. A later median-of-5 A/B on the same day hit a degraded window on this link (M=63
+reps spanned 4.3–12.0s); a back-to-back master control confirmed it was the link, not the change
+(master 6.70s vs sessions 6.07s median under identical conditions).*
 
 ## Parallelism + convergence (N=10 voters/contest, median of 5)
 
