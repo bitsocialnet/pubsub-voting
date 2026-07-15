@@ -38,11 +38,11 @@ voters vote for one community, so the tally is one community of weight `N`.
 
 | N (voters) | router | connect | fetch | bitswap | verify+merge | gate-RPC | **START→TALLY** | **START→VERIFIED** |
 |-----------:|-------:|--------:|------:|--------:|-------------:|---------:|----------------:|-------------------:|
-| 1          | 1.00s  | 1.57s   | 0.53s | 0.55s   | 0.31s        | 2        | **3.08s**       | **3.38s**          |
-| 5          | 1.00s  | 1.54s   | 0.54s | 0.60s   | 0.31s        | 2        | **3.00s**       | **3.31s**          |
-| 10         | 1.00s  | 1.55s   | 0.49s | 0.56s   | 0.33s        | 2        | **2.94s**       | **3.24s**          |
-| 100        | 1.00s  | 1.55s   | 0.52s | 0.58s   | 0.48s        | 5        | **3.11s**       | **3.41s**          |
-| 1000       | 1.00s  | 1.55s   | 0.53s | 1.21s   | 2.07s        | 38       | **5.38s**       | **5.44s**          |
+| 1          | 1.00s  | 1.61s   | 0.56s | 0.57s   | 0.34s        | 2        | **3.08s**       | **3.39s**          |
+| 5          | 1.00s  | 1.60s   | 0.56s | 0.57s   | 0.32s        | 2        | **3.12s**       | **3.48s**          |
+| 10         | 1.00s  | 1.58s   | 0.56s | 0.57s   | 0.32s        | 2        | **3.06s**       | **3.36s**          |
+| 100        | 1.00s  | 1.58s   | 0.57s | 0.58s   | 0.47s        | 2        | **3.19s**       | **3.49s**          |
+| 1000       | 1.00s  | 1.60s   | 0.56s | 0.97s   | 2.06s        | 7        | **5.25s**       | **5.87s**          |
 | 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | —        | **18.95s**      | —                  |
 
 *Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
@@ -62,6 +62,16 @@ of one `findProviders` per block): every column matched this baseline within jit
 `bitswap` 0.57–1.05s, `verify+merge` 0.31–1.99s). The change's win is off-column: router queries and
 per-peer WANT chatter, not wall-clock. The joiner instrumentation now wraps `blockstore.createSession`
 so the `bitswap` column times the session pull (which bypasses the plain instrumented `get`).*
+
+*Re-measured 2026-07-15 (median of 5, the table above) with the **rate-limit-safe batched gate reads**
+(the rule chunks 200 `balanceOf`s per `aggregate3` with viem re-chunking off, ≤2 round trips in flight,
+and the voter-level read coalescer merges every consumer's pinned reads — DESIGN.md "Background chain
+verification"): every column is within jitter of the 2026-07-14 numbers except the read pattern itself —
+`gate-RPC` fell from 5 to **2** at N=100 and from 38 to **7** at N=1000 (fewer, bigger multicalls), and
+`START→VERIFIED` at N=1000 rose 5.44s → **5.87s** because the 5 chunks now flush in ≤2-in-flight waves
+instead of 38 concurrent posts — the polite-read policy's designed trade against free public endpoints
+(the same policy that takes the REAL Base mainnet N=1000 join from never-verifying to 8.2s — see "Real
+chain" below).*
 
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
@@ -305,6 +315,15 @@ read coalescer that merges parallel contests' pinned-block reads into shared rou
 | 10         | 1.00s  | 1.72s   | 0.56s | 0.59s   | 0.51s        | 2        | **3.35s**       | **3.75s**          |
 | 100        | 1.00s  | 1.60s   | 0.56s | 0.77s   | 0.66s        | 2        | **3.64s**       | **4.19s**          |
 | 1000       | 1.00s  | 1.59s   | 0.57s | 1.09s   | 2.38s        | 8.5      | **5.53s**       | **8.22s**          |
+
+*Re-measured 2026-07-15 (median of 5) after merging master (advertiser-seeded session chase +
+announcer-discovered seeder) and the exotic-multicall raw-path guard: within jitter of this table at
+every N (N ≤ 100 render 3.29–3.59s / verified 3.69–4.20s; N=1000 on a quiet machine 5.4–6.0s render /
+7.6–7.9s verified), with the read pattern unchanged — 8 round trips (5 multicalls carrying all 1000
+reads), **0 HTTP / 0 JSON-RPC errors in 5/5 reps**, measured median round trip 498–814 ms. A
+concurrent local CPU load during part of that sweep inflated only the `verify+merge` column (2.4 s →
+4.3–5.6 s; a mock-mode control on the same tree reproduced the same inflation, so it is machine load,
+not a transport or read-policy change).*
 
 ### Gate-RPC round trips per operation (median; `reads` = multicall inner reads)
 
