@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.4](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.3...v0.0.4) (2026-07-15)
+
+### Features
+
+* **transport:** chase checkpoint roots through advertiser-seeded bitswap sessions ([63a522e](https://github.com/bitsocialnet/pubsub-voting/commit/63a522e7d92ffb72db2642057af1262f3df0f823)), closes [#191](https://github.com/bitsocialnet/pubsub-voting/issues/191) [#5](https://github.com/bitsocialnet/pubsub-voting/issues/5)
+
+### Bug Fixes
+
+* **transport:** enforce ChaseSession never-throw contracts at the session boundary ([4a7e93a](https://github.com/bitsocialnet/pubsub-voting/commit/4a7e93a6925a3fcf3a83d44f8f2d52190a5541c4))
+
 ## [0.0.3](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.2...v0.0.3) (2026-07-14)
 
 ### Features
