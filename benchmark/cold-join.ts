@@ -1,7 +1,7 @@
 import { PubsubVoter } from "../dist/client/voter.js";
 import { TOPIC_PREFIX } from "../dist/topic.js";
 import { makeHostNode, waitFor, type HostNode } from "./host-node.js";
-import { startRouter, type RunningRouter } from "./router.js";
+import type { RouterRequest } from "./router.js";
 import { formatRpcByOp, startRpcGateway, summarizeRpc, type GateRpcSummary, type GatewayRequest, type RunningGateway } from "./rpc-gateway.js";
 import { benchCriteria, benchGatewayChains, benchRpcUrl, benchRules, realJoinerChains } from "./signing.js";
 
@@ -9,19 +9,27 @@ import { benchCriteria, benchGatewayChains, benchRpcUrl, benchRules, realJoinerC
  * Cold-join benchmark — COLD JOINER side (runs locally; discovers the remote seeder via an HTTP
  * content router, exactly like pkc-js — delegated Routing V1, no DHT).
  *
+ * The router is NOT hardcoded anymore: the orchestrator (run.mjs) runs it on this machine and the
+ * remote seeder ANNOUNCES its provider records to it for real (`httpRouterUrls`, over an SSH
+ * reverse tunnel — out-of-band of the measured join path), so this bench exercises the announcer
+ * end-to-end: announce → router → `findProviders` → dial. This process only receives the router's
+ * URL.
+ *
  * Flow, all inside `start()`:
  *   1. `#coldStart` asks the (local, ~1s-latency) HTTP router "who provides `<criteriaCid>`?";
- *   2. the router names the seeder at its **public multiaddr** (`<providerAddr>`), dialed directly
- *      over the real internet — no SSH tunnel, so the measured RTT is the true network path;
+ *   2. the router answers with the record the seeder announced — its peer id and **public
+ *      multiaddr** — dialed directly over the real internet — no SSH tunnel on the data path, so
+ *      the measured RTT is the true network path;
  *   3. the node dials it and **fetches the root record immediately** — no wait for gossipsub
  *      subscription gossip;
  *   4. the divergent root is chased over directed bitswap, verified, merged;
  *   5. `getTally()` returns the full ranking (the "which board to load" signal).
  *
- * Every expensive operation is timed: the router lookup (from the in-process router's request log),
- * the connect/identify, the fetch, each bitswap block pull, and verify+merge (the residual). The
- * network ops are timed by wrapping the injected `blockstore.get` + `fetch` seams (no production
- * changes); the router lookup shares this process's `performance.now()` clock.
+ * Every expensive operation is timed: the router lookup (from the router's request log, pulled via
+ * its `/_requests` control endpoint and mapped onto this process's clock through the shared epoch
+ * — same machine, same system clock), the connect/identify, the fetch, each bitswap block pull,
+ * and verify+merge (the residual). The network ops are timed by wrapping the injected
+ * `blockstore.get` + `fetch` seams (no production changes).
  *
  * The joiner's chain client is a REAL default-config viem client against the local mock ETH
  * gateway (rpc-gateway.ts), each RPC round trip charged `BENCH_RPC_LATENCY_MS` — so the deferred
@@ -31,10 +39,10 @@ import { benchCriteria, benchGatewayChains, benchRpcUrl, benchRules, realJoinerC
  * RPC latency; see signing.ts. Two total milestones come out: `start->tally` (render-ready,
  * rows possibly `chainVerified: false`) and `start->verified` (every deferred gate read landed).
  *
- * Usage: `node benchmark/cold-join.js <providerAddr> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
- *   `<providerAddr>` is the seeder's full dialable multiaddr, e.g. `/ip4/1.2.3.4/tcp/41000/p2p/<id>`.
- * Env: `BENCH_ROUTER_LATENCY_MS` (default 1000), `BENCH_RPC_LATENCY_MS` (default 270, mock mode),
- *      `BENCH_RPC_URL` (real Base RPC — switches to REAL-CHAIN mode).
+ * Usage: `node benchmark/cold-join.js <routerUrl> <seederPeerId> <topic> <N>`, after `npm run build:bench`.
+ *   `<routerUrl>` is the orchestrator-run local router the seeder announced to, e.g. `http://127.0.0.1:43210/`.
+ * Env: `BENCH_RPC_LATENCY_MS` (default 270, mock mode), `BENCH_RPC_URL` (real Base RPC — switches
+ *      to REAL-CHAIN mode), `BENCH_JOIN_TIMEOUT_MS`. The router latency lives with the router (run.mjs).
  */
 
 /** One timed operation on the cold-join path, in ms relative to the `start()` call (t0). */
@@ -104,13 +112,11 @@ export interface ColdJoinMilestones {
 }
 
 export interface ColdJoinArgs {
-    /** The seeder's full dialable multiaddr (includes `/p2p/<id>`), dialed directly over the WAN. */
-    providerAddr: string;
+    /** The orchestrator-run local router's base URL — holds what the seeder announced for real. */
+    routerUrl: string;
     seederPeerId: string;
     topic: string;
     expectedN: number;
-    /** Simulated HTTP-router latency (ms). Default 1000. */
-    routerLatencyMs?: number;
     /** Simulated ETH-gateway latency per RPC round trip (ms). Default 270 (the bench WAN's RTT). */
     rpcLatencyMs?: number;
     /** Overall ceiling for the whole join (ms); a hung join throws instead of hanging forever. */
@@ -120,6 +126,10 @@ export interface ColdJoinArgs {
 /** The subset of a Helia blockstore we monkey-patch to time bitswap pulls. */
 interface TimedBlockstore {
     get(cid: { toString(): string }, options?: unknown): AsyncIterable<Uint8Array> | Promise<Uint8Array>;
+}
+/** The session-capable blockstore surface: sessions must be timed like plain gets. */
+interface TimedSessionBlockstore {
+    createSession?(root: unknown, options?: unknown): TimedBlockstore;
 }
 /** The subset of the libp2p fetch service we monkey-patch to time root-record pulls. */
 interface TimedFetch {
@@ -159,6 +169,25 @@ function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; l
         events.push({ kind: "blockGet", label: cid.toString(), start, end: performance.now(), bytes: bytes.length });
         return bytes;
     };
+    // The chase pulls through an advertiser-seeded bitswap session when the blockstore can make
+    // one (DESIGN.md "Block pull"), bypassing the wrapped top-level `get` — wrap each session's
+    // `get` too, or the bitswap column silently under-counts and the pull time hides in the
+    // verify+merge residual.
+    const sessionBs = node.helia.blockstore as unknown as TimedSessionBlockstore;
+    if (typeof sessionBs.createSession === "function") {
+        const rawCreateSession = sessionBs.createSession.bind(sessionBs);
+        sessionBs.createSession = (root, options) => {
+            const session = rawCreateSession(root, options);
+            const rawSessionGet = session.get.bind(session);
+            session.get = async (cid, opts): Promise<Uint8Array> => {
+                const start = performance.now();
+                const bytes = await drainBlock(rawSessionGet(cid, opts));
+                events.push({ kind: "blockGet", label: cid.toString(), start, end: performance.now(), bytes: bytes.length });
+                return bytes;
+            };
+            return session;
+        };
+    }
 
     const libp2p = node.libp2p as unknown as { getConnections?(peer: unknown): TimedConnection[] };
     const fetchSvc = node.libp2p.services.fetch as unknown as TimedFetch;
@@ -195,23 +224,20 @@ function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; l
     return { events };
 }
 
-/** Run one cold join against a live seeder (discovered via a local HTTP router) and time each step. */
+/** Run one cold join against a live seeder (discovered via the announced-to HTTP router) and time each step. */
 export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMilestones> {
     const timeoutMs = args.timeoutMs ?? 60_000;
     const cidString = args.topic.slice(TOPIC_PREFIX.length);
-    const providerAddr = args.providerAddr;
+    const routerBase = args.routerUrl.replace(/\/+$/, "");
 
-    // The local HTTP content router: names the seeder as the provider of the criteria CID, after a
-    // realistic ~1s lookup latency. This is the ONLY way the cold node learns about the seeder.
-    let router: RunningRouter | undefined;
     let gateway: RunningGateway | undefined;
     let node: HostNode | undefined;
     let voter: PubsubVoter | undefined;
     try {
-        router = await startRouter({
-            providers: new Map([[cidString, { id: args.seederPeerId, addrs: [providerAddr] }]]),
-            latencyMs: args.routerLatencyMs ?? 1000
-        });
+        // Re-arm the orchestrator's shared router for this repeat: clear its lookup log and its
+        // one-time simulated latency, so every cold join pays the router round trip exactly once,
+        // like a fresh client. The provider records themselves persist — the seeder announced them.
+        await fetch(`${routerBase}/_reset`, { method: "POST" });
         // The joiner's chain client, per mode. Mock (default): a REAL default-config viem client
         // against the mock ETH gateway, each HTTP round trip charged `rpcLatencyMs` — so the
         // background verifier's batched (or unbatched) chain reads cost what they would against
@@ -222,7 +248,7 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         const rpcUrl = benchRpcUrl();
         const realRpcLog: GatewayRequest[] = [];
         if (!rpcUrl) gateway = await startRpcGateway({ latencyMs: args.rpcLatencyMs ?? 270 });
-        node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
+        node = await makeHostNode({ host: "127.0.0.1", routerUrls: [args.routerUrl] });
         const { events } = instrument(node);
         const rules = benchRules();
         voter = new PubsubVoter({
@@ -256,6 +282,7 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         // returns — cold-start merges land asynchronously well after, over the WAN.
         let firstUpdateAbs: number | null = null;
         const t0 = performance.now();
+        const t0Epoch = Date.now(); // the router logs epoch times; same machine ⇒ same clock
         await network.update();
         const startReturnMs = performance.now() - t0;
         network.on("update", () => {
@@ -318,7 +345,10 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         const fetchTotalMs = fetchOps.reduce((s, o) => s + o.durMs, 0);
         const blockOps = ops.filter((o) => o.kind === "blockGet");
         const networkBlocks = blockOps.filter((o) => o.durMs >= 5); // a real bitswap pull, not a local hit
-        const routerReq = router.requests.find((r) => r.cid === cidString);
+        // The router runs in the orchestrator's process: pull its lookup log over the control
+        // endpoint and map the epoch timestamps onto this process's t0 (same machine, same clock).
+        const routerRequests = (await (await fetch(`${routerBase}/_requests`)).json()) as RouterRequest[];
+        const routerReq = routerRequests.find((r) => r.cid === cidString && r.endEpochMs >= t0Epoch);
         const lastNetEndMs = [
             ...fetchOps.map((o) => o.startMs + o.durMs),
             ...networkBlocks.map((o) => o.startMs + o.durMs)
@@ -328,8 +358,8 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
             n: args.expectedN,
             startReturnMs,
             router: {
-                startMs: routerReq ? routerReq.startMs - t0 : null,
-                durMs: routerReq ? routerReq.endMs - routerReq.startMs : null
+                startMs: routerReq ? routerReq.startEpochMs - t0Epoch : null,
+                durMs: routerReq ? routerReq.endEpochMs - routerReq.startEpochMs : null
             },
             connectMs: connectAbs === null ? null : connectAbs - t0,
             identifyMs: identifyAbs === null ? null : identifyAbs - t0,
@@ -359,30 +389,20 @@ export async function measureColdJoin(args: ColdJoinArgs): Promise<ColdJoinMiles
         await voter?.stop().catch(() => {});
         await node?.stop().catch(() => {});
         await gateway?.stop().catch(() => {});
-        await router?.stop().catch(() => {});
     }
 }
 
 async function main(): Promise<void> {
-    const providerAddr = process.argv[2];
+    const routerUrl = process.argv[2];
     const seederPeerId = process.argv[3];
     const topic = process.argv[4];
     const expectedN = Number(process.argv[5]);
-    if (!providerAddr || !seederPeerId || !topic || !Number.isInteger(expectedN)) {
-        throw new Error("usage: cold-join.js <providerAddr> <seederPeerId> <topic> <N>");
+    if (!routerUrl || !seederPeerId || !topic || !Number.isInteger(expectedN)) {
+        throw new Error("usage: cold-join.js <routerUrl> <seederPeerId> <topic> <N>");
     }
-    const routerLatencyMs = process.env.BENCH_ROUTER_LATENCY_MS ? Number(process.env.BENCH_ROUTER_LATENCY_MS) : 1000;
     const rpcLatencyMs = process.env.BENCH_RPC_LATENCY_MS ? Number(process.env.BENCH_RPC_LATENCY_MS) : 270;
     const timeoutMs = process.env.BENCH_JOIN_TIMEOUT_MS ? Number(process.env.BENCH_JOIN_TIMEOUT_MS) : undefined;
-    const r = await measureColdJoin({
-        providerAddr,
-        seederPeerId,
-        topic,
-        expectedN,
-        routerLatencyMs,
-        rpcLatencyMs,
-        ...(timeoutMs !== undefined ? { timeoutMs } : {})
-    });
+    const r = await measureColdJoin({ routerUrl, seederPeerId, topic, expectedN, rpcLatencyMs, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
     const s = (ms: number | null): string => (ms === null ? "n/a" : `${(ms / 1000).toFixed(2)}s`);
     process.stderr.write(
         `[cold-join] N=${r.n}\n` +

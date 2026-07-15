@@ -23,7 +23,7 @@ import {
     type RootRecord,
     type FetchRootRecord
 } from "../transport/messages.js";
-import { makeRootChaser, type RootChaser } from "../transport/chase.js";
+import { makeRootChaser, toChaseSession, type RootChaser } from "../transport/chase.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../crdt/codec.js";
 import type { RuleRegistry } from "../rules/types.js";
 import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
@@ -35,6 +35,8 @@ import { makePersistentGateResultCache, purgeExpiredGateResults } from "../verif
 import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
 import { makeStorage } from "../storage/node.js";
 import type { LruStorage } from "../storage/types.js";
+import { makeAnnouncer } from "../transport/announce/node.js";
+import type { Announcer } from "../transport/announce/types.js";
 import { encode as encodeDagCbor } from "@ipld/dag-cbor";
 import { sha256 } from "viem";
 import { makeBackgroundVerifier, type BackgroundChainVerifier } from "../verify/background.js";
@@ -245,6 +247,20 @@ export interface PubsubVoterOptions {
      */
     nameResolvers?: NameResolver[];
     /**
+     * Delegated Routing V1 router base URLs to ANNOUNCE provider records to (one unsigned
+     * `PUT /routing/v1/providers` per router, `Keys` batched across all joined contests:
+     * each contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced
+     * on checkpoint/root changes, and on `self:peer:update` address changes). Absent or empty
+     * means never announce — the default, correct for plain clients: only a publicly dialable
+     * node (a seeder) should set this, and the browser build never announces regardless (the
+     * announcer is a Node-only module, stubbed inert by the package.json `browser` remap).
+     * QUERYING needs no URLs here — `#discoverProviders` rides the injected node's
+     * `libp2p.contentRouting`, which the host wires its routers into; this option exists only
+     * because the pinned js stack has no working announce path (`provide()` is a noop). See
+     * DESIGN.md "Deferred pkc-js work", provider-record announces.
+     */
+    httpRouterUrls?: string[];
+    /**
      * Directory for the voter's persistent caches (gate results, name resolutions), the
      * pkc-js `dataPath` equivalent. On Node the caches are better-sqlite3 databases under
      * `{dataPath}/lru-storage/`; in the browser the path is ignored and the caches live in
@@ -277,6 +293,14 @@ interface ResolvedDeps {
      */
     onTopicJoined: () => void;
     onTopicLeft: () => void;
+    /**
+     * Engine → voter notification that the checkpoint winner-set changed (any merge, publish,
+     * chase admit, or background settlement — the same transitions that dirty the on-demand
+     * encode cache). Drives the provider-record announcer's debounced re-announce, so router
+     * records track the current root without polling. A cheap no-op when no announcer is
+     * configured.
+     */
+    onCheckpointChanged: () => void;
     /**
      * Voter-wide per-peer budget for cold-start root fetches: runs `task` once fewer than
      * {@link COLD_START_PEER_FETCH_LIMIT} fetches to `peerId` are in flight across ALL engines,
@@ -371,6 +395,20 @@ const COLD_START_PEER_FETCH_LIMIT = 24;
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
 const CHASE_CONCURRENCY = 2;
+/**
+ * Chase-session provider slots above the advertiser seeds: the headroom keeps the session's
+ * background provider discovery running, so the HTTP routers are queried ONCE per chased root —
+ * in parallel with the seeded wants, instead of once per block — and a provider found there
+ * (a seeder announcing root/chunk records need not be a topic subscriber) joins the pull if the
+ * advertiser drops mid-chase. See DESIGN.md "Block pull".
+ */
+const CHASE_SESSION_PROVIDER_HEADROOM = 1;
+/**
+ * Bound on the per-contest peer→last-advertised-root map that seeds chase sessions (insertion-
+ * refreshed, oldest evicted): enough for any real topic mesh, small enough that a peer-id spray
+ * cannot grow memory.
+ */
+const PEER_ROOTS_MAX = 256;
 /**
  * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
  * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
@@ -479,6 +517,13 @@ class ContestEngine {
     #checkpointDirty = true;
     /** Live once joined; chases advertised roots that differ from our own. */
     #chaser: RootChaser | undefined;
+    /**
+     * Peer id → last root that peer advertised (heartbeat, divergence response, or cold-start
+     * pull), bounded by {@link PEER_ROOTS_MAX}. Chasing root R seeds its bitswap session with
+     * every still-connected peer whose entry is R — the subscribers who provably converged on
+     * the state being pulled — not just the hint's sender. See DESIGN.md "Block pull".
+     */
+    #peerRoots = new Map<string, string>();
     /** The armed heartbeat timer (jittered; see {@link #armHeartbeat}), cleared by `leave()`. */
     #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
     /** True when a heartbeat matching our own root was heard this interval (suppression). */
@@ -834,8 +879,10 @@ class ContestEngine {
             onAccept: () => this.#onStateChanged(),
             // Root records surface as unverifiable hints: compare to our own root, chase a
             // divergence lazily, answer it once per interval. Never awaited by the validator.
-            onRootRecord: (record) => {
-                void this.#handleRootRecord(record).catch(() => {});
+            // `from` seeds the chase's bitswap session — the sender provably holds the
+            // advertised root's blocks (see DESIGN.md "Block pull").
+            onRootRecord: (record, from) => {
+                void this.#handleRootRecord(record, from).catch(() => {});
             },
             maxBundleMessageBytes: maxBundleMessageBytes(this.criteria),
             maxRootMessageBytes: MAX_ROOT_MESSAGE_BYTES,
@@ -843,14 +890,29 @@ class ContestEngine {
         });
         const chaseLimit = pLimit(CHASE_CONCURRENCY);
         this.#chaser = makeRootChaser({
+            // The broadcast fallback: a plain want that any connected topic peer can answer.
+            // The seeded session below is tried first when the blockstore can make one.
             getBlock: async (cid, signal) => {
                 try {
-                    // Blockstore + bitswap: the advertisers are connected topic peers that
-                    // provably hold these blocks, so the want resolves against them directly.
                     return await this.#deps.blockstore.get(cid, { signal });
                 } catch {
                     return undefined;
                 }
+            },
+            // A directed session per chased root, seeded with its advertisers: wants go to the
+            // peers that provably hold the blocks instead of every connection, and the routers
+            // are queried once per root (the headroom slot) instead of once per block. Absent
+            // `createSession` (a plain blockstore) declines, and the chase broadcasts as before.
+            openSession: (root, providers) => {
+                const createSession = this.#deps.blockstore.createSession?.bind(this.#deps.blockstore);
+                if (createSession === undefined) return undefined;
+                // `toChaseSession` enforces the ChaseSession never-throw contracts on the raw session.
+                return toChaseSession(
+                    createSession(root, {
+                        providers,
+                        maxProviders: providers.length + CHASE_SESSION_PROVIDER_HEADROOM
+                    })
+                );
             },
             verifyOffline: (bundle) => this.#verifier.verifyOffline(bundle),
             cache: this.#cache,
@@ -921,9 +983,13 @@ class ContestEngine {
                 if (value === undefined || value === null) return;
                 const record = decodeRootRecord(value); // throws on garbage — caught, contributes nothing
                 const own = await (ownRoot ??= this.rootRecord());
+                this.#notePeerRoot(id, record.root);
                 // Hand the piggybacked chunk index to the chase: verified against `record.root`, it
-                // skips the root-manifest bitswap round-trip (see DESIGN.md "Block pull").
-                if (!record.root.equals(own.root)) this.#chaser?.chase(record.root, record.chunks);
+                // skips the root-manifest bitswap round-trip (see DESIGN.md "Block pull"). The
+                // pulled peer seeds the chase's session — it provably holds what it just served.
+                if (!record.root.equals(own.root)) {
+                    this.#chaser?.chase(record.root, record.chunks, this.#sessionProvidersFor(record.root, peer));
+                }
             } catch {
                 // Peer offline, no record, or malformed answer — best-effort; the other source and
                 // live gossip still converge.
@@ -1022,6 +1088,8 @@ class ContestEngine {
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         this.#chaser = undefined;
+        // Advertised roots go stale the moment we stop hearing heartbeats; a re-join re-learns.
+        this.#peerRoots.clear();
         const wasJoined = this.#joined;
         this.#joined = false;
         await this.#transport?.stop();
@@ -1071,6 +1139,9 @@ class ContestEngine {
     /** Invalidate the on-demand checkpoint cache: the winner-set changed (publish/merge/chase). */
     #markStateChanged(): void {
         this.#checkpointDirty = true;
+        // The same transition the encode cache invalidates on is what makes router provider
+        // records stale, so the announcer's debounced re-announce rides it (see ResolvedDeps).
+        this.#deps.onCheckpointChanged();
     }
 
     /**
@@ -1124,17 +1195,55 @@ class ContestEngine {
      * matching our own root ⇒ note it for heartbeat suppression; differing ⇒ chase it lazily and
      * answer with our own record at most once per interval. See DESIGN.md "Checkpoints".
      */
-    async #handleRootRecord(record: RootRecord): Promise<void> {
+    async #handleRootRecord(record: RootRecord, from?: string): Promise<void> {
+        if (from !== undefined) this.#notePeerRoot(from, record.root);
         const own = await this.rootRecord();
         if (own.root.equals(record.root)) {
             this.#heardMatchingRoot = true;
             return;
         }
-        this.#chaser?.chase(record.root);
+        this.#chaser?.chase(record.root, undefined, this.#sessionProvidersFor(record.root));
         if (!this.#publishedRootThisInterval) {
             this.#publishedRootThisInterval = true;
             await this.#transport?.publishRootRecord(own);
         }
+    }
+
+    /** Note `peerId`'s latest advertised root (see {@link #peerRoots}); refreshes its eviction slot. */
+    #notePeerRoot(peerId: string, root: CID): void {
+        if (this.#peerRoots.has(peerId)) {
+            this.#peerRoots.delete(peerId); // re-insert to refresh insertion order
+        } else if (this.#peerRoots.size >= PEER_ROOTS_MAX) {
+            const oldest = this.#peerRoots.keys().next().value;
+            if (oldest !== undefined) this.#peerRoots.delete(oldest);
+        }
+        this.#peerRoots.set(peerId, root.toString());
+    }
+
+    /**
+     * The session seeds for chasing `root`: every still-connected peer whose last advertised
+     * root is exactly `root` (see {@link #peerRoots}) — resolved against the node's live
+     * connections both to recover the `PeerId` handle (the gate surfaces senders as strings)
+     * and because seeding a gone peer is a wasted dial. `known` (the cold-start pull peer,
+     * already in hand as a `PeerId`) is included unconditionally. Order is deterministic; the
+     * session fans wants across its providers itself.
+     */
+    #sessionProvidersFor(root: CID, known?: PeerId): PeerId[] {
+        const rootKey = root.toString();
+        const providers: PeerId[] = known !== undefined ? [known] : [];
+        const wanted = new Set<string>();
+        for (const [peer, advertised] of this.#peerRoots) {
+            if (advertised === rootKey && peer !== known?.toString()) wanted.add(peer);
+        }
+        if (wanted.size > 0) {
+            // Optional call: unit-test fakes inject a bare `libp2p` without connection APIs.
+            for (const connection of this.#deps.helia.libp2p.getConnections?.() ?? []) {
+                if (!wanted.delete(connection.remotePeer.toString())) continue;
+                providers.push(connection.remotePeer);
+                if (wanted.size === 0) break;
+            }
+        }
+        return providers;
     }
 
     /**
@@ -1332,6 +1441,14 @@ export class PubsubVoter implements VoteClient {
     #destroyed = false;
     /** The voter's persistent caches (see {@link PubsubVoterOptions.dataPath}); closed on destroy. */
     readonly #storage: ReturnType<typeof makeStorage>;
+    /**
+     * The provider-record announcer, present only when {@link PubsubVoterOptions.httpRouterUrls}
+     * names at least one router (and inert in the browser build regardless — see
+     * `src/transport/announce/`). Started with the first joined topic and stopped with the last,
+     * the same transitions that drive the lazy fetch responder: a node announces records for
+     * exactly the contests it participates in, for exactly as long as it participates.
+     */
+    readonly #announcer: Announcer | undefined;
 
     constructor(options: PubsubVoterOptions) {
         // Fail fast: the node must expose a gossipsub service, a blockstore, and a libp2p
@@ -1358,13 +1475,48 @@ export class PubsubVoter implements VoteClient {
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
             onTopicLeft: this.#onTopicLeft,
+            onCheckpointChanged: () => this.#announcer?.notifyChange(),
             fetchBudget: makePerPeerBudget(COLD_START_PEER_FETCH_LIMIT),
             gateStore: this.#storage.openLru({ cacheName: "gate-results", maxItems: GATE_RESULTS_MAX_ITEMS }),
             nameResolutionCache: makeNameResolutionCache(
                 this.#storage.openLru({ cacheName: "name-resolutions", maxItems: NAME_RESOLUTIONS_MAX_ITEMS })
             )
         };
+        // The announcer touches libp2p (peer id, addresses, address events) only when routers are
+        // configured, so a host that never announces pays nothing and injects nothing extra.
+        if (options.httpRouterUrls !== undefined && options.httpRouterUrls.length > 0) {
+            this.#announcer = makeAnnouncer({
+                routerUrls: [...options.httpRouterUrls],
+                libp2p: options.helia.libp2p,
+                keys: this.#announceKeys
+            });
+        }
     }
+
+    /**
+     * The CIDs the announcer publishes, collected fresh per tick and batched into one record:
+     * every JOINED contest's criteria CID (the discovery key — a provider record for it means
+     * "I run this contest") plus its current checkpoint root + chunk CIDs (what the chase-time
+     * parallel router lookup finds; converged seeders share identical chunk CIDs, so any of
+     * them can serve a block). `rootRecord()` is the same on-demand, cached encode the fetch
+     * responder serves — an encode failure still announces the criteria key alone.
+     */
+    readonly #announceKeys = async (): Promise<string[]> => {
+        const keys: string[] = [];
+        for (const engine of this.#engines.values()) {
+            if (!engine.joined) continue;
+            keys.push(engine.topic.slice(TOPIC_PREFIX.length));
+            try {
+                const record = await engine.rootRecord();
+                keys.push(record.root.toString());
+                for (const chunk of record.chunks) keys.push(chunk.toString());
+            } catch {
+                // Encode failure — best-effort: the criteria CID (the discovery key) still goes out.
+            }
+        }
+        // Contests can share CIDs (e.g. two vote-less contests share the empty-checkpoint root).
+        return [...new Set(keys)];
+    };
 
     get readOnly(): boolean {
         return this.#deps.signer === undefined;
@@ -1444,6 +1596,11 @@ export class PubsubVoter implements VoteClient {
      */
     readonly #onTopicJoined = (): void => {
         this.#joinedEngines += 1;
+        // A join adds a criteria CID to the announced key set (and the first join starts the
+        // announcer's timers/listeners) — the debounce coalesces a directory-wide join into one
+        // announce per router.
+        this.#announcer?.start();
+        this.#announcer?.notifyChange();
         if (this.#responderRegistered) return;
         this.#deps.fetch.registerLookupFunction(TOPIC_PREFIX, this.#rootLookup);
         this.#responderRegistered = true;
@@ -1451,7 +1608,12 @@ export class PubsubVoter implements VoteClient {
 
     readonly #onTopicLeft = (): void => {
         this.#joinedEngines -= 1;
-        if (this.#joinedEngines <= 0) this.#unregisterResponder();
+        // Last topic left: stop refreshing records; what is already written ages out by the
+        // router's TTL (there is no un-announce), symmetric with the responder unregistering.
+        if (this.#joinedEngines <= 0) {
+            this.#announcer?.stop();
+            this.#unregisterResponder();
+        }
     };
 
     async stop(): Promise<void> {
@@ -1473,6 +1635,7 @@ export class PubsubVoter implements VoteClient {
         // Unlike `stop()`, the client does not come back.
         this.#destroyed = true;
         for (const engine of this.#engines.values()) engine.markDestroyed();
+        this.#announcer?.stop();
         this.#unregisterResponder();
         await this.stop();
         // Close the persistent caches last (Node: the sqlite handles) — engines are already

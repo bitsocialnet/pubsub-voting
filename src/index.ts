@@ -16,6 +16,10 @@
 export * from "./schema/common.js";
 export * from "./schema/votes.js";
 export * from "./schema/criteria.js";
+// Directory authoring: derive per-contest criteria documents from a defaults+contests
+// manifest. Pure and offline; exported so every consumer (web client, seeder) shares the
+// exact merge semantics — byte-identical documents are what make peers share a topic.
+export * from "./schema/directory.js";
 
 // Rules: a single kind, one file per `type`, each owning its option schema and an
 // `evaluate` returning `{ score: bigint }` (the `rule` slot gates on `score > 0n`,

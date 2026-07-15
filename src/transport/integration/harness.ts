@@ -19,7 +19,7 @@ import { makeVerdictCache, type VerdictCache } from "../../verify/cache.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../../crdt/codec.js";
 import { encodeCheckpoint } from "../../checkpoint/codec.js";
 import { makeGossipGate } from "../gossip-validator.js";
-import { makeRootChaser, type RootChaser } from "../chase.js";
+import { makeRootChaser, toChaseSession, type RootChaser } from "../chase.js";
 import { makeVoteTransport } from "../transport.js";
 import type { PubsubService, VoteTransport } from "../types.js";
 import {
@@ -79,6 +79,8 @@ export interface VoteNode {
     readonly acceptedBundles: Uint8Array[];
     /** Root records this node heard through the gate. */
     readonly heardRoots: RootRecord[];
+    /** Chase sessions this node opened: which root, seeded with which advertisers (peer id strings). */
+    readonly openedSessions: Array<{ root: string; providers: string[] }>;
     /** True once a heard root matched this node's own current root (heartbeat suppression signal). */
     heardMatchingRoot(): boolean;
     /** Replace the injected verifier (e.g. a rejecter, or a slow one, for a specific assertion). */
@@ -187,6 +189,7 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         };
     }
 
+    const openedSessions: Array<{ root: string; providers: string[] }> = [];
     const chaseLimit = pLimit(2);
     const chaser = makeRootChaser({
         getBlock: async (cid, signal) => {
@@ -195,6 +198,15 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
             } catch {
                 return undefined;
             }
+        },
+        // Mirror `PubsubVoter`'s seeded-session wiring (voter.ts `openSession`), with a recorder
+        // so the test can assert the chase really pulled through a session seeded with the
+        // advertiser — convergence alone cannot tell the session path from the broadcast fallback.
+        openSession: (root, providers) => {
+            const createSession = blockstore.createSession?.bind(blockstore);
+            if (createSession === undefined) return undefined;
+            openedSessions.push({ root: root.toString(), providers: providers.map((p) => p.toString()) });
+            return toChaseSession(createSession(root, { providers, maxProviders: providers.length + 1 }));
         },
         verifyOffline: (bundle) => verifier.verifyOffline(bundle),
         cache,
@@ -222,8 +234,9 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         allowRootPeer: () => true,
         onAccept: (_cid, _bundle, _from) => {},
         // Mirror `PubsubVoter.#handleRootRecord`: a matching root is the suppression signal (no
-        // chase, no echo); a divergent root is chased over directed bitswap.
-        onRootRecord: (record) => {
+        // chase, no echo); a divergent root is chased over directed bitswap, its session seeded
+        // with the sender — resolved from the live connections exactly as the voter does.
+        onRootRecord: (record, from) => {
             heardRoots.push(record);
             void (async () => {
                 const own = await checkpointRootRecord();
@@ -231,7 +244,10 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
                     matchedOwnRoot = true;
                     return;
                 }
-                chaser.chase(record.root);
+                const advertiser = libp2p
+                    .getConnections()
+                    .find((connection) => connection.remotePeer.toString() === from)?.remotePeer;
+                chaser.chase(record.root, undefined, advertiser === undefined ? [] : [advertiser]);
             })().catch(() => {});
         },
         maxBundleMessageBytes: maxBundleMessageBytes({ maxVotesPerAddress: 1 }),
@@ -267,6 +283,7 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         transport,
         acceptedBundles,
         heardRoots,
+        openedSessions,
         heardMatchingRoot: () => matchedOwnRoot,
         setVerifier: (verify) => {
             verifyImpl = verify;

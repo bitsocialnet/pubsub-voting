@@ -8,6 +8,13 @@
 // seeds N real-signed winners on the remote, then times how long a cold local peer takes to reach a
 // full tally — the "which board to load" signal. Prints a median-of-repeats table.
 //
+// Provider records are ANNOUNCED for real, not hardcoded: this orchestrator hosts the mock HTTP
+// router in-process, reverse-tunnels it to the seeder host (`ssh -R` — out-of-band of the measured
+// join path, so tunnel latency distorts nothing), and the seeder's `httpRouterUrls` announcer PUTs
+// its criteria CID + checkpoint root + chunk CIDs to it. The cold joiner then discovers the seeder
+// from those announced records (announce → router → findProviders → dial, end-to-end), while its
+// GET stays local + simulated-latency exactly as before, keeping joiner-side numbers comparable.
+//
 // Reachability: the seeder listens on 0.0.0.0:<port> on the remote, so that port must be dialable
 // from this machine (a public IP with the port open — no inbound firewall rule blocking it). The
 // cold joiner only dials out, so it may sit behind NAT.
@@ -16,7 +23,7 @@
 //   BENCH_HOST=<ssh-host>        remote ssh host to run the seeder on (REQUIRED)
 //   BENCH_HOST_IP=<ip-or-dns>    public IP/DNS the joiner dials the seeder at
 //                                (default: the `hostname` from `ssh -G $BENCH_HOST`)
-//   BENCH_REMOTE_DIR=~/pubsub-votes-bench   remote checkout dir
+//   BENCH_REMOTE_DIR=~/pubsub-voting-bench   remote checkout dir
 //   BENCH_NS=1,5,10,100,1000     voter counts to sweep
 //   BENCH_REPEATS=3              cold joins per N (median reported)
 //   BENCH_ROUTER_LATENCY_MS=1000 simulated HTTP-router lookup latency (paid once)
@@ -38,10 +45,13 @@ import path from "node:path";
 
 const HOST = process.env.BENCH_HOST;
 if (!HOST) throw new Error("set BENCH_HOST to the ssh host that runs the seeder (e.g. BENCH_HOST=my-server npm run bench:cold-join)");
-const REMOTE_DIR = process.env.BENCH_REMOTE_DIR ?? "~/pubsub-votes-bench";
+const REMOTE_DIR = process.env.BENCH_REMOTE_DIR ?? "~/pubsub-voting-bench";
 const NS = (process.env.BENCH_NS ?? "1,5,10,100,1000").split(",").map((s) => Number(s.trim()));
 const REPEATS = Number(process.env.BENCH_REPEATS ?? "3");
+const ROUTER_LATENCY_MS = Number(process.env.BENCH_ROUTER_LATENCY_MS ?? "1000");
 const BASE_PORT = 41000;
+// Remote loopback port the local router is reverse-tunneled to (the seeder's announce target).
+const BASE_ROUTER_PORT = 43000;
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const COLD_JOIN_JS = path.join(REPO, "benchmark/cold-join.js");
 
@@ -137,10 +147,14 @@ async function resolveDialHost() {
     return hostname;
 }
 
-/** Build the seeder's dialable multiaddr from the resolved dial host (IPv4 literal → /ip4, else /dns4). */
-function providerMultiaddr(dialHost, port, peerId) {
+/**
+ * The seeder's dialable multiaddr (IPv4 literal → /ip4, else /dns4), WITHOUT `/p2p/<id>`: it goes
+ * into libp2p's `addresses.announce`, and `getMultiaddrs()` (what the announcer publishes) appends
+ * the peer id itself.
+ */
+function announceMultiaddr(dialHost, port) {
     const proto = /^\d{1,3}(\.\d{1,3}){3}$/.test(dialHost) ? "ip4" : "dns4";
-    return `/${proto}/${dialHost}/tcp/${port}/p2p/${peerId}`;
+    return `/${proto}/${dialHost}/tcp/${port}`;
 }
 
 async function syncAndBuildRemote() {
@@ -168,31 +182,63 @@ async function syncAndBuildRemote() {
 
 async function measureOne(n, i) {
     const remotePort = BASE_PORT + i;
+    const remoteRouterPort = BASE_ROUTER_PORT + i;
 
-    // 1) Launch the remote seeder (ssh -tt so it dies when we close the pipe); await SEEDER_READY.
+    // 1) Host the mock router locally (in-process — the joiner reads its lookup log over the
+    //    `/_requests` control endpoint) and reverse-tunnel it to the seeder host's loopback, so
+    //    the seeder can announce to it before the joiner exists. The tunnel carries ONLY the
+    //    out-of-band announce PUTs, never the measured data path.
+    const { startRouter } = await import("./router.js");
+    const router = await startRouter({ latencyMs: ROUTER_LATENCY_MS });
+
+    // 2) Launch the remote seeder (ssh -tt so it dies when we close the pipe); await SEEDER_READY.
+    //    It announces its provider records (criteria CID + root + chunks) through the tunnel, and
+    //    advertises the public multiaddr the joiner will actually dial (libp2p announce address).
     const seedTimeout = 120_000 + n * 200; // seeding grows with N (feeder graft + verify)
-    const { child: seeder, match } = await spawnUntil(
-        "ssh",
-        ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && ${SEEDER_ENV}node benchmark/seeder.js ${n} ${remotePort}`],
-        /SEEDER_READY peerId=(\S+) port=\d+ topic=(\S+)/,
-        seedTimeout,
-        `seeder(N=${n})`
-    );
-    const peerId = match[1];
-    const topic = match[2];
-    seeder.stdout.on("data", () => {});
-    seeder.stderr.on("data", () => {});
-
-    // 2) The joiner dials the seeder directly at its public multiaddr over the real internet — no
-    //    tunnel, so the measured RTT is the true path. Wait until the remote port is dialable.
-    const providerAddr = providerMultiaddr(DIAL_HOST, remotePort, peerId);
+    const seederEnv =
+        SEEDER_ENV +
+        `BENCH_ROUTER_URL=http://127.0.0.1:${remoteRouterPort}/ ` +
+        `BENCH_ANNOUNCE_ADDR=${announceMultiaddr(DIAL_HOST, remotePort)}`;
+    let seeder;
     let results = [];
     try {
-        await waitPort(DIAL_HOST, remotePort, 25_000);
+        const spawned = await spawnUntil(
+            "ssh",
+            [
+                "-tt",
+                "-o",
+                "ControlPath=none",
+                "-R",
+                `${remoteRouterPort}:127.0.0.1:${router.port}`,
+                HOST,
+                `cd ${REMOTE_DIR} && ${seederEnv} node benchmark/seeder.js ${n} ${remotePort}`
+            ],
+            /SEEDER_READY peerId=(\S+) port=\d+ topic=(\S+)/,
+            seedTimeout,
+            `seeder(N=${n})`
+        );
+        seeder = spawned.child;
+        const match = spawned.match;
+        const peerId = match[1];
+        const topic = match[2];
+        seeder.stdout.on("data", () => {});
+        seeder.stderr.on("data", () => {});
 
-        // 3) Run REPEATS fresh cold joins against the same static seeder.
+        // 3) The joiner dials the seeder directly at its announced public multiaddr over the real
+        //    internet — no tunnel, so the measured RTT is the true path. Wait until the remote port
+        //    is dialable AND the seeder's (debounced) announce landed in the local router.
+        await waitPort(DIAL_HOST, remotePort, 25_000);
+        const cidString = topic.split("/").pop();
+        const announceDeadline = Date.now() + 60_000;
+        while (router.providersFor(cidString).length === 0) {
+            if (Date.now() > announceDeadline) throw new Error(`seeder(N=${n}): no announced provider record after 60s`);
+            await sleep(250);
+        }
+
+        // 4) Run REPEATS fresh cold joins against the same static seeder; each one discovers the
+        //    seeder from the ANNOUNCED record (cold-join resets the router's one-time latency).
         for (let r = 0; r < REPEATS; r++) {
-            const cj = await run("node", [COLD_JOIN_JS, providerAddr, peerId, topic, String(n)], {
+            const cj = await run("node", [COLD_JOIN_JS, router.url, peerId, topic, String(n)], {
                 env: { ...process.env }
             });
             const line = cj.stdout.split("\n").find((l) => l.startsWith("RESULT "));
@@ -217,8 +263,9 @@ async function measureOne(n, i) {
             );
         }
     } finally {
-        seeder.kill("SIGKILL");
+        seeder?.kill("SIGKILL");
         await run("ssh", [HOST, `pkill -f "seeder.js ${n} ${remotePort}" || true`]);
+        await router.stop().catch(() => {});
     }
     if (results.length === 0) return { n, ok: false };
     const med = (pick) => median(results.map(pick).filter((x) => x != null));

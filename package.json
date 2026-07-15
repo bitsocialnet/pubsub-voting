@@ -1,6 +1,6 @@
 {
   "name": "@bitsocial/pubsub-votes",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "description": "Trustless pubsub voting over a shared libp2p/Helia node.",
   "type": "module",
   "license": "GPL-3.0-or-later",
@@ -18,7 +18,8 @@
     }
   },
   "browser": {
-    "./dist/storage/node.js": "./dist/storage/browser.js"
+    "./dist/storage/node.js": "./dist/storage/browser.js",
+    "./dist/transport/announce/node.js": "./dist/transport/announce/browser.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

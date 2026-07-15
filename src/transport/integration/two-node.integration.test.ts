@@ -186,19 +186,24 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
 
         await waitFor(() => b.heardMatchingRoot(), 15_000, "B to hear A's matching root record");
         expect(b.chaser.inFlight()).toBe(0); // a matching root is not chased — the topic stays quiet
+        expect(b.openedSessions).toHaveLength(0); // and no chase means no session either
     });
 
-    it("a divergent root triggers a directed-bitswap chase that converges the pair", async () => {
+    it("a divergent root triggers a chase through a bitswap session seeded with the advertiser", async () => {
         const { a, b } = await connectedPair();
         // A holds a winner; B is empty ⇒ their checkpoint roots differ.
         await a.admitBundle(sampleBundle(ADDR, KEY_A));
 
         // Advertise A's root (its checkpoint blocks are now in A's blockstore). B hears the divergent
-        // root and chases it: decode the checkpoint, pull the blocks over directed bitswap from A,
-        // verify each bundle, and merge — converging to A's winner-set.
+        // root and chases it: decode the checkpoint, pull the blocks over a real bitswap session
+        // seeded with A (the advertiser), verify each bundle, and merge — converging to A's
+        // winner-set. The session recorder is the positive control that the pull went through the
+        // seeded path — convergence alone cannot tell it from the broadcast fallback.
         await a.publishOwnRoot();
 
         await waitFor(() => b.crdt.current(0).length === 1, 20_000, "B to chase A's root over bitswap and converge");
         expect(b.crdt.current(0)[0]?.address).toBe(ADDR);
+        const ownRoot = (await a.checkpointRootRecord()).root.toString();
+        expect(b.openedSessions).toEqual([{ root: ownRoot, providers: [a.peerId] }]);
     });
 });
