@@ -116,6 +116,10 @@ export interface ColdJoinArgs {
 interface TimedBlockstore {
     get(cid: { toString(): string }, options?: unknown): AsyncIterable<Uint8Array> | Promise<Uint8Array>;
 }
+/** The session-capable blockstore surface: sessions must be timed like plain gets. */
+interface TimedSessionBlockstore {
+    createSession?(root: unknown, options?: unknown): TimedBlockstore;
+}
 /** The subset of the libp2p fetch service we monkey-patch to time root-record pulls. */
 interface TimedFetch {
     fetch(peer: unknown, key: string | Uint8Array, options?: unknown): Promise<Uint8Array | undefined | null>;
@@ -154,6 +158,25 @@ function instrument(node: HostNode): { events: Array<{ kind: OpTiming["kind"]; l
         events.push({ kind: "blockGet", label: cid.toString(), start, end: performance.now(), bytes: bytes.length });
         return bytes;
     };
+    // The chase pulls through an advertiser-seeded bitswap session when the blockstore can make
+    // one (DESIGN.md "Block pull"), bypassing the wrapped top-level `get` — wrap each session's
+    // `get` too, or the bitswap column silently under-counts and the pull time hides in the
+    // verify+merge residual.
+    const sessionBs = node.helia.blockstore as unknown as TimedSessionBlockstore;
+    if (typeof sessionBs.createSession === "function") {
+        const rawCreateSession = sessionBs.createSession.bind(sessionBs);
+        sessionBs.createSession = (root, options) => {
+            const session = rawCreateSession(root, options);
+            const rawSessionGet = session.get.bind(session);
+            session.get = async (cid, opts): Promise<Uint8Array> => {
+                const start = performance.now();
+                const bytes = await drainBlock(rawSessionGet(cid, opts));
+                events.push({ kind: "blockGet", label: cid.toString(), start, end: performance.now(), bytes: bytes.length });
+                return bytes;
+            };
+            return session;
+        };
+    }
 
     const libp2p = node.libp2p as unknown as { getConnections?(peer: unknown): TimedConnection[] };
     const fetchSvc = node.libp2p.services.fetch as unknown as TimedFetch;
