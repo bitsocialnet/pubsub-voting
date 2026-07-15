@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.0.5](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.4...v0.0.5) (2026-07-15)
+
+### Features
+
+* **benchmark:** real-chain mode — gate reads against live Base mainnet ([f4db7f0](https://github.com/bitsocialnet/pubsub-voting/commit/f4db7f037f1d367aea4e4b0d0bd5dbfbf87981ca))
+
+### Bug Fixes
+
+* **chain:** decompose pinned multicalls into the coalescer pool ([a5f3671](https://github.com/bitsocialnet/pubsub-voting/commit/a5f367113c8e27fdc74c94786202a602de49b6e4))
+* **chain:** route pinned multicalls with exotic options around the coalescer ([72f59c5](https://github.com/bitsocialnet/pubsub-voting/commit/72f59c5a34edba0bd9fb72856e13f31766fc0b2b))
+* **rules:** chunk and coalesce gate reads so free public RPCs don't throttle verification ([bb7ef83](https://github.com/bitsocialnet/pubsub-voting/commit/bb7ef83ee7fd911c128f88320988b95bf9703977))
+
 ## [0.0.4](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.3...v0.0.4) (2026-07-15)
 
 ### Features
