@@ -2,8 +2,8 @@ import { PubsubVoter, type Contest } from "../dist/client/voter.js";
 import { criteriaCid } from "../dist/topic.js";
 import { makeHostNode, type HostNode } from "./host-node.js";
 import { startRouter, type RouterProvider, type RunningRouter } from "./router.js";
-import { startRpcGateway, type RunningGateway } from "./rpc-gateway.js";
-import { benchGatewayChains, benchDirectoryCriteria } from "./signing.js";
+import { formatRpcByOp, startRpcGateway, summarizeRpc, type GateRpcSummary, type GatewayRequest, type RunningGateway } from "./rpc-gateway.js";
+import { benchDirectoryCriteria, benchGatewayChains, benchRpcUrl, benchRules, realJoinerChains } from "./signing.js";
 
 /**
  * Directory-load benchmark — COLD JOINER side (runs locally).
@@ -62,6 +62,13 @@ export interface DirectoryJoinMilestones {
      * bench's `start→verified`. `allTalliesReadyMs` is the render-ready milestone before it.
      */
     allVerifiedMs: number;
+    /**
+     * Gate-read RPC traffic across the WHOLE directory join (t0-relative requests): HTTP round
+     * trips paid, split by the library operation that caused each (`byOp` — see rpc-gateway.ts
+     * `GatewayOp`), plus the inner reads the multicalls carried and any error/retry traffic.
+     * `latencyMs` is the mock gateway's fixed charge, or the measured median in REAL-CHAIN mode.
+     */
+    gateRpc: GateRpcSummary;
 }
 
 /** The subset of a Helia blockstore we monkey-patch to time bitswap pulls. */
@@ -174,11 +181,21 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         router = await startRouter({ providers, latencyMs: args.routerLatencyMs ?? 1000 });
         // The mock ETH gateway (see rpc-gateway.ts): tally-ready below is RENDER-ready — the chase
         // admits on the offline checks — so the RPC latency shapes only the background gate reads
-        // that batch behind it, not the measured convergence curve.
-        gateway = await startRpcGateway({ latencyMs: Number(process.env.BENCH_RPC_LATENCY_MS ?? 270) });
+        // that batch behind it, not the measured convergence curve. With `BENCH_RPC_URL` set
+        // (REAL-CHAIN mode) the joiner instead reads the real Base-mainnet endpoint through the
+        // probe-rule registry — real reads, bench-local threshold (see signing.ts).
+        const rpcUrl = benchRpcUrl();
+        const realRpcLog: GatewayRequest[] = [];
+        if (!rpcUrl) gateway = await startRpcGateway({ latencyMs: Number(process.env.BENCH_RPC_LATENCY_MS ?? 270) });
         node = await makeHostNode({ host: "127.0.0.1", routerUrls: [router.url] });
         const { events } = instrument(node);
-        voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: benchGatewayChains(gateway.url) });
+        const rules = benchRules();
+        voter = new PubsubVoter({
+            dataPath: false,
+            helia: node.helia,
+            chains: rpcUrl ? realJoinerChains(rpcUrl, realRpcLog) : benchGatewayChains(gateway!.url),
+            ...(rules ? { rules } : {})
+        });
 
         const networks: Contest[] = await Promise.all(criteria.map((c) => voter!.createContest({ criteria: c })));
 
@@ -274,6 +291,14 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         const routerReqs = router.requests.filter((r) => providers.has(r.cid));
         const firstRouter = routerReqs.reduce<typeof routerReqs[number] | null>((a, r) => (a === null || r.startMs < a.startMs ? r : a), null);
 
+        // Gate-read RPC traffic paid across the whole directory join (requests arriving after
+        // t0), split per operation.
+        const gateRpc = summarizeRpc(
+            rpcUrl ? realRpcLog : gateway!.requests,
+            t0,
+            rpcUrl ? undefined : Number(process.env.BENCH_RPC_LATENCY_MS ?? 270)
+        );
+
         return {
             m: args.m,
             n: args.expectedN,
@@ -300,7 +325,8 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
             allTalliesReadyMs,
             allVerified,
             verifiedCount: verifiedAtMs.length,
-            allVerifiedMs
+            allVerifiedMs,
+            gateRpc
         };
     } finally {
         await voter?.stop().catch(() => {});
@@ -338,6 +364,7 @@ async function main(): Promise<void> {
             `  cold-start:  fetch=${s(r.fetch.totalMs)} (${r.fetch.count}x) ` +
             `bitswap=${s(r.blockGets.totalMs)} (${r.blockGets.networkCount} net/${r.blockGets.count} gets, ${(r.blockGets.bytes / 1024).toFixed(0)} KiB) ` +
             `verify+merge=${s(r.verifyMergeMs)}\n` +
+            `  gate rpc:    ${r.gateRpc.requests} round trips @${r.gateRpc.latencyMs}ms — ${formatRpcByOp(r.gateRpc)}\n` +
             `  converge:    ${r.readyCount}/${r.m} ready` +
             (r.readyAtMs.length ? ` (p50=${s(r.readyAtMs[Math.floor(r.readyAtMs.length / 2)] ?? null)} p90=${s(r.readyAtMs[Math.floor(r.readyAtMs.length * 0.9)] ?? null)} last=${s(r.readyAtMs[r.readyAtMs.length - 1] ?? null)})` : "") +
             `\n` +
