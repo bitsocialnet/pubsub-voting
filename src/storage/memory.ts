@@ -1,4 +1,4 @@
-import type { LruStorage, VoteStorage } from "./types.js";
+import type { LruStorage, SnapshotStorage, VoteStorage } from "./types.js";
 
 /**
  * The `dataPath: false` backend on both platforms (pkc-js's `noData` equivalent): a true-LRU
@@ -38,9 +38,26 @@ export function makeMemoryLruStorage(maxItems: number): LruStorage {
     };
 }
 
+/** The `dataPath: false` snapshot store: a plain `Map`, no eviction (see types.ts). */
+export function makeMemorySnapshotStorage(): SnapshotStorage {
+    const blobs = new Map<string, Uint8Array>();
+    return {
+        async get(key) {
+            return blobs.get(key);
+        },
+        async set(key, bytes) {
+            blobs.set(key, bytes);
+        },
+        async remove(key) {
+            blobs.delete(key);
+        }
+    };
+}
+
 /** An all-in-memory {@link VoteStorage}; `destroy()` only drops the references. */
 export function makeMemoryStorage(): VoteStorage {
     const stores = new Map<string, LruStorage>();
+    let snapshots: SnapshotStorage | undefined;
     return {
         openLru({ cacheName, maxItems }) {
             let store = stores.get(cacheName);
@@ -50,8 +67,12 @@ export function makeMemoryStorage(): VoteStorage {
             }
             return store;
         },
+        openSnapshots() {
+            return (snapshots ??= makeMemorySnapshotStorage());
+        },
         async destroy() {
             stores.clear();
+            snapshots = undefined;
         }
     };
 }

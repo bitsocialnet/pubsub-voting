@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, readdirSync, readlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeMemoryLruStorage } from "./memory.js";
@@ -83,6 +83,78 @@ describe("makeStorage (node/sqlite)", () => {
         await store.setItem("k", 1);
         expect(await store.getItem("k")).toBe(1);
         expect(existsSync(join(dataPath, "lru-storage"))).toBe(false);
+        await storage.destroy();
+    });
+});
+
+describe("snapshot store (node/sqlite)", () => {
+    it("round-trips binary blobs across close and reopen", async () => {
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const storage = makeStorage({ dataPath });
+        const snapshots = storage.openSnapshots();
+        const blob = new Uint8Array([0, 1, 2, 255, 254]);
+        await snapshots.set("topic-a", new Uint8Array([9, 9]));
+        await snapshots.set("topic-a", blob); // replace, not append
+        expect(await snapshots.get("topic-a")).toEqual(blob);
+        expect(await snapshots.get("missing")).toBeUndefined();
+        await storage.destroy();
+
+        const reopened = makeStorage({ dataPath });
+        expect(await reopened.openSnapshots().get("topic-a")).toEqual(blob);
+        await reopened.openSnapshots().remove("topic-a");
+        expect(await reopened.openSnapshots().get("topic-a")).toBeUndefined();
+        await reopened.destroy();
+    });
+
+    it("rejects use after destroy (no silent file re-create)", async () => {
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const storage = makeStorage({ dataPath });
+        const snapshots = storage.openSnapshots();
+        await snapshots.set("k", new Uint8Array([1]));
+        await storage.destroy();
+        await expect(snapshots.set("k2", new Uint8Array([2]))).rejects.toThrow("storage is closed");
+    });
+
+    // Regression (PR #16 review): a corrupt db file makes `new Database()` succeed but the
+    // first statement throw (SQLite reads the header lazily), and `#open()` used to lose the
+    // never-assigned handle. Callers retry snapshot writes forever, so each retry leaked one
+    // fd — an eventual EMFILE on a long-running seeder. Linux-only: counts fds via /proc.
+    it.runIf(process.platform === "linux")("leaks no file handle when opening a corrupt database file", async () => {
+        const openHandlesTo = (file: string) =>
+            readdirSync("/proc/self/fd").filter((fd) => {
+                try {
+                    return readlinkSync(`/proc/self/fd/${fd}`) === file;
+                } catch {
+                    return false; // fd closed between readdir and readlink
+                }
+            }).length;
+
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const snapshotFile = join(dataPath, "checkpoints.db");
+        const lruFile = join(dataPath, "lru-storage", "gate-results.db");
+        mkdirSync(join(dataPath, "lru-storage"));
+        writeFileSync(snapshotFile, "this is not a sqlite database, padded past the 100-byte header ".repeat(4));
+        writeFileSync(lruFile, "this is not a sqlite database, padded past the 100-byte header ".repeat(4));
+
+        const storage = makeStorage({ dataPath });
+        const snapshots = storage.openSnapshots();
+        const lru = storage.openLru({ cacheName: "gate-results", maxItems: 10 });
+        for (let attempt = 0; attempt < 5; attempt++) {
+            await expect(snapshots.set("k", new Uint8Array([1]))).rejects.toThrow();
+            await expect(lru.setItem("k", 1)).rejects.toThrow();
+        }
+        expect(openHandlesTo(snapshotFile)).toBe(0);
+        expect(openHandlesTo(lruFile)).toBe(0);
+        await storage.destroy();
+    });
+
+    it("stays in memory for `dataPath: false`", async () => {
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const storage = makeStorage({ dataPath: false });
+        const snapshots = storage.openSnapshots();
+        await snapshots.set("k", new Uint8Array([9]));
+        expect(await snapshots.get("k")).toEqual(new Uint8Array([9]));
+        expect(existsSync(join(dataPath, "checkpoints.db"))).toBe(false);
         await storage.destroy();
     });
 });

@@ -23,6 +23,22 @@ export interface LruStorage {
     clear(): Promise<void>;
 }
 
+/**
+ * The checkpoint-snapshot store: one binary blob per topic, holding the node's own last
+ * fully-verified checkpoint so a restart with no other peer online does not lose the tally
+ * (see DESIGN.md "Persistent caches", checkpoint snapshots). Deliberately NOT an
+ * {@link LruStorage}: values are binary (no JSON round-trip for ~half-MB block sets) and
+ * eviction would silently corrupt a snapshot — a topic's blob lives until overwritten or
+ * removed. Each `set` replaces the whole blob in one write, so a snapshot is never torn.
+ */
+export interface SnapshotStorage {
+    /** The stored blob, or `undefined` on a miss. */
+    get(key: string): Promise<Uint8Array | undefined>;
+    /** Insert or replace the blob atomically. */
+    set(key: string, bytes: Uint8Array): Promise<void>;
+    remove(key: string): Promise<void>;
+}
+
 /** One voter's persistent-cache root: opens named LRU stores, closed as a unit on `destroy()`. */
 export interface VoteStorage {
     /**
@@ -30,6 +46,8 @@ export interface VoteStorage {
      * (`gate-results`, `name-resolutions`), never user input.
      */
     openLru(opts: { cacheName: string; maxItems: number }): LruStorage;
+    /** Open (or return the already-open) checkpoint-snapshot store (one per voter). */
+    openSnapshots(): SnapshotStorage;
     /** Close every open store (Node: close the sqlite handles). Terminal, like `PubsubVoter.destroy`. */
     destroy(): Promise<void>;
 }

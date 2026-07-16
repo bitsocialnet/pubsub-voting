@@ -31,6 +31,7 @@
     "build:bench": "tsc -p benchmark/tsconfig.json",
     "bench:cold-join": "node benchmark/run.mjs",
     "bench:directory-load": "node benchmark/run-directory.mjs",
+    "bench:warm-restart": "npm run build && npm run build:bench && node benchmark/warm-restart.js",
     "release": "HUSKY=0 release-it --config config/.release-it.json",
     "prepare": "husky",
     "prepublishOnly": "npm run build",

@@ -32,7 +32,8 @@ import {
     fakeFetchService,
     fakeChains,
     stubChains,
-    fakeSigner
+    fakeSigner,
+    realSigner
 } from "../test-fixtures.js";
 
 /** A valid base58btc IPNS community key (VotesBundleSchema rejects non-keys, so a real one is needed). */
@@ -480,6 +481,98 @@ describe("Contest lifecycle", () => {
         const contest = await voter.createContest({ criteria: bizCriteria() });
         await expect(contest.update()).resolves.toBeUndefined();
         await expect(contest.stop()).resolves.toBeUndefined();
+    });
+});
+
+describe("checkpoint snapshot persistence (dataPath)", () => {
+    const tempDataPath = async (): Promise<string> => {
+        const { mkdtempSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        return mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
+    };
+    const countingChains = (): { chains: ChainClientFactory; gateReads: () => number } => {
+        let gateReads = 0;
+        const client = {
+            getBlockNumber: async () => 43200n,
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => {
+                gateReads += 1;
+                return 1n;
+            }
+        };
+        return { chains: () => client as unknown as ChainClient, gateReads: () => gateReads };
+    };
+
+    it("restores the persisted checkpoint at join: a seeder restart with no other peer online keeps the tally (issue #14)", async () => {
+        const dataPath = await tempDataPath();
+        const signer = realSigner(); // the restore re-runs verifyOffline, so the signature must recover
+
+        // Session 1: publish, let the background gate read settle, then destroy — the leave()
+        // flush persists the snapshot (the debounced timer has not fired yet).
+        const first = countingChains();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: first.chains, signer });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contestA = await voterA.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voterA.destroy();
+
+        // Session 2 (the incident's restart): a FRESH Helia node — empty blockstore, zero topic
+        // subscribers, no providers — so only the persisted snapshot can populate the tally.
+        const second = countingChains();
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: second.chains, signer });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        await contestB.update();
+        // The restored state is already in the initial tally (provisional, then re-verified in
+        // the background from the persisted gate cache — zero chain reads).
+        expect(contestB.tally?.ranking[0]?.community.publicKey).toBe(VALID_KEY);
+        await vi.waitFor(() => expect(contestB.tally?.ranking[0]?.chainVerified).toBe(true));
+        expect(second.gateReads()).toBe(0);
+        await voterB.destroy();
+    });
+
+    it("discards a corrupt snapshot blob and joins empty (the pre-persistence behavior)", async () => {
+        const dataPath = await tempDataPath();
+        const { makeStorage } = await import("../storage/node.js");
+        const topic = await topicFor(bizCriteria());
+        const writer = makeStorage({ dataPath });
+        await writer.openSnapshots().set(topic, new Uint8Array([1, 2, 3]));
+        await writer.destroy();
+
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        expect(contest.tally?.ranking).toEqual([]);
+        // The bad blob was removed, not left to fail every future join (WAL admits the reader).
+        const reader = makeStorage({ dataPath });
+        await vi.waitFor(async () => expect(await reader.openSnapshots().get(topic)).toBeUndefined());
+        await reader.destroy();
+        await voter.destroy();
+    });
+
+    it("skips the snapshot write while deferred checks are pending (never clobbers a good snapshot with a lossy one)", async () => {
+        const dataPath = await tempDataPath();
+        const topic = await topicFor(bizCriteria());
+        const { chains, release } = gatedChains(); // the gate read never lands until release()
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains, signer: realSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+
+        // Leave with the gate read still pending: the flush must SKIP — the encoder would
+        // serve none of the pending bundles, persisting an empty checkpoint.
+        await voter.stop();
+        const { makeStorage } = await import("../storage/node.js");
+        const reader = makeStorage({ dataPath });
+        expect(await reader.openSnapshots().get(topic)).toBeUndefined();
+        await reader.destroy();
+        release();
+        await voter.destroy();
+    });
+
+    it("runs the flush safely on the in-memory backend (`dataPath: false` — nothing to persist, nothing thrown)", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await expect(voter.stop()).resolves.toBeUndefined(); // leave() flush against the memory store
+        await expect(voter.destroy()).resolves.toBeUndefined();
     });
 });
 

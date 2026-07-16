@@ -34,15 +34,16 @@ import { makeVerdictCache } from "../verify/cache.js";
 import { makePersistentGateResultCache, purgeExpiredGateResults } from "../verify/gate-result-cache.js";
 import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
 import { makeStorage } from "../storage/node.js";
-import type { LruStorage } from "../storage/types.js";
+import type { LruStorage, SnapshotStorage } from "../storage/types.js";
 import { makeAnnouncer } from "../transport/announce/node.js";
 import type { Announcer } from "../transport/announce/types.js";
 import { encode as encodeDagCbor } from "@ipld/dag-cbor";
 import { sha256 } from "viem";
-import { makeBackgroundVerifier, type BackgroundChainVerifier } from "../verify/background.js";
+import { makeBackgroundVerifier, type BackgroundChainVerifier, type PendingBundle } from "../verify/background.js";
 import type { BundleChecks } from "../verify/types.js";
 import { makeAcceptedDedup } from "../transport/accepted-dedup.js";
-import { encodeCheckpoint } from "../checkpoint/codec.js";
+import { blockForBytes, decodeCheckpoint, encodeCheckpoint, type CheckpointBlock } from "../checkpoint/codec.js";
+import { decodeSnapshot, encodeSnapshot } from "../checkpoint/snapshot.js";
 import { CID } from "multiformats/cid";
 import type { PeerId } from "@libp2p/interface";
 import { makeTally } from "../tally/tally.js";
@@ -261,12 +262,16 @@ export interface PubsubVoterOptions {
      */
     httpRouterUrls?: string[];
     /**
-     * Directory for the voter's persistent caches (gate results, name resolutions), the
-     * pkc-js `dataPath` equivalent. On Node the caches are better-sqlite3 databases under
-     * `{dataPath}/lru-storage/`; in the browser the path is ignored and the caches live in
-     * IndexedDB (via localforage) either way. Defaults to `{cwd}/.bitsocial-pubsub-voting`
-     * on Node. Pass `false` for in-memory-only caches (no disk, no IndexedDB — the pkc-js
-     * `noData` equivalent): nothing survives the process, but nothing is written either.
+     * Directory for the voter's persistent state, the pkc-js `dataPath` equivalent: the
+     * gate-result and name-resolution caches, plus each joined contest's **checkpoint
+     * snapshot** — the node's own last fully-verified winner-set, written debounced on
+     * changes and reloaded at join, so a seeder restarting with no other peer online does
+     * not lose the tally. On Node this is better-sqlite3 databases under
+     * `{dataPath}/lru-storage/` plus `{dataPath}/checkpoints.db`; in the browser the path
+     * is ignored and everything lives in IndexedDB (via localforage) either way. Defaults
+     * to `{cwd}/.bitsocial-pubsub-voting` on Node. Pass `false` for in-memory-only (no
+     * disk, no IndexedDB — the pkc-js `noData` equivalent): nothing survives the process,
+     * but nothing is written either. A seeder should ALWAYS set a stable path.
      */
     dataPath?: string | false;
 }
@@ -316,6 +321,13 @@ interface ResolvedDeps {
     gateStore: LruStorage;
     /** The voter's persisted name resolutions, shared across all contests (pkc-js rule). */
     nameResolutionCache: NameResolutionCache;
+    /**
+     * The voter's persisted checkpoint snapshots, one blob per topic: each engine's own last
+     * fully-verified checkpoint, written debounced on winner-set changes and reloaded at
+     * `join()`, so a seeder restarting with no other peer online does not lose the tally
+     * (see DESIGN.md "Persistent caches", checkpoint snapshots).
+     */
+    snapshots: SnapshotStorage;
 }
 
 /**
@@ -391,6 +403,12 @@ const COLD_START_FETCH_BACKOFF_CAP_MS = 4_000;
  * others idle.
  */
 const COLD_START_PEER_FETCH_LIMIT = 24;
+/**
+ * Debounce (ms) for persisting the checkpoint snapshot after a winner-set change, mirroring the
+ * announcer's cadence on the same transition: a gossip burst costs one write per window, and
+ * `leave()` flushes whatever is still pending so a clean shutdown never loses the tail.
+ */
+const SNAPSHOT_DEBOUNCE_MS = 10_000;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
@@ -508,11 +526,13 @@ class ContestEngine {
      */
     #currentBucketCache = 0;
     /**
-     * The on-demand checkpoint cache: the last encoded root record and the bucket it was encoded
-     * at. Invalidated by {@link #markStateChanged} (any merge/publish/chase admit) and by a bucket
+     * The on-demand checkpoint cache: the last encoded root record, the bucket it was encoded
+     * at, and the encoded blocks themselves (also in the blockstore; kept here so the snapshot
+     * writer never has to read them back through a seam that can fall back to a network want).
+     * Invalidated by {@link #markStateChanged} (any merge/publish/chase admit) and by a bucket
      * advance (expiry changes the winner set without any message). See DESIGN.md "Checkpoints".
      */
-    #rootRecordCache: { record: FetchRootRecord; bucket: number } | undefined = undefined;
+    #rootRecordCache: { record: FetchRootRecord; bucket: number; blocks: CheckpointBlock[] } | undefined = undefined;
     /** True when the winner-set changed since the last encode; the next `rootRecord()` re-encodes. */
     #checkpointDirty = true;
     /** Live once joined; chases advertised roots that differ from our own. */
@@ -526,6 +546,8 @@ class ContestEngine {
     #peerRoots = new Map<string, string>();
     /** The armed heartbeat timer (jittered; see {@link #armHeartbeat}), cleared by `leave()`. */
     #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+    /** The armed (debounced) snapshot-write timer; flushed by `leave()`. See {@link #writeSnapshot}. */
+    #snapshotTimer: ReturnType<typeof setTimeout> | undefined;
     /** True when a heartbeat matching our own root was heard this interval (suppression). */
     #heardMatchingRoot = false;
     /** True once we published our record this interval (heartbeat OR divergence response). */
@@ -951,13 +973,21 @@ class ContestEngine {
         // heartbeat it broadcasts there.
         this.#deps.onTopicJoined();
         this.#armHeartbeat();
+        // Reload our own persisted checkpoint BEFORE any network activity, and awaited — so a
+        // seeder restarting with no other peer online serves its restored state immediately
+        // (the initial tally after `update()` already carries it), and the cold-start pull
+        // below compares peers' roots against the restored root instead of an empty one.
+        // No snapshot ⇒ no cost (one store miss); a non-empty one costs one head read (the
+        // bucket-admissibility check), consistent with the state-present rule below.
+        await this.#restoreSnapshot();
         // Cold-start / reconnect pull: ask connected topic peers for their root records and
         // chase any divergence. Fire-and-forget — joining must not block on slow peers, and
         // live gossip plus the heartbeat converge regardless; this only shortens the gap.
         void this.#coldStart().catch(() => {});
-        // If a re-join left state behind, refresh the bucket and prune the decayed nodes. Gated
-        // on non-empty state so an empty join stays network-free (no getBlockNumber read),
-        // preserving the "zero chain reads for a constant-weight tally" property.
+        // If a re-join left state behind (or the snapshot restore just reloaded some), refresh
+        // the bucket and prune the decayed nodes. Gated on non-empty state so an empty join
+        // stays network-free (no getBlockNumber read), preserving the "zero chain reads for a
+        // constant-weight tally" property.
         if (this.#crdt.nodeCount() > 0) {
             await this.#refreshBucket();
             await this.#crdt.prune(this.#currentBucketCache);
@@ -1088,6 +1118,13 @@ class ContestEngine {
     async leave(): Promise<void> {
         if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
         this.#heartbeatTimer = undefined;
+        // Flush the debounced snapshot write so a clean shutdown persists the latest state
+        // (still skipped if checks are pending — the stale-but-good snapshot stays put).
+        if (this.#snapshotTimer !== undefined) {
+            clearTimeout(this.#snapshotTimer);
+            this.#snapshotTimer = undefined;
+            await this.#writeSnapshot();
+        }
         // Pause the background verifier's retry timer; pending state survives for a re-join.
         this.#background.stop();
         this.#heardMatchingRoot = false;
@@ -1145,8 +1182,122 @@ class ContestEngine {
     #markStateChanged(): void {
         this.#checkpointDirty = true;
         // The same transition the encode cache invalidates on is what makes router provider
-        // records stale, so the announcer's debounced re-announce rides it (see ResolvedDeps).
+        // records stale, so the announcer's debounced re-announce rides it (see ResolvedDeps),
+        // and what makes the persisted snapshot stale, so the debounced write rides it too.
         this.#deps.onCheckpointChanged();
+        this.#scheduleSnapshotWrite();
+    }
+
+    /**
+     * Arm the debounced snapshot write (announcer-style: the first change in a window arms the
+     * timer, the rest coalesce into it). Only while joined — a never-joined engine (a ballot
+     * created but never published) holds no view worth persisting, and `leave()` flushes the
+     * armed timer so nothing fires after teardown.
+     */
+    #scheduleSnapshotWrite(): void {
+        if (!this.#joined || this.#snapshotTimer !== undefined) return;
+        const timer = setTimeout(() => {
+            this.#snapshotTimer = undefined;
+            void this.#writeSnapshot();
+        }, SNAPSHOT_DEBOUNCE_MS);
+        // Don't hold a Node process open; no-op in the browser.
+        (timer as { unref?: () => void }).unref?.();
+        this.#snapshotTimer = timer;
+    }
+
+    /** Any admitted bundle with a deferred check still pending (same predicate as {@link #isPending}). */
+    #hasUnsettledChecks(): boolean {
+        for (const checks of this.#checks.values()) {
+            if (!checks.chainVerified || checks.nameResolved === false) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Persist this contest's current checkpoint under the voter's `dataPath`: the root record's
+     * wire bytes plus the blocks it references (just re-put by the encode, read back from the
+     * blockstore so no second copy is held in memory). Best-effort like every persistent-cache
+     * write — a broken store degrades to the pre-persistence behavior (the cold-start pull),
+     * never an error.
+     *
+     * Skipped while ANY admitted bundle has a deferred check pending: the encoder serves only
+     * fully verified bundles, so writing mid-settlement would persist a snapshot that OMITS the
+     * pending ones — right after a restore (where every reloaded bundle is provisional) that
+     * would clobber a good snapshot with a near-empty one, and a crash in that window would lose
+     * the very votes persistence exists to keep. Every settlement and eviction re-marks the
+     * state changed, so the write that was skipped here is re-armed by the last one to land.
+     */
+    async #writeSnapshot(): Promise<void> {
+        if (this.#hasUnsettledChecks()) return;
+        try {
+            await this.rootRecord(); // (re-)encode so the cache reflects the current winner-set
+            // Read record + blocks from the cache as one unit: a state change racing the encode
+            // above can only leave a NEWER consistent pair here, never a torn one.
+            const cached = this.#rootRecordCache;
+            if (cached === undefined) return;
+            await this.#deps.snapshots.set(
+                this.topic,
+                encodeSnapshot({ record: encodeRootRecord(cached.record), blocks: cached.blocks.map((block) => block.bytes) })
+            );
+        } catch {
+            // Best-effort: a failed write leaves the previous snapshot in place; the next
+            // state change re-arms the debounce and retries.
+        }
+    }
+
+    /**
+     * Reload this node's own persisted checkpoint at `join()`, before any network activity: the
+     * fix for the seeder-restart vote loss (issue #14). The blob is decoded through the SAME
+     * pipeline as a chased remote checkpoint — block CIDs re-derived (a corrupted block
+     * self-invalidates), `decodeCheckpoint` re-derives the chunk index against the root, each
+     * bundle re-passes the offline signature/constraint checks, and the deferred gate read +
+     * name resolution ride the background verifier (mostly persisted-gate-cache hits on a
+     * restart) — so the trust model is unchanged: this is the node's own previously-validated
+     * state, re-validated on load. A corrupt or version-mismatched blob is removed and the join
+     * proceeds empty, exactly as before persistence; the cold-start pull then still runs, so a
+     * stale snapshot self-heals by union with the live topic.
+     */
+    async #restoreSnapshot(): Promise<void> {
+        let blob: Uint8Array | undefined;
+        try {
+            blob = await this.#deps.snapshots.get(this.topic);
+        } catch {
+            return; // unreadable store — degrade to a plain cold join
+        }
+        if (blob === undefined) return;
+        try {
+            const snapshot = decodeSnapshot(blob);
+            const record = decodeRootRecord(snapshot.record);
+            const byCid = new Map<string, Uint8Array>();
+            for (const bytes of snapshot.blocks) byCid.set((await blockForBytes(bytes)).cid.toString(), bytes);
+            const winners = await decodeCheckpoint(record.root, async (cid) => byCid.get(cid.toString()), record.chunks);
+
+            const pending: PendingBundle[] = [];
+            for (const bundle of winners) {
+                // Same two-stage admit as the chase (see transport/chase.ts): offline checks
+                // synchronously before admit, chain/name checks deferred and batched. Admission
+                // goes through `crdt.add` (which stores the block AND registers the bundle) — a
+                // merge-by-CID would re-read through the blockstore, which the restore must not
+                // depend on: it may be fresh (the incident's in-memory case) or hold the block
+                // already (a persistent one), neither of which says the CRDT knows the bundle.
+                const cid = await bundleCidForBytes(encodeBundle(bundle));
+                if (this.#checks.has(cid.toString())) continue; // already admitted (a re-join)
+                if (!(await this.#isEvaluableNow(bundle))) continue;
+                const offline = await this.#verifier.verifyOffline(bundle);
+                if (!offline.valid) continue;
+                await this.#crdt.add(bundle);
+                this.#recordChecks(cid, bundle, false);
+                pending.push({ cid, bundle });
+            }
+            if (pending.length > 0) {
+                this.#background.enqueue(pending);
+                this.#onStateChanged();
+            }
+        } catch {
+            // Corrupt, truncated, or version-mismatched blob: discard it and join empty — the
+            // pre-persistence behavior. Never let a bad snapshot block the join.
+            void this.#deps.snapshots.remove(this.topic).catch(() => {});
+        }
     }
 
     /**
@@ -1183,7 +1334,7 @@ class ContestEngine {
             count: winners.length,
             sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
         };
-        this.#rootRecordCache = { record, bucket };
+        this.#rootRecordCache = { record, bucket, blocks };
         return record;
     }
 
@@ -1485,7 +1636,8 @@ export class PubsubVoter implements VoteClient {
             gateStore: this.#storage.openLru({ cacheName: "gate-results", maxItems: GATE_RESULTS_MAX_ITEMS }),
             nameResolutionCache: makeNameResolutionCache(
                 this.#storage.openLru({ cacheName: "name-resolutions", maxItems: NAME_RESOLUTIONS_MAX_ITEMS })
-            )
+            ),
+            snapshots: this.#storage.openSnapshots()
         };
         // The announcer touches libp2p (peer id, addresses, address events) only when routers are
         // configured, so a host that never announces pays nothing and injects nothing extra.
