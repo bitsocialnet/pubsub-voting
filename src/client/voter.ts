@@ -2,6 +2,7 @@ import pLimit from "p-limit";
 import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
+import { coalescingChainFactory } from "../chain/coalescer.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { tickerForRef } from "../chain/ticker.js";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService, VoteTransport } from "../transport/types.js";
@@ -263,7 +264,7 @@ export interface PubsubVoterOptions {
      * Directory for the voter's persistent caches (gate results, name resolutions), the
      * pkc-js `dataPath` equivalent. On Node the caches are better-sqlite3 databases under
      * `{dataPath}/lru-storage/`; in the browser the path is ignored and the caches live in
-     * IndexedDB (via localforage) either way. Defaults to `{cwd}/.bitsocial-pubsub-votes`
+     * IndexedDB (via localforage) either way. Defaults to `{cwd}/.bitsocial-pubsub-voting`
      * on Node. Pass `false` for in-memory-only caches (no disk, no IndexedDB — the pkc-js
      * `noData` equivalent): nothing survives the process, but nothing is written either.
      */
@@ -1469,7 +1470,11 @@ export class PubsubVoter implements VoteClient {
             pubsub,
             blockstore,
             fetch,
-            chains: options.chains,
+            // Every chain client is handed out through the read coalescer: pinned-block
+            // `readContract` calls from ALL consumers (every contest, the gossip forward-gate,
+            // the background verifier) merge into shared multicall3 round trips under one
+            // per-client in-flight budget — see src/chain/coalescer.ts.
+            chains: coalescingChainFactory(options.chains),
             signer: options.signer,
             registry: resolveRegistry(options.rules),
             nameResolvers: options.nameResolvers ?? [],

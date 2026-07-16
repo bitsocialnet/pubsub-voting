@@ -6,7 +6,7 @@ import type { LruStorage, StorageOptions, VoteStorage } from "./types.js";
  * The browser backend, swapped in for storage/node.ts by the package.json `browser` field
  * remap (same mechanism pkc-js uses for its whole runtime tree, scoped here to one module).
  * It is a port of pkc-js's localforage-lru (runtime/browser/localforage-lru.ts): two
- * IndexedDB databases per named cache (`pubsub-votes-{cacheName}` and `…2`) with round-robin
+ * IndexedDB databases per named cache (`pubsub-voting-{cacheName}` and `…2`) with round-robin
  * eviction — writes fill the active database, and when it reaches `maxItems` the databases
  * swap roles and the new active one is cleared, so at most the oldest half of entries drops
  * at once. A read hit in the inactive database promotes the entry to the active one, which is
@@ -28,7 +28,7 @@ class LocalForageLruStorage implements LruStorage {
         | undefined;
 
     constructor(opts: { cacheName: string; maxItems: number }) {
-        this.#name = `pubsub-votes-${opts.cacheName}`;
+        this.#name = `pubsub-voting-${opts.cacheName}`;
         this.#maxItems = opts.maxItems;
     }
 

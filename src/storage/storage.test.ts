@@ -33,7 +33,7 @@ describe("makeMemoryLruStorage", () => {
 
 describe("makeStorage (node/sqlite)", () => {
     it("persists across close and reopen under the same dataPath", async () => {
-        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-test-"));
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
         const storage = makeStorage({ dataPath });
         const store = storage.openLru({ cacheName: "gate-results", maxItems: 10 });
         await store.setItem("k", "42");
@@ -47,7 +47,7 @@ describe("makeStorage (node/sqlite)", () => {
     });
 
     it("evicts by lastAccess past maxItems, refreshed on read (LRU, not FIFO)", async () => {
-        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-test-"));
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
         const storage = makeStorage({ dataPath });
         const store = storage.openLru({ cacheName: "gate-results", maxItems: 2 });
         await store.setItem("a", 1);
@@ -64,7 +64,7 @@ describe("makeStorage (node/sqlite)", () => {
     });
 
     it("keeps named caches separate and rejects use after destroy (no silent file re-create)", async () => {
-        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-test-"));
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
         const storage = makeStorage({ dataPath });
         const gate = storage.openLru({ cacheName: "gate-results", maxItems: 10 });
         const names = storage.openLru({ cacheName: "name-resolutions", maxItems: 10 });
@@ -77,7 +77,7 @@ describe("makeStorage (node/sqlite)", () => {
     });
 
     it("touches no disk for `dataPath: false` (in-memory backend)", async () => {
-        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-test-"));
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
         const storage = makeStorage({ dataPath: false });
         const store = storage.openLru({ cacheName: "gate-results", maxItems: 10 });
         await store.setItem("k", 1);
