@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.9](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.8...v0.0.9) (2026-07-16)
+
+### Features
+
+* persist checkpoint snapshots under dataPath so a seeder restart keeps the tally ([9cccea0](https://github.com/bitsocialnet/pubsub-voting/commit/9cccea0150d4f18b86df346b0017005943fa5815))
+
+### Bug Fixes
+
+* close the orphaned sqlite handle when [#open](https://github.com/bitsocialnet/pubsub-voting/issues/open)() fails mid-initialization ([e144e1a](https://github.com/bitsocialnet/pubsub-voting/commit/e144e1a06551d75b6f5ec02fe28256733486d986))
+
 ## [0.0.8](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.7...v0.0.8) (2026-07-16)
 
 ## [0.0.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.6...v0.0.7) (2026-07-16)
