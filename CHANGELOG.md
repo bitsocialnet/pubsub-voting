@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.10](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.9...v0.0.10) (2026-07-16)
+
+### Features
+
+* re-run the cold-start pull on gossipsub subscription-change ([c838023](https://github.com/bitsocialnet/pubsub-voting/commit/c8380239b9e73d1e59d4512d82c0bef12a95e7fc)), closes [#15](https://github.com/bitsocialnet/pubsub-voting/issues/15) [#14](https://github.com/bitsocialnet/pubsub-voting/issues/14) [#16](https://github.com/bitsocialnet/pubsub-voting/issues/16)
+
 ## [0.0.9](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.8...v0.0.9) (2026-07-16)
 
 ### Features
