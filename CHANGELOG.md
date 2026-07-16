@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.6...v0.0.7) (2026-07-16)
+
+### Features
+
+* **transport:** announce wildcard rewrite sentinels so zero-config seeders are discoverable ([7459d5b](https://github.com/bitsocialnet/pubsub-voting/commit/7459d5bf2e24d778f767f574e176c01e1d0ac808))
+
 ## [0.0.6](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.5...v0.0.6) (2026-07-16)
 
 ## [0.0.5](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.4...v0.0.5) (2026-07-15)
