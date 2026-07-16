@@ -65,6 +65,15 @@ export interface PubsubService {
     addEventListener(type: "message", listener: (evt: { detail: { topic: string; data: Uint8Array; from?: PeerId } }) => void): void;
     removeEventListener(type: "message", listener: (evt: { detail: { topic: string; data: Uint8Array; from?: PeerId } }) => void): void;
     /**
+     * gossipsub's "a peer's subscription set changed" notification. The cold-start pull
+     * re-runs off it (see client/voter.ts `#armSubscriptionRepull`): a joiner that dials a
+     * seeder and joins immediately sees zero subscribers at the instant of `join()` — the
+     * seeder only appears here once subscription gossip lands — so without this trigger it
+     * would idle until the topic heartbeat.
+     */
+    addEventListener(type: "subscription-change", listener: SubscriptionChangeListener): void;
+    removeEventListener(type: "subscription-change", listener: SubscriptionChangeListener): void;
+    /**
      * gossipsub's per-topic validator map. The transport installs the async forward-gate
      * here (`topicValidators.set(topic, gate)`); gossipsub awaits the returned promise
      * before re-forwarding the message to the mesh, which is what makes `reject` land on the
@@ -74,6 +83,11 @@ export interface PubsubService {
      */
     topicValidators?: Map<string, GossipTopicValidator>;
 }
+
+/** Listener for gossipsub's `subscription-change` (the libp2p `SubscriptionChangeData` shape). */
+export type SubscriptionChangeListener = (evt: {
+    detail: { peerId: PeerId; subscriptions: Array<{ topic: string; subscribe: boolean }> };
+}) => void;
 
 /** A received pubsub message, as passed to a gossipsub topic validator. */
 export interface GossipMessage {

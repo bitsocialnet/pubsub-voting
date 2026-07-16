@@ -115,6 +115,56 @@ function spyableHelia(): { helia: HeliaInstance; publish: ReturnType<typeof vi.f
     return { helia, publish };
 }
 
+/**
+ * A Helia node whose gossipsub records `subscription-change` listeners (dispatchable by the
+ * test) and whose fetch service logs each pulled peer — the seams the cold-start re-pull
+ * (issue #15) rides. `fetch` answers a definitive "no record" (undefined), so a pull completes
+ * without retries and without needing a decodable root record.
+ */
+function subscribableHelia(): {
+    helia: HeliaInstance;
+    fetchedPeers: string[];
+    listenerCount: () => number;
+    dispatch: (peerId: string, topic: string, subscribe?: boolean) => void;
+} {
+    type Listener = (evt: { detail: { peerId: PeerId; subscriptions: Array<{ topic: string; subscribe: boolean }> } }) => void;
+    const listeners = new Set<Listener>();
+    const fetchedPeers: string[] = [];
+    const pubsub = {
+        publish: async () => ({ recipients: [] as PeerId[] }),
+        subscribe: () => {},
+        unsubscribe: () => {},
+        getSubscribers: () => [],
+        addEventListener: (type: string, listener: unknown) => {
+            if (type === "subscription-change") listeners.add(listener as Listener);
+        },
+        removeEventListener: (type: string, listener: unknown) => {
+            listeners.delete(listener as Listener);
+        },
+        topicValidators: new Map()
+    } as unknown as PubsubService;
+    const fetch = {
+        fetch: async (peer: PeerId) => {
+            fetchedPeers.push(peer.toString());
+            return undefined; // definitive "no record" — no retry, nothing to decode
+        },
+        registerLookupFunction: () => {},
+        unregisterLookupFunction: () => {}
+    };
+    const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
+    const helia = { libp2p: { services: { pubsub, fetch } }, blockstore } as unknown as HeliaInstance;
+    return {
+        helia,
+        fetchedPeers,
+        listenerCount: () => listeners.size,
+        dispatch: (peerId, topic, subscribe = true) => {
+            for (const listener of [...listeners]) {
+                listener({ detail: { peerId: { toString: () => peerId } as unknown as PeerId, subscriptions: [{ topic, subscribe }] } });
+            }
+        }
+    };
+}
+
 describe("PubsubVoter construction + read-only", () => {
     it("is read-only without a signer", () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
@@ -481,6 +531,65 @@ describe("Contest lifecycle", () => {
         const contest = await voter.createContest({ criteria: bizCriteria() });
         await expect(contest.update()).resolves.toBeUndefined();
         await expect(contest.stop()).resolves.toBeUndefined();
+    });
+});
+
+describe("cold-start re-pull on subscription-change (issue #15)", () => {
+    it("pulls a peer whose subscription appears after join (the join-races-subscription-gossip gap)", async () => {
+        const node = subscribableHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // zero subscribers at the join snapshot — nothing pulled yet
+        expect(node.fetchedPeers).toEqual([]);
+
+        node.dispatch("peer-late", contest.topic);
+        await vi.waitFor(() => expect(node.fetchedPeers).toEqual(["peer-late"]));
+        await voter.destroy();
+    });
+
+    it("asks each peer at most once (the pull's seen-set dedups re-announcements)", async () => {
+        const node = subscribableHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+
+        node.dispatch("peer-a", contest.topic);
+        node.dispatch("peer-a", contest.topic);
+        node.dispatch("peer-b", contest.topic);
+        await vi.waitFor(() => expect(node.fetchedPeers.sort()).toEqual(["peer-a", "peer-b"]));
+        await voter.destroy();
+    });
+
+    it("ignores other topics and unsubscribes", async () => {
+        const node = subscribableHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+
+        node.dispatch("peer-x", "some/other-topic");
+        node.dispatch("peer-y", contest.topic, false); // an UNsubscribe is not a pull target
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(node.fetchedPeers).toEqual([]);
+        await voter.destroy();
+    });
+
+    it("disarms the listener on stop() and re-arms on the next update()", async () => {
+        const node = subscribableHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        expect(node.listenerCount()).toBe(1);
+
+        await contest.stop();
+        expect(node.listenerCount()).toBe(0);
+        node.dispatch("peer-after-stop", contest.topic);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(node.fetchedPeers).toEqual([]);
+
+        await contest.update(); // a re-join arms a fresh window (no stacked listeners)
+        expect(node.listenerCount()).toBe(1);
+        await voter.destroy();
+        expect(node.listenerCount()).toBe(0);
     });
 });
 

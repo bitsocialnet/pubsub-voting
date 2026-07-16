@@ -5,7 +5,14 @@ import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from
 import { coalescingChainFactory } from "../chain/coalescer.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { tickerForRef } from "../chain/ticker.js";
-import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService, VoteTransport } from "../transport/types.js";
+import type {
+    BlockstoreLike,
+    FetchServiceLike,
+    HeliaInstance,
+    PubsubService,
+    SubscriptionChangeListener,
+    VoteTransport
+} from "../transport/types.js";
 import { requireHeliaServices } from "../transport/helia.js";
 import { makeBlockstoreBundleStore } from "../transport/bundle-store.js";
 import { makeRateLimiter } from "../transport/rate-limit.js";
@@ -404,6 +411,14 @@ const COLD_START_FETCH_BACKOFF_CAP_MS = 4_000;
  */
 const COLD_START_PEER_FETCH_LIMIT = 24;
 /**
+ * How long after `join()` the cold-start pull stays armed on gossipsub's `subscription-change`
+ * (see `#armSubscriptionRepull`). One heartbeat interval: the window exists to close the
+ * join-races-subscription-gossip gap (issue #15), and past the first heartbeat the passive
+ * root-record heartbeat covers divergence detection anyway — an unbounded listener would
+ * instead pay one root fetch per churning subscriber for the node's whole lifetime.
+ */
+const COLD_START_REPULL_WINDOW_MS = HEARTBEAT_INTERVAL_MS;
+/**
  * Debounce (ms) for persisting the checkpoint snapshot after a winner-set change, mirroring the
  * announcer's cadence on the same transition: a gossip burst costs one write per window, and
  * `leave()` flushes whatever is still pending so a clean shutdown never loses the tail.
@@ -548,6 +563,11 @@ class ContestEngine {
     #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
     /** The armed (debounced) snapshot-write timer; flushed by `leave()`. See {@link #writeSnapshot}. */
     #snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+    /**
+     * Tears down the per-join `subscription-change` re-pull (listener + window timer); set by
+     * {@link #armSubscriptionRepull}, cleared by `leave()` or by the window expiring.
+     */
+    #subscriptionRepullDisarm: (() => void) | undefined;
     /** True when a heartbeat matching our own root was heard this interval (suppression). */
     #heardMatchingRoot = false;
     /** True once we published our record this interval (heartbeat OR divergence response). */
@@ -1002,6 +1022,14 @@ class ContestEngine {
      * the providers of the criteria CID from the host's HTTP content router. Roots are **unioned,
      * never quorum'd** — a record served by a single peer is still chased, so a colluding majority
      * cannot hide a vote.
+     *
+     * The `getSubscribers` source is an instantaneous snapshot, and a joiner that dials a seeder
+     * and joins immediately (the normal browser boot order) races subscription gossip: at the
+     * instant of `join()` it sees zero subscribers, pulls nothing, and would idle until the topic
+     * heartbeat (issue #15 — measured 90+ s vs ~4 s). So the pull closure (and its `seen` dedup)
+     * stays armed on gossipsub's `subscription-change` for {@link COLD_START_REPULL_WINDOW_MS}:
+     * each peer whose subscription to this topic becomes visible inside the window is asked once,
+     * closing the race for router-less clients too. See {@link #armSubscriptionRepull}.
      */
     async #coldStart(): Promise<void> {
         const seen = new Set<string>();
@@ -1030,11 +1058,45 @@ class ContestEngine {
                 // live gossip still converge.
             }
         };
+        // Arm the re-pull BEFORE the initial fan-out so no subscriber can land in the gap
+        // between the snapshot below and the listener; `seen` dedups any overlap.
+        this.#armSubscriptionRepull(pull);
         // Shuffle before slicing: a deterministic first-N pick would funnel a whole directory
         // join through the same peers' stream caps while other subscribers idle; a random N
         // spreads contests across the topic's serving peers (see COLD_START_PEER_FETCH_LIMIT).
         const fromSubscribers = shuffled(this.#deps.pubsub.getSubscribers(this.topic)).slice(0, COLD_START_PEERS).map(pull);
         await Promise.allSettled([...fromSubscribers, this.#discoverProviders(pull)]);
+    }
+
+    /**
+     * Keep the cold-start pull live on gossipsub's `subscription-change` for one re-pull window:
+     * a peer whose subscription to this topic becomes visible after `join()`'s instantaneous
+     * `getSubscribers` snapshot is pulled the moment it appears (once — the shared `seen` set
+     * dedups), instead of waiting for the heartbeat. Bounded by {@link COLD_START_REPULL_WINDOW_MS}:
+     * past the first heartbeat interval the passive heartbeat already covers divergence detection,
+     * so a long-lived node does not pay one fetch per churning subscriber forever. Disarmed by
+     * `leave()`; a re-join arms a fresh window.
+     */
+    #armSubscriptionRepull(pull: (peer: PeerId) => Promise<void>): void {
+        this.#disarmSubscriptionRepull(); // a stale listener from a prior join must not leak
+        const pubsub = this.#deps.pubsub;
+        const listener: SubscriptionChangeListener = (evt) => {
+            if (!evt.detail.subscriptions.some((s) => s.topic === this.topic && s.subscribe)) return;
+            void pull(evt.detail.peerId).catch(() => {});
+        };
+        pubsub.addEventListener("subscription-change", listener);
+        const timer = setTimeout(() => this.#disarmSubscriptionRepull(), COLD_START_REPULL_WINDOW_MS);
+        // Don't hold a Node process open; no-op in the browser.
+        (timer as { unref?: () => void }).unref?.();
+        this.#subscriptionRepullDisarm = () => {
+            clearTimeout(timer);
+            pubsub.removeEventListener("subscription-change", listener);
+        };
+    }
+
+    #disarmSubscriptionRepull(): void {
+        this.#subscriptionRepullDisarm?.();
+        this.#subscriptionRepullDisarm = undefined;
     }
 
     /**
@@ -1127,6 +1189,7 @@ class ContestEngine {
         }
         // Pause the background verifier's retry timer; pending state survives for a re-join.
         this.#background.stop();
+        this.#disarmSubscriptionRepull();
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         this.#chaser = undefined;
