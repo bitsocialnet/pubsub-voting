@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.0.6](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.5...v0.0.6) (2026-07-16)
+
 ## [0.0.5](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.4...v0.0.5) (2026-07-15)
 
 ### Features
