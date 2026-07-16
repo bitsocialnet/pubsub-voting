@@ -47,7 +47,7 @@
     "better-sqlite3": "12.9.0",
     "helia": "6.1.4",
     "localforage": "1.10.0",
-    "multiformats": "13.4.2",
+    "multiformats": "14.0.0",
     "p-limit": "6.2.0",
     "viem": "2.54.0",
     "zod": "4.3.6"
