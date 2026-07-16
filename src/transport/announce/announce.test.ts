@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import http from "node:http";
+import net from "node:net";
 import type { AddressInfo } from "node:net";
-import { makeAnnouncer, announceableAddrs } from "./node.js";
+import { makeAnnouncer, announceableAddrs, sentinelAddrs } from "./node.js";
 import { makeAnnouncer as makeBrowserAnnouncer } from "./browser.js";
 import type { AnnouncerLibp2p, AnnouncerOptions } from "./types.js";
 
@@ -103,7 +104,7 @@ describe("announceableAddrs", () => {
         ]);
     });
 
-    it("drops loopback, private, link-local, CGNAT, ULA, and unspecified addrs", () => {
+    it("drops loopback, private, link-local, CGNAT, and ULA addrs", () => {
         expect(
             announceableAddrs([
                 "/ip4/127.0.0.1/tcp/4001",
@@ -112,11 +113,51 @@ describe("announceableAddrs", () => {
                 "/ip4/192.168.1.2/tcp/4001",
                 "/ip4/169.254.0.2/tcp/4001",
                 "/ip4/100.64.0.2/tcp/4001",
-                "/ip4/0.0.0.0/tcp/4001",
                 "/ip6/::1/tcp/4001",
-                "/ip6/::/tcp/4001",
                 "/ip6/fe80::1/tcp/4001",
                 "/ip6/fd00::1/tcp/4001",
+                "/memory/0"
+            ])
+        ).toEqual([]);
+    });
+
+    it("passes exactly-unspecified addrs through as the router's rewrite sentinel", () => {
+        expect(
+            announceableAddrs([
+                "/ip4/0.0.0.0/tcp/4001",
+                "/ip6/::/tcp/4001",
+                "/ip4/0.0.0.1/tcp/4001", // "this network" but NOT the unspecified addr — still dropped
+                "/ip4/192.168.1.2/tcp/4001"
+            ])
+        ).toEqual(["/ip4/0.0.0.0/tcp/4001", "/ip6/::/tcp/4001"]);
+    });
+});
+
+describe("sentinelAddrs", () => {
+    it("derives deduped wildcard sentinels from non-loopback interface addrs, keeping port/transport/p2p suffix", () => {
+        expect(
+            sentinelAddrs([
+                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer",
+                "/ip4/192.168.1.7/tcp/4001/p2p/12D3KooWAnnouncerPeer",
+                "/ip4/172.31.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer", // same port as above — dedupes
+                "/ip4/192.168.1.7/tcp/4002/ws/p2p/12D3KooWAnnouncerPeer",
+                "/ip6/fd00::1/tcp/4001/p2p/12D3KooWAnnouncerPeer"
+            ])
+        ).toEqual([
+            "/ip4/0.0.0.0/tcp/4001/p2p/12D3KooWAnnouncerPeer",
+            "/ip4/0.0.0.0/tcp/4002/ws/p2p/12D3KooWAnnouncerPeer",
+            "/ip6/::/tcp/4001/p2p/12D3KooWAnnouncerPeer"
+        ]);
+    });
+
+    it("derives nothing from loopback-only, already-unspecified, or non-IP addrs", () => {
+        expect(
+            sentinelAddrs([
+                "/ip4/127.0.0.1/tcp/4001",
+                "/ip6/::1/tcp/4001",
+                "/ip4/0.0.0.0/tcp/4001",
+                "/ip6/::/tcp/4001",
+                "/dns4/example.libp2p.direct/tcp/443/tls/ws",
                 "/memory/0"
             ])
         ).toEqual([]);
@@ -199,12 +240,29 @@ describe("makeAnnouncer (node)", () => {
         }
     });
 
-    it("announces nothing when no publicly dialable address survives the filter", async () => {
+    it("announces wildcard sentinels when only private interface addrs exist (NAT/Docker-bridge, no config)", async () => {
         const router = await startMockRouter();
         try {
             const announcer = testAnnouncer({
                 routerUrls: [router.url],
                 libp2p: fakeLibp2p(["/ip4/127.0.0.1/tcp/4001", "/ip4/192.168.1.7/tcp/4001"])
+            });
+            announcer.start();
+            announcer.notifyChange();
+            await waitUntil(() => router.puts.length >= 1);
+            announcer.stop();
+            expect(router.puts[0]!.body.Providers[0]!.Payload.Addrs).toEqual(["/ip4/0.0.0.0/tcp/4001"]);
+        } finally {
+            await router.stop();
+        }
+    });
+
+    it("announces nothing when only loopback addrs exist (not listening on any rewritable interface)", async () => {
+        const router = await startMockRouter();
+        try {
+            const announcer = testAnnouncer({
+                routerUrls: [router.url],
+                libp2p: fakeLibp2p(["/ip4/127.0.0.1/tcp/4001", "/ip6/::1/tcp/4001"])
             });
             announcer.start();
             announcer.notifyChange();
@@ -274,6 +332,125 @@ describe("makeAnnouncer (node)", () => {
             announcer.stop(); // cancels the armed debounce before it fires
             await new Promise((resolve) => setTimeout(resolve, 150));
             expect(router.puts).toHaveLength(0);
+        } finally {
+            await router.stop();
+        }
+    });
+});
+
+/**
+ * The production router's `cleanAddrs` (pkc-http-router lib/utils.ts), mirrored faithfully:
+ * strip the nodejs `::ffff:` prefix from the source IP; rewrite ONLY the exactly-unspecified
+ * leading component of the matching family to the source IP and drop the other family's
+ * unspecified addrs; then drop any addr whose leading IP does not equal the source IP (except
+ * `p2p-circuit` addrs). The one production step skipped is the final private-IP drop — the real
+ * router's own `NO_IP_VALIDATE` test mode skips it for the same reason we must: a loopback test
+ * connection's observed source IP is itself private.
+ */
+function cleanAddrsMirror(addrs: string[], reqIp: string): string[] {
+    if (reqIp.startsWith("::ffff:")) reqIp = reqIp.slice("::ffff:".length);
+    if (net.isIP(reqIp) === 4) {
+        addrs = addrs.filter((a) => !a.startsWith("/ip6/::")).map((a) => a.replace(/^\/ip4\/0\.0\.0\.0(\/|$)/, `/ip4/${reqIp}$1`));
+    } else if (net.isIP(reqIp) === 6) {
+        addrs = addrs.filter((a) => !a.startsWith("/ip4/0.0.0.0")).map((a) => a.replace(/^\/ip6\/::(\/|$)/, `/ip6/${reqIp}$1`));
+    }
+    return addrs.filter((addr) => {
+        const ip = addr.match(/^\/ip(?:4|6)\/([^/]+)/)?.[1];
+        if (ip === undefined) return true; // dns etc — the production router passes them through
+        return ip === reqIp || addr.includes("p2p-circuit");
+    });
+}
+
+/** A mock router that applies {@link cleanAddrsMirror} at PUT time, storing what production would store. */
+async function startRewritingRouter(): Promise<{
+    url: string;
+    records: Array<{ sourceIp: string; addrs: string[]; id: string; keys: string[] }>;
+    stop: () => Promise<void>;
+}> {
+    const records: Array<{ sourceIp: string; addrs: string[]; id: string; keys: string[] }> = [];
+    const server = http.createServer((req, res) => {
+        let raw = "";
+        req.on("data", (d) => (raw += d));
+        req.on("end", () => {
+            const sourceIp = req.socket.remoteAddress ?? "";
+            const body = JSON.parse(raw) as ReceivedPut["body"];
+            for (const provider of body.Providers) {
+                records.push({
+                    sourceIp: sourceIp.startsWith("::ffff:") ? sourceIp.slice("::ffff:".length) : sourceIp,
+                    addrs: cleanAddrsMirror(provider.Payload.Addrs, sourceIp),
+                    id: provider.Payload.ID,
+                    keys: provider.Payload.Keys
+                });
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ProvideResults: [] }));
+        });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const { port } = server.address() as AddressInfo;
+    return {
+        url: `http://127.0.0.1:${port}/`,
+        records,
+        stop: () =>
+            new Promise<void>((resolve) => {
+                server.closeAllConnections?.();
+                server.close(() => resolve());
+            })
+    };
+}
+
+describe("end-to-end against the production router's cleanAddrs semantics", () => {
+    it("a NAT'd node's synthesized sentinels become the PUT's actual source IP; no unspecified addr survives", async () => {
+        const router = await startRewritingRouter();
+        try {
+            // Only private interface addrs (the new-plebbit shape: loopback + a bridge), both
+            // families — the announcer must synthesize /ip4/0.0.0.0 + /ip6/:: sentinels itself.
+            const announcer = testAnnouncer({
+                routerUrls: [router.url],
+                libp2p: fakeLibp2p([
+                    "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer",
+                    "/ip4/172.31.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer",
+                    "/ip6/fd00::1/tcp/4001/p2p/12D3KooWAnnouncerPeer"
+                ]),
+                keys: async () => ["bafyCriteria", "bafyRoot"]
+            });
+            announcer.start();
+            announcer.notifyChange();
+            await waitUntil(() => router.records.length >= 1);
+            announcer.stop();
+
+            const record = router.records[0]!;
+            // The stored record carries the request's ACTUAL source IP where the sentinel stood...
+            expect(record.sourceIp).not.toBe("");
+            expect(record.addrs).toEqual([`/ip4/${record.sourceIp}/tcp/4001/p2p/12D3KooWAnnouncerPeer`]);
+            // ...the cross-family /ip6/:: sentinel was dropped by the router (the PUT came over v4)...
+            expect(record.addrs.join()).not.toContain("::");
+            // ...and nothing unspecified leaked into what the router stores.
+            expect(record.addrs.some((a) => a.includes("0.0.0.0"))).toBe(false);
+            expect(record.id).toBe("12D3KooWAnnouncerPeer");
+            expect(record.keys).toEqual(["bafyCriteria", "bafyRoot"]);
+        } finally {
+            await router.stop();
+        }
+    });
+
+    it("a configured wildcard announce addr (kubo style) is rewritten the same way", async () => {
+        const router = await startRewritingRouter();
+        try {
+            // addresses.announce = ['/ip4/0.0.0.0/tcp/4001'] makes getMultiaddrs() return the
+            // wildcard verbatim — the pass-through path, no synthesis involved.
+            const announcer = testAnnouncer({
+                routerUrls: [router.url],
+                libp2p: fakeLibp2p(["/ip4/0.0.0.0/tcp/4001/p2p/12D3KooWAnnouncerPeer"])
+            });
+            announcer.start();
+            announcer.notifyChange();
+            await waitUntil(() => router.records.length >= 1);
+            announcer.stop();
+
+            const record = router.records[0]!;
+            expect(record.addrs).toEqual([`/ip4/${record.sourceIp}/tcp/4001/p2p/12D3KooWAnnouncerPeer`]);
+            expect(record.addrs.some((a) => a.includes("0.0.0.0"))).toBe(false);
         } finally {
             await router.stop();
         }

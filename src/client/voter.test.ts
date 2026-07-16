@@ -1153,6 +1153,26 @@ describe("provider-record announcer (httpRouterUrls)", () => {
         await voter.stop();
     });
 
+    it("a failing router surfaces through each joined contest's error event (announce failures are not silent)", async () => {
+        const h = announcerHarness();
+        h.fetchSpy.mockResolvedValue({ ok: false, status: 503, arrayBuffer: async () => new ArrayBuffer(0) });
+        const voter = new PubsubVoter({
+            dataPath: false,
+            helia: h.helia,
+            chains: stubChains(),
+            httpRouterUrls: ["http://router.example"]
+        });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const errors: unknown[] = [];
+        contest.on("error", (e) => errors.push(e));
+        await contest.update();
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+        await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
+        expect(String(errors[0])).toContain("router.example");
+        expect(String(errors[0])).toContain("503");
+        await voter.stop();
+    });
+
     it("stop() stops announcing (no periodic re-announce after the last topic leaves)", async () => {
         const h = announcerHarness();
         const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: stubChains(), httpRouterUrls: ["http://router.example"] });
