@@ -75,11 +75,14 @@ chain" below).*
 
 *Re-measured 2026-07-16 (median of 3) with **checkpoint-snapshot persistence** (DESIGN.md "Persistent
 caches", checkpoint snapshots — the cold joiner runs `dataPath: false`, so its join path gains only an
-awaited snapshot-store miss): within jitter of a same-day N=1000 **control run on master** on every
-column (`START→TALLY` 7.67s vs control 7.52s, `START→VERIFIED` 8.35s vs 8.21s, `gate-RPC` 7 vs 7).
-Both same-day runs showed `verify+merge` ~4.1–4.3s against the table's 2.06s — equally on master, so
-rig conditions, not the change; the table above stands as the baseline. The restart path itself is
-measured separately — see "Warm restart" below.*
+awaited snapshot-store miss) and the **`subscription-change` cold-start re-pull** (issue #15 — not on
+this bench's measured path, the joiner discovers via the router first and the pull's seen-set dedups):
+every column matched this baseline within jitter (`START→TALLY` 3.07s / 3.11s / 3.13s / 3.27s / 5.30s
+for N=1…1000 vs 3.08s / 3.12s / 3.06s / 3.19s / 5.25s above; `verify+merge` 1.99s at N=1000 vs 2.06s).
+An earlier same-day run had shown `verify+merge` ~4.1–4.3s — but so did an N=1000 **control run on
+master** (7.52s/8.21s totals, identical columns), and the later idle-rig run above returned to
+baseline: local CPU conditions, not the changes. The restart path itself is measured separately — see
+"Warm restart" below.*
 
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
