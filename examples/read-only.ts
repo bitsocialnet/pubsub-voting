@@ -12,7 +12,7 @@ import {
     type HeliaInstance,
     type ChainClientFactory,
     type Criteria
-} from "@bitsocial/pubsub-votes";
+} from "@bitsocial/pubsub-voting";
 
 declare function hostHelia(): HeliaInstance;
 declare function viemChains(): ChainClientFactory;

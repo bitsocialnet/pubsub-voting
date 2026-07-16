@@ -37,7 +37,7 @@ export interface VoteStorage {
 /**
  * `PubsubVoterOptions.dataPath`, resolved: a directory for persistent caches, or `false` for
  * in-memory-only (no disk, no IndexedDB — the pkc-js `noData` equivalent). `undefined` picks
- * the platform default: `{cwd}/.bitsocial-pubsub-votes` on Node, named IndexedDB databases in
+ * the platform default: `{cwd}/.bitsocial-pubsub-voting` on Node, named IndexedDB databases in
  * the browser (where a path is meaningless and ignored).
  */
 export interface StorageOptions {

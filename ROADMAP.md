@@ -1,4 +1,4 @@
-# Roadmap: @bitsocial/pubsub-votes
+# Roadmap: @bitsocial/pubsub-voting
 
 The scope-of-record for what ships when. [DESIGN.md](./DESIGN.md) is *how* each part works and why; this is *which* parts are in v1 and what is deliberately held back. When the two disagree about scope, this file wins.
 

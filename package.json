@@ -1,5 +1,5 @@
 {
-  "name": "@bitsocial/pubsub-votes",
+  "name": "@bitsocial/pubsub-voting",
   "version": "0.0.5",
   "description": "Trustless pubsub voting over a shared libp2p/Helia node.",
   "type": "module",

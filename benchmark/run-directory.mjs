@@ -16,7 +16,7 @@
 //   BENCH_HOST=<ssh-host>        remote ssh host to run the seeder on (REQUIRED)
 //   BENCH_HOST_IP=<ip-or-dns>    public IP/DNS the joiner dials the seeder at
 //                                (default: the `hostname` from `ssh -G $BENCH_HOST`)
-//   BENCH_REMOTE_DIR=~/pubsub-votes-bench   remote checkout dir
+//   BENCH_REMOTE_DIR=~/pubsub-voting-bench   remote checkout dir
 //   BENCH_MS=1,10,63             contest counts (M) to sweep
 //   BENCH_N=10                   voters per contest (fixed across the M sweep)
 //   BENCH_REPEATS=3              cold joins per M (median reported)
@@ -36,7 +36,7 @@ import path from "node:path";
 
 const HOST = process.env.BENCH_HOST;
 if (!HOST) throw new Error("set BENCH_HOST to the ssh host that runs the seeder (e.g. BENCH_HOST=my-server npm run bench:directory-load)");
-const REMOTE_DIR = process.env.BENCH_REMOTE_DIR ?? "~/pubsub-votes-bench";
+const REMOTE_DIR = process.env.BENCH_REMOTE_DIR ?? "~/pubsub-voting-bench";
 const MS = (process.env.BENCH_MS ?? "1,10,63").split(",").map((s) => Number(s.trim()));
 // Voters (= bundles) per contest. A comma list sweeps it; the table gets one row per (M, N) pair.
 const NS = (process.env.BENCH_N ?? "10").split(",").map((s) => Number(s.trim()));
