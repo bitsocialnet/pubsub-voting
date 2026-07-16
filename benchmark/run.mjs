@@ -23,7 +23,7 @@
 //   BENCH_HOST=<ssh-host>        remote ssh host to run the seeder on (REQUIRED)
 //   BENCH_HOST_IP=<ip-or-dns>    public IP/DNS the joiner dials the seeder at
 //                                (default: the `hostname` from `ssh -G $BENCH_HOST`)
-//   BENCH_REMOTE_DIR=~/pubsub-votes-bench   remote checkout dir
+//   BENCH_REMOTE_DIR=~/pubsub-voting-bench   remote checkout dir
 //   BENCH_NS=1,5,10,100,1000     voter counts to sweep
 //   BENCH_REPEATS=3              cold joins per N (median reported)
 //   BENCH_ROUTER_LATENCY_MS=1000 simulated HTTP-router lookup latency (paid once)
@@ -45,7 +45,7 @@ import path from "node:path";
 
 const HOST = process.env.BENCH_HOST;
 if (!HOST) throw new Error("set BENCH_HOST to the ssh host that runs the seeder (e.g. BENCH_HOST=my-server npm run bench:cold-join)");
-const REMOTE_DIR = process.env.BENCH_REMOTE_DIR ?? "~/pubsub-votes-bench";
+const REMOTE_DIR = process.env.BENCH_REMOTE_DIR ?? "~/pubsub-voting-bench";
 const NS = (process.env.BENCH_NS ?? "1,5,10,100,1000").split(",").map((s) => Number(s.trim()));
 const REPEATS = Number(process.env.BENCH_REPEATS ?? "3");
 const ROUTER_LATENCY_MS = Number(process.env.BENCH_ROUTER_LATENCY_MS ?? "1000");

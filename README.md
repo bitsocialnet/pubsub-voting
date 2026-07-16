@@ -1,4 +1,4 @@
-# @bitsocial/pubsub-votes
+# @bitsocial/pubsub-voting
 
 Trustless, leaderless voting over libp2p pubsub, designed to run on top of a host node's shared libp2p/Helia instance.
 
@@ -38,7 +38,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
-| `dataPath` | `string \| false` | no | directory for the voter's persistent caches (gate results + name resolutions), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-votes` (better-sqlite3 under `{dataPath}/lru-storage/`); in the browser the path is ignored and the caches live in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC |
+| `dataPath` | `string \| false` | no | directory for the voter's persistent caches (gate results + name resolutions), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-voting` (better-sqlite3 under `{dataPath}/lru-storage/`); in the browser the path is ignored and the caches live in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC |
 | `httpRouterUrls` | `string[]` | no | Delegated Routing V1 router base URLs to **announce provider records to** (one unsigned `PUT /routing/v1/providers` per router; `Keys` batches every joined contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced on root changes, and on address changes). **Seeders only**: absent/empty means never announce (the default — plain clients are not dialable), and the browser build never announces regardless. The node must be publicly dialable, with its dialable addresses in `libp2p` (listen/announce/AutoTLS): private, loopback, and link-local addrs are filtered client-side, and an announce with no surviving address is skipped. *Querying* needs no URLs here — cold-join discovery uses the injected node's `libp2p.contentRouting`, which the host wires its routers into |
 
 A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists.
@@ -46,14 +46,14 @@ A contest is addressed by its **full criteria document**, passed to `createConte
 ### Construct a voter
 
 ```ts
-import { PubsubVoter } from "@bitsocial/pubsub-votes";
+import { PubsubVoter } from "@bitsocial/pubsub-voting";
 
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
   chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
-  dataPath: "/path/to/data",    // optional; persistent-cache directory (default {cwd}/.bitsocial-pubsub-votes; false → in-memory)
+  dataPath: "/path/to/data",    // optional; persistent-cache directory (default {cwd}/.bitsocial-pubsub-voting; false → in-memory)
   httpRouterUrls: [             // optional, SEEDERS ONLY (publicly dialable node): announce provider
     "https://routing.example"   // records (criteria CID + checkpoint root + chunks) so cold joiners
   ]                             // can discover this node via the routers; clients omit this
@@ -121,7 +121,7 @@ A community's identity is its `publicKey`. The optional `name` is the community'
 A vote is not permanent: a bundle is valid only for `voteExpiryBuckets` after its `blockNumber`, so a live vote must be re-published before it decays. **This library does not do that automatically** — it publishes each vote once and the consuming client decides when (or whether) to refresh. To refresh, just `createContestVote(...).publish()` again; a new bundle at the current bucket supersedes the old one. To stop, simply stop refreshing and let the vote lapse. The library gives you what you need to schedule it — all pure, no chain reads:
 
 ```ts
-import { republishIntervalBuckets } from "@bitsocial/pubsub-votes";
+import { republishIntervalBuckets } from "@bitsocial/pubsub-voting";
 
 const cadence = republishIntervalBuckets(criteria); // ceil(voteExpiryBuckets / 2) — the recommended cadence, in buckets
 // A vote sampled at bucket b (bundle.blockNumber / criteria.blocksPerBucket) expires once the
@@ -135,7 +135,7 @@ See [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-th
 One criteria document is one contest (one topic). A directory is conveniently authored as a single manifest of shared `defaults` plus one entry per slot — as in [5chan-directory-criteria.jsonc](./5chan-directory-criteria.jsonc) and [examples/5chan.ts](./examples/5chan.ts) — and `deriveDirectoryCriteria` derives the finished documents (`{ ...defaults, ...entry }`, shallow — an override replaces that whole field) and validates each one. What participants must share **byte-identically** is the derived documents (the topic is their CID), which is why every consumer of the same directory should derive through this one helper rather than re-implement the merge. The manifest is JSONC by convention; strip comments before parsing:
 
 ```ts
-import { deriveDirectoryCriteria } from "@bitsocial/pubsub-votes";
+import { deriveDirectoryCriteria } from "@bitsocial/pubsub-voting";
 import stripJsonComments from "strip-json-comments";
 
 const manifest = JSON.parse(stripJsonComments(manifestJsonc)) as unknown;
@@ -160,7 +160,7 @@ await voter.destroy();   // terminal: leave all topics, unregister the responder
 ### Pure helpers (no node, no network)
 
 ```ts
-import { topicFor, deriveDirectoryCriteria } from "@bitsocial/pubsub-votes";
+import { topicFor, deriveDirectoryCriteria } from "@bitsocial/pubsub-voting";
 
 const topic = await topicFor(criteria);            // "bitsocial-votes/" + CID(dag-cbor(criteria))
 const allCriteria = deriveDirectoryCriteria(json); // directory manifest → validated Criteria[] (see above)
@@ -175,7 +175,7 @@ The gate and weight are a single flat registry of rules, one `type` per file, mi
 Built-ins: `erc721-min-balance` (v1) and `constant` (v1). A host adds or shadows rules by `type` via the `rules` option — this is how clients like 5chan or seedit register custom rules without forking the library:
 
 ```ts
-import { PubsubVoter, type Rule } from "@bitsocial/pubsub-votes";
+import { PubsubVoter, type Rule } from "@bitsocial/pubsub-voting";
 import { z } from "zod";
 
 const seeditModAllowlist: Rule<{ type: "seedit-mod-allowlist"; allow: string[] }> = {

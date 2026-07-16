@@ -16,7 +16,7 @@ import {
     type ChainClientFactory,
     type VoteSigner,
     type Criteria
-} from "@bitsocial/pubsub-votes";
+} from "@bitsocial/pubsub-voting";
 
 // Host-provided seams. seedit passes its own Helia node and wires chains + signer.
 // (Bodies omitted here; this is the shape a host implements.)

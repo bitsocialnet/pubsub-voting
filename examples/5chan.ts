@@ -30,7 +30,7 @@ import {
     type ChainClientFactory,
     type VoteSigner,
     type NameResolver
-} from "@bitsocial/pubsub-votes";
+} from "@bitsocial/pubsub-voting";
 
 // 5chan's authoring manifest is JSONC (commented for human readers) and is NOT a protocol
 // object — it is never encoded or published. `deriveDirectoryCriteria` derives one

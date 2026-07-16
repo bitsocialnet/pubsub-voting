@@ -281,7 +281,7 @@ describe("Contest read view + tally", () => {
         const { mkdtempSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
-        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-voter-test-"));
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
         const countingChains = (): { chains: ChainClientFactory; gateReads: () => number } => {
             let gateReads = 0;
             const client = {
@@ -320,7 +320,7 @@ describe("Contest read view + tally", () => {
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
         const { makeStorage } = await import("../storage/node.js");
-        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-votes-voter-test-"));
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
 
         // Head starts at bucket 40, so the first head read already purges (boundary: bucket 10).
         let block = 43200n * 40n;

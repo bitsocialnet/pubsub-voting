@@ -5,7 +5,7 @@
     "rootDir": ".",
     "resolveJsonModule": true,
     "paths": {
-      "@bitsocial/pubsub-votes": ["./src/index.ts"]
+      "@bitsocial/pubsub-voting": ["./src/index.ts"]
     }
   },
   "include": ["examples", "src"]

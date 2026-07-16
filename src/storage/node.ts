@@ -101,7 +101,7 @@ class SqliteLruStorage implements LruStorage {
 
 /** Node's default data path when the host passes none (see {@link StorageOptions.dataPath}). */
 export function defaultDataPath(): string {
-    return join(process.cwd(), ".bitsocial-pubsub-votes");
+    return join(process.cwd(), ".bitsocial-pubsub-voting");
 }
 
 /** Build the Node {@link VoteStorage}: sqlite under the data path, or in-memory for `false`. */

@@ -264,7 +264,7 @@ export interface PubsubVoterOptions {
      * Directory for the voter's persistent caches (gate results, name resolutions), the
      * pkc-js `dataPath` equivalent. On Node the caches are better-sqlite3 databases under
      * `{dataPath}/lru-storage/`; in the browser the path is ignored and the caches live in
-     * IndexedDB (via localforage) either way. Defaults to `{cwd}/.bitsocial-pubsub-votes`
+     * IndexedDB (via localforage) either way. Defaults to `{cwd}/.bitsocial-pubsub-voting`
      * on Node. Pass `false` for in-memory-only caches (no disk, no IndexedDB — the pkc-js
      * `noData` equivalent): nothing survives the process, but nothing is written either.
      */
