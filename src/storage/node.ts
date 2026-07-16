@@ -49,23 +49,32 @@ class SqliteLruStorage implements LruStorage {
         // errors), never silently re-create the database file.
         if (this.#closed) throw new Error("storage is closed");
         mkdirSync(this.#dir, { recursive: true });
+        // A corrupt file fails on the first statement, not the constructor (SQLite reads the
+        // header lazily), so close the never-assigned handle or every caller retry leaks an fd.
         const db = new Database(this.#file);
-        db.pragma("journal_mode = WAL");
-        db.prepare(`CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, lastAccess INT)`).run();
-        db.prepare(`CREATE INDEX IF NOT EXISTS lastAccess ON cache (lastAccess)`).run();
-        this.#db = db;
-        this.#statements = {
-            get: db.prepare(`UPDATE OR IGNORE cache SET lastAccess = @now WHERE key = @key RETURNING value`),
-            set: db.prepare(`INSERT OR REPLACE INTO cache (key, value, lastAccess) VALUES (@key, @value, @now)`),
-            remove: db.prepare(`DELETE FROM cache WHERE key = @key`),
-            keys: db.prepare(`SELECT key FROM cache`),
-            clear: db.prepare(`DELETE FROM cache`),
-            evict: db.prepare(
-                `WITH lru AS (SELECT key FROM cache ORDER BY lastAccess DESC LIMIT -1 OFFSET @maxItems)
-                 DELETE FROM cache WHERE key IN lru`
-            )
-        };
-        return this.#statements;
+        try {
+            db.pragma("journal_mode = WAL");
+            db.prepare(`CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, lastAccess INT)`).run();
+            db.prepare(`CREATE INDEX IF NOT EXISTS lastAccess ON cache (lastAccess)`).run();
+            this.#db = db;
+            this.#statements = {
+                get: db.prepare(`UPDATE OR IGNORE cache SET lastAccess = @now WHERE key = @key RETURNING value`),
+                set: db.prepare(`INSERT OR REPLACE INTO cache (key, value, lastAccess) VALUES (@key, @value, @now)`),
+                remove: db.prepare(`DELETE FROM cache WHERE key = @key`),
+                keys: db.prepare(`SELECT key FROM cache`),
+                clear: db.prepare(`DELETE FROM cache`),
+                evict: db.prepare(
+                    `WITH lru AS (SELECT key FROM cache ORDER BY lastAccess DESC LIMIT -1 OFFSET @maxItems)
+                     DELETE FROM cache WHERE key IN lru`
+                )
+            };
+            return this.#statements;
+        } catch (error) {
+            this.#db = undefined;
+            this.#statements = undefined;
+            db.close();
+            throw error;
+        }
     }
 
     async getItem(key: string): Promise<unknown> {
@@ -122,16 +131,25 @@ class SqliteSnapshotStorage implements SnapshotStorage {
         if (this.#statements) return this.#statements;
         if (this.#closed) throw new Error("storage is closed");
         mkdirSync(this.#dir, { recursive: true });
+        // Same handle-leak guard as SqliteLruStorage.#open: the debounced snapshot write
+        // retries on every state change, so an unclosed handle per attempt is an EMFILE.
         const db = new Database(this.#file);
-        db.pragma("journal_mode = WAL");
-        db.prepare(`CREATE TABLE IF NOT EXISTS snapshot (key TEXT PRIMARY KEY, value BLOB)`).run();
-        this.#db = db;
-        this.#statements = {
-            get: db.prepare(`SELECT value FROM snapshot WHERE key = @key`),
-            set: db.prepare(`INSERT OR REPLACE INTO snapshot (key, value) VALUES (@key, @value)`),
-            remove: db.prepare(`DELETE FROM snapshot WHERE key = @key`)
-        };
-        return this.#statements;
+        try {
+            db.pragma("journal_mode = WAL");
+            db.prepare(`CREATE TABLE IF NOT EXISTS snapshot (key TEXT PRIMARY KEY, value BLOB)`).run();
+            this.#db = db;
+            this.#statements = {
+                get: db.prepare(`SELECT value FROM snapshot WHERE key = @key`),
+                set: db.prepare(`INSERT OR REPLACE INTO snapshot (key, value) VALUES (@key, @value)`),
+                remove: db.prepare(`DELETE FROM snapshot WHERE key = @key`)
+            };
+            return this.#statements;
+        } catch (error) {
+            this.#db = undefined;
+            this.#statements = undefined;
+            db.close();
+            throw error;
+        }
     }
 
     async get(key: string): Promise<Uint8Array | undefined> {
