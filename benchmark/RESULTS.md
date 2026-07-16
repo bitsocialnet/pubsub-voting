@@ -73,6 +73,14 @@ instead of 38 concurrent posts — the polite-read policy's designed trade again
 (the same policy that takes the REAL Base mainnet N=1000 join from never-verifying to 8.2s — see "Real
 chain" below).*
 
+*Re-measured 2026-07-16 (median of 3) with **checkpoint-snapshot persistence** (DESIGN.md "Persistent
+caches", checkpoint snapshots — the cold joiner runs `dataPath: false`, so its join path gains only an
+awaited snapshot-store miss): within jitter of a same-day N=1000 **control run on master** on every
+column (`START→TALLY` 7.67s vs control 7.52s, `START→VERIFIED` 8.35s vs 8.21s, `gate-RPC` 7 vs 7).
+Both same-day runs showed `verify+merge` ~4.1–4.3s against the table's 2.06s — equally on master, so
+rig conditions, not the change; the table above stands as the baseline. The restart path itself is
+measured separately — see "Warm restart" below.*
+
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
 gateway and background chain verification existed, hence no gate-RPC/VERIFIED values) — a realistic
@@ -195,6 +203,34 @@ host muxer/libp2p upgrade and is tracked as deferred pkc-js work (DESIGN.md, "De
   join waited for subscription gossip to propagate (~5 s over the WAN link) before it could even
   start fetching, for **~11–16 s** end-to-end. HTTP-router discovery replaces that ~5 s wait with the
   1 s router lookup.
+
+---
+
+# Warm restart — checkpoint-snapshot reload, no peers online
+
+**What this measures:** the issue-#14 incident path — a seeder holding `N` verified votes restarts
+while **no other peer is online** (zero subscribers, zero providers), and recovers its tally from
+the checkpoint snapshot persisted under `dataPath`. All-local (there is nothing remote to measure);
+the restart session's chain client counts gate reads (`readContract`), which must be 0 — the
+background re-verification of the restored bundles is served entirely by the persisted gate-result
+store.
+
+Run it yourself: `npm run bench:warm-restart` (see [warm-restart.ts](./warm-restart.ts)).
+
+## Restart-session latency (measured 2026-07-16)
+
+| N (voters) | snapshot size | START→TALLY | START→VERIFIED | gate-RPC round trips |
+|-----------:|--------------:|------------:|---------------:|---------------------:|
+| 1          | 421 B         | **0.01s**   | 0.01s          | 0                     |
+| 100        | 22 KB         | **0.33s**   | 0.38s          | 0                     |
+| 1000       | 220 KB        | **2.96s**   | 3.01s          | 0                     |
+
+*`START→TALLY` is `update()` → the tally showing all `N` restored voters; `START→VERIFIED` adds the
+background settlement of every restored row's `chainVerified` flag. The N=1000 figure is dominated
+by re-running the offline secp256k1 signature checks on reload (the same ~2–3 s the cold-join
+table's verify+merge column pays at that N). Before snapshot persistence this scenario returned an
+EMPTY tally: recovery depended on some other peer re-advertising its checkpoint within the
+heartbeat window (10 min ±25%), and with no peer online the votes were simply gone.*
 
 ---
 

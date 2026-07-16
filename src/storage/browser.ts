@@ -1,6 +1,6 @@
 import localForage from "localforage";
 import { makeMemoryStorage } from "./memory.js";
-import type { LruStorage, StorageOptions, VoteStorage } from "./types.js";
+import type { LruStorage, SnapshotStorage, StorageOptions, VoteStorage } from "./types.js";
 
 /**
  * The browser backend, swapped in for storage/node.ts by the package.json `browser` field
@@ -102,10 +102,40 @@ class LocalForageLruStorage implements LruStorage {
     }
 }
 
+/**
+ * The browser checkpoint-snapshot store: a single localforage (IndexedDB) database, no
+ * dual-instance eviction — a snapshot must never be evicted (see types.ts). localforage
+ * round-trips typed arrays natively under its IndexedDB driver; an `ArrayBuffer` coming
+ * back from an older driver is re-wrapped.
+ */
+class LocalForageSnapshotStorage implements SnapshotStorage {
+    #db: LocalForage | undefined;
+
+    #init(): LocalForage {
+        return (this.#db ??= localForage.createInstance({ name: "pubsub-voting-checkpoints" }));
+    }
+
+    async get(key: string): Promise<Uint8Array | undefined> {
+        const value = await this.#init().getItem<unknown>(key);
+        if (value instanceof Uint8Array) return value;
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        return undefined;
+    }
+
+    async set(key: string, bytes: Uint8Array): Promise<void> {
+        await this.#init().setItem(key, bytes);
+    }
+
+    async remove(key: string): Promise<void> {
+        await this.#init().removeItem(key);
+    }
+}
+
 /** Build the browser {@link VoteStorage}: IndexedDB via localforage, or in-memory for `false`. */
 export function makeStorage(options: StorageOptions): VoteStorage {
     if (options.dataPath === false) return makeMemoryStorage();
     const stores = new Map<string, LruStorage>();
+    let snapshots: SnapshotStorage | undefined;
     return {
         openLru({ cacheName, maxItems }) {
             let store = stores.get(cacheName);
@@ -115,9 +145,13 @@ export function makeStorage(options: StorageOptions): VoteStorage {
             }
             return store;
         },
+        openSnapshots() {
+            return (snapshots ??= new LocalForageSnapshotStorage());
+        },
         // localforage holds no closeable handles; dropping the references is the whole teardown.
         async destroy() {
             stores.clear();
+            snapshots = undefined;
         }
     };
 }

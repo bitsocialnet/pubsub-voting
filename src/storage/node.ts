@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { makeMemoryStorage } from "./memory.js";
-import type { LruStorage, StorageOptions, VoteStorage } from "./types.js";
+import type { LruStorage, SnapshotStorage, StorageOptions, VoteStorage } from "./types.js";
 
 /**
  * The Node backend: one better-sqlite3 database per named cache under
@@ -99,6 +99,62 @@ class SqliteLruStorage implements LruStorage {
     }
 }
 
+/**
+ * The Node checkpoint-snapshot store: one better-sqlite3 database at
+ * `{dataPath}/checkpoints.db`, one BLOB row per topic. Same lazy open / WAL / closed-flag
+ * discipline as {@link SqliteLruStorage}, but no LRU machinery: a snapshot must never be
+ * evicted (see types.ts). A single `INSERT OR REPLACE` per `set` makes each write atomic —
+ * a crash mid-write leaves the previous blob, never a torn one.
+ */
+class SqliteSnapshotStorage implements SnapshotStorage {
+    #db: Database.Database | undefined;
+    readonly #file: string;
+    readonly #dir: string;
+    #closed = false;
+    #statements: { get: Database.Statement; set: Database.Statement; remove: Database.Statement } | undefined;
+
+    constructor(opts: { dir: string }) {
+        this.#dir = opts.dir;
+        this.#file = join(opts.dir, "checkpoints.db");
+    }
+
+    #open() {
+        if (this.#statements) return this.#statements;
+        if (this.#closed) throw new Error("storage is closed");
+        mkdirSync(this.#dir, { recursive: true });
+        const db = new Database(this.#file);
+        db.pragma("journal_mode = WAL");
+        db.prepare(`CREATE TABLE IF NOT EXISTS snapshot (key TEXT PRIMARY KEY, value BLOB)`).run();
+        this.#db = db;
+        this.#statements = {
+            get: db.prepare(`SELECT value FROM snapshot WHERE key = @key`),
+            set: db.prepare(`INSERT OR REPLACE INTO snapshot (key, value) VALUES (@key, @value)`),
+            remove: db.prepare(`DELETE FROM snapshot WHERE key = @key`)
+        };
+        return this.#statements;
+    }
+
+    async get(key: string): Promise<Uint8Array | undefined> {
+        const row = this.#open().get.get({ key }) as { value: Buffer } | undefined;
+        return row === undefined ? undefined : new Uint8Array(row.value);
+    }
+
+    async set(key: string, bytes: Uint8Array): Promise<void> {
+        this.#open().set.run({ key, value: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength) });
+    }
+
+    async remove(key: string): Promise<void> {
+        this.#open().remove.run({ key });
+    }
+
+    close(): void {
+        this.#closed = true;
+        this.#db?.close();
+        this.#db = undefined;
+        this.#statements = undefined;
+    }
+}
+
 /** Node's default data path when the host passes none (see {@link StorageOptions.dataPath}). */
 export function defaultDataPath(): string {
     return join(process.cwd(), ".bitsocial-pubsub-voting");
@@ -107,8 +163,10 @@ export function defaultDataPath(): string {
 /** Build the Node {@link VoteStorage}: sqlite under the data path, or in-memory for `false`. */
 export function makeStorage(options: StorageOptions): VoteStorage {
     if (options.dataPath === false) return makeMemoryStorage();
-    const dir = join(options.dataPath ?? defaultDataPath(), "lru-storage");
+    const dataPath = options.dataPath ?? defaultDataPath();
+    const dir = join(dataPath, "lru-storage");
     const stores = new Map<string, SqliteLruStorage>();
+    let snapshots: SqliteSnapshotStorage | undefined;
     return {
         openLru({ cacheName, maxItems }) {
             let store = stores.get(cacheName);
@@ -118,9 +176,14 @@ export function makeStorage(options: StorageOptions): VoteStorage {
             }
             return store;
         },
+        openSnapshots() {
+            return (snapshots ??= new SqliteSnapshotStorage({ dir: dataPath }));
+        },
         async destroy() {
             for (const store of stores.values()) store.close();
             stores.clear();
+            snapshots?.close();
+            snapshots = undefined;
         }
     };
 }

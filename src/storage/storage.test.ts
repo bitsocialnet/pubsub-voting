@@ -86,3 +86,42 @@ describe("makeStorage (node/sqlite)", () => {
         await storage.destroy();
     });
 });
+
+describe("snapshot store (node/sqlite)", () => {
+    it("round-trips binary blobs across close and reopen", async () => {
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const storage = makeStorage({ dataPath });
+        const snapshots = storage.openSnapshots();
+        const blob = new Uint8Array([0, 1, 2, 255, 254]);
+        await snapshots.set("topic-a", new Uint8Array([9, 9]));
+        await snapshots.set("topic-a", blob); // replace, not append
+        expect(await snapshots.get("topic-a")).toEqual(blob);
+        expect(await snapshots.get("missing")).toBeUndefined();
+        await storage.destroy();
+
+        const reopened = makeStorage({ dataPath });
+        expect(await reopened.openSnapshots().get("topic-a")).toEqual(blob);
+        await reopened.openSnapshots().remove("topic-a");
+        expect(await reopened.openSnapshots().get("topic-a")).toBeUndefined();
+        await reopened.destroy();
+    });
+
+    it("rejects use after destroy (no silent file re-create)", async () => {
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const storage = makeStorage({ dataPath });
+        const snapshots = storage.openSnapshots();
+        await snapshots.set("k", new Uint8Array([1]));
+        await storage.destroy();
+        await expect(snapshots.set("k2", new Uint8Array([2]))).rejects.toThrow("storage is closed");
+    });
+
+    it("stays in memory for `dataPath: false`", async () => {
+        const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-test-"));
+        const storage = makeStorage({ dataPath: false });
+        const snapshots = storage.openSnapshots();
+        await snapshots.set("k", new Uint8Array([9]));
+        expect(await snapshots.get("k")).toEqual(new Uint8Array([9]));
+        expect(existsSync(join(dataPath, "checkpoints.db"))).toBe(false);
+        await storage.destroy();
+    });
+});

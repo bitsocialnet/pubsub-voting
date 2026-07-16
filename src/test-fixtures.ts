@@ -1,4 +1,5 @@
 import { createPublicClient, http } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import type { Criteria } from "./schema/criteria.js";
 import type { PeerId } from "@libp2p/interface";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./transport/types.js";
@@ -115,6 +116,20 @@ export function fakeSigner(): VoteSigner {
     return {
         address: () => "0x0000000000000000000000000000000000000001",
         signBallot: () => ({ signature: `0x${"de".repeat(65)}`, type: EIP712_SIGNATURE_TYPE })
+    };
+}
+
+/**
+ * A REAL signer over the anvil/hardhat test account #1 (as in verify/bundle.test.ts and the
+ * two-node integration test), for tests whose bundles must survive the verifier's signature
+ * recovery — e.g. the checkpoint-snapshot restore, which re-runs `verifyOffline` on reload.
+ * `fakeSigner`'s placeholder fails recovery by design.
+ */
+export function realSigner(): VoteSigner {
+    const account = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+    return {
+        address: () => account.address,
+        signBallot: async (typedData) => ({ signature: await account.signTypedData(typedData), type: EIP712_SIGNATURE_TYPE })
     };
 }
 

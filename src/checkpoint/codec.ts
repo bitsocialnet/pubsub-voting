@@ -52,7 +52,12 @@ interface CheckpointRoot {
 /** Default chunk ceiling (bytes of inlined bundles per chunk), just under a 1 MiB block. */
 export const DEFAULT_MAX_CHUNK_BYTES = 1 << 20;
 
-async function blockFor(bytes: Uint8Array): Promise<CheckpointBlock> {
+/**
+ * The content address of one checkpoint block's bytes (dag-cbor + sha256). Exported for the
+ * snapshot restore path (see client/voter.ts): re-deriving each persisted block's CID is what
+ * lets the restore self-verify the blob against its root instead of trusting stored CIDs.
+ */
+export async function blockForBytes(bytes: Uint8Array): Promise<CheckpointBlock> {
     const digest = await sha256.digest(bytes);
     return { cid: CID.createV1(dagCborCode, digest), bytes };
 }
@@ -65,7 +70,7 @@ async function blockFor(bytes: Uint8Array): Promise<CheckpointBlock> {
  */
 async function checkpointRootBlock(chunks: CID[]): Promise<CheckpointBlock> {
     const root: CheckpointRoot = { chunks };
-    return blockFor(encodeCanonical(root));
+    return blockForBytes(encodeCanonical(root));
 }
 
 /**
@@ -106,7 +111,7 @@ export async function encodeCheckpoint(
     for (const chunk of chunks) {
         // Chunks inline the same binary wire objects the bundle block uses (see crdt/codec.ts),
         // so the binary-field byte saving multiplies across every inlined winner.
-        const block = await blockFor(encodeCanonical(chunk.map(toWireBundle)));
+        const block = await blockForBytes(encodeCanonical(chunk.map(toWireBundle)));
         blocks.push(block);
         chunkCids.push(block.cid);
     }
