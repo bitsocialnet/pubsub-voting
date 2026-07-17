@@ -15,12 +15,14 @@ import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
+    InvalidCommunityNameError,
     MissingBlockstoreError,
     MissingChainClientError,
     MissingFetchError,
     MissingPubsubError,
     ReadOnlyError,
     UnknownRuleError,
+    VoteEvictedError,
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
@@ -39,8 +41,12 @@ import {
 
 /** A valid base58btc IPNS community key (VotesBundleSchema rejects non-keys, so a real one is needed). */
 const VALID_KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
+/** A different key, for name resolutions that must NOT match the claimed `publicKey`. */
+const OTHER_KEY = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust";
 /** A one-community upvote used across the publish tests. */
 const VOTE = [{ community: { publicKey: VALID_KEY }, vote: 1 }];
+/** The same upvote carrying a resolvable community name (exercises the name pipeline). */
+const NAMED_VOTE = [{ community: { name: "memes.bso", publicKey: VALID_KEY }, vote: 1 }];
 
 /**
  * A chain factory whose current block advances between calls, so a vote published at one bucket can
@@ -75,12 +81,14 @@ function gatedChains(): { chains: ChainClientFactory; release: () => void } {
 }
 
 /**
- * A `.bso` resolver whose `resolve` blocks until `release()`, so a test can observe the
- * provisional (nameResolved: false) window deterministically before the background verifier
- * settles the name check.
+ * A `.bso` resolver whose FIRST `resolve` throws (the publish-time preflight's call — a
+ * transient outage, so the publish proceeds with the name check deferred) and whose later
+ * calls block until `release()`, so a test can observe the provisional (nameResolved: false)
+ * window deterministically before the background verifier settles the name check.
  */
 function gatedResolver(publicKey: string): { resolver: NameResolver; release: () => void } {
     let release!: () => void;
+    let calls = 0;
     const gate = new Promise<void>((resolve) => (release = resolve));
     return {
         resolver: {
@@ -88,11 +96,23 @@ function gatedResolver(publicKey: string): { resolver: NameResolver; release: ()
             provider: "test",
             canResolve: ({ name }) => name.endsWith(".bso"),
             resolve: async () => {
+                calls += 1;
+                if (calls === 1) throw new Error("registry briefly down"); // fails the preflight open
                 await gate;
                 return { publicKey };
             }
         },
         release
+    };
+}
+
+/** A `.bso` resolver that instantly resolves every name to `publicKey` (or to no record). */
+function instantResolver(publicKey: string | undefined): NameResolver {
+    return {
+        key: "instant",
+        provider: "test",
+        canResolve: ({ name }) => name.endsWith(".bso"),
+        resolve: async () => (publicKey === undefined ? undefined : { publicKey })
     };
 }
 
@@ -446,8 +466,9 @@ describe("Contest read view + tally", () => {
         contest.on("update", () => flags.push(contest.tally?.ranking[0]?.nameResolved));
         await contest.update();
 
-        const named = [{ community: { name: "memes.bso", publicKey: VALID_KEY }, vote: 1 }];
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: named })).publish();
+        // The preflight's resolve throws (gatedResolver call 1): a registry outage never blocks
+        // the publish — the name check stays deferred to the background verifier.
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish();
         await vi.waitFor(() => expect(flags).toContain(false)); // name still pending at render
 
         release(); // the resolution lands in the background
@@ -463,6 +484,122 @@ describe("Contest read view + tally", () => {
         const contest = await voter.createContest({ criteria: bizCriteria() });
         // The local tally converges to the network's view: an ineligible vote does not stick.
         await vi.waitFor(async () => expect((await contest.getTally()).ranking).toEqual([]));
+    });
+
+    it("publish() rejects InvalidCommunityNameError when the carried name resolves to a different key", async () => {
+        const { helia, publish } = spyableHelia();
+        const voter = new PubsubVoter({ dataPath: false,
+            helia,
+            chains: stubChains(),
+            signer: fakeSigner(),
+            nameResolvers: [instantResolver(OTHER_KEY)] // the registry says the name is someone else's
+        });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE });
+        const states: PublishingState[] = [];
+        const errors: unknown[] = [];
+        vote.on("publishingstatechange", (s) => states.push(s));
+        vote.on("error", (e) => errors.push(e));
+
+        await expect(vote.publish()).rejects.toBeInstanceOf(InvalidCommunityNameError);
+        expect(states).toEqual(["failed"]); // refused before signing — no signing/publishing walk
+        const error = errors[0] as InvalidCommunityNameError;
+        expect(error.communityName).toBe("memes.bso");
+        expect(error.claimedPublicKey).toBe(VALID_KEY);
+        expect(error.resolvedPublicKey).toBe(OTHER_KEY);
+        expect(publish).not.toHaveBeenCalled(); // nothing hit the wire
+        // ...and nothing was admitted locally either.
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        expect((await contest.getTally()).ranking).toEqual([]);
+    });
+
+    it("publish() rejects when the carried name has no record, or no resolver handles it", async () => {
+        const noRecord = new PubsubVoter({ dataPath: false,
+            helia: fakeHelia(),
+            chains: stubChains(),
+            signer: fakeSigner(),
+            nameResolvers: [instantResolver(undefined)]
+        });
+        await expect((await noRecord.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish()).rejects.toThrow(
+            /does not resolve/
+        );
+
+        const noResolver = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        await expect((await noResolver.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish()).rejects.toThrow(
+            /no resolver handles/
+        );
+    });
+
+    it("records a preflight-resolved name as settled: no pending nameResolved flash on the own row", async () => {
+        const { chains, release } = gatedChains(); // the gate read is what stays pending
+        const voter = new PubsubVoter({ dataPath: false,
+            helia: fakeHelia(),
+            chains,
+            signer: fakeSigner(),
+            nameResolvers: [instantResolver(VALID_KEY)]
+        });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish();
+
+        // The preflight resolved the name before signing, so the very first rendered row is
+        // already nameResolved — only the deferred gate read is still owed.
+        const tally = await contest.getTally();
+        expect(tally.ranking[0]?.nameResolved).toBe(true);
+        expect(tally.ranking[0]?.chainVerified).toBe(false);
+        release();
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+    });
+
+    it("surfaces VoteEvictedError on the vote AND the contest when the gate evicts an own publish", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const contestErrors: unknown[] = [];
+        contest.on("error", (e) => contestErrors.push(e));
+        await contest.update();
+
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const voteErrors: unknown[] = [];
+        vote.on("error", (e) => voteErrors.push(e));
+        await vote.publish(); // resolves on the offline checks; the gate read lands in the background
+
+        await vi.waitFor(() => expect(voteErrors.length).toBeGreaterThan(0));
+        const error = voteErrors[0] as VoteEvictedError;
+        expect(error).toBeInstanceOf(VoteEvictedError);
+        expect(error.verdict.reason).toContain("rule score is 0n");
+        expect(error.bundle).toBe(vote.bundle); // names the exact publish that was evicted
+        expect(vote.publishingState).toBe("failed"); // flipped post hoc
+        // The same error reaches a long-lived contest view, and the tally recounted without it.
+        await vi.waitFor(() => expect(contestErrors.some((e) => e instanceof VoteEvictedError)).toBe(true));
+        expect((await contest.getTally()).ranking).toEqual([]);
+        await contest.stop();
+    });
+
+    it("publishes through a resolver outage, then surfaces VoteEvictedError when the name turns out mismatched", async () => {
+        let calls = 0;
+        const resolver: NameResolver = {
+            key: "flaky",
+            provider: "test",
+            canResolve: ({ name }) => name.endsWith(".bso"),
+            resolve: async () => {
+                calls += 1;
+                if (calls === 1) throw new Error("registry down"); // the preflight's call
+                return { publicKey: OTHER_KEY }; // the background verifier's call: a mismatch
+            }
+        };
+        const voter = new PubsubVoter({ dataPath: false,
+            helia: fakeHelia(),
+            chains: stubChains(),
+            signer: fakeSigner(),
+            nameResolvers: [resolver]
+        });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE });
+        const voteErrors: unknown[] = [];
+        vote.on("error", (e) => voteErrors.push(e));
+        await vote.publish(); // the outage fails open — publishing is never blocked on the registry
+
+        await vi.waitFor(() => expect(voteErrors.some((e) => e instanceof VoteEvictedError)).toBe(true));
+        const error = voteErrors.find((e) => e instanceof VoteEvictedError) as VoteEvictedError;
+        expect(error.verdict.reason).toContain(`resolves to ${OTHER_KEY}`);
+        expect(vote.publishingState).toBe("failed");
     });
 
     it("serves only verified bundles in its checkpoint (a pending own vote is withheld)", async () => {
