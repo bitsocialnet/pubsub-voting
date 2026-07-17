@@ -47,7 +47,8 @@ import type { Announcer } from "../transport/announce/types.js";
 import { encode as encodeDagCbor } from "@ipld/dag-cbor";
 import { sha256 } from "viem";
 import { makeBackgroundVerifier, type BackgroundChainVerifier, type PendingBundle } from "../verify/background.js";
-import type { BundleChecks } from "../verify/types.js";
+import type { BundleChecks, VerifyFail } from "../verify/types.js";
+import { preflightCommunityNames } from "../verify/name-preflight.js";
 import { makeAcceptedDedup } from "../transport/accepted-dedup.js";
 import { blockForBytes, decodeCheckpoint, encodeCheckpoint, type CheckpointBlock } from "../checkpoint/codec.js";
 import { decodeSnapshot, encodeSnapshot } from "../checkpoint/snapshot.js";
@@ -58,7 +59,14 @@ import type { ContestTally } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
-import { MissingChainClientError, ReadOnlyError, UnknownRuleError, VoterDestroyedError } from "../errors.js";
+import {
+    InvalidCommunityNameError,
+    MissingChainClientError,
+    ReadOnlyError,
+    UnknownRuleError,
+    VoteEvictedError,
+    VoterDestroyedError
+} from "../errors.js";
 
 /**
  * The recommended cadence, in buckets, at which a client should re-publish a live vote to keep
@@ -100,7 +108,14 @@ export function republishIntervalBuckets(criteria: Criteria): number {
  * {@link republishIntervalBuckets} and DESIGN.md "Republishing is the client's job").
  */
 
-/** A vote publication's lifecycle, walked by {@link ContestVote.publish}. */
+/**
+ * A vote publication's lifecycle, walked by {@link ContestVote.publish}. `"succeeded"` means
+ * signed, admitted locally, and broadcast — NOT accepted by the network (gossipsub gives a
+ * publisher no acceptance/rejection feedback). It can therefore still flip to `"failed"`
+ * afterwards: if this node's own deferred checks — the same checks every peer runs — evict the
+ * bundle, the vote emits a `VoteEvictedError` and fails post hoc (see DESIGN.md "Background
+ * chain verification", publisher feedback).
+ */
 export type PublishingState = "stopped" | "signing" | "publishing" | "succeeded" | "failed";
 
 /** What {@link ContestVote.publish} resolves: the signed bundle plus a peer-reach hint. */
@@ -150,9 +165,11 @@ export interface Contest {
      */
     on(event: "update", cb: () => void): void;
     /**
-     * Fired on a contest-level failure: the tally's chain read throws, or the background chain
+     * Fired on a contest-level failure: the tally's chain read throws, the background chain
      * verifier hits an infra-class failure (RPC/resolver down — its bundles stay pending and
-     * retry, but the degradation is surfaced here instead of silently stalling).
+     * retry, but the degradation is surfaced here instead of silently stalling), or a deferred
+     * check evicts THIS wallet's own published vote (`VoteEvictedError` — the same error the
+     * publishing `ContestVote` emits; here so a long-lived view hears it too).
      */
     on(event: "error", cb: (error: unknown) => void): void;
 }
@@ -176,14 +193,24 @@ export interface ContestVote {
      * the `VotesBundle` (whose `blockNumber` the client uses to schedule its own refresh — see
      * {@link republishIntervalBuckets}) plus `recipientCount`, the number of peers gossipsub sent
      * the vote directly to. Emits `publishingstatechange` as it goes; throws (and emits `error`) on
-     * failure, and `ReadOnlyError` with no signer. This library does not re-publish: to keep the
-     * vote alive, call `publish()` again before it expires.
+     * failure: `ReadOnlyError` with no signer, and `InvalidCommunityNameError` when a vote's
+     * carried `community.name` definitively does not resolve to its claimed `publicKey` (checked
+     * BEFORE signing or joining — every verifier drops such a bundle silently, so it is refused
+     * here instead of published into a network-wide silent drop; a resolver outage does not block
+     * the publish). This library does not re-publish: to keep the vote alive, call `publish()`
+     * again before it expires.
      */
     publish(): Promise<PublishOutcome>;
 
     /** Fired on each `publishingState` transition. */
     on(event: "publishingstatechange", cb: (state: PublishingState) => void): void;
-    /** Fired if publishing fails. */
+    /**
+     * Fired if publishing fails — including POST HOC, after `publish()` resolved: gossipsub
+     * peers reject a bad bundle silently, but this node runs the same deferred checks (gate
+     * chain read, name resolution) on its own publish, and if they evict it a `VoteEvictedError`
+     * fires here (and `publishingState` flips to `"failed"`) carrying the exact verdict every
+     * honest verifier would produce. See DESIGN.md "Background chain verification".
+     */
     on(event: "error", cb: (error: unknown) => void): void;
 }
 
@@ -649,7 +676,7 @@ class ContestEngine {
             cache: this.#cache,
             onGateVerified: (cid) => this.#settleCheck(cid, "chainVerified"),
             onNameResolved: (cid) => this.#settleCheck(cid, "nameResolved"),
-            onEvict: (cid) => this.#evictBundle(cid),
+            onEvict: (cid, verdict) => this.#evictBundle(cid, verdict),
             onError: (error) => this.#emitError(error),
             limit: (fn) => this.#backgroundLimit(fn)
         });
@@ -686,17 +713,30 @@ class ContestEngine {
      * settled bundles (never re-serve what we have not verified).
      */
     readonly #checks = new Map<string, BundleChecks>();
+    /**
+     * This wallet's own published bundles still awaiting their deferred checks, keyed by CID
+     * string — the bundles whose background EVICTION must be reported instead of silent (see
+     * {@link #evictBundle} / `VoteEvictedError`; remote evictions are normal operation). An
+     * entry is dropped once its checks settle, on evict (after reporting), and on expiry prune.
+     */
+    readonly #ownPublishes = new Map<string, VotesBundle>();
+    /** Per-own-CID eviction callbacks: the publishing `ContestVote` registers one at sign time. */
+    readonly #ownEvictionCbs = new Map<string, (error: VoteEvictedError) => void>();
 
     /** Does any vote in the bundle carry a `community.name` claim (needing resolution)? */
     #carriesName(bundle: VotesBundle): boolean {
         return bundle.votes.some((v) => v.community.name !== undefined);
     }
 
-    /** Record a bundle's deferred-check state at admit: fully settled, or pending both checks. */
-    #recordChecks(cid: CID, bundle: VotesBundle, settled: boolean): void {
+    /**
+     * Record a bundle's deferred-check state at admit: fully settled, pending both checks, or —
+     * for an own publish whose name preflight already resolved every carried name — pending the
+     * gate read only (`nameSettled`).
+     */
+    #recordChecks(cid: CID, bundle: VotesBundle, settled: boolean, nameSettled = settled): void {
         this.#checks.set(
             cid.toString(),
-            this.#carriesName(bundle) ? { chainVerified: settled, nameResolved: settled } : { chainVerified: settled }
+            this.#carriesName(bundle) ? { chainVerified: settled, nameResolved: nameSettled } : { chainVerified: settled }
         );
     }
 
@@ -725,14 +765,38 @@ class ContestEngine {
         const checks = this.#checks.get(cid.toString());
         if (!checks) return; // evicted or pruned while its check was in flight
         checks[key] = true;
+        // A fully settled own publish can no longer be evicted — its verdict is terminal — so
+        // its eviction-reporting entries are done (see #ownPublishes).
+        if (this.#isFullyVerified(cid)) this.#dropOwnTracking(cid.toString());
         this.#onStateChanged();
     }
 
-    /** A deferred check failed: drop the bundle (its verified predecessor, if any, wins again). */
-    #evictBundle(cid: CID): void {
+    /**
+     * A deferred check failed: drop the bundle (its verified predecessor, if any, wins again).
+     * Evicting this wallet's OWN publish is the one rejection a publisher can ever hear about —
+     * gossipsub peers drop a bad bundle silently, but this node runs the same checks (see
+     * DESIGN.md "Background chain verification") — so it is reported as a `VoteEvictedError`
+     * through the publishing `ContestVote` and the contest `error` event instead of silent.
+     */
+    #evictBundle(cid: CID, verdict: VerifyFail): void {
         this.#crdt.remove(cid);
-        this.#checks.delete(cid.toString());
+        const key = cid.toString();
+        this.#checks.delete(key);
+        const own = this.#ownPublishes.get(key);
+        if (own) {
+            const error = new VoteEvictedError(own, verdict);
+            const notifyVote = this.#ownEvictionCbs.get(key);
+            this.#dropOwnTracking(key);
+            notifyVote?.(error);
+            this.#emitError(error);
+        }
         this.#onStateChanged();
+    }
+
+    /** Forget an own publish's eviction-reporting entries (settled, evicted, or expired). */
+    #dropOwnTracking(key: string): void {
+        this.#ownPublishes.delete(key);
+        this.#ownEvictionCbs.delete(key);
     }
 
     #emitError(error: unknown): void {
@@ -848,7 +912,9 @@ class ContestEngine {
         if (this.#crdt.nodeCount() > 0) {
             await this.#refreshBucket();
             for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
-                this.#checks.delete(removed.toString());
+                const key = removed.toString();
+                this.#checks.delete(key);
+                this.#dropOwnTracking(key); // expiry is decay, not an eviction — no error
             }
         }
         return this.#tally.compute();
@@ -1213,11 +1279,36 @@ class ContestEngine {
     }
 
     /**
+     * Publish-time community-name preflight (see verify/name-preflight.ts): throws
+     * `InvalidCommunityNameError` when a carried name definitively fails to resolve to its
+     * vote's claimed key — before signing, before the caller joins the topic — because every
+     * verifier would silently drop such a bundle. Returns whether every carried name settled
+     * (false = a resolver outage skipped one; the background verifier still owns that check).
+     */
+    async preflightNames(votes: readonly Vote[]): Promise<boolean> {
+        const result = await preflightCommunityNames({
+            votes,
+            nameResolvers: this.#deps.nameResolvers,
+            cache: this.#deps.nameResolutionCache
+        });
+        if (!result.ok) {
+            throw new InvalidCommunityNameError(result.communityName, result.claimedPublicKey, result.resolvedPublicKey, result.reason);
+        }
+        return result.settled;
+    }
+
+    /**
      * Sign the votes into a bundle for the current bucket boundary block (the block every verifier
      * reads at), add it to the CRDT, and return the bundle plus its encoded block bytes for
-     * broadcast. Throws `ReadOnlyError` with no signer.
+     * broadcast. Throws `ReadOnlyError` with no signer. `namesSettled` carries the
+     * {@link preflightNames} outcome (default false: name checks still owed to the background
+     * verifier); `onEvicted` is told if a deferred check later evicts THIS bundle — registered
+     * here, before the background verifier can possibly settle, so the report cannot be missed.
      */
-    async signVote(votes: Vote[]): Promise<{ bundle: VotesBundle; encoded: Uint8Array }> {
+    async signVote(
+        votes: Vote[],
+        opts: { namesSettled?: boolean; onEvicted?: (error: VoteEvictedError) => void } = {}
+    ): Promise<{ bundle: VotesBundle; encoded: Uint8Array }> {
         const signer = this.#deps.signer;
         if (signer === undefined) throw new ReadOnlyError();
 
@@ -1234,8 +1325,11 @@ class ContestEngine {
         // Own bundles take the same deferred path as a chased checkpoint's: admitted
         // provisionally, then confirmed (or evicted) by the background gate read — so an
         // ineligible wallet's local tally does not silently disagree with the network's, and
-        // our checkpoint never serves a vote we have not verified (even our own).
-        this.#recordChecks(cid, bundle, false);
+        // our checkpoint never serves a vote we have not verified (even our own). A name the
+        // preflight already resolved is recorded settled, so it renders verified immediately.
+        this.#recordChecks(cid, bundle, false, opts.namesSettled ?? false);
+        this.#ownPublishes.set(cid.toString(), bundle);
+        if (opts.onEvicted) this.#ownEvictionCbs.set(cid.toString(), opts.onEvicted);
         this.#background.enqueue([{ cid, bundle }]);
         this.#onStateChanged();
         return { bundle, encoded: encodeBundle(bundle) };
@@ -1584,6 +1678,13 @@ class ContestVotePublication implements ContestVote {
     readonly #errorCbs: Array<(error: unknown) => void> = [];
     #state: PublishingState = "stopped";
     #bundle: VotesBundle | undefined;
+    /**
+     * True once the background verifier evicted the current publish's bundle. The eviction can
+     * land WHILE `publish()` is still broadcasting (the deferred checks run concurrently), and
+     * its `"failed"` is terminal for this attempt — the in-flight publish must not stomp it
+     * with `"publishing"`/`"succeeded"`. Reset by the next `publish()` call.
+     */
+    #evicted = false;
 
     constructor(engine: ContestEngine, votes: Vote[]) {
         this.#engine = engine;
@@ -1619,13 +1720,31 @@ class ContestVotePublication implements ContestVote {
             throw error;
         }
         try {
+            // Name preflight, also before joining: a vote whose carried community name
+            // definitively fails to resolve to its claimed key would be silently dropped by
+            // every verifier, so it is refused here (`InvalidCommunityNameError`) instead of
+            // broadcast. A resolver outage does not block the publish (namesSettled: false —
+            // the background verifier owns the deferred check).
+            const namesSettled = await this.#engine.preflightNames(this.votes);
             await this.#engine.join();
+            this.#evicted = false;
             this.#setState("signing");
-            const { bundle, encoded } = await this.#engine.signVote([...this.votes]);
+            const { bundle, encoded } = await this.#engine.signVote([...this.votes], {
+                namesSettled,
+                // The one rejection a publisher can hear about (peers drop silently): our own
+                // node's deferred checks evicting this bundle. Usually post hoc — publish() has
+                // already resolved — so it surfaces as `error` + `publishingState: "failed"`.
+                onEvicted: (error) => {
+                    this.#evicted = true;
+                    this.#fail(error);
+                }
+            });
             this.#bundle = bundle;
-            this.#setState("publishing");
+            if (!this.#evicted) this.#setState("publishing");
             const { recipientCount } = await this.#engine.broadcastBundle(encoded);
-            this.#setState("succeeded");
+            // An eviction that landed mid-broadcast already failed this attempt; the outcome
+            // still resolves (the bundle DID hit the wire) but the state stays "failed".
+            if (!this.#evicted) this.#setState("succeeded");
             return { bundle, recipientCount };
         } catch (error) {
             this.#fail(error);

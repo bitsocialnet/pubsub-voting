@@ -1,3 +1,6 @@
+import type { VotesBundle } from "./schema/votes.js";
+import type { VerifyFail } from "./verify/types.js";
+
 /**
  * Library error types.
  *
@@ -163,5 +166,65 @@ export class ReadOnlyError extends Error {
                 "Provide a VoteSigner to publish or withdraw votes; reading tallies needs no signer."
         );
         this.name = "ReadOnlyError";
+    }
+}
+
+/**
+ * Thrown by `ContestVote.publish()` when a vote carries a `community.name` that definitively
+ * fails the publish-time preflight (see verify/name-preflight.ts): no configured resolver
+ * handles it, it resolves to no record, or it resolves to a DIFFERENT key than the vote
+ * claims. Every honest verifier runs the same check and drops such a bundle without telling
+ * the publisher (gossipsub has no rejection feedback), so the vote is refused here — before
+ * signing, before joining the topic — instead of being published into a silent network-wide
+ * drop. Fix the name (or the claimed `publicKey`) and publish again. A resolver that merely
+ * THREW (registry outage) does not throw this: the vote publishes and the background verifier
+ * settles the check, surfacing a `VoteEvictedError` if it turns out bad.
+ */
+export class InvalidCommunityNameError extends Error {
+    constructor(
+        /** The offending `community.name`. */
+        readonly communityName: string,
+        /** The `community.publicKey` the vote claims the name points at. */
+        readonly claimedPublicKey: string,
+        /** What the registry resolved the name to; `undefined` for no-resolver / no-record. */
+        readonly resolvedPublicKey: string | undefined,
+        reason: string
+    ) {
+        super(
+            `Cannot publish this vote: ${reason}. Every verifier checks a carried community ` +
+                `name against its registry and silently drops a bundle whose name does not ` +
+                `resolve to the claimed publicKey, so this vote would never be counted. Fix ` +
+                `the name (or the claimed publicKey), or drop the name from the vote, and ` +
+                `publish again.`
+        );
+        this.name = "InvalidCommunityNameError";
+    }
+}
+
+/**
+ * Emitted (never thrown) when a deferred network check EVICTS this wallet's own published
+ * vote: the background verifier read the gate rule as `0n` at the vote's sample block, or its
+ * carried community name did not check out (see DESIGN.md "Background chain verification").
+ * `publish()` resolves on the offline checks, so an own vote that fails a deferred check
+ * would otherwise just silently vanish from the local tally — while every honest peer,
+ * running the same checks, drops it with no feedback (gossipsub has no rejection channel).
+ * This error is that missing feedback, built from the local verdict: it fires on the
+ * publishing `ContestVote`'s `error` event (flipping its `publishingState` to `"failed"`)
+ * and on the contest's `error` event. Carries the evicted bundle and the exact verdict.
+ */
+export class VoteEvictedError extends Error {
+    constructor(
+        /** The signed bundle that was evicted (the one `publish()` resolved with). */
+        readonly bundle: VotesBundle,
+        /** The failing verdict, with the same `reason` wording every verifier produces. */
+        readonly verdict: VerifyFail
+    ) {
+        super(
+            `This wallet's published vote failed a deferred verification check and was ` +
+                `evicted from the local tally: ${verdict.reason}. Honest peers run the same ` +
+                `checks, so the network will not count this vote either. Fix the cause and ` +
+                `publish again.`
+        );
+        this.name = "VoteEvictedError";
     }
 }

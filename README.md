@@ -81,7 +81,7 @@ Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingF
 ```ts
 const contest = await voter.createContest({ criteria });  // criteria: the contest's full document (strictly validated here)
 contest.on("update", () => render(contest.tally));        // tally rides the object; recomputed before each emit
-contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed, or the background verifier's RPC/resolver is down (retrying)
+contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed, the background verifier's RPC/resolver is down (retrying), or a deferred check evicted THIS wallet's own vote (VoteEvictedError)
 await contest.update();                                   // join the topic, cold-start, begin emitting
 // const fresh = await contest.getTally();                // or force a fresh read, bypassing the cache
 // await contest.stop();                                  // leave the topic
@@ -127,6 +127,20 @@ A community's identity is its `publicKey`. The optional `name` is the community'
 `recipientCount` is the peer-reach hint gossipsub reports: how many peers it sent the vote *directly* to at publish time (first-hop fan-out, filtered for send failures) — **not** total network reach, and **not** an acceptance confirmation, since each recipient still runs the forward-gate before re-forwarding. Treat it as a coarse "did this reach anyone?" signal. Note that gossipsub *rejects* the publish with `NoPeersSubscribedToTopic` when it would reach zero peers (common right after joining, before the mesh grafts), unless the host enables `allowPublishToZeroTopicPeers` — so a resolved `recipientCount === 0` only occurs under that host setting; otherwise a no-reach publish surfaces as a thrown error (and a `failed` state).
 
 `publish()` on a voter built without a `signer` throws `ReadOnlyError` (and emits an `error`).
+
+#### Rejection feedback
+
+Gossipsub gives a publisher **no acceptance or rejection feedback** — a peer that drops a bundle does so silently. Since every honest peer runs the same checks this node runs, the library turns its own local verdict into the feedback the protocol can't provide, in two places:
+
+- **At `publish()`**: each vote's `community.name` is preflighted through the shared resolution cache first — a name that definitively fails (no resolver for its TLD, no record, or it resolves to a **different** `publicKey` than the vote claims) throws `InvalidCommunityNameError` before signing or joining the topic, since every verifier would silently drop that bundle anyway. A resolver that merely *throws* (registry outage) never blocks the publish — the check stays deferred to the background verifier.
+- **After `publish()` resolved**: `"succeeded"` means signed and broadcast, **not** accepted by the network. The deferred checks (the on-chain gate read, and any name resolution a preflight outage skipped) run in the background; if one evicts the bundle, the vote emits a `VoteEvictedError` on its `error` event — carrying the evicted `bundle` and the exact `verdict` any verifier would produce — and its `publishingState` flips to `"failed"` post hoc. The same error fires on the contest's `error` event, for long-lived views.
+
+```ts
+vote.on("error", (err) => {
+    if (err instanceof VoteEvictedError) console.log(err.verdict.reason); // e.g. "not admitted: rule score is 0n at block …"
+});
+await vote.publish(); // throws InvalidCommunityNameError if a carried name can't back the vote
+```
 
 ### Republishing is the client's job
 
