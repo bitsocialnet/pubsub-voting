@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.10...v0.1.0) (2026-07-17)
+
+### ⚠ BREAKING CHANGES
+
+* drop RPC URLs from the criteria document
+
+### Features
+
+* drop RPC URLs from the criteria document ([17dbc67](https://github.com/bitsocialnet/pubsub-voting/commit/17dbc67abd799725eac8655de674fdcd074496eb))
+
 ## [0.0.10](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.9...v0.0.10) (2026-07-16)
 
 ### Features
