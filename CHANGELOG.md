@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.0...v0.1.1) (2026-07-17)
+
+### Features
+
+* fail fast on invalid community names and report own-vote evictions ([32dca7e](https://github.com/bitsocialnet/pubsub-voting/commit/32dca7ed52535d9eec939029bd77e57a77036a88))
+
 ## [0.1.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.0.10...v0.1.0) (2026-07-17)
 
 ### ⚠ BREAKING CHANGES
