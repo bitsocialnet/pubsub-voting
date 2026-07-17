@@ -8,7 +8,7 @@ import { makeBucketMath } from "../../chain/bucket.js";
 import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../../signer/eip712.js";
 import { criteriaCid } from "../../topic.js";
 import { bizCriteria } from "../../test-fixtures.js";
-import type { ChainClient } from "../../chain/types.js";
+import type { ChainClient, NameResolver } from "../../chain/types.js";
 import type { Vote, VotesBundle } from "../../schema/votes.js";
 import { makeVoteNode, connectNodes, waitFor, delay, sampleBundle, type VoteNode, type VoteNodeOptions } from "./harness.js";
 
@@ -17,20 +17,21 @@ import { makeVoteNode, connectNodes, waitFor, delay, sampleBundle, type VoteNode
  * floor). These pin what the pure unit tests (`gossip-validator.test.ts`, `chase.test.ts`)
  * cannot: real gossipsub forwarding, real peer scoring on a `reject`, a rejection produced by
  * the REAL verify pipeline (EIP-712 recover → constraints → the erc721-min-balance "5chan Pass"
- * gate, only the chain read stubbed), the real validation deadline, heartbeat-suppression quiet,
- * and a real directed-bitswap chase across a live connection. Slow by design — gated out of
+ * gate → name resolution, only the chain read and registry stubbed) — including a byzantine
+ * bundle claiming a community name mapped to a different key, dropped with `ignore` (no
+ * penalty, uncached) — the real validation deadline, heartbeat-suppression quiet, and a real
+ * directed-bitswap chase across a live connection. Slow by design — gated out of
  * `npm test`, run via `npm run test:integration`.
  *
- * KNOWN GAP: the directed-bitswap chase here is driven from a **heartbeat** root record (no chunk
- * index), so it exercises the manifest-fetch **fallback** path. The cold-start **piggyback
- * fast-path** (a fetch-protocol `FetchRootRecord.chunks` verified against the root, skipping the
- * root-manifest round-trip — see DESIGN.md "Block pull") is covered only by the codec/chaser unit
- * tests (`checkpoint/codec.test.ts`, `chase.test.ts`) and the WAN benchmark, NOT here. Pinning it
- * over real gossipsub+bitswap needs the harness to drive a cold-start fetch pull (deferred).
+ * The divergent-root chase is driven from a **heartbeat** root record (no chunk index), so it
+ * exercises the manifest-fetch **fallback** path; the name-mismatch test drives a cold-start
+ * fetch pull (real `@libp2p/fetch` → `FetchRootRecord.chunks` → chase), covering the
+ * **piggyback fast-path** that skips the root-manifest round-trip (see DESIGN.md "Block pull").
  */
 
 const TOPIC = "bitsocial-votes/integration-test";
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
+const KEY_B = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust";
 const ADDR = "0x1111111111111111111111111111111111111111";
 
 const reject = (): BundleVerdict => ({ valid: false, disposition: "reject", reason: "test reject" });
@@ -44,8 +45,9 @@ const BIZ_CHAIN_ID = 8453;
 const wallet = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 
 /** A genuinely-signed one-vote bundle for `bizCriteria()`: only steps ≥ 2 of the pipeline can fail it. */
-async function passSignedBundle(blockNumber: number): Promise<VotesBundle> {
-    const votes: Vote[] = [{ community: { publicKey: KEY_A }, vote: 1 }];
+async function passSignedBundle(blockNumber: number, communityName?: string): Promise<VotesBundle> {
+    const community = { publicKey: KEY_A, ...(communityName !== undefined ? { name: communityName } : {}) };
+    const votes: Vote[] = [{ community, vote: 1 }];
     const cid = await criteriaCid(bizCriteria());
     const typedData = ballotTypedData({ criteriaCid: cid.bytes, chainId: BIZ_CHAIN_ID, votes, blockNumber });
     const signature = await wallet.signTypedData(typedData);
@@ -53,7 +55,7 @@ async function passSignedBundle(blockNumber: number): Promise<VotesBundle> {
 }
 
 /** The REAL verify pipeline over bizCriteria; only the chain read is stubbed to a fixed Pass balance. */
-async function realVerifier(passBalance: bigint): Promise<BundleVerifier> {
+async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] = []): Promise<BundleVerifier> {
     const criteria = bizCriteria();
     return makeBundleVerifier({
         criteria,
@@ -62,8 +64,18 @@ async function realVerifier(passBalance: bigint): Promise<BundleVerifier> {
         registry: builtinRegistry,
         chainFor: () => ({ readContract: async () => passBalance }) as unknown as ChainClient,
         bucketMath: makeBucketMath(criteria.blocksPerBucket),
-        nameResolvers: []
+        nameResolvers
     });
+}
+
+/** A `.bso` registry that instantly maps every name to `publicKey` (as in client/voter.test.ts). */
+function bsoResolver(publicKey: string): NameResolver {
+    return {
+        key: "instant",
+        provider: "test",
+        canResolve: ({ name }) => name.endsWith(".bso"),
+        resolve: async () => ({ publicKey })
+    };
 }
 
 let live: VoteNode[] = [];
@@ -119,6 +131,71 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
         await waitFor(() => a.crdt.current(0).length === 1, 15_000, "A to merge the Pass-holder's bundle");
         // The binary bundle codec round-trips the address lowercased (EIP-55 casing is display-only).
         expect(a.crdt.current(0)[0]?.address).toBe(wallet.address.toLowerCase());
+    });
+
+    it("a name mapped to a DIFFERENT key is dropped at the relay: not forwarded, uncached, absent from the served checkpoint", async () => {
+        const { a, b } = await connectedPair();
+        // B's fully verified view holds one valid (unnamed) board vote from another wallet, so
+        // the fetch assertion below distinguishes "bad board excluded" from "nothing served".
+        await b.admitBundle(sampleBundle(ADDR, KEY_A));
+        // B runs the real pipeline with the Pass held and a live registry, so ONLY the name stage
+        // (step 4) can fail: the registry maps "memes.bso" to KEY_B, not the claimed KEY_A.
+        const gated = await realVerifier(1n, [bsoResolver(KEY_B)]);
+        const verdicts: BundleVerdict[] = [];
+        b.setVerifier(async (bundle) => {
+            const verdict = await gated.verify(bundle);
+            verdicts.push(verdict);
+            return verdict;
+        });
+
+        // A byzantine publish: genuinely signed, but claiming a name the wallet does not own. An
+        // honest node cannot emit this — its own preflight refuses before signing (client/
+        // voter.test.ts) — so the relay-side refusal needs the raw bundle pushed onto the wire.
+        const bytes = encodeBundle(await passSignedBundle(10, "memes.bso"));
+        const cid = await bundleCidForBytes(bytes);
+        await a.transport.publishBundle(bytes);
+
+        await waitFor(() => verdicts.length > 0, 15_000, "B to verify the name-mismatch bundle");
+        expect(verdicts[0]).toMatchObject({
+            valid: false,
+            disposition: "ignore",
+            reason: expect.stringContaining(`resolves to ${KEY_B}`)
+        });
+        await delay(500); // let the gate's verdict reach gossipsub before the negative assertions
+
+        expect(b.acceptedBundles).toHaveLength(0); // never delivered ⇒ never forwarded
+        expect(b.crdt.current(0)).toHaveLength(1); // only the pre-admitted valid board — never merged
+        // `ignore`, not `reject`: names resolve at head, so today's mismatch may be a re-point in
+        // flight — the sender is not penalized and the verdict stays uncached (re-evaluable).
+        expect(b.pubsub.getScore(a.peerId)).toBeGreaterThanOrEqual(0);
+        expect(b.cache.has(cid)).toBe(false);
+
+        // The cold-start pull against the node that ignored the bundle: fetch B's root record
+        // over the real libp2p fetch protocol, then chase it through the chunk-index fast-path
+        // (`FetchRootRecord.chunks`, session seeded with B). What B serves is its fully verified
+        // winner-set: the valid board arrives, the invalid-name board is NOT in it.
+        const record = await a.fetchRootRecord(b);
+        if (record === undefined) throw new Error("B served no root record over the fetch protocol");
+        expect(record.count).toBe(1);
+        a.chaser.chase(record.root, record.chunks, [b.libp2p.peerId]);
+        await waitFor(() => a.crdt.current(0).length === 1, 15_000, "A to pull B's checkpoint over bitswap");
+        const pulled = a.crdt.current(0);
+        expect(pulled[0]?.address).toBe(ADDR); // the valid board's wallet
+        expect(pulled.some((winner) => winner.address === wallet.address.toLowerCase())).toBe(false);
+        expect(pulled.some((winner) => winner.votes.some((v) => v.community.name === "memes.bso"))).toBe(false);
+        // ...and the blocks came through a bitswap session seeded with B, the fetched-from peer.
+        expect(a.openedSessions).toEqual([{ root: record.root.toString(), providers: [b.peerId] }]);
+
+        // Positive control through the SAME pipeline, in the clean direction (B→A): with the
+        // registry mapping the name to the claimed key, a fresh bundle (different block ⇒
+        // different CID) verifies and merges — proving the drop above was the name stage, not
+        // the signature, constraints, or gate.
+        const admitted = await realVerifier(1n, [bsoResolver(KEY_A)]);
+        a.setVerifier((bundle) => admitted.verify(bundle));
+        await b.transport.publishBundle(encodeBundle(await passSignedBundle(11, "memes.bso")));
+        await waitFor(() => a.crdt.current(0).length === 2, 15_000, "A to merge the correctly-named bundle");
+        const named = a.crdt.current(0).find((winner) => winner.address === wallet.address.toLowerCase());
+        expect(named?.votes[0]?.community.name).toBe("memes.bso");
     });
 
     it("accepts a valid inline bundle: forwarded and LWW-merged on the peer", async () => {

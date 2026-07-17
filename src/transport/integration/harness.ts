@@ -24,9 +24,13 @@ import { makeVoteTransport } from "../transport.js";
 import type { PubsubService, VoteTransport } from "../types.js";
 import {
     decodeVoteMessage,
+    decodeRootRecord,
+    encodeRootRecord,
     maxBundleMessageBytes,
+    rootFetchKey,
     MAX_ROOT_MESSAGE_BYTES,
     ROOT_RECORD_VERSION,
+    type FetchRootRecord,
     type RootRecord
 } from "../messages.js";
 
@@ -86,7 +90,13 @@ export interface VoteNode {
     /** Replace the injected verifier (e.g. a rejecter, or a slow one, for a specific assertion). */
     setVerifier(verify: (bundle: VotesBundle) => Promise<BundleVerdict>): void;
     /** Encode this node's current winner-set to a checkpoint (blocks written to its blockstore). */
-    checkpointRootRecord(): Promise<RootRecord>;
+    checkpointRootRecord(): Promise<FetchRootRecord>;
+    /**
+     * Pull `from`'s root record over the REAL libp2p fetch protocol — the cold-start pull a
+     * joiner makes before chasing (voter.ts `#fetchRootWithRetry`). `undefined` when the peer
+     * serves nothing for the key.
+     */
+    fetchRootRecord(from: VoteNode): Promise<FetchRootRecord | undefined>;
     /** Publish this node's own root record on the topic (a heartbeat). */
     publishOwnRoot(): Promise<void>;
     /** Seed a bundle straight into this node's state (store block + CRDT merge), no network. */
@@ -177,17 +187,30 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
     const heardRoots: RootRecord[] = [];
     let matchedOwnRoot = false;
 
-    async function checkpointRootRecord(): Promise<RootRecord> {
+    async function checkpointRootRecord(): Promise<FetchRootRecord> {
         const winners = crdt.current(CURRENT_BUCKET);
-        const { root, blocks } = await encodeCheckpoint(winners);
+        const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await blockstore.put(block.cid, block.bytes);
         return {
             version: ROOT_RECORD_VERSION,
             root,
+            chunks,
             count: winners.length,
             sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
         };
     }
+
+    // Mirror the production fetch responder (voter.ts `#rootLookup`): answer `<topic>/root` with
+    // this node's current root record, encoded on demand — the surface a cold joiner pulls
+    // before chasing. `@libp2p/fetch` hands the lookup the requested key as raw bytes.
+    libp2p.services.fetch.registerLookupFunction(topic, async (keyBytes: Uint8Array) => {
+        if (new TextDecoder().decode(keyBytes) !== rootFetchKey(topic)) return undefined;
+        try {
+            return encodeRootRecord(await checkpointRootRecord());
+        } catch {
+            return undefined;
+        }
+    });
 
     const openedSessions: Array<{ root: string; providers: string[] }> = [];
     const chaseLimit = pLimit(2);
@@ -289,6 +312,10 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
             verifyImpl = verify;
         },
         checkpointRootRecord,
+        fetchRootRecord: async (from) => {
+            const bytes = await libp2p.services.fetch.fetch(from.libp2p.peerId, rootFetchKey(topic));
+            return bytes == null ? undefined : decodeRootRecord(bytes);
+        },
         publishOwnRoot: async () => {
             await transport.publishRootRecord(await checkpointRootRecord());
         },
