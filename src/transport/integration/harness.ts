@@ -104,10 +104,13 @@ export interface VoteNode {
     stop(): Promise<void>;
 }
 
-/** Build one real node with the full forward-gate wired to real gossipsub. */
-export async function makeVoteNode(topic: string, options: VoteNodeOptions = {}): Promise<VoteNode> {
-    const timeoutMs = options.timeoutMs ?? 10_000;
-
+/**
+ * One real loopback libp2p + Helia node carrying gossipsub (topic-scoped score params) and
+ * `@libp2p/fetch` — the raw host node with nothing else wired. {@link makeVoteNode} builds the
+ * harness transport on top of it; the three-node relay test instead hands it straight to the
+ * REAL `PubsubVoter` as the injected host node (the `PubsubVoterOptions.helia` seam).
+ */
+export async function makeBareNode(topic: string) {
     const libp2p = await createLibp2p({
         addresses: { listen: ["/ip4/127.0.0.1/tcp/0"] },
         transports: [tcp()],
@@ -154,6 +157,13 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         }
     });
     const helia = await createHelia({ libp2p });
+    return { libp2p, helia };
+}
+
+/** Build one real node with the full forward-gate wired to real gossipsub. */
+export async function makeVoteNode(topic: string, options: VoteNodeOptions = {}): Promise<VoteNode> {
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    const { libp2p, helia } = await makeBareNode(topic);
 
     const pubsub = libp2p.services.pubsub as unknown as PubsubService & ScoreOps;
     // Adapt Helia's async-generator `get` to the library's Promise-returning BlockstoreLike, the
