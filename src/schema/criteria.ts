@@ -35,10 +35,24 @@ export const RuleRefSchema = z.looseObject({
     type: z.string().min(1)
 });
 
-/** RPC configuration for one chain ticker. Part of the dependency manifest. */
-export const ChainConfigSchema = z.object({
-    chainId: z.number().int().positive(),
-    rpcUrls: z.array(z.string().min(1)).nonempty()
+/**
+ * One chain the contest reads, by ticker. Part of the dependency manifest.
+ *
+ * Only the `chainId` is here — it is consensus-critical (bound into every EIP-712 ballot
+ * domain and defining which chain the rules read). RPC endpoints are deliberately NOT part
+ * of the criteria: which gateway a client trusts is client-local transport configuration
+ * (`PubsubVoterOptions.chains` maps ticker/chainId to a client), and two honest verifiers
+ * reading the same pinned block through different gateways compute identical results. Keeping
+ * URLs out means an operator can swap a dead RPC provider without changing the document's
+ * bytes — i.e. without forking the topic and orphaning the contest's votes.
+ *
+ * Strict on purpose: the topic is derived from the PARSED document, so an unknown key must
+ * fail loudly here — a plain (stripping) object would silently drop it and derive a different
+ * topic than the author's raw document implies. This also makes pre-v1 documents that still
+ * carry `rpcUrls` a loud error instead of a silent re-topic.
+ */
+export const ChainConfigSchema = z.strictObject({
+    chainId: z.number().int().positive()
 });
 
 /**

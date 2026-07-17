@@ -71,8 +71,10 @@ export function fetchRealHead(rpcUrl: string): Promise<bigint> {
 
 /**
  * The /biz/ criteria document the benchmark runs (kept in sync with the shared test fixture).
- * In REAL-CHAIN mode the gate contract and RPC URL are real ({@link REAL_PROBE_CONTRACT},
- * `BENCH_RPC_URL`); both sides derive it from the same env var, so the topics match.
+ * In REAL-CHAIN mode the gate contract is a real deployment ({@link REAL_PROBE_CONTRACT});
+ * both sides derive the document from the same env var, so the topics match. The RPC URL is
+ * NOT part of the document (it is each node's own `chains` factory setting), so mock mode's
+ * gateway URL and real mode's `BENCH_RPC_URL` never touch the criteria bytes.
  */
 export function benchCriteria(): Criteria {
     const rpcUrl = benchRpcUrl();
@@ -92,7 +94,7 @@ export function benchCriteria(): Criteria {
         weight: { type: "constant", value: 1 },
         requires: {
             rules: ["erc721-min-balance", "constant"],
-            chains: { base: { chainId: 8453, rpcUrls: [rpcUrl ?? "https://mainnet.base.org"] } }
+            chains: { base: { chainId: 8453 } }
         }
     };
 }

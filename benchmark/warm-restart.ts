@@ -41,6 +41,7 @@ function countingChains(): { chains: ChainClientFactory; gateReads: () => number
     let gateReads = 0;
     const chains: ChainClientFactory = (args) => {
         const client = inner(args);
+        if (client === undefined) return undefined; // benchChains always resolves; type-narrowing only
         return new Proxy(client, {
             get(target, prop, receiver) {
                 if (prop === "readContract") {

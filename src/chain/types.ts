@@ -1,5 +1,4 @@
 import type { PublicClient } from "viem";
-import type { ChainConfig } from "../schema/criteria.js";
 
 /**
  * Chain access.
@@ -25,11 +24,24 @@ export type ChainClient = PublicClient;
 export type ChainClients = Record<string, ChainClient>;
 
 /**
- * Factory the host provides: turn a chain config into a viem `PublicClient`
- * (typically `createPublicClient({ transport: http(config.rpcUrls[0]) })`).
- * Declared here so the public API can describe how chain clients are supplied.
+ * Factory the host provides: resolve a chain named by the criteria (`requires.chains`,
+ * ticker + chainId) to a viem `PublicClient`. The RPC endpoint is the HOST's setting —
+ * deliberately not part of the criteria document (see schema/criteria.ts,
+ * `ChainConfigSchema`) — so this factory is where ticker/chainId meets the gateways this
+ * client trusts (typically `createPublicClient({ chain, transport: http(myRpcUrl) })`).
+ *
+ * Return `undefined` (or throw) when no RPC is configured for the named chain: the voter
+ * then throws `MissingChainClientError` at the create seam (`createContest` /
+ * `createContestVote`) — this client must recuse the contest rather than miscount.
+ *
+ * Return ONE shared client per chain (memoize on `chainId`), not a fresh client per call:
+ * the voter wraps each distinct client with the cross-contest read coalescer
+ * (src/chain/coalescer.ts), so sharing is what merges parallel contests' pinned-block reads
+ * into shared multicalls under one in-flight budget. Pick a gateway that serves historical
+ * state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head (gate reads pin
+ * to bucket sample blocks) and carries a multicall3 deployment in its viem `chain` config.
  */
-export type ChainClientFactory = (args: { chain: string; config: ChainConfig }) => ChainClient;
+export type ChainClientFactory = (args: { chain: string; chainId: number }) => ChainClient | undefined;
 
 /**
  * A community-name resolver the host injects (`PubsubVoterOptions.nameResolvers`). The

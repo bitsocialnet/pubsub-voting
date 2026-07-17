@@ -173,6 +173,26 @@ describe("makeGossipGate — bundle deltas", () => {
         expect(cache.has(cid)).toBe(false);
     });
 
+    it("ignores (no penalty, uncached) a verify that THROWS — an RPC failure is infra, not the sender's fault", async () => {
+        const { cid, message } = await makeDelta("0x1");
+        const cache = makeVerdictCache();
+        let verifies = 0;
+        const g = gate({
+            cache,
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    throw new Error("RPC endpoint down"); // the gate chain read failed outright
+                }
+            }
+        });
+        expect(await g.validate(message, "p")).toBe("ignore");
+        // Uncached and re-evaluable: once the RPC recovers, a re-publish verifies for real.
+        expect(await g.validate(message, "p")).toBe("ignore");
+        expect(verifies).toBe(2);
+        expect(cache.has(cid)).toBe(false);
+    });
+
     it("caches a provable reject so a re-publish is not re-verified", async () => {
         const { cid, message } = await makeDelta("0xbad");
         const cache = makeVerdictCache();

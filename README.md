@@ -35,22 +35,34 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`), a `blockstore` (else `MissingBlockstoreError`), and a libp2p fetch service at `libp2p.services.fetch` (else `MissingFetchError`) |
-| `chains` | `ChainClientFactory` | yes | builds a viem `PublicClient` per chain; rules read through it for the gate and weight |
+| `chains` | `ChainClientFactory` | yes | resolves each chain a contest's criteria requires (`{ chain, chainId }`) to a viem `PublicClient`; rules read through it for the gate and weight. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that serves historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head and carries a multicall3 deployment in its viem `chain` config; return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 | `dataPath` | `string \| false` | no | directory for the voter's persistent state (gate-result + name-resolution caches, and each joined contest's **checkpoint snapshot** — its last fully-verified winner-set, reloaded at join so a restart with no other peer online keeps the tally), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-voting` (better-sqlite3 under `{dataPath}/lru-storage/` + `{dataPath}/checkpoints.db`); in the browser the path is ignored and everything lives in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC, and restores each contest's checkpoint before the cold-start pull. A seeder should always set a stable path |
 | `httpRouterUrls` | `string[]` | no | Delegated Routing V1 router base URLs to **announce provider records to** (one unsigned `PUT /routing/v1/providers` per router; `Keys` batches every joined contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced on root changes, and on address changes). **Seeders only**: absent/empty means never announce (the default — plain clients are not dialable), and the browser build never announces regardless. The node must be publicly **reachable** (its listening port open/forwarded/published), but it does not need to know its own public IP: private, loopback, and link-local addrs are filtered client-side, and when nothing survives — the normal zero-config case behind NAT or a Docker bridge, and even on public-IP hosts, since libp2p withholds unconfirmed public addrs pending AutoNAT — the announcer sends the wildcard sentinels (`/ip4/0.0.0.0/...`, `/ip6/::/...`) that the router rewrites to the PUT's observed source IP, exactly as kubo announces work. Configured `addresses.announce` values (concrete public addrs, DNS/AutoTLS, or a kubo-style wildcard) are used as-is. Only a loopback-only node announces nothing. *Querying* needs no URLs here — cold-join discovery uses the injected node's `libp2p.contentRouting`, which the host wires its routers into |
 
-A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists.
+A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry + the `chains` factory: an unimplemented rule throws `UnknownRuleError`, an unresolvable required chain throws `MissingChainClientError` — recuse, don't miscount), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists. The document names each required chain only by ticker + `chainId`; RPC endpoints stay out of it, so operators can swap gateways without forking the topic.
 
 ### Construct a voter
 
 ```ts
-import { PubsubVoter } from "@bitsocial/pubsub-voting";
+import { PubsubVoter, type ChainClientFactory } from "@bitsocial/pubsub-voting";
+import { createPublicClient, http } from "viem";
+import { base } from "viem/chains";
+
+// The host's chain settings: which RPC gateway to trust per chain is THIS client's choice
+// (never part of a criteria document). One shared client per chain, memoized — sharing is
+// what lets parallel contests' pinned-block reads coalesce into shared multicalls.
+const viemChainFactory = (): ChainClientFactory => {
+  const clients: Record<number, ReturnType<typeof createPublicClient>> = {
+    [base.id]: createPublicClient({ chain: base, transport: http("https://my-trusted-base-rpc.example") })
+  };
+  return ({ chainId }) => clients[chainId]; // undefined → recuse contests requiring that chain
+};
 
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
-  chains: viemChainFactory(),   // ({ chain, config }) => viem PublicClient
+  chains: viemChainFactory(),   // ({ chain, chainId }) => viem PublicClient | undefined
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
   dataPath: "/path/to/data",    // optional; persistent state: caches + checkpoint snapshots (default {cwd}/.bitsocial-pubsub-voting; false → in-memory)

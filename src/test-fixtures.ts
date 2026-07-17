@@ -31,7 +31,7 @@ export function bizCriteria(): Criteria {
         weight: { type: "constant", value: 1 },
         requires: {
             rules: ["erc721-min-balance", "constant"],
-            chains: { base: { chainId: 8453, rpcUrls: ["https://mainnet.base.org"] } }
+            chains: { base: { chainId: 8453 } }
         }
     };
 }
@@ -103,12 +103,13 @@ export function fakeHeliaWithoutFetch(): HeliaInstance {
 }
 
 /**
- * A chain client factory backed by real viem clients. viem clients are lazy (no
- * connection until a read), and these unit tests never read, so the configured RPC
- * URL is never contacted.
+ * A chain client factory backed by a real viem client — one shared client, as the
+ * `ChainClientFactory` contract recommends. viem clients are lazy (no connection until a
+ * read), and these unit tests never read, so the RPC URL is never contacted.
  */
 export function fakeChains(): ChainClientFactory {
-    return ({ config }) => createPublicClient({ transport: http(config.rpcUrls[0]) });
+    const client = createPublicClient({ transport: http("https://mainnet.base.org") });
+    return () => client;
 }
 
 /** A minimal signer for write-path tests (65-byte placeholder — the binary codec checks size). */

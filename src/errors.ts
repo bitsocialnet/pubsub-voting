@@ -37,6 +37,28 @@ export class UnknownRuleError extends Error {
 }
 
 /**
+ * Thrown by `createContest` / `createContestVote` when the criteria's dependency manifest
+ * names a chain (`requires.chains`) the host's `ChainClientFactory` cannot resolve to a
+ * client (it returned `undefined`). RPC endpoints are client-local settings, not part of
+ * the criteria document, so a client with no gateway configured for a required chain must
+ * recuse the contest rather than miscount — the chain-side twin of `UnknownRuleError`.
+ */
+export class MissingChainClientError extends Error {
+    constructor(
+        readonly chain: string,
+        readonly chainId: number
+    ) {
+        super(
+            `No chain client for "${chain}" (chainId ${chainId}), which this contest's criteria ` +
+                `requires. RPC endpoints are client settings, not part of the criteria document: ` +
+                `configure the \`chains\` factory (PubsubVoterOptions.chains) to return a viem ` +
+                `PublicClient for this chain, or recuse this contest.`
+        );
+        this.name = "MissingChainClientError";
+    }
+}
+
+/**
  * Thrown at construction when the injected Helia node's libp2p has no usable pubsub
  * (gossipsub) service at `libp2p.services.pubsub`. The library broadcasts and receives
  * winner bundle CIDs over gossipsub, so a node without it cannot participate. Helia's default

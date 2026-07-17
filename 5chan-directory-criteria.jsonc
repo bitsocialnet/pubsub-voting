@@ -32,8 +32,10 @@
       "type": "constant",
       "value": 1
     },
-    // Dependency manifest + version negotiation: the rules and chain RPC config
-    // a client must support to verify this contest.
+    // Dependency manifest + version negotiation: the rules and chains a client must
+    // support to verify this contest. Only the chainId is named — WHICH RPC gateway to
+    // read it through is each client's own setting (PubsubVoterOptions.chains), never
+    // part of the document, so operators can swap endpoints without forking topics.
     "requires": {
       "rules": [
         "erc721-min-balance",
@@ -41,10 +43,7 @@
       ],
       "chains": {
         "base": {
-          "chainId": 8453,
-          "rpcUrls": [
-            "https://mainnet.base.org"
-          ]
+          "chainId": 8453
         }
       }
     }

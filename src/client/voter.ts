@@ -58,7 +58,7 @@ import type { ContestTally } from "../tally/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
-import { ReadOnlyError, UnknownRuleError, VoterDestroyedError } from "../errors.js";
+import { MissingChainClientError, ReadOnlyError, UnknownRuleError, VoterDestroyedError } from "../errors.js";
 
 /**
  * The recommended cadence, in buckets, at which a client should re-publish a live vote to keep
@@ -236,9 +236,13 @@ export interface PubsubVoterOptions {
      */
     helia: HeliaInstance;
     /**
-     * Builds a chain client from a `{ chain, config }` pair. Each contest builds its
-     * own clients from `criteria.requires.chains` via this factory, so chains are
-     * per-contest data, not a global injection.
+     * Resolves a chain named by a contest's criteria (`requires.chains`, ticker + chainId)
+     * to a viem `PublicClient`. Which RPC gateway to use is THIS client's setting — RPC URLs
+     * are deliberately not part of the criteria document, so this factory is where the host
+     * maps chains to the endpoints it trusts. Return one shared client per chain (memoized),
+     * and `undefined` for a chain with no RPC configured — `createContest` /
+     * `createContestVote` then throws `MissingChainClientError` (recuse, don't miscount).
+     * See `ChainClientFactory` (src/chain/types.ts) for the full contract.
      */
     chains: ChainClientFactory;
     /** Identity. Omit for a read-only voter (renders tallies, cannot publish). */
@@ -579,10 +583,14 @@ class ContestEngine {
         this.readOnly = deps.signer === undefined;
         this.#deps = deps;
         this.#criteriaCid = criteriaCidBytes;
+        // Resolve every chain the manifest requires, eagerly: a client with no RPC configured
+        // for one of them must find out at the create seam (recuse), not on its first verify.
         this.#chainClients = Object.fromEntries(
-            Object.entries(criteria.requires.chains).map(
-                ([chain, config]): [string, ChainClient] => [chain, deps.chains({ chain, config })]
-            )
+            Object.entries(criteria.requires.chains).map(([chain, config]): [string, ChainClient] => {
+                const client = deps.chains({ chain, chainId: config.chainId });
+                if (client === undefined) throw new MissingChainClientError(chain, config.chainId);
+                return [chain, client];
+            })
         );
 
         // The gating (`rule`) chain fixes the ballot's chainId and the tie-break seed chain.

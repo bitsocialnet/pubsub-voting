@@ -16,6 +16,7 @@ import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/typ
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
     MissingBlockstoreError,
+    MissingChainClientError,
     MissingFetchError,
     MissingPubsubError,
     ReadOnlyError,
@@ -237,6 +238,24 @@ describe("PubsubVoter.createContest", () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
         const foreignRule = { ...bizCriteria(), requires: { ...bizCriteria().requires, rules: ["not-a-rule"] } };
         await expect(voter.createContest({ criteria: foreignRule })).rejects.toThrow(UnknownRuleError);
+    });
+
+    it("rejects a criteria requiring a chain the host's factory cannot resolve (recuse, not miscount)", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => undefined });
+        await expect(voter.createContest({ criteria: bizCriteria() })).rejects.toThrow(MissingChainClientError);
+        await expect(voter.createContest({ criteria: bizCriteria() })).rejects.toThrow(/chainId 8453/);
+    });
+
+    it("rejects a pre-v1 criteria still carrying rpcUrls (loud error, never a silent re-topic)", async () => {
+        // RPC endpoints are client settings now; a stripping schema would silently derive a
+        // DIFFERENT topic from such a document, so the strict schema must fail it instead.
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
+        const criteria = bizCriteria();
+        const withRpcUrls = {
+            ...criteria,
+            requires: { ...criteria.requires, chains: { base: { chainId: 8453, rpcUrls: ["https://mainnet.base.org"] } } }
+        } as unknown as ReturnType<typeof bizCriteria>;
+        await expect(voter.createContest({ criteria: withRpcUrls })).rejects.toThrow();
     });
 });
 

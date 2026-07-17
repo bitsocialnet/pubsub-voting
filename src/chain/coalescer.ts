@@ -251,6 +251,9 @@ export function coalescingChainFactory(factory: ChainClientFactory, options?: Co
     const wrapped = new WeakMap<ChainClient, ChainClient>();
     return (args) => {
         const client = factory(args);
+        // No client for this chain — the host has no RPC configured; the voter turns this
+        // into MissingChainClientError at the create seam.
+        if (client === undefined) return undefined;
         let coalesced = wrapped.get(client);
         if (!coalesced) {
             coalesced = coalescingChainClient(client, options);
