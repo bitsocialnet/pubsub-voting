@@ -65,7 +65,7 @@
     "@libp2p/identify": "4.1.8",
     "@libp2p/tcp": "11.0.22",
     "@multiformats/multiaddr": "13.0.3",
-    "@pkcprotocol/pkc-js": "0.0.63",
+    "@pkcprotocol/pkc-js": "0.0.72",
     "@release-it/conventional-changelog": "10.0.6",
     "@types/better-sqlite3": "7.6.13",
     "@vitest/coverage-v8": "4.1.9",

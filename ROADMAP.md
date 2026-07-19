@@ -42,10 +42,10 @@ Nothing in this repository. The required host-side service registrations have la
 
 ### Deferred pkc-js work (external dependency)
 
-- A documented, version-stable accessor on pkc-js that returns the Helia node (with `libp2p.services.pubsub`, `blockstore`, and a registered `fetch` service), so consumers stop reaching through the private `._helia` field.
+- **A documented, version-stable accessor for the shared Helia node — done in pkc-js `0.0.72`** (`Libp2pJsClient.heliaNode`, [pkc-js#221](https://github.com/pkcprotocol/pkc-js/issues/221) / [PR #223](https://github.com/pkcprotocol/pkc-js/pull/223)): returns the node carrying `libp2p.services.pubsub`, `blockstore`, the `fetch` service, and `libp2p.contentRouting`, semver-covered. The pinned devDependency and both pkc-js host tests use it; consumers no longer reach through the private `._helia` field.
 - **Adding `@libp2p/fetch` to the shared node's construction — done in pkc-js `0.0.63`** (`fetch: libp2pFetch()` alongside `pubsub: gossipsub()` in `helia-for-pkc`). This library registers its own lookup function and runs its own requester against `libp2p.services.fetch` (see Done, root-record checkpoint sync); `PubsubVoter` still throws `MissingFetchError` at construction on a node without the service.
 
-Filed as [pkc-js#183](https://github.com/pkcprotocol/pkc-js/issues/183), closed 2026-07 — the service registrations landed (gossipsub `16.0.2`, above the >= 15.0.23 floor, plus `@libp2p/fetch`). Still open upstream: the version-stable accessor and score tuning; and this library pins gossipsub `16.0.3`, so a follow-up asks the host to match.
+Filed as [pkc-js#183](https://github.com/pkcprotocol/pkc-js/issues/183), closed 2026-07 — the service registrations landed (gossipsub `16.0.2`, above the >= 15.0.23 floor, plus `@libp2p/fetch`); the version-stable accessor followed in `0.0.72`. Still open upstream: score tuning; and this library pins gossipsub `16.0.3`, so a follow-up asks the host to match.
 
 ## Deferred (designed, not shipped)
 

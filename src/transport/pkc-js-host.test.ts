@@ -10,8 +10,9 @@ import { bizCriteria, realSigner, stubChains } from "../test-fixtures.js";
 
 /**
  * The pkc-js HOST CONTRACT, offline: a stock `PKC({ libp2pJsClientsOptions })` instance's shared
- * Helia node — the exact object a real consumer injects, `pkc.clients.libp2pJsClients[key]._helia`
- * — must pass `PubsubVoter`'s construction guards (gossipsub + blockstore + fetch service, all
+ * Helia node — the exact object a real consumer injects, reached through the public
+ * `pkc.clients.libp2pJsClients[key].heliaNode` accessor (pkc-js#221, shipped in 0.0.72) —
+ * must pass `PubsubVoter`'s construction guards (gossipsub + blockstore + fetch service, all
  * registered by pkc-js since 0.0.63) and drive the offline facade. The unit suite's other
  * transport tests exercise fakes shaped like the host node; this one pins the REAL host object,
  * so a pkc-js release that stops registering a service (or reshapes the blockstore) fails here,
@@ -20,13 +21,13 @@ import { bizCriteria, realSigner, stubChains } from "../test-fixtures.js";
  * end-to-end path lives in `integration/pkc-js-host.integration.test.ts`.
  */
 
-// The injected-node seam, reached the way consumers reach it today. TODO: switch to the public
-// `client.heliaNode` accessor once pkc-js#221 ships (implemented in pkc-js PR #223).
+// The injected-node seam: `heliaNode` is the public, semver-covered accessor for the shared
+// Helia node (pkc-js#221, shipped in 0.0.72) — no more reaching through the private `_helia`.
 type PkcInstance = Awaited<ReturnType<typeof PKC>>;
 const sharedHelia = (pkc: PkcInstance, key: string) => {
     const client = pkc.clients.libp2pJsClients[key];
     if (client === undefined) throw new Error(`pkc-js created no libp2p-js client under key "${key}"`);
-    return client._helia;
+    return client.heliaNode;
 };
 
 describe("pkc-js host contract (offline)", () => {

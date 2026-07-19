@@ -9,8 +9,8 @@ import { waitFor } from "./harness.js";
 /**
  * End to end on REAL pkc-js hosts: three `PKC({ libp2pJsClientsOptions })` instances in one
  * process (distinct keys ⇒ distinct shared nodes), each injecting its OWN shared Helia node —
- * `pkc.clients.libp2pJsClients[key]._helia`, the exact seam production consumers use — into a
- * real `PubsubVoter`. Unlike the other integration tests, nothing here is harness-built: the
+ * `pkc.clients.libp2pJsClients[key].heliaNode`, the public accessor production consumers use —
+ * into a real `PubsubVoter`. Unlike the other integration tests, nothing here is harness-built: the
  * nodes run pkc-js's stock configuration (gossipsub 16.0.2 + `@libp2p/fetch` registered since
  * 0.0.63, its default connection gater, loopback TCP listeners passed through
  * `libp2pOptions.addresses`), so this pins the full host contract the library documents —
@@ -50,9 +50,9 @@ async function pkcHostedVoter(key: string, options: { signed?: boolean } = {}) {
     cleanups.push(() => pkc.destroy());
     const client = pkc.clients.libp2pJsClients[key];
     if (client === undefined) throw new Error(`pkc-js created no libp2p-js client under key "${key}"`);
-    // The injected-node seam, reached the way consumers reach it today. TODO: switch to the
-    // public `client.heliaNode` accessor once pkc-js#221 ships (implemented in pkc-js PR #223).
-    const helia = client._helia;
+    // The injected-node seam: the public, semver-covered `heliaNode` accessor (pkc-js#221,
+    // shipped in 0.0.72) — no more reaching through the private `_helia`.
+    const helia = client.heliaNode;
 
     const voter = new PubsubVoter({
         dataPath: false,

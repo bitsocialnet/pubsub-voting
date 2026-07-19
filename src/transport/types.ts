@@ -19,7 +19,7 @@ import type { RootRecord } from "./messages.js";
  *
  * The library does not start a node and does not take a host SDK. It receives the
  * host's already-running **Helia node** directly (e.g. the value `createHelia` returns,
- * which for a pkc-js host is `pkc.clients.libp2pJsClients[key]._helia`) and drives its
+ * which for a pkc-js host is `pkc.clients.libp2pJsClients[key].heliaNode`) and drives its
  * libp2p pubsub + blockstore itself — there is no host-written adapter. The node must
  * carry a gossipsub service at `libp2p.services.pubsub` and a usable `blockstore`;
  * construction enforces both (see `requireHeliaServices` / `MissingPubsubError` /

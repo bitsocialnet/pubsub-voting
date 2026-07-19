@@ -254,7 +254,7 @@ export interface VoteClient {
 export interface PubsubVoterOptions {
     /**
      * The host's running Helia node (the value `createHelia` returns; for pkc-js it is
-     * `pkc.clients.libp2pJsClients[key]._helia`). The only host-node seam, passed
+     * `pkc.clients.libp2pJsClients[key].heliaNode`). The only host-node seam, passed
      * directly with no adapter. It MUST carry a gossipsub service at
      * `libp2p.services.pubsub`, a usable `blockstore`, and a libp2p fetch service at
      * `libp2p.services.fetch`; the constructor throws `MissingPubsubError` /

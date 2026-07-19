@@ -2,8 +2,9 @@
  * Example: how 5chan would call this library.
  *
  * The library never takes a pkc instance — it takes the host's running Helia node
- * directly (no adapter). 5chan runs on pkc-js, so it passes pkc's shared node, today
- * reached at `pkc.clients.libp2pJsClients[key]._helia`. That node must carry a gossipsub
+ * directly (no adapter). 5chan runs on pkc-js, so it passes pkc's shared node, reached
+ * through the public `pkc.clients.libp2pJsClients[key].heliaNode` accessor (semver-covered
+ * since pkc-js `0.0.72`). That node must carry a gossipsub
  * service at `libp2p.services.pubsub`, a `blockstore`, and a libp2p fetch service at
  * `libp2p.services.fetch` (`@libp2p/fetch` — the checkpoint root-record pull), or
  * construction throws `MissingPubsubError` / `MissingBlockstoreError` /
@@ -47,7 +48,7 @@ const allCriteria: Criteria[] = deriveDirectoryCriteria(manifest);
 // resolvers are the same instances 5chan already gives pkc-js (e.g. @bitsocial/
 // bso-resolver's BsoResolver for name.bso) — needed because votes carry community names,
 // whose name→publicKey claim the tally verifies before counting.
-declare function pkcHelia(): HeliaInstance; // pkc.clients.libp2pJsClients[key]._helia
+declare function pkcHelia(): HeliaInstance; // pkc.clients.libp2pJsClients[key].heliaNode
 declare function viemChains(): ChainClientFactory;
 declare const signer: VoteSigner;
 declare const bsoResolver: NameResolver; // e.g. new BsoResolver({ key: "bso-viem", provider: "viem" })
