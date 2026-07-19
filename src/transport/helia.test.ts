@@ -11,6 +11,51 @@ async function rawCid(bytes: Uint8Array): Promise<CID> {
     return CID.createV1(raw.code, await sha256.digest(bytes));
 }
 
+describe("adaptBlockstore get normalisation", () => {
+    it("passes through a plain Promise<Uint8Array> blockstore and forwards put/has", async () => {
+        const bytes = new Uint8Array([1, 2, 3]);
+        const cid = await rawCid(bytes);
+        const puts: string[] = [];
+        const adapted = adaptBlockstore({
+            get: async () => bytes,
+            put: async (c) => {
+                puts.push(c.toString());
+                return c;
+            },
+            has: async (c) => c.equals(cid)
+        });
+        expect(await adapted.get(cid)).toEqual(bytes);
+        expect(await adapted.put(cid, bytes)).toBe(cid);
+        expect(puts).toEqual([cid.toString()]);
+        expect(await adapted.has(cid)).toBe(true);
+    });
+
+    it("concatenates a multi-chunk streaming get in order (Helia's Blocks interface)", async () => {
+        const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+        const cid = await rawCid(bytes);
+        const adapted = adaptBlockstore({
+            get: () =>
+                (async function* () {
+                    yield bytes.slice(0, 2);
+                    yield bytes.slice(2);
+                })(),
+            put: async (c) => c,
+            has: async () => true
+        });
+        expect(await adapted.get(cid)).toEqual(bytes);
+    });
+
+    it("rejects a stream that yields no bytes (a block cannot be empty-by-omission)", async () => {
+        const cid = await rawCid(new Uint8Array([1]));
+        const adapted = adaptBlockstore({
+            get: () => (async function* () {})(),
+            put: async (c) => c,
+            has: async () => true
+        });
+        await expect(adapted.get(cid)).rejects.toThrow(/yielded no bytes/);
+    });
+});
+
 describe("adaptBlockstore sessions", () => {
     it("omits createSession when the raw blockstore cannot make sessions", () => {
         const adapted = adaptBlockstore({

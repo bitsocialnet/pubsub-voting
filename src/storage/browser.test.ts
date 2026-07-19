@@ -63,6 +63,17 @@ describe("LocalForageLruStorage (browser round-robin LRU)", () => {
         expect(await store.getItem("c")).toBe(3);
     });
 
+    it("clear() empties both halves", async () => {
+        const store = openLru(2);
+        await store.setItem("a", 1);
+        await store.setItem("b", 2); // swap: a,b become the inactive half
+        await store.setItem("c", 3);
+        await store.clear();
+        expect(await store.getItem("a")).toBeUndefined();
+        expect(await store.getItem("c")).toBeUndefined();
+        expect(await store.keys()).toEqual([]);
+    });
+
     it("does not swap early after removeItem frees active slots (counter drift)", async () => {
         // Regression: `activeSize` was only ever incremented, so removals (the gate-result
         // expiry purge calls removeItem in bulk) left it inflated and grow() swapped before
@@ -82,5 +93,56 @@ describe("LocalForageLruStorage (browser round-robin LRU)", () => {
         expect(await store.getItem("c")).toBe(3);
         expect(await store.getItem("e")).toBe(5);
         expect(await store.getItem("f")).toBe(6);
+    });
+});
+
+describe("LocalForageSnapshotStorage (browser checkpoint snapshots)", () => {
+    const CHECKPOINTS_DB = "pubsub-voting-checkpoints";
+    const snapshots = () => makeStorage({ dataPath: undefined }).openSnapshots();
+
+    it("round-trips snapshot bytes and removes them", async () => {
+        const store = snapshots();
+        const bytes = new Uint8Array([1, 2, 3, 4]);
+        await store.set("topic-a", bytes);
+        expect(await store.get("topic-a")).toEqual(bytes);
+        await store.remove("topic-a");
+        expect(await store.get("topic-a")).toBeUndefined();
+    });
+
+    it("re-wraps an ArrayBuffer coming back from an older driver, and refuses non-binary values", async () => {
+        const store = snapshots();
+        await store.set("seed", new Uint8Array([9])); // materialize the mocked database
+        const db = databases.get(CHECKPOINTS_DB)!;
+        db.set("legacy", new Uint8Array([5, 6]).buffer); // an older driver stored the raw ArrayBuffer
+        db.set("garbage", "not a snapshot"); // a foreign write must read as absent, not crash decode
+        expect(await store.get("legacy")).toEqual(new Uint8Array([5, 6]));
+        expect(await store.get("garbage")).toBeUndefined();
+    });
+});
+
+describe("makeStorage (browser backend wiring)", () => {
+    it("returns the same LRU per cacheName and the same snapshot store per storage (stable handles)", () => {
+        const storage = makeStorage({ dataPath: undefined });
+        expect(storage.openLru({ cacheName: "same", maxItems: 5 })).toBe(storage.openLru({ cacheName: "same", maxItems: 5 }));
+        expect(storage.openSnapshots()).toBe(storage.openSnapshots());
+    });
+
+    it("dataPath: false selects the in-memory backend (no IndexedDB touched), and destroy() resolves", async () => {
+        const before = databases.size;
+        const storage = makeStorage({ dataPath: false });
+        const lru = storage.openLru({ cacheName: "mem", maxItems: 5 });
+        await lru.setItem("k", 1);
+        expect(await lru.getItem("k")).toBe(1);
+        await storage.openSnapshots().set("t", new Uint8Array([1]));
+        expect(await storage.openSnapshots().get("t")).toEqual(new Uint8Array([1]));
+        expect(databases.size).toBe(before); // nothing hit the (mocked) localforage layer
+        await storage.destroy();
+    });
+
+    it("destroy() drops the handles (a later open builds fresh ones)", async () => {
+        const storage = makeStorage({ dataPath: undefined });
+        const first = storage.openSnapshots();
+        await storage.destroy();
+        expect(storage.openSnapshots()).not.toBe(first);
     });
 });

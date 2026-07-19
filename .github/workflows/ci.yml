@@ -41,7 +41,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run typecheck:examples
       - run: npm run build
-      - run: npm test
+      # Unit suite with V8 coverage; the thresholds in vitest.config.ts fail the run if
+      # coverage regresses below the pinned baseline.
+      - run: npm run test:coverage
       # Two-node gossipsub integration test (real libp2p + Helia on loopback),
       # excluded from the unit suite. Runs here so releases gate on it too.
       - run: npm run test:integration

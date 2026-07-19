@@ -3,6 +3,9 @@ dist/
 *.log
 .tmp/
 
+# Vitest V8 coverage output (`npm run test:coverage`)
+/coverage/
+
 # Default PubsubVoter dataPath (persistent caches) — tests/benches pass `dataPath: false`,
 # but a stray local run must never commit its sqlite files.
 /.bitsocial-pubsub-voting/

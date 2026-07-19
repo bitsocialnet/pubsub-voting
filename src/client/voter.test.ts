@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { CID } from "multiformats/cid";
+import { sha256 } from "multiformats/hashes/sha2";
+import { base58btc } from "multiformats/bases/base58";
 import type { PeerId } from "@libp2p/interface";
 import { PubsubVoter, republishIntervalBuckets, type PublishingState } from "./voter.js";
 import {
@@ -1551,5 +1553,412 @@ describe("provider-record announcer (httpRouterUrls)", () => {
         await vi.advanceTimersByTimeAsync(2 * 3_600_000);
         expect(h.fetchSpy).not.toHaveBeenCalled();
         await voter.stop();
+    });
+
+    it("announces only JOINED contests: a created-but-never-updated engine contributes no keys", async () => {
+        const h = announcerHarness();
+        const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: stubChains(), httpRouterUrls: ["http://router.example"] });
+        const joined = await voter.createContest({ criteria: bizCriteria() });
+        // A second engine exists (createContest built it) but this node never joined its topic —
+        // announcing its criteria CID would advertise state we do not serve.
+        const bystander = await voter.createContest({ criteria: { ...bizCriteria(), contestId: "pol" } });
+        await joined.update();
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+        expect(h.fetchSpy).toHaveBeenCalledTimes(1);
+        const keys = h.bodies()[0]!.body.Providers[0]!.Payload.Keys;
+        const criteriaCidOf = (topic: string) => topic.slice(TOPIC_PREFIX.length);
+        expect(keys).toContain(criteriaCidOf(joined.topic));
+        expect(keys).not.toContain(criteriaCidOf(bystander.topic));
+        expect(keys).toHaveLength(2); // joined criteria CID + its (empty-checkpoint) root, nothing else
+        await voter.stop();
+    });
+});
+
+describe("cold-start fetch backoff bounds", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+    });
+
+    /** One subscriber whose fetch ALWAYS throws — a peer permanently over its inbound-stream cap. */
+    function throwingFetchHarness() {
+        vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0.5); // deterministic backoff: 200, 400, 800 … ms
+        let attempts = 0;
+        const fetchService: FetchServiceLike = {
+            fetch: async () => {
+                attempts += 1;
+                throw new Error("stream reset");
+            },
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [{ toString: () => "peerA" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
+        const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: fakeChains() });
+        return { voter, attempts: () => attempts };
+    }
+
+    it("abandons the retry quietly when the contest is left mid-backoff (no post-leave fetches)", async () => {
+        const h = throwingFetchHarness();
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.waitFor(() => expect(h.attempts()).toBe(1)); // first attempt threw; the pull is in its backoff sleep
+        await h.voter.stop(); // leave() clears the chaser mid-backoff
+        await vi.advanceTimersByTimeAsync(60_000); // every scheduled backoff wake-up fires...
+        expect(h.attempts()).toBe(1); // ...and finds the contest left: no further fetch, no throw
+    });
+
+    it("stops retrying at the fetch deadline; the join itself stays healthy", async () => {
+        const h = throwingFetchHarness();
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.advanceTimersByTimeAsync(40_000); // well past COLD_START_FETCH_DEADLINE_MS (30 s)
+        const settled = h.attempts();
+        expect(settled).toBeGreaterThan(1); // it did retry while inside the deadline...
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(h.attempts()).toBe(settled); // ...and gave up for good once past it
+        expect(contest.tally?.ranking).toEqual([]); // the failed pull never poisoned the join
+        await h.voter.stop();
+    });
+});
+
+describe("cold-start provider discovery bounds", () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    function routedHarness(contentRouting: unknown) {
+        const fetchedPeers: string[] = [];
+        const dialed: string[] = [];
+        const fetchService: FetchServiceLike = {
+            fetch: async (peer) => {
+                fetchedPeers.push(peer.toString());
+                return undefined; // definitive "no record" — no retry, no chase
+            },
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [], // router-only discovery
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
+        const libp2p = {
+            peerId: { toString: () => "self" },
+            dial: async (addrs: unknown) => {
+                dialed.push(String(addrs));
+            },
+            contentRouting,
+            services: { pubsub, fetch: fetchService }
+        };
+        const helia = { libp2p, blockstore } as unknown as HeliaInstance;
+        return { voter: new PubsubVoter({ dataPath: false, helia, chains: fakeChains() }), fetchedPeers, dialed };
+    }
+
+    it("caps router-discovered providers at COLD_START_PEERS and skips dialing an address-less provider", async () => {
+        // Seven providers announced; only the first four (COLD_START_PEERS) are taken. The first
+        // carries no multiaddrs — it is still pulled (it may already be connected), just not dialed.
+        const contentRouting = {
+            findProviders: async function* () {
+                for (let i = 0; i < 7; i++) {
+                    yield { id: { toString: () => `prov${i}` }, multiaddrs: i === 0 ? [] : [`/ip4/203.0.113.${i}/tcp/4001`] };
+                }
+            }
+        };
+        const h = routedHarness(contentRouting);
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.waitFor(() => expect(h.fetchedPeers.length).toBe(4));
+        expect(h.fetchedPeers.sort()).toEqual(["prov0", "prov1", "prov2", "prov3"]);
+        expect(h.dialed).toHaveLength(3); // prov0 has no addrs to dial
+        await h.voter.stop();
+    });
+
+    it("abandons a hung content router at the discovery timeout (bounded, never wedged)", async () => {
+        vi.useFakeTimers();
+        // A router that never answers: `next` resolves only by rejecting on the abort signal —
+        // exactly how a signal-respecting libp2p content router surfaces the timeout.
+        const contentRouting = {
+            findProviders: (_cid: unknown, opts: { signal: AbortSignal }) => ({
+                [Symbol.asyncIterator]() {
+                    return {
+                        next: () =>
+                            new Promise<never>((_, reject) => {
+                                opts.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+                            })
+                    };
+                }
+            })
+        };
+        const h = routedHarness(contentRouting);
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // join resolves immediately — discovery is fire-and-forget
+        await vi.advanceTimersByTimeAsync(10_000); // COLD_START_ROUTER_TIMEOUT_MS fires the abort
+        expect(h.fetchedPeers).toEqual([]); // nothing discovered, nothing pulled...
+        expect(contest.tally?.ranking).toEqual([]); // ...and the contest is live regardless
+        await h.voter.stop();
+    });
+});
+
+describe("tally tie-break through the engine (bucket-boundary block hash seed)", () => {
+    /** bizCriteria, but one wallet may vote for two communities — the minimal weight tie. */
+    const tieCriteria = () => ({ ...bizCriteria(), maxVotesPerAddress: 2 });
+    const TWO_VOTES = [
+        { community: { publicKey: VALID_KEY }, vote: 1 },
+        { community: { publicKey: OTHER_KEY }, vote: 1 }
+    ];
+
+    it("orders a weight tie by the rolling seed sha256(bucketBlockHash ‖ publicKey), reading the boundary block", async () => {
+        let blockReads = 0;
+        const client = {
+            getBlockNumber: async () => 43200n,
+            getBlock: async () => {
+                blockReads += 1;
+                return { hash: `0x${"11".repeat(32)}` };
+            },
+            readContract: async () => 1n
+        };
+        const voter = new PubsubVoter({ dataPath: false,
+            helia: fakeHelia(),
+            chains: () => client as unknown as ChainClient,
+            signer: fakeSigner()
+        });
+        await (await voter.createContestVote({ criteria: tieCriteria(), votes: TWO_VOTES })).publish();
+        const contest = await voter.createContest({ criteria: tieCriteria() });
+        const tally = await contest.getTally();
+        expect(tally.ranking.map((r) => r.weight)).toEqual([1n, 1n]); // a genuine tie
+        expect(blockReads).toBeGreaterThanOrEqual(1); // the seed's one boundary-block read happened
+
+        // Recompute the documented seed independently and assert the REAL order, not just stability.
+        const blockHash = new Uint8Array(32).fill(0x11);
+        const seedOf = async (publicKey: string): Promise<Uint8Array> => {
+            const pk = base58btc.decode(`z${publicKey}`);
+            const buf = new Uint8Array(blockHash.length + pk.length);
+            buf.set(blockHash, 0);
+            buf.set(pk, blockHash.length);
+            return (await sha256.digest(buf)).digest;
+        };
+        const lex = (x: Uint8Array, y: Uint8Array): number => {
+            for (let i = 0; i < Math.min(x.length, y.length); i++) {
+                if (x[i] !== y[i]) return x[i]! - y[i]!;
+            }
+            return x.length - y.length;
+        };
+        const expected = [VALID_KEY, OTHER_KEY];
+        const seeds = new Map(await Promise.all(expected.map(async (k) => [k, await seedOf(k)] as const)));
+        expected.sort((a, b) => lex(seeds.get(a)!, seeds.get(b)!));
+        expect(tally.ranking.map((r) => r.community.publicKey)).toEqual(expected);
+    });
+
+    it("surfaces a boundary block with no hash as a tally error event (never a silent mis-order)", async () => {
+        const client = {
+            getBlockNumber: async () => 43200n,
+            getBlock: async () => ({ hash: null }), // a pruned/pending boundary block
+            readContract: async () => 1n
+        };
+        const voter = new PubsubVoter({ dataPath: false,
+            helia: fakeHelia(),
+            chains: () => client as unknown as ChainClient,
+            signer: fakeSigner()
+        });
+        const contest = await voter.createContest({ criteria: tieCriteria() });
+        const errors: unknown[] = [];
+        contest.on("error", (e) => errors.push(e));
+        await contest.update();
+        await (await voter.createContestVote({ criteria: tieCriteria(), votes: TWO_VOTES })).publish();
+        await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
+        expect(String(errors[0])).toContain("has no hash");
+        await voter.stop();
+    });
+});
+
+describe("peer-root map (advertiser LRU + chase session providers)", () => {
+    const PEER_ROOTS_MAX = 256; // src/client/voter.ts PEER_ROOTS_MAX
+
+    /**
+     * A voter on a session-capable blockstore with a fixed connection set, its topic validator
+     * exposed: delivering root records drives `#notePeerRoot`, and each divergent-root chase
+     * reveals the map's contents through the session's `providers` (advertisers ∩ connections).
+     */
+    async function peerRootHarness(connections: string[]) {
+        const sessions: Array<{ root: string; providers: string[] }> = [];
+        let broadcastGets = 0;
+        const blockstore = {
+            get: async () => {
+                broadcastGets += 1;
+                throw new Error("no block"); // every chase fails fast; only its session opening matters
+            },
+            put: async (cid: unknown) => cid,
+            has: async () => false,
+            createSession: (root: CID, options?: { providers?: PeerId[] }) => {
+                sessions.push({ root: root.toString(), providers: (options?.providers ?? []).map((p) => p.toString()) });
+                return {
+                    get: async () => {
+                        throw new Error("no block");
+                    },
+                    addPeer: () => {},
+                    close: () => {}
+                };
+            }
+        };
+        const pubsub: PubsubService = {
+            publish: async () => undefined,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [],
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const libp2p = {
+            peerId: { toString: () => "self" },
+            getConnections: () => connections.map((id) => ({ remotePeer: { toString: () => id } })),
+            services: { pubsub, fetch: fakeFetchService() }
+        };
+        const helia = { libp2p, blockstore } as unknown as HeliaInstance;
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const validator = pubsub.topicValidators!.get(contest.topic)!;
+        const deliver = async (record: RootRecord, from: string) => {
+            const peer = { toString: () => from } as unknown as Parameters<typeof validator>[0];
+            await validator(peer, { topic: contest.topic, data: encodeRootMessage(record) });
+        };
+        /** Wait until `n` chases ran to completion (each failed chase does exactly one broadcast get). */
+        const drainChases = async (n: number) => {
+            await vi.waitFor(() => expect(broadcastGets).toBe(n));
+            await new Promise((resolve) => setTimeout(resolve, 25)); // let the flight leave the in-flight map
+        };
+        const ownRecord = await (contest as unknown as { rootRecord(): Promise<RootRecord> }).rootRecord();
+        return { voter, contest, deliver, drainChases, sessions, ownRecord };
+    }
+
+    it("seeds a chase with every still-connected advertiser of that exact root; refresh keeps a peer, overflow evicts the oldest", async () => {
+        // p1, p2, p257 are connected; the divergent root RA is what they advertise.
+        const h = await peerRootHarness(["p1", "p2", "p257"]);
+        const RA = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const recordA: RootRecord = { version: ROOT_RECORD_VERSION, root: RA, count: 1, sizeBytes: 100 };
+
+        await h.deliver(recordA, "p1"); // map: p1→RA
+        await h.drainChases(1);
+        expect(h.sessions[0]).toEqual({ root: RA.toString(), providers: ["p1"] });
+
+        await h.deliver(recordA, "p2"); // map: p1, p2 — both advertise RA and both are connected
+        await h.drainChases(2);
+        expect(h.sessions[1]).toEqual({ root: RA.toString(), providers: ["p1", "p2"] });
+
+        // Fill the map to PEER_ROOTS_MAX with peers advertising OUR root (noted, but no chase).
+        for (let i = 3; i <= PEER_ROOTS_MAX; i++) await h.deliver(h.ownRecord, `filler${i}`);
+        // Re-advertising refreshes p1's slot: p2 is now the oldest entry.
+        await h.deliver(recordA, "p1");
+        await h.drainChases(3);
+        // p257 lands on the FULL map: the oldest (p2) is evicted — its slot, and only its slot.
+        await h.deliver(recordA, "p257");
+        await h.drainChases(4);
+        // The final chase proves both: p1 survived (refreshed), p2 is gone (evicted), p257 present.
+        expect(h.sessions[3]).toEqual({ root: RA.toString(), providers: ["p1", "p257"] });
+
+        await h.voter.stop();
+    });
+});
+
+describe("facade odds and ends", () => {
+    it("update() is idempotent while joined (no duplicate listeners, no re-join)", async () => {
+        const h = subscribableHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        let updates = 0;
+        contest.on("update", () => {
+            updates += 1;
+        });
+        await contest.update();
+        expect(h.listenerCount()).toBe(1);
+        expect(updates).toBe(1);
+        await contest.update(); // second call is a no-op: already subscribed
+        expect(h.listenerCount()).toBe(1);
+        expect(updates).toBe(1);
+        await voter.stop();
+    });
+
+    it("a ContestVote exposes its contest's topic", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        expect(vote.topic).toBe(await topicFor(bizCriteria()));
+        await voter.destroy();
+    });
+});
+
+describe("checkpoint snapshot restore admissibility", () => {
+    const tempDataPath = async (): Promise<string> => {
+        const { mkdtempSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        return mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
+    };
+    const chainsAt = (head: bigint): ChainClientFactory => {
+        const client = {
+            getBlockNumber: async () => head,
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        return () => client as unknown as ChainClient;
+    };
+
+    it("skips a restored bundle dated past our own chain head (transiently unevaluable, not admitted blind)", async () => {
+        const dataPath = await tempDataPath();
+        const signer = realSigner();
+
+        // Session 1 persists a vote sampled at bucket 40.
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: chainsAt(40n * 43200n), signer });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contestA = await voterA.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voterA.destroy();
+
+        // Session 2's chain head is far BEHIND the snapshot (a lagging or wrong RPC): the bundle's
+        // sample bucket is not yet reachable, so the restore must skip it rather than admit a
+        // bundle no verifier could evaluate.
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: chainsAt(43200n), signer });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        await contestB.update();
+        expect(contestB.tally?.ranking).toEqual([]);
+        await voterB.destroy();
+    });
+
+    it("a re-join restores idempotently (already-admitted bundles are not doubled)", async () => {
+        const dataPath = await tempDataPath();
+        const signer = realSigner();
+        const chains = chainsAt(40n * 43200n);
+
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains, signer });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contestA = await voterA.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voterA.destroy();
+
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains, signer });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        await contestB.update();
+        expect(contestB.tally?.ranking).toHaveLength(1);
+        await contestB.stop();
+        await contestB.update(); // the re-join re-runs the restore against already-admitted state
+        expect(contestB.tally?.ranking).toHaveLength(1); // same vote, not doubled
+        expect(contestB.tally?.ranking[0]?.weight).toBe(1n);
+        await voterB.destroy();
     });
 });
