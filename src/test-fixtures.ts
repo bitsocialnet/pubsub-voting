@@ -4,6 +4,13 @@ import type { Criteria } from "./schema/criteria.js";
 import type { PeerId } from "@libp2p/interface";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./transport/types.js";
 import type { ChainClient, ChainClientFactory } from "./chain/types.js";
+import {
+    encodeBulkRootRecords,
+    encodeRootRecord,
+    BULK_ROOTS_FETCH_KEY,
+    ROOT_FETCH_KEY_SUFFIX,
+    type FetchRootRecord
+} from "./transport/messages.js";
 import type { VoteSigner } from "./signer/types.js";
 import { EIP712_SIGNATURE_TYPE } from "./signer/eip712.js";
 
@@ -63,6 +70,52 @@ function fakeBlockstore(): BlockstoreLike {
 export function fakeFetchService(): FetchServiceLike {
     return {
         fetch: async () => undefined,
+        registerLookupFunction: () => {},
+        unregisterLookupFunction: () => {}
+    };
+}
+
+/**
+ * A fetch service that answers BOTH root-record key shapes from one source of truth: the
+ * per-topic `<topic>/root` key and the bulk `bitsocial-votes/roots` key that batches them.
+ *
+ * Tests must be explicit about which kind of peer they model, because the two differ in a way
+ * the client depends on:
+ *
+ *   - `speaksBulk: true` (default) — a current peer. The bulk key always answers, with an EMPTY
+ *     map when it serves nothing. The client reads that as "speaks bulk, has nothing".
+ *   - `speaksBulk: false` — answers `undefined` to the bulk key. That models BOTH a pre-bulk peer
+ *     and one whose responder is not registered yet (it has joined nothing so far), which are
+ *     indistinguishable on the wire. This is what drives the client's fall-back-and-re-probe path.
+ *
+ * `onFetch` observes every request as `(peerId, key)`, which is how a test counts round trips —
+ * the number that distinguishes a batched directory join from a per-contest one.
+ */
+export function rootFetchService(options: {
+    /** topic → that topic's record, as the responder would encode it. Absent topic = no record. */
+    records?: () => Record<string, FetchRootRecord>;
+    /**
+     * Model a pre-bulk peer (answers nothing to the bulk key). Default true = current peer.
+     * Pass a FUNCTION to have it re-read per request — that is how a test models a peer whose
+     * responder is not registered yet and starts answering partway through the session.
+     */
+    speaksBulk?: boolean | (() => boolean);
+    /** Called for every request, before the answer is computed. */
+    onFetch?: (peerId: string, key: string) => void;
+} = {}): FetchServiceLike {
+    const { records = () => ({}), speaksBulk = true, onFetch } = options;
+    const answersBulk = () => (typeof speaksBulk === "function" ? speaksBulk() : speaksBulk);
+    return {
+        fetch: async (peer: PeerId, key: string | Uint8Array) => {
+            const keyString = typeof key === "string" ? key : new TextDecoder().decode(key);
+            onFetch?.(peer.toString(), keyString);
+            if (keyString === BULK_ROOTS_FETCH_KEY) {
+                return answersBulk() ? encodeBulkRootRecords(records()) : undefined;
+            }
+            if (!keyString.endsWith(ROOT_FETCH_KEY_SUFFIX)) return undefined;
+            const record = records()[keyString.slice(0, -ROOT_FETCH_KEY_SUFFIX.length)];
+            return record === undefined ? undefined : encodeRootRecord(record);
+        },
         registerLookupFunction: () => {},
         unregisterLookupFunction: () => {}
     };

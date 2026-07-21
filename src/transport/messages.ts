@@ -2,6 +2,7 @@ import { CID } from "multiformats/cid";
 import * as dagCbor from "@ipld/dag-cbor";
 import { z } from "zod";
 import { encodeCanonical } from "../encoding/canonical.js";
+import { TOPIC_PREFIX } from "../topic.js";
 import type { Criteria } from "../schema/criteria.js";
 
 /**
@@ -117,6 +118,48 @@ export const ROOT_FETCH_KEY_SUFFIX = "/root";
 /** The fetch-protocol key for one contest's root record. */
 export function rootFetchKey(topic: string): string {
     return `${topic}${ROOT_FETCH_KEY_SUFFIX}`;
+}
+
+/**
+ * The fetch-protocol key for the BULK root record: "every contest you currently serve", answered
+ * as one `{ [topic]: FetchRootRecord }` map. A directory-sized cold joiner needs one root record
+ * per contest, and asking for them one at a time costs one request/response round trip each —
+ * measured as the dominant cold-start term for a 63-contest directory, since the multistream-select
+ * negotiation (~1-2 RTT) dominates each fetch regardless of how tiny the answer is. Records are
+ * ~100 B, so a whole directory fits in a handful of KB: one round trip instead of 63.
+ *
+ * Deliberately *not* parameterized by the topics the caller wants. The fetch protocol's key is the
+ * only client-to-server payload, so a topic list would mean a multi-KB key; and scoping the answer
+ * to a "directory" would push the manifest concept — which lives in the host above this library —
+ * into the wire format. "Everything I serve" needs neither: the caller intersects the answer with
+ * its own topics, exactly as it would have done across 63 separate replies.
+ *
+ * Shares the {@link TOPIC_PREFIX} registration with {@link rootFetchKey} and cannot collide with it
+ * (a per-topic key ends in `/root`, this one in `/roots`).
+ */
+export const BULK_ROOTS_FETCH_KEY = `${TOPIC_PREFIX}roots`;
+
+/**
+ * The bulk answer's cap. A responder never returns more than this many records in one reply, so a
+ * single unauthenticated request cannot compel a node serving thousands of contests to encode all
+ * of them. Callers treat a capped (hence possibly incomplete) answer the same as any other: topics
+ * they asked about that are missing simply fall back to a per-topic fetch.
+ */
+export const BULK_ROOTS_MAX_RECORDS = 512;
+
+const BulkRootRecordsSchema = z.record(z.string(), FetchRootRecordSchema);
+
+/** The bulk root-record answer: contest topic → that contest's root record. */
+export type BulkRootRecords = Record<string, FetchRootRecord>;
+
+/** Encode a bulk root-record answer (see {@link BULK_ROOTS_FETCH_KEY}). */
+export function encodeBulkRootRecords(records: BulkRootRecords): Uint8Array {
+    return encodeCanonical(BulkRootRecordsSchema.parse(records));
+}
+
+/** Decode a bulk root-record answer; throws on malformed (caller treats a throw as "no answer"). */
+export function decodeBulkRootRecords(bytes: Uint8Array): BulkRootRecords {
+    return BulkRootRecordsSchema.parse(dagCbor.decode(bytes));
 }
 
 /**
