@@ -126,7 +126,9 @@ export function rootFetchKey(topic: string): string {
  * per contest, and asking for them one at a time costs one request/response round trip each —
  * measured as the dominant cold-start term for a 63-contest directory, since the multistream-select
  * negotiation (~1-2 RTT) dominates each fetch regardless of how tiny the answer is. Records are
- * ~100 B, so a whole directory fits in a handful of KB: one round trip instead of 63.
+ * ~100 B, so a whole directory fits in a handful of KB: one round trip instead of 63. Each record
+ * may additionally inline its checkpoint's chunk blocks (see {@link BulkFetchRootRecord}), making
+ * the one round trip carry the whole cold-pull payload, not just the pointers to it.
  *
  * Deliberately *not* parameterized by the topics the caller wants. The fetch protocol's key is the
  * only client-to-server payload, so a topic list would mean a multi-KB key; and scoping the answer
@@ -147,10 +149,33 @@ export const BULK_ROOTS_FETCH_KEY = `${TOPIC_PREFIX}roots`;
  */
 export const BULK_ROOTS_MAX_RECORDS = 512;
 
-const BulkRootRecordsSchema = z.record(z.string(), FetchRootRecordSchema);
+/**
+ * Byte budget for checkpoint chunk blocks INLINED into one bulk answer (see
+ * {@link BulkFetchRootRecord.chunkBlocks}). Checkpoint payloads are tiny in practice (~300 B per
+ * contest for a leaderboard directory), so a whole directory's cold-pull payload rides the one
+ * bulk round trip — but the budget caps what a single unauthenticated request can compel: once
+ * spent, remaining records answer without their blocks and the caller chases them over bitswap
+ * exactly as before. Spent in joined-contest iteration order, all-or-nothing per record (a
+ * partial chunk set would still cost the chase round-trip it exists to remove).
+ */
+export const BULK_ROOTS_MAX_INLINE_BYTES = 512 * 1024;
 
-/** The bulk root-record answer: contest topic → that contest's root record. */
-export type BulkRootRecords = Record<string, FetchRootRecord>;
+/**
+ * One bulk-answer entry: the root record, optionally carrying the checkpoint's chunk blocks
+ * inline. `chunkBlocks[i]` is the raw block whose content address must be `chunks[i]` — the
+ * receiver re-hashes every block and drops any that does not match, so inlined bytes are exactly
+ * as trustworthy as bitswap-fetched ones (content addressing is the verification either way, and
+ * the bundles inside are re-verified offline before merge regardless). Absent on the wire when a
+ * record has no chunks or the answer's inline budget ran out.
+ */
+const BulkFetchRootRecordSchema = FetchRootRecordSchema.extend({ chunkBlocks: z.array(BytesSchema).optional() });
+
+export type BulkFetchRootRecord = FetchRootRecord & { chunkBlocks?: Uint8Array[] | undefined };
+
+const BulkRootRecordsSchema = z.record(z.string(), BulkFetchRootRecordSchema);
+
+/** The bulk root-record answer: contest topic → that contest's root record (chunks maybe inline). */
+export type BulkRootRecords = Record<string, BulkFetchRootRecord>;
 
 /** Encode a bulk root-record answer (see {@link BULK_ROOTS_FETCH_KEY}). */
 export function encodeBulkRootRecords(records: BulkRootRecords): Uint8Array {

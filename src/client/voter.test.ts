@@ -31,6 +31,7 @@ import {
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
+import { blockForBytes } from "../checkpoint/codec.js";
 import {
     bizCriteria,
     fakeHelia,
@@ -1104,6 +1105,7 @@ describe("root-record fetch protocol", () => {
         };
         const subscribers = [...peerServices.keys()].map((id) => ({ toString: () => id }));
         const chased: string[] = []; // root CIDs the chase pulled blocks for
+        const puts: string[] = []; // CIDs stored (the bulk answer's verified inline chunk blocks land here)
         const pubsub: PubsubService = {
             publish: async () => undefined,
             subscribe: () => {},
@@ -1118,11 +1120,14 @@ describe("root-record fetch protocol", () => {
                 chased.push(cid.toString());
                 throw new Error("no block"); // the chase yields nothing; only the attempt matters here
             },
-            put: async (cid: CID) => cid,
+            put: async (cid: CID) => {
+                puts.push(cid.toString());
+                return cid;
+            },
             has: async () => false
         };
         const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
-        return { helia, lookups, fetchCalls, chased, counts };
+        return { helia, lookups, fetchCalls, chased, puts, counts };
     }
 
     it("registers a responder that answers <topic>/root with the on-demand record, and unregisters on stop", async () => {
@@ -1545,7 +1550,11 @@ describe("root-record fetch protocol", () => {
             serving = true; // the seeder finished joining and now answers the bulk key
             const perTopicBefore = h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY).length;
             await wave(3, 3);
-            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(3));
+            // All SIX chase, not just the second wave: the bulk answer names every contest the peer
+            // serves, and records nobody in the batch asked about fan out to their engines — so the
+            // first wave, which met the seeder mid-startup and got nothing, catches up off the
+            // second wave's answer instead of waiting out the heartbeat.
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(6));
 
             // The second wave rode ONE bulk reply: no new per-topic fetches at all.
             expect(h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY)).toHaveLength(perTopicBefore);
@@ -1573,6 +1582,94 @@ describe("root-record fetch protocol", () => {
             await vi.waitFor(() => expect(h.chased).toContain(ROOT.toString()));
             // Still bulk both times — the empty answer left no sticky verdict behind.
             expect(h.fetchCalls.map((call) => call.key)).toEqual([BULK_ROOTS_FETCH_KEY, BULK_ROOTS_FETCH_KEY]);
+            await voter.stop();
+        });
+
+        it("serves a straggler from the previous answer instead of refetching it (bulk answer cache)", async () => {
+            // A directory cold start does NOT arrive as one batch: each contest pulls only when its
+            // own discovery returns. Measured against production, a 63-contest cold start coalesced
+            // into 3 batches — the last two refetching the byte-identical answer while the first
+            // tally waited on them. A fresh answer is kept briefly, so a straggler whose topic it
+            // already names is served without touching the wire.
+            const lateCriteria = { ...bizCriteria(), contestId: "late" };
+            const lateTopic = await topicFor(lateCriteria);
+            let topics: string[] = [];
+            const records = () => Object.fromEntries([...topics, lateTopic].map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const early = await Promise.all(
+                Array.from({ length: 3 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = early.map((contest) => contest.topic);
+            await Promise.all(early.map((contest) => contest.update()));
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(3));
+            expect(h.fetchCalls).toHaveLength(1);
+
+            const late = await voter.createContest({ criteria: lateCriteria });
+            await late.update(); // the straggler: pulled after the batch closed, inside the cache window
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(4));
+            expect(h.fetchCalls).toHaveLength(1); // still the ONE bulk request — the straggler cost no wire
+            await voter.stop();
+        });
+
+        it("re-asks for a topic the cached answer predates instead of serving it a stale 'no record'", async () => {
+            // The deliberate asymmetry in the cache: "absent = definitive no record" holds within
+            // one answer, but a cached answer cannot speak for a contest joined after it was taken
+            // — a stale "no" would strand that contest until the heartbeat. The straggler above is
+            // served from the cache because its topic IS in the answer; a topic that is NOT goes
+            // back to the wire, where the fresh answer covers it.
+            let topics: string[] = [];
+            const records = () => Object.fromEntries(topics.map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const early = await voter.createContest({ criteria: bizCriteria() });
+            topics = [early.topic];
+            await early.update();
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(1));
+            expect(h.fetchCalls).toHaveLength(1);
+
+            const late = await voter.createContest({ criteria: { ...bizCriteria(), contestId: "late" } });
+            topics = [...topics, late.topic]; // the seeder serves it — only the cached answer predates it
+            await late.update();
+            // The second bulk request is the point: the cache did not answer for a topic it never saw.
+            await vi.waitFor(() => expect(h.fetchCalls.filter((call) => call.key === BULK_ROOTS_FETCH_KEY)).toHaveLength(2));
+            // ≥2, not exactly 2: the late contest chased off the fresh answer, and that answer may
+            // also legitimately re-fan-out to the first engine (its chase failed in this harness,
+            // so its root still diverges — a re-chase of an unfetchable root, not double-counting).
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString()).length).toBeGreaterThanOrEqual(2));
+            await voter.stop();
+        });
+
+        it("stores hash-verified inline chunk blocks and drops lying ones (content addressing is the verification)", async () => {
+            // The bulk answer may inline each record's checkpoint chunk blocks so the chase finds
+            // them locally instead of over bitswap. Inlined bytes are exactly as trustworthy as
+            // bitswap-fetched ones for the same reason: the CID is the verification. A block whose
+            // bytes do not hash to the record's chunk CID is dropped (the chase fetches it), never
+            // stored under a CID it does not match.
+            const honest = await blockForBytes(new TextEncoder().encode("honest chunk bytes"));
+            const claimed = await blockForBytes(new TextEncoder().encode("what the liar claims to serve"));
+            const lie = new TextEncoder().encode("what the liar actually inlined");
+            let topics: string[] = [];
+            const records = () =>
+                Object.fromEntries([
+                    [topics[0]!, { ...recordOf(ROOT), chunks: [honest.cid], chunkBlocks: [honest.bytes] }],
+                    [topics[1]!, { ...recordOf(ROOT), chunks: [claimed.cid], chunkBlocks: [lie] }]
+                ]);
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const contests = await Promise.all(
+                Array.from({ length: 2 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = contests.map((contest) => contest.topic);
+            await Promise.all(contests.map((contest) => contest.update()));
+
+            await vi.waitFor(() => expect(h.puts).toContain(honest.cid.toString()));
+            // The lie lands nowhere: not under the CID it claimed (that would poison the store)
+            // and not under its true hash either (a mismatched block is dropped, not adopted).
+            // `puts` is not asserted exact — the engines' own empty-checkpoint encodes also store
+            // their root blocks through the same seam.
+            expect(h.puts).not.toContain(claimed.cid.toString());
+            expect(h.puts).not.toContain((await blockForBytes(lie)).cid.toString());
             await voter.stop();
         });
 

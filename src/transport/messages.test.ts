@@ -107,6 +107,24 @@ describe("pubsub message codec (two-kind union)", () => {
         expect(decoded["bitsocial-votes/biz"]!.root.equals(ROOT)).toBe(true);
     });
 
+    it("round-trips inline chunk blocks, and keeps the block-less encoding byte-identical to the pre-inline one", async () => {
+        // The optional per-record `chunkBlocks` payload (the whole cold pull in one round trip):
+        // present entries must round-trip byte-exact, and its ABSENCE must leave the map's bytes
+        // exactly what the pre-inline encoder produced — the field is additive, not a re-freeze
+        // of the existing vector.
+        const blockBytes = new Uint8Array([0xa1, 0x01, 0x02]); // any bytes; the CID check is the receiver's job
+        const withBlocks = {
+            ...BULK_RECORDS,
+            "bitsocial-votes/biz": { ...FETCH_RECORD, chunkBlocks: [blockBytes] }
+        };
+        const decoded = decodeBulkRootRecords(encodeBulkRootRecords(withBlocks));
+        expect(Array.from(decoded["bitsocial-votes/biz"]!.chunkBlocks![0]!)).toEqual(Array.from(blockBytes));
+        expect(decoded["bitsocial-votes/pol"]!.chunkBlocks).toBeUndefined();
+        // Absent field ⇒ the frozen no-inline vector still holds (same CID as the vector test).
+        const cid = await bundleCidForBytes(encodeBulkRootRecords(BULK_RECORDS));
+        expect(cid.toString()).toBe("bafyreidsxpchf5kl5g7xp7lh5t523siaox5qazwmme5tb4pfave3isfrkm");
+    });
+
     it("round-trips the EMPTY map, which is a real answer and not the same as no answer", () => {
         // "I speak bulk, I serve nothing" — distinct from a pre-bulk peer's silence, which is what
         // the caller uses to decide whether to remember a peer as bulk-less (see makeRootPuller).

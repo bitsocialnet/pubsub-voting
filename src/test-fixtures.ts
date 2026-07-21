@@ -9,7 +9,7 @@ import {
     encodeRootRecord,
     BULK_ROOTS_FETCH_KEY,
     ROOT_FETCH_KEY_SUFFIX,
-    type FetchRootRecord
+    type BulkFetchRootRecord
 } from "./transport/messages.js";
 import type { VoteSigner } from "./signer/types.js";
 import { EIP712_SIGNATURE_TYPE } from "./signer/eip712.js";
@@ -92,8 +92,12 @@ export function fakeFetchService(): FetchServiceLike {
  * the number that distinguishes a batched directory join from a per-contest one.
  */
 export function rootFetchService(options: {
-    /** topic → that topic's record, as the responder would encode it. Absent topic = no record. */
-    records?: () => Record<string, FetchRootRecord>;
+    /**
+     * topic → that topic's record, as the responder would encode it. Absent topic = no record.
+     * An entry may carry inline `chunkBlocks` (the bulk answer's optional payload); the per-topic
+     * answer strips them, mirroring the real responder (only the bulk reply inlines blocks).
+     */
+    records?: () => Record<string, BulkFetchRootRecord>;
     /**
      * Model a pre-bulk peer (answers nothing to the bulk key). Default true = current peer.
      * Pass a FUNCTION to have it re-read per request — that is how a test models a peer whose
@@ -114,7 +118,9 @@ export function rootFetchService(options: {
             }
             if (!keyString.endsWith(ROOT_FETCH_KEY_SUFFIX)) return undefined;
             const record = records()[keyString.slice(0, -ROOT_FETCH_KEY_SUFFIX.length)];
-            return record === undefined ? undefined : encodeRootRecord(record);
+            if (record === undefined) return undefined;
+            const { chunkBlocks: _bulkOnly, ...bare } = record;
+            return encodeRootRecord(bare);
         },
         registerLookupFunction: () => {},
         unregisterLookupFunction: () => {}
