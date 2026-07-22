@@ -1967,9 +1967,10 @@ describe("cold-start fetch backoff bounds", () => {
 describe("cold-start provider discovery bounds", () => {
     afterEach(() => {
         vi.useRealTimers();
+        vi.restoreAllMocks();
     });
 
-    function routedHarness(contentRouting: unknown) {
+    function routedHarness(contentRouting: unknown, dial?: (addrs: unknown, opts?: { signal?: AbortSignal }) => Promise<void>) {
         const fetchedPeers: string[] = [];
         const dialed: string[] = [];
         // Current-generation providers serving no contest: the empty bulk map is a definitive "no
@@ -1988,9 +1989,11 @@ describe("cold-start provider discovery bounds", () => {
         const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
         const libp2p = {
             peerId: { toString: () => "self" },
-            dial: async (addrs: unknown) => {
-                dialed.push(String(addrs));
-            },
+            dial:
+                dial ??
+                (async (addrs: unknown) => {
+                    dialed.push(String(addrs));
+                }),
             contentRouting,
             services: { pubsub, fetch: fetchService }
         };
@@ -2039,6 +2042,80 @@ describe("cold-start provider discovery bounds", () => {
         await vi.advanceTimersByTimeAsync(10_000); // COLD_START_ROUTER_TIMEOUT_MS fires the abort
         expect(h.fetchedPeers).toEqual([]); // nothing discovered, nothing pulled...
         expect(contest.tally?.ranking).toEqual([]); // ...and the contest is live regardless
+        await h.voter.stop();
+    });
+
+    it("bounds a HUNG provider dial at COLD_START_DIAL_TIMEOUT_MS so the root pull fires at ~3s, not the 10s router timeout", async () => {
+        // Production browser regression: a WSS dial can HANG (neither resolve nor reject). Since the
+        // root-record `pull` runs only after the dial await settles, the hang gated the pull for the
+        // whole COLD_START_ROUTER_TIMEOUT_MS (10s) — measured 4/32 cold rounds, ~6s loads turning into
+        // 8.7–22s. The fix bounds each dial by COLD_START_DIAL_TIMEOUT_MS combined with the router
+        // signal (AbortSignal.any), so a hung dial is cut at ~3s and the catch lets `pull` run anyway.
+        vi.useFakeTimers();
+        // The bundled fake-timers cannot fake AbortSignal.timeout (no entry in its timers table), so
+        // drive it off the faked setTimeout — the fix's real AbortSignal.any composition is exercised.
+        vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+            const c = new AbortController();
+            setTimeout(() => c.abort(new DOMException("dial timeout", "TimeoutError")), ms);
+            return c.signal;
+        });
+        let dialAborted = false;
+        // A hung WSS dial: the returned promise settles ONLY when its abort signal fires (honouring
+        // the timeout), never on its own — so any pull before the timeout proves the dial was gating.
+        const hungDial = (_addrs: unknown, opts?: { signal?: AbortSignal }): Promise<void> =>
+            new Promise<void>((_resolve, reject) => {
+                const signal = opts?.signal;
+                if (signal === undefined) return; // no signal => genuinely never settles
+                if (signal.aborted) {
+                    dialAborted = true;
+                    reject(signal.reason ?? new Error("aborted"));
+                    return;
+                }
+                signal.addEventListener(
+                    "abort",
+                    () => {
+                        dialAborted = true;
+                        reject(signal.reason ?? new Error("aborted"));
+                    },
+                    { once: true }
+                );
+            });
+        const contentRouting = {
+            findProviders: async function* () {
+                yield { id: { toString: () => "hungProv" }, multiaddrs: ["/dns4/seed.example/tcp/443/wss"] };
+            }
+        };
+        const h = routedHarness(contentRouting, hungDial);
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // fire-and-forget discovery starts the hung dial
+
+        // Before the dial timeout fires the dial is genuinely stuck, so the pull has NOT run — this is
+        // the exact failure the fix targets (pull gated on the dial). Proves the dial is really hung.
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(dialAborted).toBe(false);
+        expect(h.fetchedPeers).toEqual([]);
+
+        // Just past COLD_START_DIAL_TIMEOUT_MS (3s) — and well short of the 10s router timeout — the
+        // dial's own timeout aborts it, the catch swallows, and `pull` runs.
+        await vi.advanceTimersByTimeAsync(1_500); // total 3.5s
+        expect(dialAborted).toBe(true); // the dial was cut by ITS timeout, not left hanging to 10s
+        expect(h.fetchedPeers).toEqual(["hungProv"]); // ...and the root pull fired regardless
+        await h.voter.stop();
+    });
+
+    it("pulls a provider whose dial REJECTS immediately (the catch must not stop the pull)", async () => {
+        // The catch-then-pull invariant on the fast path: an undialable provider still gets pulled (it
+        // may already be connected). No timers — an instant rejection means the pull happens at once.
+        const rejectingDial = (_addrs: unknown): Promise<void> => Promise.reject(new Error("no route to host"));
+        const contentRouting = {
+            findProviders: async function* () {
+                yield { id: { toString: () => "unreachable" }, multiaddrs: ["/ip4/203.0.113.9/tcp/4001"] };
+            }
+        };
+        const h = routedHarness(contentRouting, rejectingDial);
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.waitFor(() => expect(h.fetchedPeers).toEqual(["unreachable"]));
         await h.voter.stop();
     });
 });

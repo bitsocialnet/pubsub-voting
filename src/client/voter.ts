@@ -411,6 +411,17 @@ const COLD_START_PEERS = 4;
  */
 const COLD_START_ROUTER_TIMEOUT_MS = 10_000;
 /**
+ * Per-provider dial deadline (ms) for cold-join discovery source 2. Each provider dial shares the
+ * router-lookup {@link COLD_START_ROUTER_TIMEOUT_MS} signal, but is ALSO bounded on its own by this
+ * shorter timeout — because a browser WSS dial can HANG (neither resolve nor reject) indefinitely,
+ * and since the root-record `pull` only runs after the dial await settles, a hung dial otherwise
+ * gates the pull for the full 10s router timeout even when a connection to that peer opens by other
+ * means in the meantime. Measured in production browser traces: 4 of 32 recent cold-start rounds hit
+ * the hang, turning ~6s loads into 8.7–22s totals. Bounding the dial at 3s lets the catch swallow the
+ * timeout and fire `pull` at ≤3s instead of ≤10s; only the dial is cut, never the pull.
+ */
+const COLD_START_DIAL_TIMEOUT_MS = 3_000;
+/**
  * Root-record heartbeat interval (ms): 10 minutes — the IPNS-over-pubsub rebroadcast default
  * (`go-libp2p-pubsub-router`) — jittered ±25% per firing, with suppression on top (skip when a
  * matching root was heard this interval) so a converged topic stays near-silent. See DESIGN.md
@@ -1490,10 +1501,18 @@ class ContestEngine {
                     (async () => {
                         try {
                             if (provider.multiaddrs.length > 0) {
-                                await libp2p.dial(provider.multiaddrs, { signal: controller.signal });
+                                // Bound each dial by its own COLD_START_DIAL_TIMEOUT_MS in addition to the
+                                // shared router signal: a hung WSS dial that never settles must not gate the
+                                // pull for the full router timeout (see COLD_START_DIAL_TIMEOUT_MS). Only the
+                                // dial carries this signal — `pull` below is never aborted by it.
+                                const dialSignal = AbortSignal.any([
+                                    controller.signal,
+                                    AbortSignal.timeout(COLD_START_DIAL_TIMEOUT_MS)
+                                ]);
+                                await libp2p.dial(provider.multiaddrs, { signal: dialSignal });
                             }
                         } catch {
-                            // Undialable via its advertised addrs — `pull` still tries (it may be connected).
+                            // Undialable, timed out, or router-aborted — `pull` still tries (it may be connected).
                         }
                         await pull(provider.id);
                     })()
