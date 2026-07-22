@@ -3,15 +3,18 @@ import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
 import type { PeerId } from "@libp2p/interface";
-import { PubsubVoter, republishIntervalBuckets, type PublishingState } from "./voter.js";
+import { PubsubVoter, republishIntervalBuckets, makeHeadReader, type PublishingState } from "./voter.js";
 import {
     decodeVoteMessage,
     decodeRootRecord,
+    decodeBulkRootRecords,
     encodeRootMessage,
     encodeRootRecord,
     rootFetchKey,
+    BULK_ROOTS_FETCH_KEY,
     ROOT_RECORD_VERSION,
-    type RootRecord
+    type RootRecord,
+    type FetchRootRecord
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
@@ -28,6 +31,7 @@ import {
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
+import { blockForBytes } from "../checkpoint/codec.js";
 import {
     bizCriteria,
     fakeHelia,
@@ -35,6 +39,7 @@ import {
     fakeHeliaWithoutBlockstore,
     fakeHeliaWithoutFetch,
     fakeFetchService,
+    rootFetchService,
     fakeChains,
     stubChains,
     fakeSigner,
@@ -166,14 +171,12 @@ function subscribableHelia(): {
         },
         topicValidators: new Map()
     } as unknown as PubsubService;
-    const fetch = {
-        fetch: async (peer: PeerId) => {
-            fetchedPeers.push(peer.toString());
-            return undefined; // definitive "no record" — no retry, nothing to decode
-        },
-        registerLookupFunction: () => {},
-        unregisterLookupFunction: () => {}
-    };
+    // Current-generation peers (`speaksBulk` defaults true), serving no contest: they answer the
+    // bulk key with an EMPTY map, which is a definitive "no record" for every topic — no retry,
+    // nothing to decode, and exactly ONE request per peer. That keeps `fetchedPeers` a faithful
+    // log of WHICH peers the re-pull chose, which is all this suite is about. (A pre-bulk peer
+    // would log twice per peer: the bulk probe plus the per-topic fallback.)
+    const fetch = rootFetchService({ onFetch: (peer) => fetchedPeers.push(peer) });
     const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
     const helia = { libp2p: { services: { pubsub, fetch } }, blockstore } as unknown as HeliaInstance;
     return {
@@ -1073,16 +1076,23 @@ describe("root-record heartbeat", () => {
  * the cold-join requester (see DESIGN.md "Checkpoints", "Cold-join pull").
  */
 describe("root-record fetch protocol", () => {
-    /** A helia whose fetch service records registrations and serves canned per-peer answers. */
-    function fetchSpyHelia(peerAnswers: Map<string, Uint8Array>) {
+    /**
+     * A helia whose fetch service records registrations and routes each request to the answering
+     * service of the peer it names, so one joiner can face a heterogeneous topic: peers on
+     * different roots, a peer answering garbage, or a pre-bulk generation — each modelled by its
+     * own {@link rootFetchService}. Every request is logged here (not via the fixture's `onFetch`)
+     * so the log stays a single ordered view across all peers. The map's keys double as the
+     * topic's gossipsub subscribers.
+     */
+    function fetchSpyHelia(peerServices: Map<string, FetchServiceLike>) {
         // `@libp2p/fetch` invokes the lookup with the key as raw bytes, not a string.
         const lookups = new Map<string, (key: Uint8Array) => Promise<Uint8Array | undefined>>();
         const fetchCalls: Array<{ peer: string; key: string }> = [];
         const counts = { register: 0, unregister: 0 };
         const fetchService: FetchServiceLike = {
             fetch: async (peer, key) => {
-                fetchCalls.push({ peer: peer.toString(), key });
-                return peerAnswers.get(peer.toString());
+                fetchCalls.push({ peer: peer.toString(), key: typeof key === "string" ? key : new TextDecoder().decode(key) });
+                return await peerServices.get(peer.toString())?.fetch(peer, key);
             },
             registerLookupFunction: (prefix, lookup) => {
                 counts.register += 1;
@@ -1093,8 +1103,9 @@ describe("root-record fetch protocol", () => {
                 lookups.delete(prefix);
             }
         };
-        const subscribers = [...peerAnswers.keys()].map((id) => ({ toString: () => id }));
+        const subscribers = [...peerServices.keys()].map((id) => ({ toString: () => id }));
         const chased: string[] = []; // root CIDs the chase pulled blocks for
+        const puts: string[] = []; // CIDs stored (the bulk answer's verified inline chunk blocks land here)
         const pubsub: PubsubService = {
             publish: async () => undefined,
             subscribe: () => {},
@@ -1109,11 +1120,14 @@ describe("root-record fetch protocol", () => {
                 chased.push(cid.toString());
                 throw new Error("no block"); // the chase yields nothing; only the attempt matters here
             },
-            put: async (cid: CID) => cid,
+            put: async (cid: CID) => {
+                puts.push(cid.toString());
+                return cid;
+            },
             has: async () => false
         };
         const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
-        return { helia, lookups, fetchCalls, chased, counts };
+        return { helia, lookups, fetchCalls, chased, puts, counts };
     }
 
     it("registers a responder that answers <topic>/root with the on-demand record, and unregisters on stop", async () => {
@@ -1164,27 +1178,39 @@ describe("root-record fetch protocol", () => {
     it("cold-joins by pulling each subscriber's record and chasing every distinct divergent root (union, not quorum)", async () => {
         const rootA = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
         const rootB = CID.parse("bafyreigz22r5ujmwkzdopj5b4yl55plabqbrq3hf3gvv4b6ekfbf2xxfd4");
-        const recordOf = (root: CID) => encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        const recordOf = (root: CID): FetchRootRecord => ({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        // The topic only exists once the contest does, and the fixture reads `records` per request —
+        // so a lazily-filled binding is enough to key each peer's answer by this contest's topic.
+        let topic = "";
+        const serving = (root: CID) => rootFetchService({ records: () => ({ [topic]: recordOf(root) }) });
+        const garbage: FetchServiceLike = {
+            fetch: async () => new Uint8Array([0xff]), // decodes as neither key's shape
+            registerLookupFunction: () => {},
+            unregisterLookupFunction: () => {}
+        };
         const h = fetchSpyHelia(
             new Map([
-                ["peerA", recordOf(rootA)], // two peers agree on rootA...
-                ["peerB", recordOf(rootA)],
-                ["peerC", recordOf(rootB)], // ...one lone peer differs — still chased
-                ["peerD", new Uint8Array([0xff])] // and one answers garbage — ignored
+                ["peerA", serving(rootA)], // two peers agree on rootA...
+                ["peerB", serving(rootA)],
+                ["peerC", serving(rootB)], // ...one lone peer differs — still chased
+                ["peerD", garbage] // and one answers garbage — ignored
             ])
         );
         const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
+        topic = contest.topic;
         await contest.update(); // the join fires the cold-start pull
 
-        await vi.waitFor(() => expect(h.fetchCalls.length).toBe(4));
-        expect(new Set(h.fetchCalls.map((c) => c.key))).toEqual(new Set([rootFetchKey(contest.topic)]));
+        // Every subscriber is asked — union, not a quorum sample. Peers are asked over the BULK key
+        // now (one request carries the whole directory), never per topic. The count is asserted as a
+        // peer SET rather than a call count because the garbage answerer's undecodable reply reads as
+        // transient to the retry loop, so it may legitimately be re-asked while this runs.
+        await vi.waitFor(() => expect(new Set(h.fetchCalls.map((c) => c.peer))).toEqual(new Set(["peerA", "peerB", "peerC", "peerD"])));
+        expect(new Set(h.fetchCalls.map((c) => c.key))).toEqual(new Set([BULK_ROOTS_FETCH_KEY]));
         // Both distinct roots were chased (the lone divergent one included); the agreeing pair
-        // collapsed into one chase via the in-flight dedup.
-        await vi.waitFor(() => {
-            expect(h.chased).toContain(rootA.toString());
-            expect(h.chased).toContain(rootB.toString());
-        });
+        // collapsed into one chase via the in-flight dedup, and the garbage answer contributed
+        // no chase at all — the chased set is exactly the two roots that were really served.
+        await vi.waitFor(() => expect(new Set(h.chased)).toEqual(new Set([rootA.toString(), rootB.toString()])));
         await voter.stop();
     });
 
@@ -1194,14 +1220,16 @@ describe("root-record fetch protocol", () => {
         // is swallowed and the board never pulls its checkpoint; with one it re-fetches and converges.
         // Here the FIRST attempt throws, the retry lands.
         const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
-        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        const record: FetchRootRecord = { version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 };
+        let topic = ""; // filled from the contest below; the fixture reads `records` per request
+        const seeder = rootFetchService({ records: () => ({ [topic]: record }) });
         let attempts = 0;
         const chased: string[] = [];
         const fetchService: FetchServiceLike = {
-            fetch: async () => {
+            fetch: async (peer, key) => {
                 attempts += 1;
                 if (attempts === 1) throw new Error("stream reset"); // TooManyInboundProtocolStreamsError on the seeder
-                return record;
+                return await seeder.fetch(peer, key);
             },
             registerLookupFunction: () => {},
             unregisterLookupFunction: () => {}
@@ -1225,9 +1253,13 @@ describe("root-record fetch protocol", () => {
         };
         const helia = { libp2p: { services: { pubsub, fetch: fetchService } }, blockstore } as unknown as HeliaInstance;
         const voter = new PubsubVoter({ dataPath: false, helia, chains: fakeChains() });
-        await (await voter.createContest({ criteria: bizCriteria() })).update();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        topic = contest.topic;
+        await contest.update();
 
-        // The retry re-fetches after the reset, so the record's root is still chased.
+        // The retry re-fetches after the reset, so the record's root is still chased. The reset now
+        // lands on the batched request, so it strands EVERY contest waiting on that peer until the
+        // retry — which is exactly why the retry must survive batching.
         await vi.waitFor(() => expect(chased).toContain(root.toString()), { timeout: 5000 });
         expect(attempts).toBeGreaterThanOrEqual(2);
         await voter.stop();
@@ -1238,13 +1270,23 @@ describe("root-record fetch protocol", () => {
         // budget that opens 40 concurrent fetch streams — past libp2p's default 32-inbound cap on
         // the responder, which would reset the excess (the failure the retry rides out). The
         // budget must instead hold at most 24 in flight and queue the rest.
+        //
+        // Modelled against a PRE-BULK peer on purpose: that is the generation where the per-contest
+        // fan-out this budget exists to cap is still real. A current peer collapses the same 40
+        // pulls into ONE request (pinned by the bulk suite below), which subsumes the cap rather
+        // than replacing it — the budget still has to hold for every peer that cannot batch.
         const CONTESTS = 40;
         const BUDGET = 24; // COLD_START_PEER_FETCH_LIMIT
         let inFlight = 0;
         let peak = 0;
         const pending: Array<() => void> = [];
         const fetchService: FetchServiceLike = {
-            fetch: async () => {
+            fetch: async (_peer, key) => {
+                // The pre-bulk peer does not know the bulk key and answers nothing, sending every
+                // waiter down the per-topic path. Answered inline: the probe is one request per
+                // peer for the whole session, not one of the concurrent streams under test.
+                const keyString = typeof key === "string" ? key : new TextDecoder().decode(key);
+                if (keyString === BULK_ROOTS_FETCH_KEY) return undefined;
                 inFlight += 1;
                 peak = Math.max(peak, inFlight);
                 await new Promise<void>((resolve) => pending.push(resolve));
@@ -1295,17 +1337,50 @@ describe("root-record fetch protocol", () => {
         // first 4 peers (funnelling the whole directory through their stream caps while the other
         // 4 idle). With the shuffle, the odds that 12 independent picks all land on one fixed
         // 4-subset are (1/70)^11 — so seeing a 5th peer is a safe assertion.
+        //
+        // The picks are no longer countable as requests: 12 contests against one peer collapse into
+        // that peer's single bulk request, so the old "12 x 4 fetches" tally cannot exist. What the
+        // shuffle must still guarantee is WHERE the picks land, which is asserted directly on the
+        // set of peers contacted; the per-contest breadth of COLD_START_PEERS is pinned by the
+        // single-contest test below, where no cross-contest batching can hide it.
         const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
-        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
-        const h = fetchSpyHelia(new Map(Array.from({ length: 8 }, (_, i) => [`peer${i}`, record])));
+        const record: FetchRootRecord = { version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 };
+        let topics: string[] = []; // filled below; the fixture reads `records` per request
+        const records = () => Object.fromEntries(topics.map((topic) => [topic, record]));
+        const h = fetchSpyHelia(new Map(Array.from({ length: 8 }, (_, i) => [`peer${i}`, rootFetchService({ records })])));
         const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
         const contests = await Promise.all(
             Array.from({ length: 12 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
         );
+        topics = contests.map((contest) => contest.topic);
         await Promise.all(contests.map((contest) => contest.update()));
 
-        await vi.waitFor(() => expect(h.fetchCalls.length).toBe(12 * 4)); // each contest still asks COLD_START_PEERS peers
-        expect(new Set(h.fetchCalls.map((call) => call.peer)).size).toBeGreaterThan(4);
+        await vi.waitFor(() => expect(new Set(h.fetchCalls.map((call) => call.peer)).size).toBeGreaterThan(4));
+        // ...and the directory cost far less than one request per (contest, peer) pick: the pulls
+        // collapsed into per-peer bulk requests, which is the whole point of paying for the shuffle.
+        expect(h.fetchCalls.length).toBeLessThan(12 * 4);
+        expect(new Set(h.fetchCalls.map((call) => call.key))).toEqual(new Set([BULK_ROOTS_FETCH_KEY]));
+        await voter.stop();
+    });
+
+    it("asks exactly COLD_START_PEERS of the topic's subscribers, once each (the breadth a directory join spends per contest)", async () => {
+        // The companion to the shuffle test: ONE contest, so nothing batches across contests and
+        // the peer count is the raw cold-start breadth. 8 subscribers offered, 4 (COLD_START_PEERS)
+        // asked — the bound that keeps a join from stampeding every subscriber of a busy topic.
+        const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const record: FetchRootRecord = { version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 };
+        let topic = "";
+        const h = fetchSpyHelia(
+            new Map(Array.from({ length: 8 }, (_, i) => [`peer${i}`, rootFetchService({ records: () => ({ [topic]: record }) })]))
+        );
+        const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        topic = contest.topic;
+        await contest.update();
+
+        await vi.waitFor(() => expect(h.chased).toContain(root.toString())); // the pull landed...
+        expect(new Set(h.fetchCalls.map((call) => call.peer)).size).toBe(4); // ...against 4 of the 8
+        expect(h.fetchCalls).toHaveLength(4); // one request each — no peer asked twice
         await voter.stop();
     });
 
@@ -1313,19 +1388,18 @@ describe("root-record fetch protocol", () => {
         // The pkc-js discovery path: gossipsub knows no subscribers yet, but the content router
         // names a provider of the criteria CID. The library must dial + fetch it immediately.
         const root = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
-        const record = encodeRootRecord({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+        const record: FetchRootRecord = { version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 };
         const providerId = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
         const fetchCalls: Array<{ peer: string; key: string }> = [];
         const dialed: string[] = [];
         const chased: string[] = [];
-        const fetchService: FetchServiceLike = {
-            fetch: async (peer, key) => {
-                fetchCalls.push({ peer: peer.toString(), key });
-                return peer.toString() === providerId ? record : undefined;
-            },
-            registerLookupFunction: () => {},
-            unregisterLookupFunction: () => {}
-        };
+        let topic = ""; // filled from the contest below; the fixture reads `records` per request
+        // A current-generation provider: the discovered peer is asked over the bulk key, and this
+        // test is about discovery + dial + pull, not about protocol generation.
+        const fetchService = rootFetchService({
+            records: () => ({ [topic]: record }),
+            onFetch: (peer, key) => fetchCalls.push({ peer, key })
+        });
         const pubsub: PubsubService = {
             publish: async () => undefined,
             subscribe: () => {},
@@ -1360,14 +1434,300 @@ describe("root-record fetch protocol", () => {
 
         const voter = new PubsubVoter({ dataPath: false, helia, chains: fakeChains() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
+        topic = contest.topic;
         await contest.update(); // the join fires the cold-start pull
 
         await vi.waitFor(() => {
             expect(dialed.length).toBeGreaterThan(0); // the discovered provider was dialed...
-            expect(fetchCalls.some((c) => c.peer === providerId && c.key === rootFetchKey(contest.topic))).toBe(true); // ...and asked for its root
+            expect(fetchCalls.some((c) => c.peer === providerId && c.key === BULK_ROOTS_FETCH_KEY)).toBe(true); // ...and asked for its roots
             expect(chased).toContain(root.toString()); // ...and its divergent root chased
         });
         await voter.stop();
+    });
+
+    describe("bulk root fetch (one request per peer, not one per contest)", () => {
+        const ROOT = CID.parse("bafyreifn55wc5oqdjhb2pmaevd45kgt3uiifwyiqv5iepru5rnmmvkx6v4");
+        const recordOf = (root: CID): FetchRootRecord => ({ version: ROOT_RECORD_VERSION, root, chunks: [], count: 1, sizeBytes: 100 });
+
+        /** N contests on one voter, all cold-starting against a single peer of the given generation. */
+        async function directoryJoin(contests: number, options: { speaksBulk?: boolean; serves?: (topics: string[]) => string[] } = {}) {
+            const { speaksBulk = true, serves = (topics) => topics } = options;
+            let topics: string[] = []; // filled after creation; the fixture reads `records` per request
+            const records = () => Object.fromEntries(serves(topics).map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records, speaksBulk })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const created = await Promise.all(
+                Array.from({ length: contests }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = created.map((contest) => contest.topic);
+            await Promise.all(created.map((contest) => contest.update()));
+            return { ...h, voter, topics };
+        }
+
+        it("collapses a whole directory's cold start into ONE request against the peer", async () => {
+            // The reason the bulk key exists: 12 contests joining at once used to cost 12 fetch
+            // round trips to the same seeder — and each fetch pays a multistream-select negotiation
+            // regardless of how tiny the record is. Batched, the seeder is asked once and every
+            // contest is served out of that one answer (all 12 chase their divergent root).
+            const h = await directoryJoin(12);
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(12));
+            expect(h.fetchCalls).toEqual([{ peer: "seeder", key: BULK_ROOTS_FETCH_KEY }]);
+            await h.voter.stop();
+        });
+
+        it("treats a topic missing from a non-empty answer as a definitive 'no record' (never a per-topic re-ask)", async () => {
+            // The answer is authoritative for what it omits: the peer just told us which contests it
+            // serves, so re-asking for the other 11 individually would rebuild the exact fan-out the
+            // batch removed — the worst case, since a partially-serving seeder is the common one.
+            const h = await directoryJoin(12, { serves: (topics) => topics.slice(0, 1) });
+            await vi.waitFor(() => expect(h.chased).toContain(ROOT.toString()));
+            // Give any fallback a window to appear (the batcher's coalesce window plus slack).
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            expect(h.fetchCalls.every((call) => call.key === BULK_ROOTS_FETCH_KEY)).toBe(true);
+            expect(h.chased).toHaveLength(1); // only the one served contest had anything to chase
+            await h.voter.stop();
+        });
+
+        it("falls back to per-topic fetches against a peer that answers nothing, re-probing once per batch", async () => {
+            // A peer answers nothing to the bulk key. The client serves that batch per-topic — the
+            // cost of meeting an old peer is O(batches), not O(contests), which is what makes
+            // probing safe to do at all.
+            //
+            // Joined in two waves on purpose: one wave would coalesce into a single batch and prove
+            // nothing about what a LATER batch does. The second wave must probe again — see the
+            // recovery test below for why that re-probe is not waste.
+            let topics: string[] = []; // filled per wave; the fixture reads `records` per request
+            const records = () => Object.fromEntries(topics.map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records, speaksBulk: false })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const wave = async (from: number, count: number) => {
+                const contests = await Promise.all(
+                    Array.from({ length: count }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${from + i}` } }))
+                );
+                topics = [...topics, ...contests.map((contest) => contest.topic)];
+                await Promise.all(contests.map((contest) => contest.update()));
+            };
+
+            await wave(0, 6); // one probe for the whole batch, then six per-topic fetches
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(6));
+            expect(h.fetchCalls.filter((call) => call.key === BULK_ROOTS_FETCH_KEY)).toHaveLength(1);
+
+            await wave(6, 6);
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(12));
+            const bulk = h.fetchCalls.filter((call) => call.key === BULK_ROOTS_FETCH_KEY);
+            const perTopic = h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY);
+            expect(bulk).toHaveLength(2); // one probe per BATCH, not one per session
+            expect(new Set(perTopic.map((call) => call.key))).toEqual(new Set(topics.map(rootFetchKey)));
+            expect(perTopic).toHaveLength(12); // and each contest fell back exactly once
+            await voter.stop();
+        });
+
+        it("falls back to per-topic against a peer that ERRORs the bulk key (no bulk handler), instead of retrying it to the deadline", async () => {
+            // The failure mode the three-node-relay integration test exposed. `@libp2p/fetch`
+            // answers a protocol ERROR — surfaced to the caller as a THROWN ProtocolError, not the
+            // `undefined` NOT_FOUND of speaksBulk:false — whenever the responder has no lookup for
+            // the key's PREFIX at all. A seeder that serves its root records under a per-topic prefix
+            // (`<topic>`, not `TOPIC_PREFIX`) is exactly such a peer: the bulk key is outside its
+            // registered prefix, so it ERRORs. A throw naively read as transient would re-batch the
+            // bulk key on every cold-start retry and NEVER take the per-topic path, stranding every
+            // contest against a peer that answers each `<topic>/root` fine. So a fetch-protocol
+            // ProtocolError must fall through to per-topic exactly like an empty answer does — the
+            // only place `serve`/`flush` distinguish a refused key from a dead stream.
+            let topics: string[] = []; // filled after creation; the fixture reads `records` per request
+            const records = () => Object.fromEntries(topics.map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records, speaksBulk: "error" })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const created = await Promise.all(
+                Array.from({ length: 6 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = created.map((contest) => contest.topic);
+            await Promise.all(created.map((contest) => contest.update()));
+
+            // Every contest reaches its root over the per-topic fallback and chases it — none stranded.
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(6));
+            const perTopic = h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY);
+            expect(new Set(perTopic.map((call) => call.key))).toEqual(new Set(topics.map(rootFetchKey)));
+            await voter.stop();
+        });
+
+        it("recovers when a peer starts serving mid-session: a later batch takes the bulk path", async () => {
+            // The reason the fallback verdict must NOT be cached. "Answers nothing" is not only an
+            // old peer: the responder registers lazily on the first topic join, so a seeder that has
+            // joined nothing yet has no handler for this prefix at all and answers nothing for a
+            // reason that expires in seconds. A browser that probed during that window and cached
+            // the verdict would stay on the per-contest path for its whole session, long after the
+            // seeder began answering the whole directory in one reply.
+            let serving = false; // flips when the seeder finishes joining
+            let topics: string[] = [];
+            const records = () => (serving ? Object.fromEntries(topics.map((topic) => [topic, recordOf(ROOT)])) : {});
+            const h = fetchSpyHelia(
+                new Map([["seeder", rootFetchService({ records, speaksBulk: () => serving })]])
+            );
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const wave = async (from: number, count: number) => {
+                const contests = await Promise.all(
+                    Array.from({ length: count }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${from + i}` } }))
+                );
+                topics = [...topics, ...contests.map((contest) => contest.topic)];
+                await Promise.all(contests.map((contest) => contest.update()));
+            };
+
+            await wave(0, 3); // seeder still starting: answers nothing, this batch falls back
+            await vi.waitFor(() => expect(h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY)).toHaveLength(3));
+
+            serving = true; // the seeder finished joining and now answers the bulk key
+            const perTopicBefore = h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY).length;
+            await wave(3, 3);
+            // All SIX chase, not just the second wave: the bulk answer names every contest the peer
+            // serves, and records nobody in the batch asked about fan out to their engines — so the
+            // first wave, which met the seeder mid-startup and got nothing, catches up off the
+            // second wave's answer instead of waiting out the heartbeat.
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(6));
+
+            // The second wave rode ONE bulk reply: no new per-topic fetches at all.
+            expect(h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY)).toHaveLength(perTopicBefore);
+            expect(h.fetchCalls.filter((call) => call.key === BULK_ROOTS_FETCH_KEY)).toHaveLength(2);
+            await voter.stop();
+        });
+
+        it("does not write off a peer that answers an EMPTY map: a later contest still takes the bulk path", async () => {
+            // The distinction the responder pays for: "I speak bulk, I have nothing yet" is an empty
+            // map, not silence. A seeder caught mid-startup answers it, and must NOT be remembered as
+            // bulk-less for the session — otherwise the first contest to meet a booting peer condemns
+            // every later contest on this voter to a per-topic fetch against a peer that batches fine.
+            let served: Record<string, FetchRootRecord> = {}; // the peer serves nothing at first
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records: () => served })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const early = await voter.createContest({ criteria: bizCriteria() });
+            await early.update();
+            await vi.waitFor(() => expect(h.fetchCalls).toHaveLength(1)); // asked, told "nothing"
+            expect(h.chased).toEqual([]);
+
+            served = { [await topicFor({ ...bizCriteria(), contestId: "late" })]: recordOf(ROOT) }; // the peer finishes joining
+            const late = await voter.createContest({ criteria: { ...bizCriteria(), contestId: "late" } });
+            await late.update();
+
+            await vi.waitFor(() => expect(h.chased).toContain(ROOT.toString()));
+            // Still bulk both times — the empty answer left no sticky verdict behind.
+            expect(h.fetchCalls.map((call) => call.key)).toEqual([BULK_ROOTS_FETCH_KEY, BULK_ROOTS_FETCH_KEY]);
+            await voter.stop();
+        });
+
+        it("serves a straggler from the previous answer instead of refetching it (bulk answer cache)", async () => {
+            // A directory cold start does NOT arrive as one batch: each contest pulls only when its
+            // own discovery returns. Measured against production, a 63-contest cold start coalesced
+            // into 3 batches — the last two refetching the byte-identical answer while the first
+            // tally waited on them. A fresh answer is kept briefly, so a straggler whose topic it
+            // already names is served without touching the wire.
+            const lateCriteria = { ...bizCriteria(), contestId: "late" };
+            const lateTopic = await topicFor(lateCriteria);
+            let topics: string[] = [];
+            const records = () => Object.fromEntries([...topics, lateTopic].map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const early = await Promise.all(
+                Array.from({ length: 3 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = early.map((contest) => contest.topic);
+            await Promise.all(early.map((contest) => contest.update()));
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(3));
+            expect(h.fetchCalls).toHaveLength(1);
+
+            const late = await voter.createContest({ criteria: lateCriteria });
+            await late.update(); // the straggler: pulled after the batch closed, inside the cache window
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(4));
+            expect(h.fetchCalls).toHaveLength(1); // still the ONE bulk request — the straggler cost no wire
+            await voter.stop();
+        });
+
+        it("re-asks for a topic the cached answer predates instead of serving it a stale 'no record'", async () => {
+            // The deliberate asymmetry in the cache: "absent = definitive no record" holds within
+            // one answer, but a cached answer cannot speak for a contest joined after it was taken
+            // — a stale "no" would strand that contest until the heartbeat. The straggler above is
+            // served from the cache because its topic IS in the answer; a topic that is NOT goes
+            // back to the wire, where the fresh answer covers it.
+            let topics: string[] = [];
+            const records = () => Object.fromEntries(topics.map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const early = await voter.createContest({ criteria: bizCriteria() });
+            topics = [early.topic];
+            await early.update();
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(1));
+            expect(h.fetchCalls).toHaveLength(1);
+
+            const late = await voter.createContest({ criteria: { ...bizCriteria(), contestId: "late" } });
+            topics = [...topics, late.topic]; // the seeder serves it — only the cached answer predates it
+            await late.update();
+            // The second bulk request is the point: the cache did not answer for a topic it never saw.
+            await vi.waitFor(() => expect(h.fetchCalls.filter((call) => call.key === BULK_ROOTS_FETCH_KEY)).toHaveLength(2));
+            // ≥2, not exactly 2: the late contest chased off the fresh answer, and that answer may
+            // also legitimately re-fan-out to the first engine (its chase failed in this harness,
+            // so its root still diverges — a re-chase of an unfetchable root, not double-counting).
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString()).length).toBeGreaterThanOrEqual(2));
+            await voter.stop();
+        });
+
+        it("stores hash-verified inline chunk blocks and drops lying ones (content addressing is the verification)", async () => {
+            // The bulk answer may inline each record's checkpoint chunk blocks so the chase finds
+            // them locally instead of over bitswap. Inlined bytes are exactly as trustworthy as
+            // bitswap-fetched ones for the same reason: the CID is the verification. A block whose
+            // bytes do not hash to the record's chunk CID is dropped (the chase fetches it), never
+            // stored under a CID it does not match.
+            const honest = await blockForBytes(new TextEncoder().encode("honest chunk bytes"));
+            const claimed = await blockForBytes(new TextEncoder().encode("what the liar claims to serve"));
+            const lie = new TextEncoder().encode("what the liar actually inlined");
+            let topics: string[] = [];
+            const records = () =>
+                Object.fromEntries([
+                    [topics[0]!, { ...recordOf(ROOT), chunks: [honest.cid], chunkBlocks: [honest.bytes] }],
+                    [topics[1]!, { ...recordOf(ROOT), chunks: [claimed.cid], chunkBlocks: [lie] }]
+                ]);
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const contests = await Promise.all(
+                Array.from({ length: 2 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = contests.map((contest) => contest.topic);
+            await Promise.all(contests.map((contest) => contest.update()));
+
+            await vi.waitFor(() => expect(h.puts).toContain(honest.cid.toString()));
+            // The lie lands nowhere: not under the CID it claimed (that would poison the store)
+            // and not under its true hash either (a mismatched block is dropped, not adopted).
+            // `puts` is not asserted exact — the engines' own empty-checkpoint encodes also store
+            // their root blocks through the same seam.
+            expect(h.puts).not.toContain(claimed.cid.toString());
+            expect(h.puts).not.toContain((await blockForBytes(lie)).cid.toString());
+            await voter.stop();
+        });
+
+        it("answers every joined contest in one reply, and nothing for a contest it never joined", async () => {
+            // The serving half of the same contract (the client half is above): one reply carries the
+            // whole directory this node participates in, and a created-but-never-joined engine is
+            // absent from it rather than present with an empty checkpoint that would masquerade as
+            // this node's view of a contest it holds no view of.
+            const h = fetchSpyHelia(new Map());
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const joined = await Promise.all(
+                Array.from({ length: 3 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            await Promise.all(joined.map((contest) => contest.update()));
+            const bystander = { ...bizCriteria(), contestId: "pol" };
+            await voter.createContestVote({ criteria: bystander, votes: [] }); // builds an engine, never joins
+
+            const lookup = h.lookups.get(TOPIC_PREFIX);
+            const answer = await lookup!(new TextEncoder().encode(BULK_ROOTS_FETCH_KEY));
+            expect(answer).toBeDefined();
+            const records = decodeBulkRootRecords(answer!);
+            expect(Object.keys(records).sort()).toEqual(joined.map((contest) => contest.topic).sort());
+            expect(records[await topicFor(bystander)]).toBeUndefined();
+            // Each entry is the same record the per-topic key serves — one answer, not a second view.
+            for (const contest of joined) {
+                expect(records[contest.topic]).toEqual(decodeRootRecord((await lookup!(new TextEncoder().encode(rootFetchKey(contest.topic))))!));
+            }
+            await voter.stop();
+        });
+
     });
 
     describe("lazy responder registration (no public start(): the join/leave transitions drive it)", () => {
@@ -1635,19 +1995,16 @@ describe("cold-start fetch backoff bounds", () => {
 describe("cold-start provider discovery bounds", () => {
     afterEach(() => {
         vi.useRealTimers();
+        vi.restoreAllMocks();
     });
 
-    function routedHarness(contentRouting: unknown) {
+    function routedHarness(contentRouting: unknown, dial?: (addrs: unknown, opts?: { signal?: AbortSignal }) => Promise<void>) {
         const fetchedPeers: string[] = [];
         const dialed: string[] = [];
-        const fetchService: FetchServiceLike = {
-            fetch: async (peer) => {
-                fetchedPeers.push(peer.toString());
-                return undefined; // definitive "no record" — no retry, no chase
-            },
-            registerLookupFunction: () => {},
-            unregisterLookupFunction: () => {}
-        };
+        // Current-generation providers serving no contest: the empty bulk map is a definitive "no
+        // record" (no retry, no chase) and costs exactly one request each, so `fetchedPeers` counts
+        // providers taken — which is what these bounds are about, not protocol generation.
+        const fetchService = rootFetchService({ onFetch: (peer) => fetchedPeers.push(peer) });
         const pubsub: PubsubService = {
             publish: async () => undefined,
             subscribe: () => {},
@@ -1660,9 +2017,11 @@ describe("cold-start provider discovery bounds", () => {
         const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
         const libp2p = {
             peerId: { toString: () => "self" },
-            dial: async (addrs: unknown) => {
-                dialed.push(String(addrs));
-            },
+            dial:
+                dial ??
+                (async (addrs: unknown) => {
+                    dialed.push(String(addrs));
+                }),
             contentRouting,
             services: { pubsub, fetch: fetchService }
         };
@@ -1711,6 +2070,80 @@ describe("cold-start provider discovery bounds", () => {
         await vi.advanceTimersByTimeAsync(10_000); // COLD_START_ROUTER_TIMEOUT_MS fires the abort
         expect(h.fetchedPeers).toEqual([]); // nothing discovered, nothing pulled...
         expect(contest.tally?.ranking).toEqual([]); // ...and the contest is live regardless
+        await h.voter.stop();
+    });
+
+    it("bounds a HUNG provider dial at COLD_START_DIAL_TIMEOUT_MS so the root pull fires at ~3s, not the 10s router timeout", async () => {
+        // Production browser regression: a WSS dial can HANG (neither resolve nor reject). Since the
+        // root-record `pull` runs only after the dial await settles, the hang gated the pull for the
+        // whole COLD_START_ROUTER_TIMEOUT_MS (10s) — measured 4/32 cold rounds, ~6s loads turning into
+        // 8.7–22s. The fix bounds each dial by COLD_START_DIAL_TIMEOUT_MS combined with the router
+        // signal (AbortSignal.any), so a hung dial is cut at ~3s and the catch lets `pull` run anyway.
+        vi.useFakeTimers();
+        // The bundled fake-timers cannot fake AbortSignal.timeout (no entry in its timers table), so
+        // drive it off the faked setTimeout — the fix's real AbortSignal.any composition is exercised.
+        vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+            const c = new AbortController();
+            setTimeout(() => c.abort(new DOMException("dial timeout", "TimeoutError")), ms);
+            return c.signal;
+        });
+        let dialAborted = false;
+        // A hung WSS dial: the returned promise settles ONLY when its abort signal fires (honouring
+        // the timeout), never on its own — so any pull before the timeout proves the dial was gating.
+        const hungDial = (_addrs: unknown, opts?: { signal?: AbortSignal }): Promise<void> =>
+            new Promise<void>((_resolve, reject) => {
+                const signal = opts?.signal;
+                if (signal === undefined) return; // no signal => genuinely never settles
+                if (signal.aborted) {
+                    dialAborted = true;
+                    reject(signal.reason ?? new Error("aborted"));
+                    return;
+                }
+                signal.addEventListener(
+                    "abort",
+                    () => {
+                        dialAborted = true;
+                        reject(signal.reason ?? new Error("aborted"));
+                    },
+                    { once: true }
+                );
+            });
+        const contentRouting = {
+            findProviders: async function* () {
+                yield { id: { toString: () => "hungProv" }, multiaddrs: ["/dns4/seed.example/tcp/443/wss"] };
+            }
+        };
+        const h = routedHarness(contentRouting, hungDial);
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // fire-and-forget discovery starts the hung dial
+
+        // Before the dial timeout fires the dial is genuinely stuck, so the pull has NOT run — this is
+        // the exact failure the fix targets (pull gated on the dial). Proves the dial is really hung.
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(dialAborted).toBe(false);
+        expect(h.fetchedPeers).toEqual([]);
+
+        // Just past COLD_START_DIAL_TIMEOUT_MS (3s) — and well short of the 10s router timeout — the
+        // dial's own timeout aborts it, the catch swallows, and `pull` runs.
+        await vi.advanceTimersByTimeAsync(1_500); // total 3.5s
+        expect(dialAborted).toBe(true); // the dial was cut by ITS timeout, not left hanging to 10s
+        expect(h.fetchedPeers).toEqual(["hungProv"]); // ...and the root pull fired regardless
+        await h.voter.stop();
+    });
+
+    it("pulls a provider whose dial REJECTS immediately (the catch must not stop the pull)", async () => {
+        // The catch-then-pull invariant on the fast path: an undialable provider still gets pulled (it
+        // may already be connected). No timers — an instant rejection means the pull happens at once.
+        const rejectingDial = (_addrs: unknown): Promise<void> => Promise.reject(new Error("no route to host"));
+        const contentRouting = {
+            findProviders: async function* () {
+                yield { id: { toString: () => "unreachable" }, multiaddrs: ["/ip4/203.0.113.9/tcp/4001"] };
+            }
+        };
+        const h = routedHarness(contentRouting, rejectingDial);
+        const contest = await h.voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        await vi.waitFor(() => expect(h.fetchedPeers).toEqual(["unreachable"]));
         await h.voter.stop();
     });
 });
@@ -1960,5 +2393,168 @@ describe("checkpoint snapshot restore admissibility", () => {
         expect(contestB.tally?.ranking).toHaveLength(1); // same vote, not doubled
         expect(contestB.tally?.ranking[0]?.weight).toBe(1n);
         await voterB.destroy();
+    });
+});
+
+/**
+ * The voter-wide gating-chain head coalescer ({@link makeHeadReader}) — the fix for the cold-start
+ * `getBlockNumber` storm. Every tally recompute refreshes its expiry bucket off the gating chain's
+ * head, and a directory cold start drives ~4 recomputes per contest (the chased-bundle admit plus
+ * two deferred-check settlements) across dozens of contests that all share ONE gating-chain client.
+ * Before the coalescer each recompute posted its own `eth_blockNumber`; measured on the production
+ * 5chan cold start (63 contests, Chromium), 252 head-read requests collapse to 66 actual
+ * `getBlockNumber` (−74%) — a real cut in redundant RPC and main-thread churn (not a first-tally
+ * latency win: the first read stays on the critical path). `getBlockNumber` is a pure current-head
+ * read, so callers overlapping in time genuinely want one answer: coalescing each concurrent burst to
+ * a single in-flight read is safe. It deliberately does NOT cache across time — a read that has settled
+ * is never reused — so a later recompute still sees a head that has since moved (the expiry tests above
+ * pin that decay). These tests pin the in-flight coalescing, the read-fresh-after-settle rule, the
+ * never-share-a-rejection rule, per-client keying, and the end-to-end "concurrent recomputes, one
+ * read" behaviour through the public voter.
+ */
+describe("makeHeadReader (voter-wide gating-chain head coalescer)", () => {
+    /** A chain client whose `getBlockNumber` is counted and stays in flight until released. */
+    function countingChain(): { client: ChainClient; reads: () => number; releaseAll: () => void; pending: () => number } {
+        let reads = 0;
+        const releasers: Array<() => void> = [];
+        const client = {
+            getBlockNumber: async () => {
+                reads += 1;
+                // Stay in flight until released, so a test can observe concurrent callers coalescing
+                // onto the SAME unresolved read instead of each starting its own.
+                await new Promise<void>((resolve) => releasers.push(resolve));
+                return 43200n;
+            }
+        };
+        return {
+            client: client as unknown as ChainClient,
+            reads: () => reads,
+            releaseAll: () => releasers.splice(0).forEach((r) => r()),
+            pending: () => releasers.length
+        };
+    }
+
+    it("coalesces concurrent callers onto a single in-flight read", async () => {
+        const { client, reads, releaseAll } = countingChain();
+        const readHead = makeHeadReader();
+        // Two callers arrive while the first read is still in flight — they must share it.
+        const a = readHead(client);
+        const b = readHead(client);
+        expect(reads()).toBe(1);
+        releaseAll();
+        expect(await a).toBe(43200n);
+        expect(await b).toBe(43200n);
+        expect(reads()).toBe(1);
+    });
+
+    it("reads fresh once the prior read has settled (no stale caching across time)", async () => {
+        const { client, reads, releaseAll } = countingChain();
+        const readHead = makeHeadReader();
+
+        const first = readHead(client);
+        releaseAll();
+        await first;
+        expect(reads()).toBe(1);
+
+        // The prior read has settled, so its slot is cleared: a new (non-overlapping) caller must
+        // read the head afresh — the head is allowed to have moved on since.
+        const second = readHead(client);
+        releaseAll();
+        await second;
+        expect(reads()).toBe(2);
+    });
+
+    it("never shares a rejection: a failed read is re-attempted on the next call", async () => {
+        let reads = 0;
+        let failNext = true;
+        const client = {
+            getBlockNumber: async () => {
+                reads += 1;
+                if (failNext) {
+                    failNext = false;
+                    throw new Error("rpc down");
+                }
+                return 43200n;
+            }
+        } as unknown as ChainClient;
+        const readHead = makeHeadReader();
+
+        await expect(readHead(client)).rejects.toThrow("rpc down");
+        // The failed read cleared its slot, so the very next call reads again and succeeds.
+        expect(await readHead(client)).toBe(43200n);
+        expect(reads).toBe(2);
+    });
+
+    it("keys the in-flight slot per client instance", async () => {
+        const one = countingChain();
+        const two = countingChain();
+        const readHead = makeHeadReader();
+        void readHead(one.client);
+        void readHead(two.client);
+        // Distinct clients never share a slot — each chain reads its own head.
+        expect(one.reads()).toBe(1);
+        expect(two.reads()).toBe(1);
+        one.releaseAll();
+        two.releaseAll();
+    });
+
+    it("collapses a concurrent burst of tally recomputes on one contest to a single head read", async () => {
+        // Count head reads at the client seam. `readContract` returns 1 (constant weight / gate pass);
+        // `getBlock` feeds the tie-break path (never hit here — one row, no tie).
+        let heads = 0;
+        const client = {
+            getBlockNumber: async () => {
+                heads += 1;
+                return 43200n;
+            },
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient, signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        // Let the background gate read settle first, so no in-flight settlement recompute races the
+        // measurement below.
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+
+        const before = heads;
+        // Three CONCURRENT recomputes: before the coalescer each fired its own getBlockNumber; now
+        // the two that arrive while the first read is in flight share it — one read for the burst.
+        await Promise.all([contest.getTally(), contest.getTally(), contest.getTally()]);
+        expect(heads - before).toBe(1);
+        await voter.destroy();
+    });
+
+    it("shares the head read across contests on the same gating chain", async () => {
+        let heads = 0;
+        const client = {
+            getBlockNumber: async () => {
+                heads += 1;
+                return 43200n;
+            },
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        // Two DISTINCT contests (different contestId ⇒ different topic/engine) over the SAME chain
+        // client — the 5chan directory shape. A concurrent tally burst across them must cost one
+        // shared head read, not one per contest.
+        const criteriaA = bizCriteria();
+        const criteriaB = { ...bizCriteria(), contestId: "biz2", name: "/biz2/" };
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient, signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: criteriaA, votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: criteriaB, votes: VOTE })).publish();
+        const contestA = await voter.createContest({ criteria: criteriaA });
+        const contestB = await voter.createContest({ criteria: criteriaB });
+        await vi.waitFor(async () => {
+            expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true);
+            expect((await contestB.getTally()).ranking[0]?.chainVerified).toBe(true);
+        });
+
+        const before = heads;
+        // Fire both recomputes in the same tick: the second reaches readHead while the first read
+        // (issued synchronously before either awaits) is still in flight, so they share it.
+        await Promise.all([contestA.getTally(), contestB.getTally()]);
+        expect(heads - before).toBe(1);
+        await voter.destroy();
     });
 });

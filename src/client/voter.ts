@@ -24,11 +24,17 @@ import {
     encodeRootRecord,
     maxBundleMessageBytes,
     rootFetchKey,
+    decodeBulkRootRecords,
+    encodeBulkRootRecords,
+    BULK_ROOTS_FETCH_KEY,
+    BULK_ROOTS_MAX_RECORDS,
+    BULK_ROOTS_MAX_INLINE_BYTES,
     MAX_ROOT_MESSAGE_BYTES,
     ROOT_FETCH_KEY_SUFFIX,
     ROOT_RECORD_VERSION,
     type RootRecord,
-    type FetchRootRecord
+    type FetchRootRecord,
+    type BulkRootRecords
 } from "../transport/messages.js";
 import { makeRootChaser, toChaseSession, type RootChaser } from "../transport/chase.js";
 import { encodeBundle, decodeBundle, bundleCidForBytes } from "../crdt/codec.js";
@@ -352,6 +358,22 @@ interface ResolvedDeps {
      */
     fetchBudget: <T>(peerId: string, task: () => Promise<T>) => Promise<T>;
     /**
+     * Fetch one contest's root record from a peer, batched voter-wide: concurrent pulls against the
+     * same peer collapse into a single bulk request (see {@link makeRootPuller}). Engines call this
+     * instead of the fetch service directly, so a directory-wide cold start costs one round trip per
+     * peer rather than one per contest. Returns the encoded record, or `undefined`/`null` when the
+     * peer has none for that topic.
+     */
+    pullRoot: (peer: PeerId, topic: string) => Promise<Uint8Array | undefined | null>;
+    /**
+     * Read one chain's current head block number, coalescing concurrent callers onto a single
+     * in-flight `getBlockNumber` (keyed on the shared client instance). A directory-wide burst of
+     * tally recomputes — every one of which refreshes its expiry bucket (see
+     * {@link ContestEngine#refreshBucket}) — shares one head read per chain instead of each firing
+     * its own, without ever serving a stale head to a later read. See {@link makeHeadReader}.
+     */
+    readHead: (chain: ChainClient) => Promise<bigint>;
+    /**
      * The voter's persisted gate results, shared across ALL contests (keys carry each
      * contest's rule hash, so two contests over one gate — a 5chan-style directory — share
      * each other's reads; different rules cannot collide). See verify/gate-result-cache.ts.
@@ -396,6 +418,17 @@ const COLD_START_PEERS = 4;
  * whatever the gossipsub-subscriber source and live gossip provide.
  */
 const COLD_START_ROUTER_TIMEOUT_MS = 10_000;
+/**
+ * Per-provider dial deadline (ms) for cold-join discovery source 2. Each provider dial shares the
+ * router-lookup {@link COLD_START_ROUTER_TIMEOUT_MS} signal, but is ALSO bounded on its own by this
+ * shorter timeout — because a browser WSS dial can HANG (neither resolve nor reject) indefinitely,
+ * and since the root-record `pull` only runs after the dial await settles, a hung dial otherwise
+ * gates the pull for the full 10s router timeout even when a connection to that peer opens by other
+ * means in the meantime. Measured in production browser traces: 4 of 32 recent cold-start rounds hit
+ * the hang, turning ~6s loads into 8.7–22s totals. Bounding the dial at 3s lets the catch swallow the
+ * timeout and fire `pull` at ≤3s instead of ≤10s; only the dial is cut, never the pull.
+ */
+const COLD_START_DIAL_TIMEOUT_MS = 3_000;
 /**
  * Root-record heartbeat interval (ms): 10 minutes — the IPNS-over-pubsub rebroadcast default
  * (`go-libp2p-pubsub-router`) — jittered ±25% per firing, with suppression on top (skip when a
@@ -499,6 +532,327 @@ function makePerPeerBudget(limitPerPeer: number): <T>(peerId: string, task: () =
         } finally {
             if (limiter.activeCount === 0 && limiter.pendingCount === 0) limiters.delete(peerId);
         }
+    };
+}
+
+/**
+ * The {@link ResolvedDeps.readHead} factory: coalesce CONCURRENT `getBlockNumber` calls to one chain
+ * onto a single in-flight read, keyed on the client instance (a `WeakMap`, so a chain the voter stops
+ * using is collected). It deliberately does NOT cache across time — the moment a read settles its
+ * slot clears, so the next caller reads a fresh head. Only callers that arrive WHILE a read is in
+ * flight share it.
+ *
+ * In-flight sharing curbs the cold-start `getBlockNumber` storm. Every tally recompute refreshes its
+ * expiry bucket off the gating chain's head, and a directory join drives ~4 recomputes per contest (a
+ * chased-bundle admit plus two deferred-check settlements) across dozens of contests that all share
+ * ONE gating-chain client — so the reads land in overlapping bursts. Measured on the production 5chan
+ * cold start (63 contests, Chromium): 252 `readHead` calls collapse to 66 actual `getBlockNumber`
+ * posts (−74%), a real cut in redundant RPC to the shared endpoint (which the read coalescer's own
+ * notes show throttles concurrent posts) and in main-thread promise churn.
+ *
+ * It is NOT a first-tally latency win, and the commit is careful not to claim one: the first contest
+ * to admit still awaits its own (uncoalesced) head read on the critical path, and the measured
+ * bulk→first-tally wall is unchanged within noise — that window is network- and scheduling-bound, not
+ * head-read-bound (the 82s of `getBlockNumber` "wall" a naive probe attributes here is an async-overlap
+ * artifact: the true per-read CPU is negligible). This is a load/tidiness fix, banked because the
+ * redundancy is real and the change is cheap and safe.
+ *
+ * Coalescing is correct here without any staleness: `getBlockNumber` is a pure current-head read, so
+ * two callers overlapping in time genuinely want the same answer. A settled result is never reused, so
+ * a later recompute after the head has moved still sees the move (the expiry tests pin this), and a
+ * REJECTED read clears its slot too, so a transient RPC failure is retried on the next call rather than
+ * shared by latecomers to the same failed read.
+ */
+export function makeHeadReader(): (chain: ChainClient) => Promise<bigint> {
+    const inFlight = new WeakMap<ChainClient, Promise<bigint>>();
+    return (chain) => {
+        const existing = inFlight.get(chain);
+        if (existing !== undefined) return existing; // a read is already in flight — share it
+        const head = chain.getBlockNumber();
+        inFlight.set(chain, head);
+        // Clear the slot the instant the read settles (fulfilled OR rejected), but only if it is
+        // still ours — a defensive guard, though nothing replaces an entry before it settles.
+        const clear = (): void => {
+            if (inFlight.get(chain) === head) inFlight.delete(chain);
+        };
+        head.then(clear, clear);
+        return head;
+    };
+}
+
+/**
+ * How long the root-record batcher holds a peer's first request open, waiting for its siblings.
+ * A directory join fans out in one tick, so this only has to survive the microtask queue and the
+ * engines' pre-fetch awaits; it is latency added to every cold start, so it stays small.
+ */
+const BULK_ROOTS_COALESCE_MS = 50;
+/**
+ * How long a decoded (non-empty) bulk answer stays reusable for later pulls against the same peer.
+ * A directory cold start does NOT arrive in one batch: each contest's pull fires when its own
+ * router lookup returns, and lookups straggle over seconds — measured against production, a
+ * 63-contest cold start coalesced into 3 batches, the last two refetching the byte-identical
+ * answer (and the first tally waited on batch 3, not batch 1). Within this window a straggler is
+ * served from the previous answer without touching the wire. Staleness is bounded and harmless:
+ * a root is an unverifiable hint wherever it comes from, a re-pull that chases an already-chased
+ * root dedups in the chaser, and real divergence is what the 10-minute heartbeat exists for.
+ * Empty answers are never cached ("I serve nothing yet" expires in seconds on a booting seeder).
+ */
+const BULK_ROOTS_CACHE_MS = 10_000;
+/** Bound on cached bulk answers (one per peer): cold start touches a handful of peers, not 32. */
+const BULK_ROOTS_CACHE_MAX_PEERS = 32;
+
+/**
+ * A fetch-protocol ERROR response — the peer received the request and refused the key — as opposed
+ * to a transport-level failure (a stream reset, a dial failure, a timeout). `@libp2p/fetch` answers
+ * the ERROR status (not NOT_FOUND) whenever it has NO lookup function registered for the requested
+ * key's prefix at all, and surfaces it to the caller as a thrown `ProtocolError` (from
+ * `@libp2p/interface`). Detected by `name` rather than `instanceof` so a duplicated
+ * `@libp2p/interface` copy in the dependency tree cannot defeat the check (libp2p sets these names
+ * exactly so cross-package callers can match them). See {@link makeRootPuller}'s `flush`: a bulk
+ * fetch that hits this is a peer serving its root records under a narrower/foreign prefix (or under
+ * no bitsocial prefix yet), and must fall back to the per-topic key instead of being retried to the
+ * cold-start deadline as if it were unreachable.
+ */
+function isFetchProtocolError(error: unknown): boolean {
+    return error instanceof Error && error.name === "ProtocolError";
+}
+
+/** The seams a bulk answer feeds beyond its own waiters (both optional; see {@link makeRootPuller}). */
+interface RootPullerHooks {
+    /**
+     * Store one hash-verified inlined chunk block (see `BulkFetchRootRecord.chunkBlocks`). Wired to
+     * the host blockstore so the subsequent chase resolves every chunk locally instead of over
+     * bitswap. Blocks are verified against their CID BEFORE this is called.
+     */
+    putBlock?: (cid: CID, bytes: Uint8Array) => Promise<void>;
+    /**
+     * Hand a record to a contest that did NOT ask for it. A bulk answer names every contest the
+     * peer serves — not just the batch that happened to ask — and a directory cold start straggles
+     * (each contest pulls only after its own discovery returns), so without this the contests whose
+     * router lookup drew a slow path sit idle next to an answer that already covers them. `encoded`
+     * is the same re-encoded record bytes a waiter would have received.
+     */
+    onRecord?: (peer: PeerId, topic: string, encoded: Uint8Array) => void;
+}
+
+/**
+ * The {@link ResolvedDeps.pullRoot} factory: turn N per-contest root fetches against one peer into
+ * ONE bulk fetch (see {@link BULK_ROOTS_FETCH_KEY}), transparently to the engines.
+ *
+ * Requests to the same peer that arrive within {@link BULK_ROOTS_COALESCE_MS} share one bulk
+ * request. Its answer is authoritative for what it contains: a topic PRESENT resolves to that
+ * record, and a topic ABSENT from a non-empty answer resolves to "no record" — the peer told us it
+ * does not serve that contest, and re-asking individually would rebuild the very fan-out this
+ * exists to remove.
+ *
+ * The one case that does fall back is a peer that answers the bulk key with NOTHING. Those waiters
+ * re-issue per-topic fetches — and that verdict is deliberately NOT remembered.
+ *
+ * Not remembering looks wasteful and is the important part. "Nothing" does not only mean "old
+ * peer": the responder registers lazily on the first topic join, so a node that has not joined
+ * anything yet has no handler for this prefix at all and answers nothing for a reason that expires
+ * in seconds. Caching that verdict would strand a browser that happened to probe a seeder mid
+ * startup on the per-contest path for its whole session, long after the seeder began serving the
+ * whole directory in one reply. Re-probing per batch costs one wasted round trip per batch against
+ * a genuinely old peer (measured: ~3 batches in a cold start) and self-heals against a young one,
+ * which is the better trade in both directions.
+ *
+ * Throws propagate to every waiter in the batch: the engines' own retry loop
+ * (`#fetchRootWithRetry`) treats a throw as transient and backs off, which is the correct response
+ * to a saturated or resetting peer whether one contest asked or sixty-three did.
+ *
+ * On top of the batching, one answered request is squeezed for everything it is worth, because a
+ * directory cold start does NOT arrive as one tidy batch — each contest pulls only when its own
+ * router lookup returns, and lookups straggle over seconds (measured: 3 batches, the last two
+ * refetching the byte-identical answer while the first tally waited on them):
+ *
+ *   - a fresh non-empty answer is CACHED ({@link BULK_ROOTS_CACHE_MS}), so a straggler's pull is
+ *     served without touching the wire;
+ *   - a pull arriving while a bulk request is already in flight JOINS it;
+ *   - topics present in the answer that nobody in the batch asked about fan out to their engines
+ *     through {@link RootPullerHooks.onRecord}, so the slowest lookup no longer gates the last
+ *     contest's chase;
+ *   - inlined checkpoint chunk blocks are hash-verified and stored through
+ *     {@link RootPullerHooks.putBlock} BEFORE any waiter resolves, so the chases the answer
+ *     triggers find their blocks locally instead of over bitswap.
+ */
+function makeRootPuller(fetch: FetchServiceLike, hooks: RootPullerHooks = {}): (peer: PeerId, topic: string) => Promise<Uint8Array | undefined | null> {
+    type Waiter = { topic: string; resolve: (value: Uint8Array | undefined | null) => void; reject: (error: unknown) => void };
+    /** A decoded answer with inline blocks already stripped (verified + stored via `putBlock`). */
+    type StrippedRecords = Record<string, FetchRootRecord>;
+    const batches = new Map<string, { waiters: Waiter[]; timer: ReturnType<typeof setTimeout> }>();
+    /** Non-empty answers kept for {@link BULK_ROOTS_CACHE_MS} so stragglers skip the wire. */
+    const cached = new Map<string, { at: number; records: StrippedRecords }>();
+    /** In-flight bulk requests: a pull arriving mid-request joins it instead of starting another. */
+    const inflight = new Map<string, Promise<StrippedRecords | null>>();
+
+    const fetchOne = async (peer: PeerId, topic: string) => await fetch.fetch(peer, rootFetchKey(topic));
+
+    const serve = (waiter: Waiter, records: StrippedRecords): void => {
+        const record = records[waiter.topic];
+        // Re-encode rather than thread a decoded record through: the engines' pull path decodes
+        // what it receives, so handing back bytes keeps the bulk and per-topic paths identical
+        // (and re-validates the entry through the same schema on the way out). A topic ABSENT
+        // from a non-empty answer is a definitive "no record" — the peer just told us what it
+        // serves, and re-asking individually would rebuild the fan-out this exists to remove.
+        if (record === undefined) {
+            waiter.resolve(undefined);
+            return;
+        }
+        try {
+            waiter.resolve(encodeRootRecord(record));
+        } catch (error) {
+            waiter.reject(error);
+        }
+    };
+
+    /**
+     * Strip, verify and distribute one decoded bulk answer: inlined chunk blocks are re-hashed and
+     * (only when the hash matches their record's chunk CID) stored via `putBlock` — content
+     * addressing is the verification, so a lying block simply falls back to the chase — then the
+     * answer is cached for stragglers and every topic nobody in this batch asked about is fanned
+     * out through `onRecord`. Returns the stripped records the waiters are served from.
+     */
+    const accept = async (peer: PeerId, id: string, decoded: BulkRootRecords, askedTopics: Set<string>): Promise<StrippedRecords> => {
+        const records: StrippedRecords = {};
+        const puts: Promise<void>[] = [];
+        for (const [topic, entry] of Object.entries(decoded)) {
+            const { chunkBlocks, ...record } = entry;
+            records[topic] = record;
+            // All-or-nothing per record (mirrors the responder): a partial set cannot skip the
+            // chase anyway, and a length mismatch means the answer is not what the encoder sends.
+            if (chunkBlocks === undefined || hooks.putBlock === undefined || chunkBlocks.length !== record.chunks.length) continue;
+            for (let i = 0; i < chunkBlocks.length; i++) {
+                const bytes = chunkBlocks[i]!;
+                const expected = record.chunks[i]!;
+                puts.push(
+                    (async () => {
+                        try {
+                            const block = await blockForBytes(bytes);
+                            if (block.cid.equals(expected)) await hooks.putBlock!(block.cid, block.bytes);
+                        } catch {
+                            // A bad inline block contributes nothing; the chase fetches it instead.
+                        }
+                    })()
+                );
+            }
+        }
+        // Blocks land BEFORE any waiter resolves or record fans out, so the chases they trigger
+        // find every verified chunk already local.
+        await Promise.all(puts);
+        if (Object.keys(records).length > 0) {
+            if (cached.size >= BULK_ROOTS_CACHE_MAX_PEERS && !cached.has(id)) {
+                const oldest = cached.keys().next().value;
+                if (oldest !== undefined) cached.delete(oldest);
+            }
+            cached.set(id, { at: Date.now(), records });
+        }
+        if (hooks.onRecord !== undefined) {
+            for (const [topic, record] of Object.entries(records)) {
+                if (askedTopics.has(topic)) continue;
+                try {
+                    hooks.onRecord(peer, topic, encodeRootRecord(record));
+                } catch {
+                    // One unservable record must not stop the fan-out (mirrors `serve`).
+                }
+            }
+        }
+        return records;
+    };
+
+    const flush = async (peer: PeerId, id: string): Promise<void> => {
+        const batch = batches.get(id);
+        if (batch === undefined) return;
+        batches.delete(id);
+        const { waiters } = batch;
+        const run = (async (): Promise<StrippedRecords | null> => {
+            let answer: Uint8Array | undefined | null;
+            try {
+                answer = await fetch.fetch(peer, BULK_ROOTS_FETCH_KEY);
+            } catch (error) {
+                // A peer that speaks the fetch protocol but has NO lookup registered for the bulk
+                // key's prefix answers with a protocol ERROR status, which `@libp2p/fetch` surfaces
+                // as a thrown `ProtocolError` — NOT the `undefined` a registered-but-empty responder
+                // returns for NOT_FOUND. Both mean the same thing to us ("this peer will not serve me
+                // over the bulk key"), so treat the ERROR exactly like the empty answer: return null
+                // and fall through to the per-topic path every root-serving peer answers. A
+                // transport failure (a stream reset from a saturated inbound cap, a dial failure, a
+                // timeout) is a DIFFERENT throw — never a `ProtocolError` — and must stay transient so
+                // the retry loop backs off, rather than permanently downgrading a live seeder that was
+                // only briefly over its stream cap to the per-topic fan-out this batching exists to
+                // remove. (See isFetchProtocolError; the integration harness's per-topic-prefix seeder
+                // is exactly the ERROR-answering peer this handles.)
+                if (!isFetchProtocolError(error)) throw error;
+                return null;
+            }
+            if (answer === undefined || answer === null) return null;
+            // A malformed bulk answer throws here — this peer's problem, not a reason to re-ask
+            // it 63 times: the throw rejects every waiter and the engines' retry loop backs off.
+            return await accept(peer, id, decodeBulkRootRecords(answer), new Set(waiters.map((waiter) => waiter.topic)));
+        })();
+        // Registered synchronously (before any await), so a pull landing after this batch closed
+        // but before the answer joins THIS request instead of opening a redundant second one.
+        inflight.set(id, run);
+        let records: StrippedRecords | null;
+        try {
+            records = await run;
+        } catch (error) {
+            for (const waiter of waiters) waiter.reject(error);
+            return;
+        } finally {
+            inflight.delete(id);
+        }
+        if (records === null) {
+            // Either a pre-bulk peer or one whose responder is not registered yet (it has joined
+            // nothing so far). Indistinguishable here, and deliberately not cached as a verdict —
+            // see this factory's note. Serve this batch per-topic; the next batch re-probes.
+            for (const waiter of waiters) {
+                fetchOne(peer, waiter.topic).then(waiter.resolve, waiter.reject);
+            }
+            return;
+        }
+        for (const waiter of waiters) serve(waiter, records);
+    };
+
+    return async (peer, topic) => {
+        const id = peer.toString();
+        // Freshness first: a straggler whose discovery returned after an earlier batch answered is
+        // served from that answer without touching the wire (see BULK_ROOTS_CACHE_MS). Deliberately
+        // asymmetric with `serve`: only a topic PRESENT in the cached answer is served from it. The
+        // "absent = definitive no record" contract holds within one answer, but a cached answer
+        // predates contests joined after it was taken — a fresh batch (one coalesced round trip)
+        // re-asks for those instead of handing a late-created contest a stale "no" that would
+        // strand it until the heartbeat.
+        const fresh = cached.get(id);
+        if (fresh !== undefined) {
+            if (Date.now() - fresh.at <= BULK_ROOTS_CACHE_MS) {
+                const record = fresh.records[topic];
+                if (record !== undefined) {
+                    return await new Promise<Uint8Array | undefined | null>((resolve, reject) => serve({ topic, resolve, reject }, fresh.records));
+                }
+            } else {
+                cached.delete(id);
+            }
+        }
+        const running = inflight.get(id);
+        if (running !== undefined) {
+            const records = await running; // a throw propagates: same failure the batch saw
+            if (records !== null) {
+                return await new Promise<Uint8Array | undefined | null>((resolve, reject) => serve({ topic, resolve, reject }, records));
+            }
+            return await fetchOne(peer, topic); // the in-flight probe said "no bulk" — go per-topic
+        }
+        return await new Promise<Uint8Array | undefined | null>((resolve, reject) => {
+            const existing = batches.get(id);
+            if (existing !== undefined) {
+                existing.waiters.push({ topic, resolve, reject });
+                return;
+            }
+            const timer = setTimeout(() => void flush(peer, id), BULK_ROOTS_COALESCE_MS);
+            // Don't hold a Node process open for a coalesce window; no-op in the browser.
+            (timer as { unref?: () => void }).unref?.();
+            batches.set(id, { waiters: [{ topic, resolve, reject }], timer });
+        });
     };
 }
 
@@ -814,9 +1168,23 @@ class ContestEngine {
         return client;
     }
 
-    /** Read the gating-chain head and update {@link #currentBucketCache}; returns the bucket. */
+    /**
+     * Read the gating-chain head and update {@link #currentBucketCache}; returns the bucket.
+     *
+     * The head read goes through the voter-wide {@link ResolvedDeps.readHead} coalescer, NOT the raw
+     * client, because the tally recompute calls this on EVERY state change: a cold directory join
+     * admits ~one chased bundle per contest and then settles two deferred checks per bundle, so a
+     * 63-contest join drives ~4 recomputes per contest ≈ 250 tally computes in a couple of seconds,
+     * each of which — before this — fired its own `eth_blockNumber`. The gating chain is shared by
+     * every contest (one `ruleChain` per chain across the directory), so those reads land in
+     * overlapping bursts; coalescing collapses concurrent callers to a single in-flight read (see
+     * {@link makeHeadReader}) without ever serving a stale head. The signing path ({@link signVote})
+     * and the tie-break block-hash read ({@link #bucketBlockHash}) still read the client directly.
+     * Measured on the production 5chan cold start: 252 head-read requests → 66 actual `getBlockNumber`
+     * (−74%). This is an RPC-load / churn reduction, not a first-tally latency win (see the commit).
+     */
     async #refreshBucket(): Promise<number> {
-        const head = await this.#ruleChain.getBlockNumber();
+        const head = await this.#deps.readHead(this.#ruleChain);
         this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
         this.#headReadMs = Date.now();
         this.#maybePurgeGateResults();
@@ -1193,7 +1561,7 @@ class ContestEngine {
                 if (this.#chaser === undefined) return undefined; // left mid-backoff — abandon quietly
             }
             try {
-                return await this.#deps.fetchBudget(peer.toString(), () => this.#deps.fetch.fetch(peer, rootFetchKey(this.topic)));
+                return await this.#deps.fetchBudget(peer.toString(), () => this.#deps.pullRoot(peer, this.topic));
             } catch (error) {
                 lastError = error; // transient (e.g. seeder over its inbound-stream cap) — back off and retry
             }
@@ -1234,10 +1602,18 @@ class ContestEngine {
                     (async () => {
                         try {
                             if (provider.multiaddrs.length > 0) {
-                                await libp2p.dial(provider.multiaddrs, { signal: controller.signal });
+                                // Bound each dial by its own COLD_START_DIAL_TIMEOUT_MS in addition to the
+                                // shared router signal: a hung WSS dial that never settles must not gate the
+                                // pull for the full router timeout (see COLD_START_DIAL_TIMEOUT_MS). Only the
+                                // dial carries this signal — `pull` below is never aborted by it.
+                                const dialSignal = AbortSignal.any([
+                                    controller.signal,
+                                    AbortSignal.timeout(COLD_START_DIAL_TIMEOUT_MS)
+                                ]);
+                                await libp2p.dial(provider.multiaddrs, { signal: dialSignal });
                             }
                         } catch {
-                            // Undialable via its advertised addrs — `pull` still tries (it may be connected).
+                            // Undialable, timed out, or router-aborted — `pull` still tries (it may be connected).
                         }
                         await pull(provider.id);
                     })()
@@ -1509,6 +1885,46 @@ class ContestEngine {
      */
     latestCheckpointRoot(): CID | undefined {
         return this.#rootRecordCache?.record.root;
+    }
+
+    /**
+     * The current root record plus its checkpoint chunk blocks, for the bulk responder's inline
+     * path (see `BulkFetchRootRecord.chunkBlocks`): the blocks are already in hand from the same
+     * on-demand encode that produced the record, so inlining them is a copy, never extra encoding
+     * work. `chunkBlocks` aligns positionally with `record.chunks`; the root-manifest block is
+     * excluded (a receiver handed a verified chunk index never fetches the manifest).
+     */
+    async rootRecordWithBlocks(): Promise<{ record: FetchRootRecord; chunkBlocks: CheckpointBlock[] }> {
+        const record = await this.rootRecord();
+        // No await between the encode above and this read, so the cache is the one that made
+        // `record`; the by-CID lookup is still belt-and-braces over positional slicing.
+        const blocks = new Map((this.#rootRecordCache?.blocks ?? []).map((block) => [block.cid.toString(), block]));
+        const chunkBlocks: CheckpointBlock[] = [];
+        for (const chunk of record.chunks) {
+            const block = blocks.get(chunk.toString());
+            if (block === undefined) return { record, chunkBlocks: [] }; // can't inline coherently — serve the record alone
+            chunkBlocks.push(block);
+        }
+        return { record, chunkBlocks };
+    }
+
+    /**
+     * Ingest a root record fetched on this engine's behalf by the voter-wide bulk puller: a bulk
+     * answer names every contest the peer serves, not just the batch that asked, so the voter fans
+     * the surplus records out here (see {@link RootPullerHooks.onRecord}) instead of letting each
+     * contest wait out its own discovery to ask for bytes already in hand. Identical handling to a
+     * cold-start pull result — note the advertiser, chase a divergence — minus the fetch. A no-op
+     * before join()/after leave() (no chaser to hand the hint to); throws surface to the caller's
+     * catch exactly like a malformed pull.
+     */
+    async ingestRootRecord(peer: PeerId, encoded: Uint8Array): Promise<void> {
+        if (this.#chaser === undefined) return;
+        const record = decodeRootRecord(encoded);
+        const own = await this.rootRecord();
+        this.#notePeerRoot(peer.toString(), record.root);
+        if (!record.root.equals(own.root)) {
+            this.#chaser.chase(record.root, record.chunks, this.#sessionProvidersFor(record.root, peer));
+        }
     }
 
     /**
@@ -1823,6 +2239,26 @@ export class PubsubVoter implements VoteClient {
             onTopicLeft: this.#onTopicLeft,
             onCheckpointChanged: () => this.#announcer?.notifyChange(),
             fetchBudget: makePerPeerBudget(COLD_START_PEER_FETCH_LIMIT),
+            pullRoot: makeRootPuller(fetch, {
+                // Verified inline chunk blocks land in the host blockstore, so the chases a bulk
+                // answer triggers resolve locally instead of over bitswap (see RootPullerHooks).
+                putBlock: async (cid, bytes) => {
+                    await blockstore.put(cid, bytes);
+                },
+                // Fan surplus records out to the contests that did not ask (see RootPullerHooks):
+                // fire-and-forget like the cold-start pull it substitutes for — an ingest failure
+                // loses an optimisation, never a correctness property (live gossip + the heartbeat
+                // still converge that contest).
+                onRecord: (peer, topic, encoded) => {
+                    const engine = this.#engines.get(topic);
+                    if (engine?.joined) void engine.ingestRootRecord(peer, encoded).catch(() => {});
+                }
+            }),
+            // One head-read coalescer per voter, shared by every contest on the (shared) gating
+            // chain: a cold-start burst of concurrent tally recomputes shares one in-flight
+            // getBlockNumber per chain instead of each firing its own (see makeHeadReader /
+            // #refreshBucket).
+            readHead: makeHeadReader(),
             gateStore: this.#storage.openLru({ cacheName: "gate-results", maxItems: GATE_RESULTS_MAX_ITEMS }),
             nameResolutionCache: makeNameResolutionCache(
                 this.#storage.openLru({ cacheName: "name-resolutions", maxItems: NAME_RESOLUTIONS_MAX_ITEMS })
@@ -1938,6 +2374,7 @@ export class PubsubVoter implements VoteClient {
         // `@libp2p/fetch` hands the lookup the requested key as raw bytes; decode the utf8 topic
         // string the requester sent (`rootFetchKey(topic)`) before matching.
         const key = new TextDecoder().decode(keyBytes);
+        if (key === BULK_ROOTS_FETCH_KEY) return await this.#bulkRootsAnswer();
         if (!key.endsWith(ROOT_FETCH_KEY_SUFFIX)) return undefined;
         const engine = this.#engines.get(key.slice(0, -ROOT_FETCH_KEY_SUFFIX.length));
         if (!engine?.joined) return undefined;
@@ -1947,6 +2384,55 @@ export class PubsubVoter implements VoteClient {
             return undefined;
         }
     };
+
+    /**
+     * The bulk half of the responder (see {@link BULK_ROOTS_FETCH_KEY}): one reply carrying the
+     * root record of every joined contest, so a directory-sized cold joiner pays one round trip
+     * instead of one per contest. Same rules as the per-topic answer, applied per entry — an
+     * unjoined engine or an encode failure contributes nothing rather than a zero record that
+     * would masquerade as an empty contest.
+     *
+     * Capped at {@link BULK_ROOTS_MAX_RECORDS}: a request must never be able to compel unbounded
+     * encoding work. Truncation is safe and invisible to correctness — a caller that wanted a
+     * topic missing from the answer falls back to fetching it individually.
+     *
+     * Answers an EMPTY map rather than nothing when it serves no contest, and that distinction is
+     * load-bearing. A pre-bulk peer has this prefix registered but does not know this key, so it
+     * answers nothing; if "serves nothing" also answered nothing, a seeder caught mid-startup would
+     * be indistinguishable from one that will never support bulk, and the caller — which remembers
+     * that verdict for the session — would fall back to one fetch per contest against a peer that
+     * was about to serve the whole directory in one. An empty map says "I speak bulk, I have
+     * nothing yet", which is a different and recoverable answer.
+     */
+    async #bulkRootsAnswer(): Promise<Uint8Array | undefined> {
+        const joined = [...this.#engines.entries()].filter(([, engine]) => engine.joined).slice(0, BULK_ROOTS_MAX_RECORDS);
+        const records: BulkRootRecords = {};
+        // The checkpoint payload rides along while the budget lasts (see BULK_ROOTS_MAX_INLINE_BYTES):
+        // chunk blocks come from the same encode cache as the record, so inlining is a copy, and a
+        // record past the budget simply answers without blocks — its chase fetches them as before.
+        let inlineBudget = BULK_ROOTS_MAX_INLINE_BYTES;
+        // Sequential on purpose: `rootRecord()` is served from the engine's on-demand encode cache
+        // and this runs on the serving side of an unauthenticated request, so it must not fan out.
+        for (const [topic, engine] of joined) {
+            try {
+                const { record, chunkBlocks } = await engine.rootRecordWithBlocks();
+                const inlineBytes = chunkBlocks.reduce((total, block) => total + block.bytes.length, 0);
+                if (chunkBlocks.length > 0 && inlineBytes <= inlineBudget) {
+                    inlineBudget -= inlineBytes;
+                    records[topic] = { ...record, chunkBlocks: chunkBlocks.map((block) => block.bytes) };
+                } else {
+                    records[topic] = record;
+                }
+            } catch {
+                // This contest contributes nothing; the rest of the directory still answers.
+            }
+        }
+        try {
+            return encodeBulkRootRecords(records);
+        } catch {
+            return undefined;
+        }
+    }
 
     /**
      * Lazy responder lifecycle, driven by the engines' real join/leave transitions: the first

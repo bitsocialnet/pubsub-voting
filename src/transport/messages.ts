@@ -2,6 +2,7 @@ import { CID } from "multiformats/cid";
 import * as dagCbor from "@ipld/dag-cbor";
 import { z } from "zod";
 import { encodeCanonical } from "../encoding/canonical.js";
+import { TOPIC_PREFIX } from "../topic.js";
 import type { Criteria } from "../schema/criteria.js";
 
 /**
@@ -117,6 +118,73 @@ export const ROOT_FETCH_KEY_SUFFIX = "/root";
 /** The fetch-protocol key for one contest's root record. */
 export function rootFetchKey(topic: string): string {
     return `${topic}${ROOT_FETCH_KEY_SUFFIX}`;
+}
+
+/**
+ * The fetch-protocol key for the BULK root record: "every contest you currently serve", answered
+ * as one `{ [topic]: FetchRootRecord }` map. A directory-sized cold joiner needs one root record
+ * per contest, and asking for them one at a time costs one request/response round trip each —
+ * measured as the dominant cold-start term for a 63-contest directory, since the multistream-select
+ * negotiation (~1-2 RTT) dominates each fetch regardless of how tiny the answer is. Records are
+ * ~100 B, so a whole directory fits in a handful of KB: one round trip instead of 63. Each record
+ * may additionally inline its checkpoint's chunk blocks (see {@link BulkFetchRootRecord}), making
+ * the one round trip carry the whole cold-pull payload, not just the pointers to it.
+ *
+ * Deliberately *not* parameterized by the topics the caller wants. The fetch protocol's key is the
+ * only client-to-server payload, so a topic list would mean a multi-KB key; and scoping the answer
+ * to a "directory" would push the manifest concept — which lives in the host above this library —
+ * into the wire format. "Everything I serve" needs neither: the caller intersects the answer with
+ * its own topics, exactly as it would have done across 63 separate replies.
+ *
+ * Shares the {@link TOPIC_PREFIX} registration with {@link rootFetchKey} and cannot collide with it
+ * (a per-topic key ends in `/root`, this one in `/roots`).
+ */
+export const BULK_ROOTS_FETCH_KEY = `${TOPIC_PREFIX}roots`;
+
+/**
+ * The bulk answer's cap. A responder never returns more than this many records in one reply, so a
+ * single unauthenticated request cannot compel a node serving thousands of contests to encode all
+ * of them. Callers treat a capped (hence possibly incomplete) answer the same as any other: topics
+ * they asked about that are missing simply fall back to a per-topic fetch.
+ */
+export const BULK_ROOTS_MAX_RECORDS = 512;
+
+/**
+ * Byte budget for checkpoint chunk blocks INLINED into one bulk answer (see
+ * {@link BulkFetchRootRecord.chunkBlocks}). Checkpoint payloads are tiny in practice (~300 B per
+ * contest for a leaderboard directory), so a whole directory's cold-pull payload rides the one
+ * bulk round trip — but the budget caps what a single unauthenticated request can compel: once
+ * spent, remaining records answer without their blocks and the caller chases them over bitswap
+ * exactly as before. Spent in joined-contest iteration order, all-or-nothing per record (a
+ * partial chunk set would still cost the chase round-trip it exists to remove).
+ */
+export const BULK_ROOTS_MAX_INLINE_BYTES = 512 * 1024;
+
+/**
+ * One bulk-answer entry: the root record, optionally carrying the checkpoint's chunk blocks
+ * inline. `chunkBlocks[i]` is the raw block whose content address must be `chunks[i]` — the
+ * receiver re-hashes every block and drops any that does not match, so inlined bytes are exactly
+ * as trustworthy as bitswap-fetched ones (content addressing is the verification either way, and
+ * the bundles inside are re-verified offline before merge regardless). Absent on the wire when a
+ * record has no chunks or the answer's inline budget ran out.
+ */
+const BulkFetchRootRecordSchema = FetchRootRecordSchema.extend({ chunkBlocks: z.array(BytesSchema).optional() });
+
+export type BulkFetchRootRecord = FetchRootRecord & { chunkBlocks?: Uint8Array[] | undefined };
+
+const BulkRootRecordsSchema = z.record(z.string(), BulkFetchRootRecordSchema);
+
+/** The bulk root-record answer: contest topic → that contest's root record (chunks maybe inline). */
+export type BulkRootRecords = Record<string, BulkFetchRootRecord>;
+
+/** Encode a bulk root-record answer (see {@link BULK_ROOTS_FETCH_KEY}). */
+export function encodeBulkRootRecords(records: BulkRootRecords): Uint8Array {
+    return encodeCanonical(BulkRootRecordsSchema.parse(records));
+}
+
+/** Decode a bulk root-record answer; throws on malformed (caller treats a throw as "no answer"). */
+export function decodeBulkRootRecords(bytes: Uint8Array): BulkRootRecords {
+    return BulkRootRecordsSchema.parse(dagCbor.decode(bytes));
 }
 
 /**
