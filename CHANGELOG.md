@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.5](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.4...v0.1.5) (2026-07-22)
+
+### Features
+
+* answer every joined contest's root record in one fetch ([1795cd5](https://github.com/bitsocialnet/pubsub-voting/commit/1795cd5c80917ea8a126373b8168da1765794b0e))
+* carry the whole cold pull in the bulk answer, and spend one answer on every contest ([06ed65c](https://github.com/bitsocialnet/pubsub-voting/commit/06ed65ccb715027ffb96a06f68fd7a6387a390df))
+
+### Bug Fixes
+
+* bound a hung cold-join provider dial at 3s, not the 10s router timeout ([dc47111](https://github.com/bitsocialnet/pubsub-voting/commit/dc47111b09a81c0153e9edd88a78950a39596d1a)), closes [#discoverProviders](https://github.com/bitsocialnet/pubsub-voting/issues/discoverProviders)
+* fall back to per-topic when a peer ERRORs the bulk root key, not just when it NOT_FOUNDs ([983cd57](https://github.com/bitsocialnet/pubsub-voting/commit/983cd5747ef0ca0ad655ca1b7c5916f5b48593ba))
+
+### Performance Improvements
+
+* coalesce the cold-start gating-chain head-read storm (252 -> 66 getBlockNumber, -74%) ([931371e](https://github.com/bitsocialnet/pubsub-voting/commit/931371ebd2656ccd853de73a241a06dc8217154e))
+
 ## [0.1.4](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.3...v0.1.4) (2026-07-19)
 
 ## [0.1.3](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.2...v0.1.3) (2026-07-19)

@@ -1,6 +1,6 @@
 {
   "name": "@bitsocial/pubsub-voting",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Trustless pubsub voting over a shared libp2p/Helia node.",
   "type": "module",
   "license": "GPL-3.0-or-later",
