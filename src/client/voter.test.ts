@@ -1522,6 +1522,34 @@ describe("root-record fetch protocol", () => {
             await voter.stop();
         });
 
+        it("falls back to per-topic against a peer that ERRORs the bulk key (no bulk handler), instead of retrying it to the deadline", async () => {
+            // The failure mode the three-node-relay integration test exposed. `@libp2p/fetch`
+            // answers a protocol ERROR — surfaced to the caller as a THROWN ProtocolError, not the
+            // `undefined` NOT_FOUND of speaksBulk:false — whenever the responder has no lookup for
+            // the key's PREFIX at all. A seeder that serves its root records under a per-topic prefix
+            // (`<topic>`, not `TOPIC_PREFIX`) is exactly such a peer: the bulk key is outside its
+            // registered prefix, so it ERRORs. A throw naively read as transient would re-batch the
+            // bulk key on every cold-start retry and NEVER take the per-topic path, stranding every
+            // contest against a peer that answers each `<topic>/root` fine. So a fetch-protocol
+            // ProtocolError must fall through to per-topic exactly like an empty answer does — the
+            // only place `serve`/`flush` distinguish a refused key from a dead stream.
+            let topics: string[] = []; // filled after creation; the fixture reads `records` per request
+            const records = () => Object.fromEntries(topics.map((topic) => [topic, recordOf(ROOT)]));
+            const h = fetchSpyHelia(new Map([["seeder", rootFetchService({ records, speaksBulk: "error" })]]));
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: fakeChains() });
+            const created = await Promise.all(
+                Array.from({ length: 6 }, (_, i) => voter.createContest({ criteria: { ...bizCriteria(), contestId: `c${i}` } }))
+            );
+            topics = created.map((contest) => contest.topic);
+            await Promise.all(created.map((contest) => contest.update()));
+
+            // Every contest reaches its root over the per-topic fallback and chases it — none stranded.
+            await vi.waitFor(() => expect(h.chased.filter((cid) => cid === ROOT.toString())).toHaveLength(6));
+            const perTopic = h.fetchCalls.filter((call) => call.key !== BULK_ROOTS_FETCH_KEY);
+            expect(new Set(perTopic.map((call) => call.key))).toEqual(new Set(topics.map(rootFetchKey)));
+            await voter.stop();
+        });
+
         it("recovers when a peer starts serving mid-session: a later batch takes the bulk path", async () => {
             // The reason the fallback verdict must NOT be cached. "Answers nothing" is not only an
             // old peer: the responder registers lazily on the first topic join, so a seeder that has

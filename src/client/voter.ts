@@ -601,6 +601,22 @@ const BULK_ROOTS_CACHE_MS = 10_000;
 /** Bound on cached bulk answers (one per peer): cold start touches a handful of peers, not 32. */
 const BULK_ROOTS_CACHE_MAX_PEERS = 32;
 
+/**
+ * A fetch-protocol ERROR response — the peer received the request and refused the key — as opposed
+ * to a transport-level failure (a stream reset, a dial failure, a timeout). `@libp2p/fetch` answers
+ * the ERROR status (not NOT_FOUND) whenever it has NO lookup function registered for the requested
+ * key's prefix at all, and surfaces it to the caller as a thrown `ProtocolError` (from
+ * `@libp2p/interface`). Detected by `name` rather than `instanceof` so a duplicated
+ * `@libp2p/interface` copy in the dependency tree cannot defeat the check (libp2p sets these names
+ * exactly so cross-package callers can match them). See {@link makeRootPuller}'s `flush`: a bulk
+ * fetch that hits this is a peer serving its root records under a narrower/foreign prefix (or under
+ * no bitsocial prefix yet), and must fall back to the per-topic key instead of being retried to the
+ * cold-start deadline as if it were unreachable.
+ */
+function isFetchProtocolError(error: unknown): boolean {
+    return error instanceof Error && error.name === "ProtocolError";
+}
+
 /** The seams a bulk answer feeds beyond its own waiters (both optional; see {@link makeRootPuller}). */
 interface RootPullerHooks {
     /**
@@ -750,7 +766,25 @@ function makeRootPuller(fetch: FetchServiceLike, hooks: RootPullerHooks = {}): (
         batches.delete(id);
         const { waiters } = batch;
         const run = (async (): Promise<StrippedRecords | null> => {
-            const answer = await fetch.fetch(peer, BULK_ROOTS_FETCH_KEY);
+            let answer: Uint8Array | undefined | null;
+            try {
+                answer = await fetch.fetch(peer, BULK_ROOTS_FETCH_KEY);
+            } catch (error) {
+                // A peer that speaks the fetch protocol but has NO lookup registered for the bulk
+                // key's prefix answers with a protocol ERROR status, which `@libp2p/fetch` surfaces
+                // as a thrown `ProtocolError` — NOT the `undefined` a registered-but-empty responder
+                // returns for NOT_FOUND. Both mean the same thing to us ("this peer will not serve me
+                // over the bulk key"), so treat the ERROR exactly like the empty answer: return null
+                // and fall through to the per-topic path every root-serving peer answers. A
+                // transport failure (a stream reset from a saturated inbound cap, a dial failure, a
+                // timeout) is a DIFFERENT throw — never a `ProtocolError` — and must stay transient so
+                // the retry loop backs off, rather than permanently downgrading a live seeder that was
+                // only briefly over its stream cap to the per-topic fan-out this batching exists to
+                // remove. (See isFetchProtocolError; the integration harness's per-topic-prefix seeder
+                // is exactly the ERROR-answering peer this handles.)
+                if (!isFetchProtocolError(error)) throw error;
+                return null;
+            }
             if (answer === undefined || answer === null) return null;
             // A malformed bulk answer throws here — this peer's problem, not a reason to re-ask
             // it 63 times: the throw rejects every waiter and the engines' retry loop backs off.
