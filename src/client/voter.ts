@@ -366,6 +366,14 @@ interface ResolvedDeps {
      */
     pullRoot: (peer: PeerId, topic: string) => Promise<Uint8Array | undefined | null>;
     /**
+     * Read one chain's current head block number, coalescing concurrent callers onto a single
+     * in-flight `getBlockNumber` (keyed on the shared client instance). A directory-wide burst of
+     * tally recomputes — every one of which refreshes its expiry bucket (see
+     * {@link ContestEngine#refreshBucket}) — shares one head read per chain instead of each firing
+     * its own, without ever serving a stale head to a later read. See {@link makeHeadReader}.
+     */
+    readHead: (chain: ChainClient) => Promise<bigint>;
+    /**
      * The voter's persisted gate results, shared across ALL contests (keys carry each
      * contest's rule hash, so two contests over one gate — a 5chan-style directory — share
      * each other's reads; different rules cannot collide). See verify/gate-result-cache.ts.
@@ -524,6 +532,51 @@ function makePerPeerBudget(limitPerPeer: number): <T>(peerId: string, task: () =
         } finally {
             if (limiter.activeCount === 0 && limiter.pendingCount === 0) limiters.delete(peerId);
         }
+    };
+}
+
+/**
+ * The {@link ResolvedDeps.readHead} factory: coalesce CONCURRENT `getBlockNumber` calls to one chain
+ * onto a single in-flight read, keyed on the client instance (a `WeakMap`, so a chain the voter stops
+ * using is collected). It deliberately does NOT cache across time — the moment a read settles its
+ * slot clears, so the next caller reads a fresh head. Only callers that arrive WHILE a read is in
+ * flight share it.
+ *
+ * In-flight sharing curbs the cold-start `getBlockNumber` storm. Every tally recompute refreshes its
+ * expiry bucket off the gating chain's head, and a directory join drives ~4 recomputes per contest (a
+ * chased-bundle admit plus two deferred-check settlements) across dozens of contests that all share
+ * ONE gating-chain client — so the reads land in overlapping bursts. Measured on the production 5chan
+ * cold start (63 contests, Chromium): 252 `readHead` calls collapse to 66 actual `getBlockNumber`
+ * posts (−74%), a real cut in redundant RPC to the shared endpoint (which the read coalescer's own
+ * notes show throttles concurrent posts) and in main-thread promise churn.
+ *
+ * It is NOT a first-tally latency win, and the commit is careful not to claim one: the first contest
+ * to admit still awaits its own (uncoalesced) head read on the critical path, and the measured
+ * bulk→first-tally wall is unchanged within noise — that window is network- and scheduling-bound, not
+ * head-read-bound (the 82s of `getBlockNumber` "wall" a naive probe attributes here is an async-overlap
+ * artifact: the true per-read CPU is negligible). This is a load/tidiness fix, banked because the
+ * redundancy is real and the change is cheap and safe.
+ *
+ * Coalescing is correct here without any staleness: `getBlockNumber` is a pure current-head read, so
+ * two callers overlapping in time genuinely want the same answer. A settled result is never reused, so
+ * a later recompute after the head has moved still sees the move (the expiry tests pin this), and a
+ * REJECTED read clears its slot too, so a transient RPC failure is retried on the next call rather than
+ * shared by latecomers to the same failed read.
+ */
+export function makeHeadReader(): (chain: ChainClient) => Promise<bigint> {
+    const inFlight = new WeakMap<ChainClient, Promise<bigint>>();
+    return (chain) => {
+        const existing = inFlight.get(chain);
+        if (existing !== undefined) return existing; // a read is already in flight — share it
+        const head = chain.getBlockNumber();
+        inFlight.set(chain, head);
+        // Clear the slot the instant the read settles (fulfilled OR rejected), but only if it is
+        // still ours — a defensive guard, though nothing replaces an entry before it settles.
+        const clear = (): void => {
+            if (inFlight.get(chain) === head) inFlight.delete(chain);
+        };
+        head.then(clear, clear);
+        return head;
     };
 }
 
@@ -1081,9 +1134,23 @@ class ContestEngine {
         return client;
     }
 
-    /** Read the gating-chain head and update {@link #currentBucketCache}; returns the bucket. */
+    /**
+     * Read the gating-chain head and update {@link #currentBucketCache}; returns the bucket.
+     *
+     * The head read goes through the voter-wide {@link ResolvedDeps.readHead} coalescer, NOT the raw
+     * client, because the tally recompute calls this on EVERY state change: a cold directory join
+     * admits ~one chased bundle per contest and then settles two deferred checks per bundle, so a
+     * 63-contest join drives ~4 recomputes per contest ≈ 250 tally computes in a couple of seconds,
+     * each of which — before this — fired its own `eth_blockNumber`. The gating chain is shared by
+     * every contest (one `ruleChain` per chain across the directory), so those reads land in
+     * overlapping bursts; coalescing collapses concurrent callers to a single in-flight read (see
+     * {@link makeHeadReader}) without ever serving a stale head. The signing path ({@link signVote})
+     * and the tie-break block-hash read ({@link #bucketBlockHash}) still read the client directly.
+     * Measured on the production 5chan cold start: 252 head-read requests → 66 actual `getBlockNumber`
+     * (−74%). This is an RPC-load / churn reduction, not a first-tally latency win (see the commit).
+     */
     async #refreshBucket(): Promise<number> {
-        const head = await this.#ruleChain.getBlockNumber();
+        const head = await this.#deps.readHead(this.#ruleChain);
         this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
         this.#headReadMs = Date.now();
         this.#maybePurgeGateResults();
@@ -2153,6 +2220,11 @@ export class PubsubVoter implements VoteClient {
                     if (engine?.joined) void engine.ingestRootRecord(peer, encoded).catch(() => {});
                 }
             }),
+            // One head-read coalescer per voter, shared by every contest on the (shared) gating
+            // chain: a cold-start burst of concurrent tally recomputes shares one in-flight
+            // getBlockNumber per chain instead of each firing its own (see makeHeadReader /
+            // #refreshBucket).
+            readHead: makeHeadReader(),
             gateStore: this.#storage.openLru({ cacheName: "gate-results", maxItems: GATE_RESULTS_MAX_ITEMS }),
             nameResolutionCache: makeNameResolutionCache(
                 this.#storage.openLru({ cacheName: "name-resolutions", maxItems: NAME_RESOLUTIONS_MAX_ITEMS })

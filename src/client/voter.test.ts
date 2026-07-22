@@ -3,7 +3,7 @@ import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
 import type { PeerId } from "@libp2p/interface";
-import { PubsubVoter, republishIntervalBuckets, type PublishingState } from "./voter.js";
+import { PubsubVoter, republishIntervalBuckets, makeHeadReader, type PublishingState } from "./voter.js";
 import {
     decodeVoteMessage,
     decodeRootRecord,
@@ -2365,5 +2365,168 @@ describe("checkpoint snapshot restore admissibility", () => {
         expect(contestB.tally?.ranking).toHaveLength(1); // same vote, not doubled
         expect(contestB.tally?.ranking[0]?.weight).toBe(1n);
         await voterB.destroy();
+    });
+});
+
+/**
+ * The voter-wide gating-chain head coalescer ({@link makeHeadReader}) — the fix for the cold-start
+ * `getBlockNumber` storm. Every tally recompute refreshes its expiry bucket off the gating chain's
+ * head, and a directory cold start drives ~4 recomputes per contest (the chased-bundle admit plus
+ * two deferred-check settlements) across dozens of contests that all share ONE gating-chain client.
+ * Before the coalescer each recompute posted its own `eth_blockNumber`; measured on the production
+ * 5chan cold start (63 contests, Chromium), 252 head-read requests collapse to 66 actual
+ * `getBlockNumber` (−74%) — a real cut in redundant RPC and main-thread churn (not a first-tally
+ * latency win: the first read stays on the critical path). `getBlockNumber` is a pure current-head
+ * read, so callers overlapping in time genuinely want one answer: coalescing each concurrent burst to
+ * a single in-flight read is safe. It deliberately does NOT cache across time — a read that has settled
+ * is never reused — so a later recompute still sees a head that has since moved (the expiry tests above
+ * pin that decay). These tests pin the in-flight coalescing, the read-fresh-after-settle rule, the
+ * never-share-a-rejection rule, per-client keying, and the end-to-end "concurrent recomputes, one
+ * read" behaviour through the public voter.
+ */
+describe("makeHeadReader (voter-wide gating-chain head coalescer)", () => {
+    /** A chain client whose `getBlockNumber` is counted and stays in flight until released. */
+    function countingChain(): { client: ChainClient; reads: () => number; releaseAll: () => void; pending: () => number } {
+        let reads = 0;
+        const releasers: Array<() => void> = [];
+        const client = {
+            getBlockNumber: async () => {
+                reads += 1;
+                // Stay in flight until released, so a test can observe concurrent callers coalescing
+                // onto the SAME unresolved read instead of each starting its own.
+                await new Promise<void>((resolve) => releasers.push(resolve));
+                return 43200n;
+            }
+        };
+        return {
+            client: client as unknown as ChainClient,
+            reads: () => reads,
+            releaseAll: () => releasers.splice(0).forEach((r) => r()),
+            pending: () => releasers.length
+        };
+    }
+
+    it("coalesces concurrent callers onto a single in-flight read", async () => {
+        const { client, reads, releaseAll } = countingChain();
+        const readHead = makeHeadReader();
+        // Two callers arrive while the first read is still in flight — they must share it.
+        const a = readHead(client);
+        const b = readHead(client);
+        expect(reads()).toBe(1);
+        releaseAll();
+        expect(await a).toBe(43200n);
+        expect(await b).toBe(43200n);
+        expect(reads()).toBe(1);
+    });
+
+    it("reads fresh once the prior read has settled (no stale caching across time)", async () => {
+        const { client, reads, releaseAll } = countingChain();
+        const readHead = makeHeadReader();
+
+        const first = readHead(client);
+        releaseAll();
+        await first;
+        expect(reads()).toBe(1);
+
+        // The prior read has settled, so its slot is cleared: a new (non-overlapping) caller must
+        // read the head afresh — the head is allowed to have moved on since.
+        const second = readHead(client);
+        releaseAll();
+        await second;
+        expect(reads()).toBe(2);
+    });
+
+    it("never shares a rejection: a failed read is re-attempted on the next call", async () => {
+        let reads = 0;
+        let failNext = true;
+        const client = {
+            getBlockNumber: async () => {
+                reads += 1;
+                if (failNext) {
+                    failNext = false;
+                    throw new Error("rpc down");
+                }
+                return 43200n;
+            }
+        } as unknown as ChainClient;
+        const readHead = makeHeadReader();
+
+        await expect(readHead(client)).rejects.toThrow("rpc down");
+        // The failed read cleared its slot, so the very next call reads again and succeeds.
+        expect(await readHead(client)).toBe(43200n);
+        expect(reads).toBe(2);
+    });
+
+    it("keys the in-flight slot per client instance", async () => {
+        const one = countingChain();
+        const two = countingChain();
+        const readHead = makeHeadReader();
+        void readHead(one.client);
+        void readHead(two.client);
+        // Distinct clients never share a slot — each chain reads its own head.
+        expect(one.reads()).toBe(1);
+        expect(two.reads()).toBe(1);
+        one.releaseAll();
+        two.releaseAll();
+    });
+
+    it("collapses a concurrent burst of tally recomputes on one contest to a single head read", async () => {
+        // Count head reads at the client seam. `readContract` returns 1 (constant weight / gate pass);
+        // `getBlock` feeds the tie-break path (never hit here — one row, no tie).
+        let heads = 0;
+        const client = {
+            getBlockNumber: async () => {
+                heads += 1;
+                return 43200n;
+            },
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient, signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        // Let the background gate read settle first, so no in-flight settlement recompute races the
+        // measurement below.
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+
+        const before = heads;
+        // Three CONCURRENT recomputes: before the coalescer each fired its own getBlockNumber; now
+        // the two that arrive while the first read is in flight share it — one read for the burst.
+        await Promise.all([contest.getTally(), contest.getTally(), contest.getTally()]);
+        expect(heads - before).toBe(1);
+        await voter.destroy();
+    });
+
+    it("shares the head read across contests on the same gating chain", async () => {
+        let heads = 0;
+        const client = {
+            getBlockNumber: async () => {
+                heads += 1;
+                return 43200n;
+            },
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        // Two DISTINCT contests (different contestId ⇒ different topic/engine) over the SAME chain
+        // client — the 5chan directory shape. A concurrent tally burst across them must cost one
+        // shared head read, not one per contest.
+        const criteriaA = bizCriteria();
+        const criteriaB = { ...bizCriteria(), contestId: "biz2", name: "/biz2/" };
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient, signer: fakeSigner() });
+        await (await voter.createContestVote({ criteria: criteriaA, votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: criteriaB, votes: VOTE })).publish();
+        const contestA = await voter.createContest({ criteria: criteriaA });
+        const contestB = await voter.createContest({ criteria: criteriaB });
+        await vi.waitFor(async () => {
+            expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true);
+            expect((await contestB.getTally()).ranking[0]?.chainVerified).toBe(true);
+        });
+
+        const before = heads;
+        // Fire both recomputes in the same tick: the second reaches readHead while the first read
+        // (issued synchronously before either awaits) is still in flight, so they share it.
+        await Promise.all([contestA.getTally(), contestB.getTally()]);
+        expect(heads - before).toBe(1);
+        await voter.destroy();
     });
 });
