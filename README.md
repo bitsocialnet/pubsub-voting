@@ -158,7 +158,7 @@ See [DESIGN.md, Republishing is the client's job](./DESIGN.md#republishing-is-th
 
 ### Many contests (a 5chan-style directory)
 
-One criteria document is one contest (one topic). A directory is conveniently authored as a single manifest of shared `defaults` plus one entry per slot — as in [5chan-directory-criteria.jsonc](./5chan-directory-criteria.jsonc) and [examples/5chan.ts](./examples/5chan.ts) — and `deriveDirectoryCriteria` derives the finished documents (`{ ...defaults, ...entry }`, shallow — an override replaces that whole field) and validates each one. What participants must share **byte-identically** is the derived documents (the topic is their CID), which is why every consumer of the same directory should derive through this one helper rather than re-implement the merge. The manifest is JSONC by convention; strip comments before parsing:
+One criteria document is one contest (one topic). A directory is conveniently authored as a single manifest of shared `defaults` plus one entry per slot — as in the published [5chan-directory-criteria.jsonc](https://github.com/bitsocialnet/lists/blob/master/5chan-directory-criteria.jsonc) and [examples/5chan.ts](./examples/5chan.ts) — and `deriveDirectoryCriteria` derives the finished documents (`{ ...defaults, ...entry }`, shallow — an override replaces that whole field) and validates each one. What participants must share **byte-identically** is the derived documents (the topic is their CID), which is why every consumer of the same directory should derive through this one helper rather than re-implement the merge. The manifest is JSONC by convention; strip comments before parsing:
 
 ```ts
 import { deriveDirectoryCriteria } from "@bitsocial/pubsub-voting";

@@ -20,7 +20,6 @@
  * what it voted for and refreshes on the `republishIntervalBuckets` cadence (this library
  * never re-publishes on its own).
  */
-import { readFileSync } from "node:fs";
 import stripJsonComments from "strip-json-comments";
 import {
     PubsubVoter,
@@ -38,9 +37,12 @@ import {
 // complete, standalone criteria document per slot ({ ...defaults, ...entry }, shallow) and
 // validates each against the real schema. Two clients must end up with byte-identical
 // documents to share a topic, which is why every consumer (this app, a seeder) derives
-// through the same exported helper instead of re-implementing the merge.
+// through the same exported helper instead of re-implementing the merge — and why the
+// manifest lives in ONE published place rather than being vendored per consumer.
+const MANIFEST_URL =
+    "https://raw.githubusercontent.com/bitsocialnet/lists/master/5chan-directory-criteria.jsonc";
 const manifest = JSON.parse(
-    stripJsonComments(readFileSync(new URL("../5chan-directory-criteria.jsonc", import.meta.url), "utf8"))
+    stripJsonComments(await (await fetch(MANIFEST_URL)).text())
 ) as unknown;
 const allCriteria: Criteria[] = deriveDirectoryCriteria(manifest);
 
