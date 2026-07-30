@@ -30,11 +30,15 @@ describe("deriveDirectoryCriteria", () => {
                     contestId: "q",
                     name: "/q/ - Feedback",
                     // A rule override must be COMPLETE: nothing of defaults.rule survives.
-                    rule: { type: "erc721-min-balance", chain: "eth", contract: `0x${"ab".repeat(20)}`, min: 2 }
+                    // The chain stays "base": `requires.chains` is inherited from the defaults,
+                    // and a rule naming a chain that is not in it derives a document no client
+                    // could create (Contest resolves its gating chain client out of
+                    // `requires.chains` and throws when the ticker is missing).
+                    rule: { type: "erc721-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 }
                 }
             ])
         );
-        expect(criteria.rule).toEqual({ type: "erc721-min-balance", chain: "eth", contract: `0x${"ab".repeat(20)}`, min: 2 });
+        expect(criteria.rule).toEqual({ type: "erc721-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 });
         // Untouched fields still inherit.
         expect(criteria.weight).toEqual(bizCriteria().weight);
     });
@@ -85,7 +89,8 @@ describe("deriveDirectoryCriteria over a whole directory", () => {
         name: `/slot-${i}/ - Directory ${i}`
     }));
     // One slot gates harder than its siblings, proving the gate is per-contest, not global.
-    const strictGate = { type: "erc721-min-balance", chain: "eth", contract: `0x${"ab".repeat(20)}`, min: 2 };
+    // Same chain as the inherited `requires.chains` — only the contract and threshold differ.
+    const strictGate = { type: "erc721-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 };
     const source = manifest([
         ...slots,
         { contestId: OVERRIDDEN_SLOT, name: "/q/ - Feedback", rule: strictGate }
