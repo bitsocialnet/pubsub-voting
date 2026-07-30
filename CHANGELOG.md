@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.6...v0.1.7) (2026-07-30)
+
+### Bug Fixes
+
+* keep the directory fixture's gate on its declared chain, pin the example manifest ([48d9a8f](https://github.com/bitsocialnet/pubsub-voting/commit/48d9a8f5fc31af3151802f66835d066d3b6accc9)), closes [#24](https://github.com/bitsocialnet/pubsub-voting/issues/24)
+
 ## [0.1.6](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.5...v0.1.6) (2026-07-30)
 
 ## [0.1.5](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.4...v0.1.5) (2026-07-22)
