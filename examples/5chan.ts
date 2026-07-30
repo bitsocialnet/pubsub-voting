@@ -39,8 +39,15 @@ import {
 // documents to share a topic, which is why every consumer (this app, a seeder) derives
 // through the same exported helper instead of re-implementing the merge — and why the
 // manifest lives in ONE published place rather than being vendored per consumer.
+//
+// Pinned to a commit, not `master`: the topic is derived from the manifest's values, so a
+// client that fetches a revised manifest lands on a DIFFERENT topic than one still holding
+// the old bytes — silently, with no error on either side. A real deployment upgrades the pin
+// deliberately, in lockstep with the seeders (which must join both the old and the new topic
+// across the migration window), rather than inheriting whichever revision `master` happened
+// to be at process start.
 const MANIFEST_URL =
-    "https://raw.githubusercontent.com/bitsocialnet/lists/master/5chan-directory-criteria.jsonc";
+    "https://raw.githubusercontent.com/bitsocialnet/lists/2f8f76f3fb2c79b753da90a060d877629a165c56/5chan-directory-criteria.jsonc";
 const manifest = JSON.parse(
     stripJsonComments(await (await fetch(MANIFEST_URL)).text())
 ) as unknown;
