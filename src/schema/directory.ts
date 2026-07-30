@@ -18,7 +18,8 @@ import { DuplicateContestIdError } from "../errors.js";
  * The merge is shallow ON PURPOSE: an entry override replaces that whole top-level field
  * (a `rule` override brings its own complete rule object), no deep merge. Editing
  * `defaults` re-forks every inheriting contest in lockstep; editing one entry forks only
- * that contest. See the authoring manifest example (5chan-directory-criteria.jsonc) and
+ * that contest. See the published 5chan manifest
+ * (https://github.com/bitsocialnet/lists/blob/master/5chan-directory-criteria.jsonc) and
  * DESIGN.md "Criteria document".
  *
  * Manifest files are conventionally JSONC (commented for human readers); strip comments

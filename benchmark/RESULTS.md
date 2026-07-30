@@ -250,7 +250,7 @@ reflects all `N` voters; rows may still read `chainVerified: false`) and **START
 (trust-ready — every board's ranking row reads `chainVerified: true`, i.e. every deferred gate
 read landed). `N` is voters **per contest**; every contest is a distinct synthetic criteria doc
 (distinct CID/topic) that inherits the `/biz/` gate — the real 5chan directory is **63 contests**
-(`5chan-directory-criteria.jsonc`).
+([`5chan-directory-criteria.jsonc`](https://github.com/bitsocialnet/lists/blob/master/5chan-directory-criteria.jsonc)).
 
 Each voter is one wallet signing one **single-vote** bundle (the `/biz/` gate is `maxVotesPerAddress:
 1`, `voteSchema: {min:1,max:1}`), so **N voters = N bundles = tally weight N** (1:1:1). The bundle

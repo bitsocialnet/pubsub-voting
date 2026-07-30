@@ -1,6 +1,4 @@
-import { readFileSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import stripJsonComments from "strip-json-comments";
 import { deriveDirectoryCriteria, DirectoryManifestSchema } from "./directory.js";
 import { DuplicateContestIdError } from "../errors.js";
 import { encodeCriteria } from "../encoding/canonical.js";
@@ -74,10 +72,24 @@ describe("deriveDirectoryCriteria", () => {
     });
 });
 
-describe("deriveDirectoryCriteria on the real 5chan manifest", () => {
-    const source = JSON.parse(
-        stripJsonComments(readFileSync(new URL("../../5chan-directory-criteria.jsonc", import.meta.url), "utf8"))
-    ) as { contests: unknown[] };
+// Directory-scale derivation. This used to read the 5chan manifest that shipped in this
+// repo; that file now lives in bitsocialnet/lists, where the clients and seeders actually
+// fetch it, so the case is covered with a synthetic directory of the same shape instead of
+// a network read. The properties are what matter: one valid standalone document per slot,
+// one topic per slot, and per-contest overrides that leave every sibling untouched.
+describe("deriveDirectoryCriteria over a whole directory", () => {
+    const SLOT_COUNT = 63;
+    const OVERRIDDEN_SLOT = "q";
+    const slots = Array.from({ length: SLOT_COUNT - 1 }, (_unused, i) => ({
+        contestId: `slot-${i}`,
+        name: `/slot-${i}/ - Directory ${i}`
+    }));
+    // One slot gates harder than its siblings, proving the gate is per-contest, not global.
+    const strictGate = { type: "erc721-min-balance", chain: "eth", contract: `0x${"ab".repeat(20)}`, min: 2 };
+    const source = manifest([
+        ...slots,
+        { contestId: OVERRIDDEN_SLOT, name: "/q/ - Feedback", rule: strictGate }
+    ]) as { contests: unknown[] };
 
     it("derives every slot: one valid document per entry, all contestIds distinct", async () => {
         const allCriteria = deriveDirectoryCriteria(source);
@@ -88,13 +100,13 @@ describe("deriveDirectoryCriteria on the real 5chan manifest", () => {
         expect(new Set(topics).size).toBe(allCriteria.length);
     });
 
-    it("inherits the shared 5chan Pass gate, except the illustrative /q/ override", () => {
+    it("inherits the shared gate, except the one slot that overrides it", () => {
         const allCriteria = deriveDirectoryCriteria(source);
-        const q = allCriteria.find((c) => c.contestId === "q");
-        expect(q?.rule.min).toBe(2);
+        const overridden = allCriteria.find((c) => c.contestId === OVERRIDDEN_SLOT);
+        expect(overridden?.rule).toEqual(strictGate);
         for (const criteria of allCriteria) {
-            if (criteria.contestId === "q") continue;
-            expect(criteria.rule).toEqual(allCriteria[0]!.rule);
+            if (criteria.contestId === OVERRIDDEN_SLOT) continue;
+            expect(criteria.rule).toEqual(bizCriteria().rule);
         }
     });
 });
