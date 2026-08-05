@@ -30,14 +30,14 @@ export function bizCriteria(): Criteria {
         blocksPerBucket: 43200,
         voteExpiryBuckets: 30,
         rule: {
-            type: "erc721-min-balance",
+            type: "erc5192-min-balance",
             chain: "base",
             contract: "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
             min: 1
         },
         weight: { type: "constant", value: 1 },
         requires: {
-            rules: ["erc721-min-balance", "constant"],
+            rules: ["erc5192-min-balance", "constant"],
             chains: { base: { chainId: 8453 } }
         }
     };
@@ -205,14 +205,18 @@ export function realSigner(): VoteSigner {
 
 /**
  * A chain factory returning a stubbed viem client (no network): `getBlockNumber` for the
- * current bucket, `getBlock` for the tie-break block hash, and `readContract` for balances.
- * Lets write-path and tally tests run the engine end-to-end without an RPC.
+ * current bucket, `getBlock` for the tie-break block hash, and `readContract` for the gate's
+ * reads. Lets write-path and tally tests run the engine end-to-end without an RPC.
+ *
+ * The gate rule (`erc5192-min-balance`) makes TWO reads per evaluation, so the stub dispatches on
+ * `functionName`: `supportsInterface` answers the ERC-5192 declaration (always true — the Pass is
+ * soulbound), everything else answers `balance`.
  */
 export function stubChains(over: { blockNumber?: bigint; balance?: bigint } = {}): ChainClientFactory {
     const client = {
         getBlockNumber: async () => over.blockNumber ?? 43200n,
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-        readContract: async () => over.balance ?? 1n
+        readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : (over.balance ?? 1n))
     };
     return () => client as unknown as ChainClient;
 }

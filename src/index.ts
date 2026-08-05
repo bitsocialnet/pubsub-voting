@@ -27,8 +27,12 @@ export * from "./schema/directory.js";
 // validation). The leaf rules read through the injected viem `PublicClient`
 // (`ctx.chain`). Rule composition (combining several into one slot) is a
 // documented future extension, not a built-in — see DESIGN.md "Future improvements".
-// v1 ships the NFT path only: `erc721-min-balance` + `constant`. `erc20-balance` stays in
-// the tree but is not registered or re-exported — see ROADMAP.md ("Deferred").
+// v1 ships the soulbound-NFT path only: `erc5192-min-balance` + `constant`.
+// `erc721-min-balance` is exported but NOT registered — a bare `balanceOf` gate admits the
+// transfer amplification `erc5192-min-balance`'s lock assertion closes (issue #27), so a host
+// that wants it must opt in explicitly through the `rules` override map. `erc20-balance` stays
+// in the tree and is neither registered nor re-exported — see ROADMAP.md ("Deferred") and #28.
+export * from "./rules/erc5192-min-balance.js";
 export * from "./rules/erc721-min-balance.js";
 export * from "./rules/constant.js";
 export * from "./rules/registry.js";

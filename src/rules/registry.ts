@@ -1,7 +1,7 @@
 import type { Criteria } from "../schema/criteria.js";
 import type { RuleRegistry } from "./types.js";
 import { UnknownRuleError } from "../errors.js";
-import { erc721MinBalance } from "./erc721-min-balance.js";
+import { erc5192MinBalance } from "./erc5192-min-balance.js";
 import { constant } from "./constant.js";
 
 /**
@@ -19,32 +19,42 @@ import { constant } from "./constant.js";
 /**
  * The library's built-in rules, before any host override.
  *
- * v1 ships exactly the NFT path: `erc721-min-balance` (Pass gate) + `constant` weight.
- * `erc20-balance` is intentionally NOT registered — it stays in the tree (`erc20-balance.ts`,
- * unit-tested), but is unshipped so a criteria naming it recuses via `UnknownRuleError`
- * rather than silently enabling token-weighting. TWO independent things keep it
- * unregistered, and both must resolve before it re-ships:
+ * v1 ships exactly the soulbound-NFT path: `erc5192-min-balance` (Pass gate) + `constant`
+ * weight. TWO chain-reading rules stay in the tree and unit-tested (only `erc721-min-balance` is
+ * re-exported from `src/index.ts`) but deliberately OUT of this map, so a criteria naming either
+ * recuses via `UnknownRuleError` instead of silently gating on an asset that does not bound
+ * Sybils. A host that wants one anyway can still register it through the override map below —
+ * the library declines to bless the configuration, it does not forbid it.
+ *
+ * **`erc721-min-balance`** — a bare `balanceOf` on a *transferable* token. The gate bounds
+ * Sybils only because the asset cannot move (DESIGN.md "Does one Pass mean one vote?"): every
+ * bundle is verified at its OWN pinned block, stays live for `voteExpiryBuckets`, and the
+ * winner set is LWW-keyed per wallet, so one token walked A → B → C inside a single expiry
+ * window backs three concurrent live votes — each read true at its own block, none collapsed by
+ * LWW, and not one of them individually invalid. `erc5192-min-balance` is the same rule plus an
+ * on-chain assertion that the contract declares its tokens locked (issue #27).
+ *
+ * **`erc20-balance`** — the same amplification, reopened by fungibility, plus a second blocker.
+ * Both must resolve before it re-ships:
  *
  *   1. the weight path is design-open — a balance-derived weight derives its magnitude from
  *      the chain read, so it carries no free wire-side ceiling for the lazy tally (see
  *      `RuleResult` in types.ts, ROADMAP.md "Deferred");
- *   2. it reopens the Sybil amplification (DESIGN.md "Does one Pass mean one vote?"): every
- *      bundle is verified at its OWN pinned block, stays live for `voteExpiryBuckets`, and
- *      the winner set is LWW-keyed per wallet — so the same balance walked through several
- *      wallets inside one expiry window backs several concurrent votes, each read true at
- *      its own block. The NFT path closes this by requiring a gating asset that is
- *      non-transferable and says so on-chain; a fungible balance can be neither, and has no
- *      token id to key the LWW set by either. Closing it needs a hold-duration guard
- *      instead — require `min` at the pinned block AND at `pinned - expiryWindow`, which
- *      forces two wallets to have held the balance simultaneously. Tracked in issue #28.
+ *   2. the ERC-5192 fix does not transfer to fungibles: a balance can be neither soulbound nor
+ *      LWW-keyed by token id. Closing it needs a hold-duration guard instead — require `min` at
+ *      the pinned block AND at `pinned - expiryWindow`, which forces two wallets to have held
+ *      the balance simultaneously. Tracked in issue #28.
+ *
+ * Both exclusions are pinned by tests: the amplification each one permits in
+ * `src/crdt/amplification.test.ts`, the absence from this map in `rules.test.ts`.
  */
 export const builtinRegistry: RuleRegistry = {
-    [erc721MinBalance.type]: erc721MinBalance,
+    [erc5192MinBalance.type]: erc5192MinBalance,
     [constant.type]: constant
 };
 
 /** type ids the v1 implementation guarantees; checked against `requires.rules`. */
-export const V1_BUILTIN_RULE_TYPES = ["erc721-min-balance", "constant"] as const;
+export const V1_BUILTIN_RULE_TYPES = ["erc5192-min-balance", "constant"] as const;
 
 /**
  * Merge host overrides over the built-ins. Overrides shadow built-ins by `type`. The

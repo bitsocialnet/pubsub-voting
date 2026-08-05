@@ -382,9 +382,9 @@ describe("Contest read view + tally", () => {
             const client = {
                 getBlockNumber: async () => 43200n,
                 getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-                readContract: async () => {
+                readContract: async ({ functionName }: { functionName?: string } = {}) => {
                     gateReads += 1;
-                    return 1n;
+                    return functionName === "supportsInterface" ? true : 1n;
                 }
             };
             return { chains: () => client as unknown as ChainClient, gateReads: () => gateReads };
@@ -396,7 +396,7 @@ describe("Contest read view + tally", () => {
         await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
         const contestA = await voterA.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
-        expect(first.gateReads()).toBe(1);
+        expect(first.gateReads()).toBe(2); // the gate's ERC-5192 lock probe + the wallet's balanceOf
         await voterA.destroy();
 
         // Session 2 (a restart): same wallet, same bucket, same criteria — the gate score is a

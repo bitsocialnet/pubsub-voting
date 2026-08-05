@@ -90,7 +90,7 @@ describe("pkc-js-hosted voters (real PKC shared nodes)", () => {
             );
 
             // Live leg: a genuinely-signed ballot, published through A's pkc-js gossipsub. B's
-            // forward-gate runs the FULL verify pipeline (signature recovery, the erc721 gate via
+            // forward-gate runs the FULL verify pipeline (signature recovery, the erc5192 gate via
             // the stub chain) before admitting, so B's row lands already chain-verified.
             const vote = await a.voter.createContestVote({
                 criteria: bizCriteria(),

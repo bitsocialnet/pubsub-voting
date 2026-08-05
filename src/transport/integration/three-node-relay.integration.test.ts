@@ -59,7 +59,8 @@ async function signedBundle(wallet: (typeof WALLETS)[number], publicKey: string)
 }
 
 /**
- * A stub chain whose gate read answers `balanceOf(lowercased wallet)`. No `multicall` and no
+ * A stub chain whose gate read answers `balanceOf(lowercased wallet)`, plus the v1 gate's
+ * ERC-5192 declaration probe (always true — the Pass is soulbound). No `multicall` and no
  * `chain` property, so the rule's `evaluateMany` takes the per-wallet fallback and the read
  * coalescer leaves the client unwrapped — every deferred gate read hits `balanceOf` directly.
  * Head block 43200 ⇒ current bucket 1, so the block-10 (bucket 0) ballots are live (expiry 30).
@@ -68,7 +69,8 @@ function stubChains(balanceOf: (wallet: string) => bigint): ChainClientFactory {
     const client = {
         getBlockNumber: async () => 43_200n,
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-        readContract: async ({ args }: { args?: readonly unknown[] }) => balanceOf(String(args?.[0] ?? "").toLowerCase())
+        readContract: async ({ functionName, args }: { functionName?: string; args?: readonly unknown[] }) =>
+            functionName === "supportsInterface" ? true : balanceOf(String(args?.[0] ?? "").toLowerCase())
     };
     return () => client as unknown as ChainClient;
 }
