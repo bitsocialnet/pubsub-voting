@@ -60,7 +60,9 @@ export function balanceOf(contract: `0x${string}`, walletAddress: string, ctx: C
  * The wallets are chunked HERE (`READS_PER_MULTICALL` per aggregate3, `batchSize: 0` disables
  * viem's own 1KB re-chunking) and the chunks are sent with bounded concurrency plus one retry
  * each, so a big batch is a handful of polite round trips rather than a ~40-request burst a
- * public endpoint throttles — and one failed chunk never discards the others' results.
+ * public endpoint throttles — and the retry re-reads only the chunk that failed, never a
+ * completed one (viem's own whole-batch retry re-fired the entire burst). A chunk that fails
+ * twice still fails the whole call: the caller gets one rejection, not partial results.
  */
 export async function balancesOfBatched(contract: `0x${string}`, walletAddresses: string[], ctx: ChainReadContext): Promise<bigint[]> {
     const chunks: string[][] = [];

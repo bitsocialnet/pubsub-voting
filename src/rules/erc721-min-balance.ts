@@ -46,8 +46,9 @@ export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
         // Multicall3 `aggregate3` batching (see nft-balance.ts for the chunking policy) — the
         // path the background chain verifier rides on a cold join. A client that cannot batch
         // takes the per-wallet fallback.
-        if (!canBatch(ctx)) return Promise.all(walletAddresses.map((wallet) => this.evaluate({ options, walletAddress: wallet, ctx })));
-        const balances = await balancesOfBatched(contract, walletAddresses, ctx);
+        const balances = canBatch(ctx)
+            ? await balancesOfBatched(contract, walletAddresses, ctx)
+            : await Promise.all(walletAddresses.map((wallet) => balanceOf(contract, wallet, ctx)));
         return balances.map((balance): RuleResult => ({ score: scoreOf(balance, options.min) }));
     }
 };

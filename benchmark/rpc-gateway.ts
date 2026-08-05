@@ -180,8 +180,16 @@ export async function startRpcGateway(options: GatewayOptions = {}): Promise<Run
     // aggregate3. Answer it `true`, independently of `balance`, so a bench that reads back a
     // zero balance still exercises the gate's balance branch rather than the lock branch.
     const trueWord = encodeAbiParameters([{ type: "bool" }], [true]);
+    const falseWord = encodeAbiParameters([{ type: "bool" }], [false]);
+    // `supportsInterface(bytes4)` calldata is the 4-byte selector followed by the id left-aligned
+    // in a 32-byte word, so the queried id is hex chars 10..18. Answering `true` to ANY id would
+    // let a gate probing the WRONG interface pass the bench — the one thing this mock must not do.
     const SUPPORTS_INTERFACE_SELECTOR = "0x01ffc9a7";
-    const answerCall = (callData?: string): `0x${string}` => (callData?.startsWith(SUPPORTS_INTERFACE_SELECTOR) ? trueWord : balanceWord);
+    const ERC5192_INTERFACE_ID = "b45a3c0e";
+    const answerCall = (callData?: string): `0x${string}` => {
+        if (!callData?.startsWith(SUPPORTS_INTERFACE_SELECTOR)) return balanceWord;
+        return callData.slice(10, 18).toLowerCase() === ERC5192_INTERFACE_ID ? trueWord : falseWord;
+    };
 
     /** Answer one JSON-RPC request object, recording it. */
     function answer(rpc: { id?: unknown; method?: string; params?: unknown[] }): Record<string, unknown> {

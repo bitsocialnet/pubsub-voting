@@ -1,5 +1,14 @@
 # Cold-join latency — benchmark results
 
+> **Stale read counts (2026-08-05).** Every table below was measured with the gate rule
+> `erc721-min-balance`. The v1 gate is now `erc5192-min-balance`, which adds one
+> `supportsInterface(0xb45a3c0e)` read per (contract, sample block) — coalesced, so it rides the
+> same `aggregate3` as the balances and should not add a round trip, but it DOES add one inner
+> read per distinct contract/block pair to the `reads` counts (one for a single contest; one per
+> distinct contract/block pair for a directory run). The latency columns are expected to be
+> unchanged; nothing here has been re-measured since. **Re-run `bench:cold-join` and replace these
+> tables before treating them as the acceptance baseline again.**
+
 **What this measures:** how long a **cold peer** takes, from joining a contest to having a usable
 **tally** (the "which community/board do I load in the UI?" signal, i.e. `getTally()` returning the
 full ranking). This is the latency of the *existing code*, measured — not estimated.

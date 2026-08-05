@@ -3,7 +3,7 @@ import { base } from "viem/chains";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import type { ChainClient, ChainClientFactory } from "../dist/chain/types.js";
 import type { Rule, RuleRegistry } from "../dist/rules/types.js";
-import { erc5192MinBalance, type Erc5192MinBalanceOptions } from "../dist/rules/erc5192-min-balance.js";
+import { ERC5192_INTERFACE_ID, erc5192MinBalance, type Erc5192MinBalanceOptions } from "../dist/rules/erc5192-min-balance.js";
 import type { GatewayOp, GatewayRequest } from "./rpc-gateway.js";
 import type { VoteSigner } from "../dist/signer/types.js";
 import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../dist/signer/eip712.js";
@@ -144,7 +144,8 @@ export function benchChains(): ChainClientFactory {
     const client = {
         getBlockNumber: async (): Promise<bigint> => (rpcUrl ? fetchRealHead(rpcUrl) : BENCH_HEAD_BLOCK),
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-        readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : 1n)
+        readContract: async ({ functionName, args }: { functionName?: string; args?: readonly unknown[] } = {}) =>
+            functionName === "supportsInterface" ? String(args?.[0]).toLowerCase() === ERC5192_INTERFACE_ID : 1n
     };
     return () => client as unknown as ChainClient;
 }
