@@ -21,9 +21,22 @@ import { constant } from "./constant.js";
  *
  * v1 ships exactly the NFT path: `erc721-min-balance` (Pass gate) + `constant` weight.
  * `erc20-balance` is intentionally NOT registered — it stays in the tree (`erc20-balance.ts`,
- * unit-tested) as the design-open weight path, but is unshipped so a criteria naming it
- * recuses via `UnknownRuleError` rather than silently enabling token-weighting. See
- * ROADMAP.md ("Deferred") for when it re-ships.
+ * unit-tested), but is unshipped so a criteria naming it recuses via `UnknownRuleError`
+ * rather than silently enabling token-weighting. TWO independent things keep it
+ * unregistered, and both must resolve before it re-ships:
+ *
+ *   1. the weight path is design-open — a balance-derived weight derives its magnitude from
+ *      the chain read, so it carries no free wire-side ceiling for the lazy tally (see
+ *      `RuleResult` in types.ts, ROADMAP.md "Deferred");
+ *   2. it reopens the Sybil amplification (DESIGN.md "Does one Pass mean one vote?"): every
+ *      bundle is verified at its OWN pinned block, stays live for `voteExpiryBuckets`, and
+ *      the winner set is LWW-keyed per wallet — so the same balance walked through several
+ *      wallets inside one expiry window backs several concurrent votes, each read true at
+ *      its own block. The NFT path closes this by requiring a gating asset that is
+ *      non-transferable and says so on-chain; a fungible balance can be neither, and has no
+ *      token id to key the LWW set by either. Closing it needs a hold-duration guard
+ *      instead — require `min` at the pinned block AND at `pinned - expiryWindow`, which
+ *      forces two wallets to have held the balance simultaneously. Tracked in issue #28.
  */
 export const builtinRegistry: RuleRegistry = {
     [erc721MinBalance.type]: erc721MinBalance,

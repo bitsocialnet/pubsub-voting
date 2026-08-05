@@ -6,6 +6,13 @@ import type { Rule } from "./types.js";
 /**
  * Score by ERC-20 balance (for example BSO). Reserved for the pass + BSO combo path.
  *
+ * **NOT registered** in `builtinRegistry` — a criteria naming it recuses via
+ * `UnknownRuleError`. Two independent blockers: the design-open lazy-tally ceiling for a
+ * balance-derived weight, and the Sybil amplification a fungible gate reopens (one balance
+ * walked through several wallets inside one expiry window backs several concurrent votes;
+ * a balance can be neither non-transferable nor LWW-keyed by token id, so it needs a
+ * hold-duration guard instead). See registry.ts and issue #28 before re-registering it.
+ *
  * Score = the wallet's raw balance (base units) at the bucket block if it meets `min`,
  * else 0n. `min` (in whole tokens, default 0) is what lets this single rule serve
  * BOTH slots: in the weight slot leave `min` at 0 and the score is the magnitude; in the
