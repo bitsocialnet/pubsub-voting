@@ -1,14 +1,5 @@
 # Cold-join latency — benchmark results
 
-> **Stale read counts (2026-08-05).** Every table below was measured with the gate rule
-> `erc721-min-balance`. The v1 gate is now `erc5192-min-balance`, which adds one
-> `supportsInterface(0xb45a3c0e)` read per (contract, sample block) — coalesced, so it rides the
-> same `aggregate3` as the balances and should not add a round trip, but it DOES add one inner
-> read per distinct contract/block pair to the `reads` counts (one for a single contest; one per
-> distinct contract/block pair for a directory run). The latency columns are expected to be
-> unchanged; nothing here has been re-measured since. **Re-run `bench:cold-join` and replace these
-> tables before treating them as the acceptance baseline again.**
-
 **What this measures:** how long a **cold peer** takes, from joining a contest to having a usable
 **tally** (the "which community/board do I load in the UI?" signal, i.e. `getTally()` returning the
 full ranking). This is the latency of the *existing code*, measured — not estimated.
@@ -42,19 +33,22 @@ Run it yourself: `BENCH_HOST=<ssh-host> npm run bench:cold-join` (see [run.mjs](
 
 ## Per-operation latency (seeder on a ~270 ms-RTT WAN host, cold joiner local, median of 5)
 
+**The table is the 2026-08-07 run** (the ERC-5192 gate); the dated notes under it are the
+re-measurement history, oldest first, and quote the numbers current *at their own date*.
+
 `N` is the number of **voters** (distinct wallets, one ballot each) in the contest's checkpoint. All
 voters vote for one community, so the tally is one community of weight `N`.
 
 | N (voters) | router | connect | fetch | bitswap | verify+merge | gate-RPC | **START→TALLY** | **START→VERIFIED** |
 |-----------:|-------:|--------:|------:|--------:|-------------:|---------:|----------------:|-------------------:|
-| 1          | 1.00s  | 1.61s   | 0.56s | 0.57s   | 0.34s        | 2        | **3.08s**       | **3.39s**          |
-| 5          | 1.00s  | 1.60s   | 0.56s | 0.57s   | 0.32s        | 2        | **3.12s**       | **3.48s**          |
-| 10         | 1.00s  | 1.58s   | 0.56s | 0.57s   | 0.32s        | 2        | **3.06s**       | **3.36s**          |
-| 100        | 1.00s  | 1.58s   | 0.57s | 0.58s   | 0.47s        | 2        | **3.19s**       | **3.49s**          |
-| 1000       | 1.00s  | 1.60s   | 0.56s | 0.97s   | 2.06s        | 7        | **5.25s**       | **5.87s**          |
+| 1          | 1.00s  | 1.68s   | 0.60s | 0.00s   | 0.31s        | 2        | **2.64s**       | **2.94s**          |
+| 5          | 1.00s  | 1.66s   | 0.59s | 0.00s   | 0.32s        | 2        | **2.63s**       | **2.93s**          |
+| 10         | 1.00s  | 1.71s   | 0.62s | 0.00s   | 0.33s        | 2        | **2.72s**       | **3.02s**          |
+| 100        | 1.00s  | 1.73s   | 0.61s | 0.00s   | 0.47s        | 2        | **2.86s**       | **3.17s**          |
+| 1000       | 1.00s  | 1.69s   | 1.85s | 0.02s   | 2.18s        | 8        | **5.73s**       | **6.35s**          |
 | 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | —        | **18.95s**      | —                  |
 
-*Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
+*Historical — the first baseline of this rig. Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
 large enough that 3 repeats gave unstable per-op medians, so this baseline uses 5). This run's
 provider records were **announced by the seeder for real** (`httpRouterUrls` → `ssh -R`-tunneled
 router), not hardcoded; every column matched the 2026-07-09 hardcoded-record baseline within jitter
@@ -72,7 +66,7 @@ of one `findProviders` per block): every column matched this baseline within jit
 per-peer WANT chatter, not wall-clock. The joiner instrumentation now wraps `blockstore.createSession`
 so the `bitswap` column times the session pull (which bypasses the plain instrumented `get`).*
 
-*Re-measured 2026-07-15 (median of 5, the table above) with the **rate-limit-safe batched gate reads**
+*Re-measured 2026-07-15 (median of 5; the table above carried these numbers until the 2026-08-07 re-measure below) with the **rate-limit-safe batched gate reads**
 (the rule chunks 200 `balanceOf`s per `aggregate3` with viem re-chunking off, ≤2 round trips in flight,
 and the voter-level read coalescer merges every consumer's pinned reads — DESIGN.md "Background chain
 verification"): every column is within jitter of the 2026-07-14 numbers except the read pattern itself —
@@ -92,6 +86,20 @@ An earlier same-day run had shown `verify+merge` ~4.1–4.3s — but so did an N
 master** (7.52s/8.21s totals, identical columns), and the later idle-rig run above returned to
 baseline: local CPU conditions, not the changes. The restart path itself is measured separately — see
 "Warm restart" below.*
+
+*Re-measured 2026-08-07 (median of 5, the table above) with the **ERC-5192 gate** (`erc5192-min-balance`
+replacing `erc721-min-balance` — DESIGN.md "Does one Pass mean one vote?"). The gate's cost is one extra
+`supportsInterface(0xb45a3c0e)` inner read per (contract, sample block), hoisted out of the per-wallet
+reads and issued in parallel with the balances so the coalescer folds it into the same `aggregate3`:
+`reads` is exactly **N+1** at every N (2 / 6 / 11 / 101 / 1001), and round trips are **unchanged at
+N ≤ 100** (still 2). At **N=1000 it costs one extra round trip** — 1000 reads is exactly 5 chunks of
+200, and the 1001st opens a 6th (`gate-RPC` 7 → 8), which is most of the `START→VERIFIED` 5.87s → 6.35s
+move. The rest of the table shifted for reasons that predate this change and had never been
+re-measured here: `bitswap` fell to **0.00s** at every N while `fetch` at N=1000 rose 0.56s → 1.85s
+(write→read 0.18s → 1.48s), consistent with 0.1.5 carrying the whole cold pull inline in the bulk fetch
+answer — the payload moved from bitswap into fetch rather than getting cheaper — and small-N
+`START→TALLY` improved ~0.3–0.5s (3.08s → 2.64s at N=1). Not bisected; only the read-count and
+chunk-boundary effects above are attributable to the gate change.*
 
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
@@ -146,14 +154,17 @@ multistream-select negotiation vs the request write→response read — to find 
 
 | N (voters) | fetch | negotiate (mss) | write→read |
 |-----------:|------:|----------------:|-----------:|
-| 1          | 0.53s | 0.35s           | 0.18s      |
-| 5          | 0.54s | 0.35s           | 0.18s      |
-| 10         | 0.49s | 0.30s           | 0.18s      |
-| 100        | 0.52s | 0.35s           | 0.18s      |
-| 1000       | 0.53s | 0.35s           | 0.18s      |
+| 1          | 0.60s | 0.37s           | 0.22s      |
+| 5          | 0.59s | 0.38s           | 0.21s      |
+| 10         | 0.62s | 0.39s           | 0.25s      |
+| 100        | 0.61s | 0.38s           | 0.22s      |
+| 1000       | 1.85s | 0.39s           | 1.48s      |
 
-**The multistream-select negotiation (~0.2–0.4 s, ~1–2 RTT) dominates the fetch, not the actual
-request/response (~0.2 s, ~1 RTT).** This is the `mss.select` handshake `connection.newStream` runs
+**At N ≤ 100 the multistream-select negotiation (~0.4 s, ~1–2 RTT) dominates the fetch, not the
+actual request/response (~0.2 s, ~1 RTT).** (At N=1000 it no longer does — the bulk answer now
+carries the checkpoint blocks inline, so write→read is payload-bound at ~1.5 s while negotiation
+stays flat at ~0.4 s. The negotiation cost below is the *flat* term, and it is what dominates every
+small contest.) This is the `mss.select` handshake `connection.newStream` runs
 before the fetch stream is usable. libp2p exposes an optimistic 0-RTT path (`newStream({
 negotiateFully: false })`) that would cut ~1 RTT here, but it is a **no-op in the host's pinned stack**
 (libp2p `3.3.4` + yamux `8.0.1`): yamux ignores the early single-protocol hint, so full negotiation
@@ -168,9 +179,9 @@ host muxer/libp2p upgrade and is tracked as deferred pkc-js work (DESIGN.md, "De
 | `router` | HTTP content-router lookup for the criteria CID — find who runs the contest (simulated ~1 s, paid once). |
 | `connect` | Dial the named provider + noise/yamux/identify handshake (from `start()`, so it includes the 1 s router wait). |
 | `fetch` | Pull the tiny root record over the libp2p **fetch** protocol. |
-| `bitswap` | Pull the checkpoint chunk blocks over directed **bitswap** — **one** round-trip, since the chunk-CID index rides the fetch response (chunks pulled in parallel, root manifest skipped). |
+| `bitswap` | Pull the checkpoint chunk blocks over directed **bitswap** — **one** round-trip, since the chunk-CID index rides the fetch response (chunks pulled in parallel, root manifest skipped). **0.00s in the current table**: the bulk fetch answer now inlines the blocks themselves, so a cold join that gets a bulk answer skips bitswap entirely and that payload time appears under `fetch` instead. |
 | `verify+merge` | Recover every ballot's EIP-712 signature offline, LWW-merge into the winner-set (residual: tally-ready minus the last network op; the deferred gate reads run in the background and do not block it). |
-| `gate-RPC` | HTTP round trips to the mock ETH gateway during the join — the head read plus the background verifier's batched gate reads (multicall3 `aggregate3` chunks, sent in parallel). |
+| `gate-RPC` | HTTP round trips to the mock ETH gateway during the join — the head read plus the background verifier's batched gate reads (multicall3 `aggregate3` chunks, sent in parallel). The batch carries `N` `balanceOf`s **plus one** `supportsInterface(0xb45a3c0e)` for the gate contract, deduped across all wallets at that block. |
 | `START→TALLY` | End-to-end to render-ready: `start()` → `getTally()` reflects all `N` voters (rows may still be `chainVerified: false`). |
 | `START→VERIFIED` | End-to-end to trust-ready: the ranking row reads `chainVerified: true` (every deferred gate read landed). |
 
