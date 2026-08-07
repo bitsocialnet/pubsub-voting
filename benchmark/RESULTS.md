@@ -33,6 +33,9 @@ Run it yourself: `BENCH_HOST=<ssh-host> npm run bench:cold-join` (see [run.mjs](
 
 ## Per-operation latency (seeder on a ~270 ms-RTT WAN host, cold joiner local, median of 5)
 
+**The table is the 2026-08-07 run** (the ERC-5192 gate); the dated notes under it are the
+re-measurement history, oldest first, and quote the numbers current *at their own date*.
+
 `N` is the number of **voters** (distinct wallets, one ballot each) in the contest's checkpoint. All
 voters vote for one community, so the tally is one community of weight `N`.
 
@@ -45,7 +48,7 @@ voters vote for one community, so the tally is one community of weight `N`.
 | 1000       | 1.00s  | 1.69s   | 1.85s | 0.02s   | 2.18s        | 8        | **5.73s**       | **6.35s**          |
 | 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | —        | **18.95s**      | —                  |
 
-*Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
+*Historical — the first baseline of this rig. Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
 large enough that 3 repeats gave unstable per-op medians, so this baseline uses 5). This run's
 provider records were **announced by the seeder for real** (`httpRouterUrls` → `ssh -R`-tunneled
 router), not hardcoded; every column matched the 2026-07-09 hardcoded-record baseline within jitter
@@ -157,8 +160,11 @@ multistream-select negotiation vs the request write→response read — to find 
 | 100        | 0.61s | 0.38s           | 0.22s      |
 | 1000       | 1.85s | 0.39s           | 1.48s      |
 
-**The multistream-select negotiation (~0.2–0.4 s, ~1–2 RTT) dominates the fetch, not the actual
-request/response (~0.2 s, ~1 RTT).** This is the `mss.select` handshake `connection.newStream` runs
+**At N ≤ 100 the multistream-select negotiation (~0.4 s, ~1–2 RTT) dominates the fetch, not the
+actual request/response (~0.2 s, ~1 RTT).** (At N=1000 it no longer does — the bulk answer now
+carries the checkpoint blocks inline, so write→read is payload-bound at ~1.5 s while negotiation
+stays flat at ~0.4 s. The negotiation cost below is the *flat* term, and it is what dominates every
+small contest.) This is the `mss.select` handshake `connection.newStream` runs
 before the fetch stream is usable. libp2p exposes an optimistic 0-RTT path (`newStream({
 negotiateFully: false })`) that would cut ~1 RTT here, but it is a **no-op in the host's pinned stack**
 (libp2p `3.3.4` + yamux `8.0.1`): yamux ignores the early single-protocol hint, so full negotiation
@@ -173,7 +179,7 @@ host muxer/libp2p upgrade and is tracked as deferred pkc-js work (DESIGN.md, "De
 | `router` | HTTP content-router lookup for the criteria CID — find who runs the contest (simulated ~1 s, paid once). |
 | `connect` | Dial the named provider + noise/yamux/identify handshake (from `start()`, so it includes the 1 s router wait). |
 | `fetch` | Pull the tiny root record over the libp2p **fetch** protocol. |
-| `bitswap` | Pull the checkpoint chunk blocks over directed **bitswap** — **one** round-trip, since the chunk-CID index rides the fetch response (chunks pulled in parallel, root manifest skipped). |
+| `bitswap` | Pull the checkpoint chunk blocks over directed **bitswap** — **one** round-trip, since the chunk-CID index rides the fetch response (chunks pulled in parallel, root manifest skipped). **0.00s in the current table**: the bulk fetch answer now inlines the blocks themselves, so a cold join that gets a bulk answer skips bitswap entirely and that payload time appears under `fetch` instead. |
 | `verify+merge` | Recover every ballot's EIP-712 signature offline, LWW-merge into the winner-set (residual: tally-ready minus the last network op; the deferred gate reads run in the background and do not block it). |
 | `gate-RPC` | HTTP round trips to the mock ETH gateway during the join — the head read plus the background verifier's batched gate reads (multicall3 `aggregate3` chunks, sent in parallel). The batch carries `N` `balanceOf`s **plus one** `supportsInterface(0xb45a3c0e)` for the gate contract, deduped across all wallets at that block. |
 | `START→TALLY` | End-to-end to render-ready: `start()` → `getTally()` reflects all `N` voters (rows may still be `chainVerified: false`). |
