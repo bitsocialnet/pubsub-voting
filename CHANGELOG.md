@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.7...v0.2.0) (2026-08-07)
+
+### ⚠ BREAKING CHANGES
+
+* **rules:** the v1 gate rule is now `erc5192-min-balance`; criteria naming
+`erc721-min-balance` recuse via `UnknownRuleError` unless the host registers it
+explicitly. Both halves re-CID every criteria document, so every contest gets a
+new topic — land as one cutover (release, upgrade clients, redeploy the Pass
+locked, then flip the manifest). See DESIGN.md "Cutover ordering".
+
+### Features
+
+* **rules:** gate on ERC-5192, unregister erc721-min-balance ([35b4eca](https://github.com/bitsocialnet/pubsub-voting/commit/35b4eca8c056163b50fbe121476e3c45decabc5f)), closes [#28](https://github.com/bitsocialnet/pubsub-voting/issues/28) [#27](https://github.com/bitsocialnet/pubsub-voting/issues/27)
+
+### Bug Fixes
+
+* **rules:** address review — drop `this`, validate the probe's interface id ([a97bd29](https://github.com/bitsocialnet/pubsub-voting/commit/a97bd29307fcd4aa61178ae584f6318e6e2805c6)), closes [#29](https://github.com/bitsocialnet/pubsub-voting/issues/29)
+
 ## [0.1.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.6...v0.1.7) (2026-07-30)
 
 ### Bug Fixes
