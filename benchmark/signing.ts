@@ -3,7 +3,7 @@ import { base } from "viem/chains";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import type { ChainClient, ChainClientFactory } from "../dist/chain/types.js";
 import type { Rule, RuleRegistry } from "../dist/rules/types.js";
-import { erc721MinBalance, type Erc721MinBalanceOptions } from "../dist/rules/erc721-min-balance.js";
+import { ERC5192_INTERFACE_ID, erc5192MinBalance, type Erc5192MinBalanceOptions } from "../dist/rules/erc5192-min-balance.js";
 import type { GatewayOp, GatewayRequest } from "./rpc-gateway.js";
 import type { VoteSigner } from "../dist/signer/types.js";
 import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../dist/signer/eip712.js";
@@ -19,8 +19,9 @@ import { CriteriaSchema, type Criteria } from "../dist/schema/criteria.js";
  * re-verifies EVERY bundle it pulls (signer recovery in `verify/signature.ts` + the rule gate).
  * A placeholder signature would be rejected and the cold node's tally would stay empty, so the
  * benchmark would measure nothing. Each seeded winner is therefore signed by a distinct real viem
- * account. The rule gate (`erc721-min-balance`) passes against an instant fake chain whose
- * `readContract` returns `>= min`, and votes carry only a `publicKey` (no `name`), so no name
+ * account. The rule gate (`erc5192-min-balance`) passes against an instant fake chain whose
+ * `readContract` returns `>= min` and declares ERC-5192, and votes carry only a `publicKey` (no
+ * `name`), so no name
  * resolver is needed — chain work is ~0ms, isolating real peer-to-peer latency.
  *
  * REAL-CHAIN MODE (`BENCH_RPC_URL=<real Base RPC>`): every fixture in this module consults
@@ -29,11 +30,12 @@ import { CriteriaSchema, type Criteria } from "../dist/schema/criteria.js";
  * chain — real head, real bucket sample block (up to `blocksPerBucket` behind head, so the
  * endpoint must serve historical state at that depth), real multicall3 — instead of the mock
  * gateway. The bench wallets are freshly generated and hold nothing on any real chain, so the
- * joiner shadows `erc721-min-balance` with {@link benchRules}'s PROBE rule: it performs the
- * builtin's exact reads (same single `balanceOf`, same multicall3 `aggregate3`, same pinned
- * block) and only then admits the wallet unconditionally — the measured RPC cost is real, the
+ * joiner shadows `erc5192-min-balance` with {@link benchRules}'s PROBE rule: it performs the
+ * builtin's exact reads (same ERC-5192 `supportsInterface` probe, same single `balanceOf`, same
+ * multicall3 `aggregate3`, same pinned block) and only then admits the wallet unconditionally — the measured RPC cost is real, the
  * threshold alone is bench-local. The criteria pin a real deployed ERC-721
- * ({@link REAL_PROBE_CONTRACT}) so the reads execute real contract code. The seeder keeps its
+ * ({@link REAL_PROBE_CONTRACT}) so the reads execute real contract code — it is a plain ERC-721
+ * that does not declare ERC-5192, which is precisely why the probe rule ignores the verdict. The seeder keeps its
  * instant fake chain (seeding is setup, not the join under test) but reports the REAL head, so
  * ballots are signed at the real bucket's sample block and verify identically on both sides.
  */
@@ -86,14 +88,14 @@ export function benchCriteria(): Criteria {
         blocksPerBucket: 43200,
         voteExpiryBuckets: 30,
         rule: {
-            type: "erc721-min-balance",
+            type: "erc5192-min-balance",
             chain: "base",
             contract: rpcUrl ? REAL_PROBE_CONTRACT : "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
             min: 1
         },
         weight: { type: "constant", value: 1 },
         requires: {
-            rules: ["erc721-min-balance", "constant"],
+            rules: ["erc5192-min-balance", "constant"],
             chains: { base: { chainId: 8453 } }
         }
     };
@@ -125,7 +127,8 @@ export function benchDirectoryCriteria(m: number): Criteria[] {
 /**
  * A chain factory that answers instantly with no network: `getBlockNumber` fixes the head (so the
  * current bucket is stable), `getBlock` supplies the tie-break block hash, and `readContract`
- * returns `min` so the `erc721-min-balance` gate passes for every wallet.
+ * returns `min` (and `true` for the ERC-5192 probe) so the `erc5192-min-balance` gate passes for
+ * every wallet.
  *
  * Used only where chain latency is SETUP, not the measurement: the seeder (its 1000 gate reads
  * while seeding are not the cold join under test). The measured COLD JOINER instead talks to the
@@ -141,30 +144,31 @@ export function benchChains(): ChainClientFactory {
     const client = {
         getBlockNumber: async (): Promise<bigint> => (rpcUrl ? fetchRealHead(rpcUrl) : BENCH_HEAD_BLOCK),
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-        readContract: async () => 1n
+        readContract: async ({ functionName, args }: { functionName?: string; args?: readonly unknown[] } = {}) =>
+            functionName === "supportsInterface" ? String(args?.[0]).toLowerCase() === ERC5192_INTERFACE_ID : 1n
     };
     return () => client as unknown as ChainClient;
 }
 
 /**
  * REAL-CHAIN mode's registry override for the joiner (and, harmlessly, the seeder):
- * `undefined` in mock mode; in real mode a PROBE rule shadowing `erc721-min-balance` that
- * delegates every read to the builtin — byte-identical single `balanceOf` and multicall3
- * `aggregate3` calls at the same pinned block — then admits the wallet unconditionally
- * (bench wallets are freshly generated and hold 0 of any real token; the read cost is the
- * measurement, the threshold is not).
+ * `undefined` in mock mode; in real mode a PROBE rule shadowing `erc5192-min-balance` that
+ * delegates every read to the builtin — byte-identical `supportsInterface`, single `balanceOf`
+ * and multicall3 `aggregate3` calls at the same pinned block — then admits the wallet
+ * unconditionally (bench wallets are freshly generated and hold 0 of any real token, and the
+ * real probe contract declares no lock; the read cost is the measurement, the verdict is not).
  */
 export function benchRules(): RuleRegistry | undefined {
     if (!benchRpcUrl()) return undefined;
-    const probe: Rule<Erc721MinBalanceOptions> = {
-        type: erc721MinBalance.type,
-        optionsSchema: erc721MinBalance.optionsSchema,
+    const probe: Rule<Erc5192MinBalanceOptions> = {
+        type: erc5192MinBalance.type,
+        optionsSchema: erc5192MinBalance.optionsSchema,
         async evaluate(args) {
-            const { score } = await erc721MinBalance.evaluate(args);
+            const { score } = await erc5192MinBalance.evaluate(args);
             return { score: score > 0n ? score : 1n };
         },
         async evaluateMany(args) {
-            const results = await erc721MinBalance.evaluateMany!(args);
+            const results = await erc5192MinBalance.evaluateMany!(args);
             return results.map(({ score }) => ({ score: score > 0n ? score : 1n }));
         }
     };
@@ -240,7 +244,7 @@ export function realJoinerChains(rpcUrl: string, requests: GatewayRequest[]): Ch
  * The measured joiner's chain factory: a REAL `createPublicClient` with viem's default `http`
  * transport (one POST per read, `retryCount: 3`, no transport batching) pointed at the mock ETH
  * gateway (`benchmark/rpc-gateway.ts`). `chain: base` matches the bench criteria's chainId 8453
- * and — crucially — carries base's multicall3 deployment, so `erc721-min-balance.evaluateMany`
+ * and — crucially — carries base's multicall3 deployment, so `erc5192-min-balance.evaluateMany`
  * takes the one-aggregate3-per-batch path exactly as it would against the real chain.
  */
 export function benchGatewayChains(gatewayUrl: string): ChainClientFactory {

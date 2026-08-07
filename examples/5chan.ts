@@ -46,6 +46,13 @@ import {
 // deliberately, in lockstep with the seeders (which must join both the old and the new topic
 // across the migration window), rather than inheriting whichever revision `master` happened
 // to be at process start.
+//
+// NOTE: the pinned revision below still gates on `erc721-min-balance`, which this library no
+// longer registers (a bare `balanceOf` gates on an asset that can move — see DESIGN.md "Does one
+// Pass mean one vote?"). Deriving criteria from it therefore recuses with `UnknownRuleError`,
+// which is the intended behaviour: the manifest is re-pinned to an `erc5192-min-balance` revision
+// only AFTER the locked Pass is redeployed and clients have upgraded (DESIGN.md, "Cutover
+// ordering").
 const MANIFEST_URL =
     "https://raw.githubusercontent.com/bitsocialnet/lists/2f8f76f3fb2c79b753da90a060d877629a165c56/5chan-directory-criteria.jsonc";
 const manifest = JSON.parse(

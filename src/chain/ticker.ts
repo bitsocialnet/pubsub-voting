@@ -3,7 +3,7 @@ import type { Criteria, RuleRef } from "../schema/criteria.js";
 
 /**
  * Resolve which chain a rule reads. A rule's parsed options may name a
- * `chain` ticker (e.g. `erc721-min-balance` -> "base"); a chainless rule (e.g.
+ * `chain` ticker (e.g. `erc5192-min-balance` -> "base"); a chainless rule (e.g.
  * `constant`) names none, so callers fall back to the first configured chain. Shared by the
  * verifier, the tally, and the facade so the fallback rule stays identical everywhere.
  */

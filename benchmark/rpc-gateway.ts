@@ -175,6 +175,21 @@ export async function startRpcGateway(options: GatewayOptions = {}): Promise<Run
     const requests: GatewayRequest[] = [];
 
     const balanceWord = encodeAbiParameters([{ type: "uint256" }], [balance]);
+    // The v1 gate (`erc5192-min-balance`) probes ERC-165 `supportsInterface(0xb45a3c0e)` at the
+    // same block as the balances — one extra read per (contract, block), coalesced into the same
+    // aggregate3. Answer it `true`, independently of `balance`, so a bench that reads back a
+    // zero balance still exercises the gate's balance branch rather than the lock branch.
+    const trueWord = encodeAbiParameters([{ type: "bool" }], [true]);
+    const falseWord = encodeAbiParameters([{ type: "bool" }], [false]);
+    // `supportsInterface(bytes4)` calldata is the 4-byte selector followed by the id left-aligned
+    // in a 32-byte word, so the queried id is hex chars 10..18. Answering `true` to ANY id would
+    // let a gate probing the WRONG interface pass the bench — the one thing this mock must not do.
+    const SUPPORTS_INTERFACE_SELECTOR = "0x01ffc9a7";
+    const ERC5192_INTERFACE_ID = "b45a3c0e";
+    const answerCall = (callData?: string): `0x${string}` => {
+        if (!callData?.startsWith(SUPPORTS_INTERFACE_SELECTOR)) return balanceWord;
+        return callData.slice(10, 18).toLowerCase() === ERC5192_INTERFACE_ID ? trueWord : falseWord;
+    };
 
     /** Answer one JSON-RPC request object, recording it. */
     function answer(rpc: { id?: unknown; method?: string; params?: unknown[] }): Record<string, unknown> {
@@ -205,19 +220,20 @@ export async function startRpcGateway(options: GatewayOptions = {}): Promise<Run
                     // One aggregate3 = many inner reads for one latency charge (the batched path).
                     const { functionName, args } = decodeFunctionData({ abi: multicall3Abi, data: call.data });
                     if (functionName !== "aggregate3") throw new Error(`unsupported multicall3 function ${functionName}`);
-                    const calls = args[0] as readonly unknown[];
+                    const calls = args[0] as ReadonlyArray<{ callData?: string }>;
                     op = "gate-multicall";
                     reads = calls.length;
                     result = encodeFunctionResult({
                         abi: multicall3Abi,
                         functionName: "aggregate3",
-                        result: calls.map(() => ({ success: true, returnData: balanceWord }))
+                        result: calls.map((inner) => ({ success: true, returnData: answerCall(inner?.callData) }))
                     });
                 } else {
-                    // A direct `balanceOf` read — the unbatched path, one latency charge per wallet.
+                    // A direct gate read (`balanceOf`, or the ERC-5192 probe) — the unbatched path,
+                    // one latency charge per read.
                     op = "gate-direct";
                     reads = 1;
-                    result = balanceWord;
+                    result = answerCall(call?.data);
                 }
                 break;
             }

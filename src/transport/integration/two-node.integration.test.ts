@@ -16,7 +16,7 @@ import { makeVoteNode, connectNodes, waitFor, delay, sampleBundle, type VoteNode
  * Two real libp2p + Helia nodes running `@libp2p/gossipsub` (>= 15.0.23, the CVE-2026-46679
  * floor). These pin what the pure unit tests (`gossip-validator.test.ts`, `chase.test.ts`)
  * cannot: real gossipsub forwarding, real peer scoring on a `reject`, a rejection produced by
- * the REAL verify pipeline (EIP-712 recover → constraints → the erc721-min-balance "5chan Pass"
+ * the REAL verify pipeline (EIP-712 recover → constraints → the erc5192-min-balance "5chan Pass"
  * gate → name resolution, only the chain read and registry stubbed) — including a byzantine
  * bundle claiming a community name mapped to a different key, dropped with `ignore` (no
  * penalty, uncached) — the real validation deadline, heartbeat-suppression quiet, and a real
@@ -37,7 +37,7 @@ const ADDR = "0x1111111111111111111111111111111111111111";
 const reject = (): BundleVerdict => ({ valid: false, disposition: "reject", reason: "test reject" });
 const accept = (): BundleVerdict => ({ valid: true, ruleScore: 1n, resolvedNames: {} });
 
-// --- Real-verifier fixtures (the ERC-721 "5chan Pass" gate over bizCriteria) ---------------------
+// --- Real-verifier fixtures (the soulbound ERC-5192 "5chan Pass" gate over bizCriteria) ---------
 
 // The gating chain's chainId, as bizCriteria() pins it (requires.chains.base.chainId).
 const BIZ_CHAIN_ID = 8453;
@@ -54,7 +54,11 @@ async function passSignedBundle(blockNumber: number, communityName?: string): Pr
     return { address: wallet.address, votes, blockNumber, signature: { signature, type: EIP712_SIGNATURE_TYPE } };
 }
 
-/** The REAL verify pipeline over bizCriteria; only the chain read is stubbed to a fixed Pass balance. */
+/**
+ * The REAL verify pipeline over bizCriteria; only the chain reads are stubbed. The v1 gate
+ * (`erc5192-min-balance`) makes two: the contract's ERC-5192 declaration (always true here — the
+ * Pass is soulbound) and the wallet's `balanceOf`, which is what these tests vary.
+ */
 async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] = []): Promise<BundleVerifier> {
     const criteria = bizCriteria();
     return makeBundleVerifier({
@@ -62,7 +66,10 @@ async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] =
         criteriaCid: (await criteriaCid(criteria)).bytes,
         chainId: BIZ_CHAIN_ID,
         registry: builtinRegistry,
-        chainFor: () => ({ readContract: async () => passBalance }) as unknown as ChainClient,
+        chainFor: () =>
+            ({
+                readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : passBalance)
+            }) as unknown as ChainClient,
         bucketMath: makeBucketMath(criteria.blocksPerBucket),
         nameResolvers
     });
@@ -108,9 +115,9 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
         expect(b.crdt.current(0)).toHaveLength(0);
     });
 
-    it("the REAL rule gate (ERC-721 5chan Pass, balance 0) rejects a gossiped bundle: not forwarded, sender penalized", async () => {
+    it("the REAL rule gate (soulbound ERC-5192 5chan Pass, balance 0) rejects a gossiped bundle: not forwarded, sender penalized", async () => {
         const { a, b } = await connectedPair();
-        // B runs the real pipeline (EIP-712 recover → constraints → erc721-min-balance gate); the
+        // B runs the real pipeline (EIP-712 recover → constraints → erc5192-min-balance gate); the
         // stubbed chain says the wallet holds no Pass, so step 3 rejects with the gate reason.
         const gated = await realVerifier(0n);
         b.setVerifier((bundle) => gated.verify(bundle));

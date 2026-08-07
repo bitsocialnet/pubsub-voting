@@ -1,5 +1,14 @@
 # Cold-join latency — benchmark results
 
+> **Stale read counts (2026-08-05).** Every table below was measured with the gate rule
+> `erc721-min-balance`. The v1 gate is now `erc5192-min-balance`, which adds one
+> `supportsInterface(0xb45a3c0e)` read per (contract, sample block) — coalesced, so it rides the
+> same `aggregate3` as the balances and should not add a round trip, but it DOES add one inner
+> read per distinct contract/block pair to the `reads` counts (one for a single contest; one per
+> distinct contract/block pair for a directory run). The latency columns are expected to be
+> unchanged; nothing here has been re-measured since. **Re-run `bench:cold-join` and replace these
+> tables before treating them as the acceptance baseline again.**
+
 **What this measures:** how long a **cold peer** takes, from joining a contest to having a usable
 **tally** (the "which community/board do I load in the UI?" signal, i.e. `getTally()` returning the
 full ranking). This is the latency of the *existing code*, measured — not estimated.
@@ -333,9 +342,10 @@ gateway: `BENCH_RPC_URL=https://mainnet.base.org npm run bench:cold-join` (and
 that depth; `mainnet.base.org` does, publicnode's free tier refuses), real multicall3, real
 (**measured**, not simulated) RPC latency, and the endpoint's **real rate limiting**. The gate
 contract is a real deployed ERC-721 on Base ("Base Day One" — the 5chan Pass is not deployed yet);
-a probe rule shadows `erc721-min-balance` through the supported `rules` override, performing the
-builtin's exact reads and only relaxing admission (bench wallets hold nothing on a real chain) —
-see `signing.ts` "REAL-CHAIN MODE". Same rig otherwise: seeder on the ~270 ms-RTT WAN host, joiner
+a probe rule shadows `erc5192-min-balance` through the supported `rules` override, performing the
+builtin's exact reads (ERC-5192 `supportsInterface` probe included) and only relaxing admission
+(bench wallets hold nothing on a real chain, and the probe contract declares no lock) — see
+`signing.ts` "REAL-CHAIN MODE". Same rig otherwise: seeder on the ~270 ms-RTT WAN host, joiner
 local, dialed directly. Every JSON-RPC round trip the joiner pays is attributed to the operation
 that caused it (`gateRpc.byOp`): `head` = `eth_blockNumber` (bucket derivation), `block` =
 tie-break block-hash read, `multicall` = the batched gate reads, `direct` = single-wallet gate

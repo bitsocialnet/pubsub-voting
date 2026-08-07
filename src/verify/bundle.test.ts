@@ -34,12 +34,16 @@ async function signedBundle(votes: Vote[]): Promise<VotesBundle> {
     return VotesBundleSchema.parse({ address: account.address, votes, blockNumber: BLOCK, signature: { signature, type: "eip712" } });
 }
 
-/** A fake viem client whose ERC-721 `balanceOf` returns a fixed balance; counts reads. */
-function fakeChain(balance: bigint, onRead?: () => void): ChainClient {
+/**
+ * A fake viem client for the gate's reads, counting every `readContract`. The v1 gate
+ * (`erc5192-min-balance`) makes TWO per uncached wallet: the ERC-5192 declaration probe and
+ * `balanceOf`, so the stub dispatches on `functionName`.
+ */
+function fakeChain(balance: bigint, onRead?: () => void, declares = true): ChainClient {
     return {
-        async readContract() {
+        async readContract({ functionName }: { functionName?: string } = {}) {
             onRead?.();
-            return balance;
+            return functionName === "supportsInterface" ? declares : balance;
         }
     } as unknown as ChainClient;
 }
@@ -84,6 +88,25 @@ describe("makeBundleVerifier", () => {
         if (!verdict.valid) expect(verdict.disposition).toBe("reject"); // gate miss is provable
     });
 
+    it("rejects every wallet when the gate contract does not declare ERC-5192", async () => {
+        // The gate would otherwise be a bare `balanceOf` on a transferable asset, which one holder
+        // can walk through several wallets for several concurrent votes (issue #27, vector in
+        // crdt/amplification.test.ts). A contract that does not claim its tokens are locked is a
+        // provable chain fact, so this is a `reject` like any other gate miss.
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
+        const verdict = await makeBundleVerifier({
+            criteria: bizCriteria(),
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: builtinRegistry,
+            chainFor: () => fakeChain(1000n, undefined, false),
+            bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
+            nameResolvers: []
+        }).verify(bundle);
+        expect(verdict.valid).toBe(false);
+        if (!verdict.valid) expect(verdict.disposition).toBe("reject");
+    });
+
     it("caches a gate miss by (wallet, sampleBlock) so a second bundle skips the chain read", async () => {
         let reads = 0;
         const gateResultCache = makeGateResultCache();
@@ -94,7 +117,7 @@ describe("makeBundleVerifier", () => {
         const second = await v.verify(await signedBundle([{ community: { publicKey: KEY_B }, vote: 1 }]));
         expect(first.valid).toBe(false);
         expect(second.valid).toBe(false);
-        expect(reads).toBe(1); // only the first bundle hit the chain
+        expect(reads).toBe(2); // only the first bundle hit the chain (lock probe + balanceOf)
     });
 
     it("caches a gate HIT by (wallet, sampleBlock) so an eligible wallet's re-vote skips the read", async () => {
@@ -107,7 +130,7 @@ describe("makeBundleVerifier", () => {
         const second = await v.verify(await signedBundle([{ community: { publicKey: KEY_B }, vote: 1 }]));
         expect(first.valid).toBe(true);
         expect(second.valid).toBe(true);
-        expect(reads).toBe(1); // the eligible score was read once and reused
+        expect(reads).toBe(2); // the eligible score was read once (lock probe + balanceOf) and reused
     });
 
     it("rejects a bad signature BEFORE any chain read (cheap-first ordering)", async () => {

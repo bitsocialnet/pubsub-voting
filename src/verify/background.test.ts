@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { makeBackgroundVerifier, type BackgroundVerifierDeps } from "./background.js";
 import { makeGateResultCache } from "./gate-result-cache.js";
 import { makeVerdictCache } from "./cache.js";
-import { Erc721MinBalanceOptionsSchema } from "../rules/erc721-min-balance.js";
+import { Erc5192MinBalanceOptionsSchema } from "../rules/erc5192-min-balance.js";
 import type { Rule, RuleRegistry } from "../rules/types.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bundleCid } from "../crdt/codec.js";
@@ -35,7 +35,7 @@ async function pending(b: VotesBundle): Promise<{ cid: CID; bundle: VotesBundle 
 }
 
 /**
- * A stub gate rule shadowing `erc721-min-balance` by type. `scores` maps a LOWERCASE wallet to
+ * A stub gate rule shadowing `erc5192-min-balance` by type. `scores` maps a LOWERCASE wallet to
  * its gate score (default `1n`); a wallet mapped to an Error makes the read throw (infra).
  * `calls` records every evaluate/evaluateMany invocation for batching assertions.
  */
@@ -50,8 +50,8 @@ function stubRule(
         return entry;
     };
     const rule: Rule = {
-        type: "erc721-min-balance",
-        optionsSchema: Erc721MinBalanceOptionsSchema,
+        type: "erc5192-min-balance",
+        optionsSchema: Erc5192MinBalanceOptionsSchema,
         async evaluate({ walletAddress, ctx }) {
             calls.push({ kind: "one", wallets: [walletAddress], block: ctx.blockNumber });
             return { score: scoreFor(walletAddress) };
@@ -91,7 +91,7 @@ function harness(over: Partial<BackgroundVerifierDeps> & { registry?: RuleRegist
     const gateResultCache = makeGateResultCache();
     const verifier = makeBackgroundVerifier({
         criteria: bizCriteria(),
-        registry: over.registry ?? { "erc721-min-balance": stubRule({}).rule },
+        registry: over.registry ?? { "erc5192-min-balance": stubRule({}).rule },
         chainFor: () => ({}) as unknown as ChainClient,
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [],
@@ -112,7 +112,7 @@ function harness(over: Partial<BackgroundVerifierDeps> & { registry?: RuleRegist
 describe("makeBackgroundVerifier", () => {
     it("batches a round's gate reads into ONE evaluateMany per sample block and settles each bundle", async () => {
         const { rule, calls } = stubRule({}, { batched: true });
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2")), pending(bundle("0x3"))]);
         h.verifier.enqueue(entries);
         await h.verifier.idle();
@@ -127,7 +127,7 @@ describe("makeBackgroundVerifier", () => {
 
     it("falls back to per-wallet evaluate calls when the rule has no evaluateMany", async () => {
         const { rule, calls } = stubRule({});
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         h.verifier.enqueue(await Promise.all([pending(bundle("0x1")), pending(bundle("0x2"))]));
         await h.verifier.idle();
         expect(calls.map((c) => c.kind)).toEqual(["one", "one"]);
@@ -136,7 +136,7 @@ describe("makeBackgroundVerifier", () => {
 
     it("groups gate reads by sample block (bundles from different buckets batch separately)", async () => {
         const { rule, calls } = stubRule({}, { batched: true });
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         h.verifier.enqueue(
             await Promise.all([pending(bundle("0x1", { blockNumber: 43200 })), pending(bundle("0x2", { blockNumber: 86400 }))])
         );
@@ -147,7 +147,7 @@ describe("makeBackgroundVerifier", () => {
     it("evicts a gate-failed wallet's bundle with a cached provable reject", async () => {
         const bad = bundle("0xbad");
         const { rule } = stubRule({ [bad.address.toLowerCase()]: 0n }, { batched: true });
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         const [good, failed] = await Promise.all([pending(bundle("0x1")), pending(bad)]);
         h.verifier.enqueue([good!, failed!]);
         await h.verifier.idle();
@@ -159,7 +159,7 @@ describe("makeBackgroundVerifier", () => {
 
     it("skips the chain read entirely on a gate-result cache hit", async () => {
         const { rule, calls } = stubRule({}, { batched: true });
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         const b = bundle("0x1");
         h.gateResultCache.set(b.address, 43200, 2n);
         h.verifier.enqueue([await pending(b)]);
@@ -171,7 +171,7 @@ describe("makeBackgroundVerifier", () => {
 
     it("verifies each enqueued CID once, even when a bundle is enqueued twice", async () => {
         const { rule, calls } = stubRule({}, { batched: true });
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         const entry = await pending(bundle("0x1"));
         h.verifier.enqueue([entry]);
         h.verifier.enqueue([entry]);
@@ -209,8 +209,8 @@ describe("makeBackgroundVerifier", () => {
         let failures = 1;
         const calls: Array<{ kind: string }> = [];
         const rule: Rule = {
-            type: "erc721-min-balance",
-            optionsSchema: Erc721MinBalanceOptionsSchema,
+            type: "erc5192-min-balance",
+            optionsSchema: Erc5192MinBalanceOptionsSchema,
             async evaluate() {
                 throw new Error("unexpected: batched rule");
             },
@@ -223,7 +223,7 @@ describe("makeBackgroundVerifier", () => {
                 return walletAddresses.map(() => ({ score: 1n }));
             }
         };
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         const entry = await pending(bundle(wallet));
         h.verifier.enqueue([entry]);
         await h.verifier.idle();
@@ -250,7 +250,7 @@ describe("makeBackgroundVerifier", () => {
                 return { publicKey: KEY_A };
             }
         };
-        const h = harness({ registry: { "erc721-min-balance": rule }, nameResolvers: [flaky] });
+        const h = harness({ registry: { "erc5192-min-balance": rule }, nameResolvers: [flaky] });
         const entry = await pending(bundle("0x1", { name: "memes.bso" }));
         h.verifier.enqueue([entry]);
         await h.verifier.idle();
@@ -264,14 +264,14 @@ describe("makeBackgroundVerifier", () => {
     it("stop() pauses the retry loop and resume() drains what was left pending", async () => {
         let failing = true;
         const rule: Rule = {
-            type: "erc721-min-balance",
-            optionsSchema: Erc721MinBalanceOptionsSchema,
+            type: "erc5192-min-balance",
+            optionsSchema: Erc5192MinBalanceOptionsSchema,
             async evaluate() {
                 if (failing) throw new Error("RPC down");
                 return { score: 1n };
             }
         };
-        const h = harness({ registry: { "erc721-min-balance": rule } });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
         const entry = await pending(bundle("0x1"));
         h.verifier.enqueue([entry]);
         // Let the first (failing) round run, then pause while still pending.
