@@ -174,8 +174,11 @@ export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
     type: "erc5192-min-balance",
     optionsSchema: Erc5192MinBalanceOptionsSchema,
 
+    // One wallet is the batch of one: the two legs, the two epochs and the memos are identical,
+    // so there is one body. Called through `erc5192MinBalance.evaluateMany` rather than `this`,
+    // which a destructured or re-exported rule object would not carry (issue #29).
     async evaluate({ options, wallet, ctx }) {
-        const { results } = await this.evaluateMany!({ options, wallets: [wallet], ctx });
+        const { results } = await erc5192MinBalance.evaluateMany!({ options, wallets: [wallet], ctx });
         return results[0]!;
     },
 
