@@ -38,24 +38,31 @@ export function scoreOf(balance: bigint, min: number): bigint {
  * its chain's multicall3 deployment. A client built without a `chain` (or on a chain without
  * multicall3) takes the per-wallet path instead.
  */
-export function canBatch(ctx: ChainReadContext): boolean {
-    return typeof ctx.chain.multicall === "function" && Boolean(ctx.chain.chain?.contracts?.multicall3);
+export function canBatch(args: { ctx: ChainReadContext }): { batchable: boolean } {
+    const { ctx } = args;
+    return { batchable: typeof ctx.chain.multicall === "function" && Boolean(ctx.chain.chain?.contracts?.multicall3) };
 }
 
-/** One wallet's `balanceOf` at the bundle's sampled block. */
-export function balanceOf(contract: `0x${string}`, walletAddress: string, ctx: ChainReadContext): Promise<bigint> {
-    return ctx.chain.readContract({
-        address: contract,
+/** One wallet's `balanceOf` at `block` (the caller's choice — a pinned block or the head). */
+export async function balanceOf(args: {
+    contract: `0x${string}`;
+    wallet: string;
+    block: number;
+    ctx: ChainReadContext;
+}): Promise<{ balance: bigint }> {
+    const balance = await args.ctx.chain.readContract({
+        address: args.contract,
         abi: erc721Abi,
         functionName: "balanceOf",
-        args: [getAddress(walletAddress)],
-        blockNumber: BigInt(ctx.blockNumber)
+        args: [getAddress(args.wallet)],
+        blockNumber: BigInt(args.block)
     });
+    return { balance };
 }
 
 /**
- * Many wallets' `balanceOf` at ONE sampled block — the path the background chain verifier rides
- * on a cold join. Requires {@link canBatch}; callers fall back to mapping {@link balanceOf}.
+ * Many wallets' `balanceOf` at ONE block — the path the background chain verifier rides on a
+ * cold join. Requires {@link canBatch}; callers fall back to mapping {@link balanceOf}.
  *
  * The wallets are chunked HERE (`READS_PER_MULTICALL` per aggregate3, `batchSize: 0` disables
  * viem's own 1KB re-chunking) and the chunks are sent with bounded concurrency plus one retry
@@ -64,7 +71,13 @@ export function balanceOf(contract: `0x${string}`, walletAddress: string, ctx: C
  * completed one (viem's own whole-batch retry re-fired the entire burst). A chunk that fails
  * twice still fails the whole call: the caller gets one rejection, not partial results.
  */
-export async function balancesOfBatched(contract: `0x${string}`, walletAddresses: string[], ctx: ChainReadContext): Promise<bigint[]> {
+export async function balancesOfBatched(args: {
+    contract: `0x${string}`;
+    wallets: string[];
+    block: number;
+    ctx: ChainReadContext;
+}): Promise<{ balances: bigint[] }> {
+    const { contract, wallets: walletAddresses, block, ctx } = args;
     const chunks: string[][] = [];
     for (let at = 0; at < walletAddresses.length; at += READS_PER_MULTICALL) {
         chunks.push(walletAddresses.slice(at, at + READS_PER_MULTICALL));
@@ -80,7 +93,7 @@ export async function balancesOfBatched(contract: `0x${string}`, walletAddresses
             })),
             allowFailure: false,
             batchSize: 0,
-            blockNumber: BigInt(ctx.blockNumber)
+            blockNumber: BigInt(block)
         });
     let nextChunk = 0;
     const worker = async (): Promise<void> => {
@@ -100,5 +113,5 @@ export async function balancesOfBatched(contract: `0x${string}`, walletAddresses
         }
     };
     await Promise.all(Array.from({ length: Math.min(MULTICALL_CONCURRENCY, chunks.length) }, worker));
-    return balances;
+    return { balances };
 }

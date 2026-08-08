@@ -6,6 +6,8 @@ import { erc721MinBalance } from "../rules/erc721-min-balance.js";
 import { erc5192MinBalance } from "../rules/erc5192-min-balance.js";
 import { erc20Balance } from "../rules/erc20-balance.js";
 import type { ChainClient } from "../chain/types.js";
+import type { ChainReadContext } from "../rules/types.js";
+import { makeMemoryRuleCache } from "../rules/cache.js";
 import type { Vote, VotesBundle } from "../schema/votes.js";
 
 /**
@@ -82,6 +84,22 @@ function holderAt(block: number): string {
     return WALLET_C;
 }
 
+/**
+ * "Now" for these tests: the last bucket of the transfer chain, where C holds the asset. The
+ * gate rules are handed this as `ctx.head`; `erc721-min-balance` never reads it (it scores the
+ * pinned block a ballot names), while `erc5192-min-balance` reads it first and falls back to the
+ * pinned block — which is what the last assertion below exercises.
+ */
+const HEAD = sampleBlock(FIRST + 2);
+
+/** A rule context over `chain`, with a private memo so one test's reads never seed another's. */
+function ctxAt(chain: ChainClient): ChainReadContext {
+    return { chain, head: async () => ({ block: HEAD }), cache: makeMemoryRuleCache() };
+}
+
+/** One wallet as the rules take it: an address plus the pinned block its ballot names. */
+const at = (address: string, bucket: number) => ({ address, sampleBlock: sampleBlock(bucket) });
+
 /** A CRDT with the live manifest's expiry window. */
 function crdt() {
     return makeVoteCrdt({ store: makeMemoryBundleStore(), bucketMath, voteExpiryBuckets: VOTE_EXPIRY_BUCKETS });
@@ -98,11 +116,11 @@ describe("Sybil amplification: one transferable asset, N concurrent votes (#27)"
             [FIRST + 1, WALLET_B],
             [FIRST + 2, WALLET_C]
         ] as const) {
-            const { score } = await erc721MinBalance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: sampleBlock(bucket) } });
+            const { score } = await erc721MinBalance.evaluate({ options, wallet: at(wallet, bucket), ctx: ctxAt(chain) });
             expect(score).toBe(1n); // the gate is satisfied — the wallet really did hold the token then
         }
         // ...and each is a stranger at the others' blocks, so nothing about the sequence looks odd.
-        const { score } = await erc721MinBalance.evaluate({ options, walletAddress: WALLET_A, ctx: { chain, blockNumber: sampleBlock(FIRST + 2) } });
+        const { score } = await erc721MinBalance.evaluate({ options, wallet: at(WALLET_A, FIRST + 2), ctx: ctxAt(chain) });
         expect(score).toBe(0n);
     });
 
@@ -137,13 +155,18 @@ describe("Sybil amplification: one transferable asset, N concurrent votes (#27)"
                 [FIRST + 1, WALLET_B],
                 [FIRST + 2, WALLET_C]
             ].map(([bucket, wallet]) =>
-                erc5192MinBalance.evaluate({ options: gate, walletAddress: String(wallet), ctx: { chain, blockNumber: sampleBlock(Number(bucket)) } })
+                erc5192MinBalance.evaluate({ options: gate, wallet: at(String(wallet), Number(bucket)), ctx: ctxAt(chain) })
             )
         );
         expect(scores.map((s) => s.score)).toEqual([0n, 0n, 0n]);
         // The assertion is about the CONTRACT, not the wallet: declare the lock and the same
         // holders are admitted again (a locked contract cannot produce the transfers above).
-        const { score } = await erc5192MinBalance.evaluate({ options: gate, walletAddress: WALLET_A, ctx: { chain: chain5192, blockNumber: sampleBlock(FIRST) } });
+        // A no longer holds at the head, so this also exercises the rule's pinned fallback: the
+        // holding it had at its own ballot's block is what admits it (see erc5192-min-balance.ts,
+        // `evaluateMany`). Admitting "held then OR holds now" is exactly v1's pinned admission
+        // widened by the head leg, so it opens no amplification the ERC-5192 assertion above does
+        // not already refuse.
+        const { score } = await erc5192MinBalance.evaluate({ options: gate, wallet: at(WALLET_A, FIRST), ctx: ctxAt(chain5192) });
         expect(score).toBe(1n);
     });
 });
@@ -160,7 +183,7 @@ describe("Sybil amplification: one fungible balance, N concurrent votes (#28)", 
             [FIRST + 2, WALLET_C]
         ] as const;
         for (const [bucket, wallet] of wallets) {
-            const { score } = await erc20Balance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: sampleBlock(bucket) } });
+            const { score } = await erc20Balance.evaluate({ options, wallet: at(wallet, bucket), ctx: ctxAt(chain) });
             expect(score).toBeGreaterThan(0n); // each read is true at its own pinned block
         }
 
@@ -179,8 +202,12 @@ describe("Sybil amplification: one fungible balance, N concurrent votes (#28)", 
         const holdWindowBlocks = VOTE_EXPIRY_BUCKETS * BLOCKS_PER_BUCKET;
         const meetsGuard = async (wallet: string, bucket: number): Promise<boolean> => {
             const pinned = sampleBlock(bucket);
-            const now = await erc20Balance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: pinned } });
-            const then = await erc20Balance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: Math.max(0, pinned - holdWindowBlocks) } });
+            const now = await erc20Balance.evaluate({ options, wallet: { address: wallet, sampleBlock: pinned }, ctx: ctxAt(chain) });
+            const then = await erc20Balance.evaluate({
+                options,
+                wallet: { address: wallet, sampleBlock: Math.max(0, pinned - holdWindowBlocks) },
+                ctx: ctxAt(chain)
+            });
             return now.score > 0n && then.score > 0n;
         };
         // A held the balance for the whole window; B and C acquired it inside the window and fail

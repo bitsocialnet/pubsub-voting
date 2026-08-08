@@ -36,6 +36,10 @@ export * from "./rules/erc5192-min-balance.js";
 export * from "./rules/erc721-min-balance.js";
 export * from "./rules/constant.js";
 export * from "./rules/registry.js";
+// The cache a rule computes through (`ctx.cache`): a rule owns its keys and epochs, the library
+// owns the store, the bound and the purge. A custom chain-reading rule MUST memoize through it —
+// see rules/cache.ts and README "Custom rules".
+export { makeMemoryRuleCache, makePersistentRuleCache, type RuleCache } from "./rules/cache.js";
 
 // Implemented runtime: encoding, topic, errors, identity seam, facade.
 export * from "./encoding/canonical.js";

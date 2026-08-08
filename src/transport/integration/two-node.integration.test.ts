@@ -68,7 +68,10 @@ async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] =
         registry: builtinRegistry,
         chainFor: () =>
             ({
-                readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : passBalance)
+                readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : passBalance),
+                // The v1 gate declares a LIVE evaluation view, so the verifier reads the head to
+                // decide which block to score at (rules/types.ts, RuleEvaluation).
+                getBlockNumber: async () => BigInt(criteria.blocksPerBucket * 2 + 7)
             }) as unknown as ChainClient,
         bucketMath: makeBucketMath(criteria.blocksPerBucket),
         nameResolvers
@@ -115,23 +118,38 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
         expect(b.crdt.current(0)).toHaveLength(0);
     });
 
-    it("the REAL rule gate (soulbound ERC-5192 5chan Pass, balance 0) rejects a gossiped bundle: not forwarded, sender penalized", async () => {
+    it("the REAL rule gate (soulbound ERC-5192 5chan Pass, balance 0) drops a gossiped bundle: not forwarded, sender NOT penalized", async () => {
         const { a, b } = await connectedPair();
         // B runs the real pipeline (EIP-712 recover → constraints → erc5192-min-balance gate); the
-        // stubbed chain says the wallet holds no Pass, so step 3 rejects with the gate reason.
+        // stubbed chain says the wallet holds no Pass, so step 3 fails with the gate reason.
         const gated = await realVerifier(0n);
-        b.setVerifier((bundle) => gated.verify(bundle));
+        const verdicts: BundleVerdict[] = [];
+        b.setVerifier(async (bundle) => {
+            const verdict = await gated.verify(bundle);
+            verdicts.push(verdict);
+            return verdict;
+        });
 
-        await a.transport.publishBundle(encodeBundle(await passSignedBundle(10)));
+        const bytes = encodeBundle(await passSignedBundle(10));
+        const cid = await bundleCidForBytes(bytes);
+        await a.transport.publishBundle(bytes);
 
-        await waitFor(() => b.pubsub.getScore(a.peerId) < 0, 15_000, "B to penalize A for the gate-rejected bundle");
+        await waitFor(() => verdicts.length > 0, 15_000, "B to verify the gate-failing bundle");
+        expect(verdicts[0]).toMatchObject({ valid: false, disposition: "ignore", reason: expect.stringContaining("rule score is 0n") });
+        await delay(500); // let the gate's verdict reach gossipsub before the negative assertions
+
         expect(b.acceptedBundles).toHaveLength(0); // never delivered ⇒ never forwarded
         expect(b.crdt.current(0)).toHaveLength(0); // and never merged
+        // `ignore`, not `reject`: the v1 gate scores at the verifier's head (rules/types.ts,
+        // RuleEvaluation), and A's head may legitimately be ahead of B's — a wallet that acquired
+        // the Pass moments ago reads 0n here and >0n there. So the sender keeps its score and the
+        // verdict stays uncached, leaving the bundle re-evaluable once B's own view catches up.
+        expect(b.pubsub.getScore(a.peerId)).toBeGreaterThanOrEqual(0);
+        expect(b.cache.has(cid)).toBe(false);
 
-        // Positive control through the SAME real pipeline, in the clean direction (B→A, so the
-        // penalty above cannot interfere): with the Pass held, a fresh bundle (different block ⇒
-        // different CID, no cached verdict) verifies and merges — proving the rejection above was
-        // the rule gate, not the signature or constraints.
+        // Positive control through the SAME real pipeline, in the clean direction (B→A): with the
+        // Pass held, a fresh bundle (different block ⇒ different CID, no cached verdict) verifies
+        // and merges — proving the drop above was the rule gate, not the signature or constraints.
         const admitted = await realVerifier(1n);
         a.setVerifier((bundle) => admitted.verify(bundle));
         await b.transport.publishBundle(encodeBundle(await passSignedBundle(11)));

@@ -6,6 +6,7 @@ import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath } from "../chain/types.js";
 import type { BundleChecks } from "../verify/types.js";
 import { tickerForRef } from "../chain/ticker.js";
+import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
 import { UnknownRuleError } from "../errors.js";
 import type { Tally, ContestTally, CommunityTally } from "./types.js";
 
@@ -38,6 +39,15 @@ export interface TallyDeps {
      */
     current: () => Array<{ bundle: VotesBundle; checks: BundleChecks }>;
     /**
+     * This verifier's current head, handed to the weight rule as `ctx.head`. Never called by a
+     * weight rule that scores pinned historical state — including `constant`, which reads no
+     * chain at all — so the "an idle contest does zero chain reads" property is untouched.
+     * Defaults to the weight chain's own `getBlockNumber()`.
+     */
+    readHead?: (args: { chain: ChainClient }) => Promise<{ block: number }>;
+    /** The weight rule's memo, handed to it as `ctx.cache` (rules/cache.ts). */
+    ruleCache?: RuleCache;
+    /**
      * Hash of the current bucket boundary block on the criteria's chain, for the rolling tie
      * seed. Invoked at most once per `compute`, and only when a tie must actually be broken —
      * so a tie-free tally still does no extra read.
@@ -58,6 +68,7 @@ function compareBytes(x: Uint8Array, y: Uint8Array): number {
 
 export function makeTally(deps: TallyDeps): Tally {
     const { criteria, registry, chainFor, bucketMath, current, bucketBlockHash } = deps;
+    const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
 
     // Resolve the weight rule, its options, and its chain once (see verify/bundle.ts).
     const weight = registry[criteria.weight.type];
@@ -65,12 +76,20 @@ export function makeTally(deps: TallyDeps): Tally {
     const weightOptions = weight.optionsSchema.parse(criteria.weight);
     const weightChain = chainFor(tickerForRef(criteria, criteria.weight, weightOptions));
 
+    // The weight rule picks its own block exactly as the gate rule does (see rules/types.ts):
+    // it is handed the bundle's pinned sample block and this verifier's head, and reads whichever
+    // it needs. The tally never asks what kind of rule it is holding.
+    const weightCtx = {
+        chain: weightChain,
+        head: () => readHead({ chain: weightChain }),
+        cache: deps.ruleCache ?? makeMemoryRuleCache()
+    };
     const weightFor = async (wallet: string, blockNumber: number): Promise<bigint> => {
         const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(blockNumber));
         const { score } = await weight.evaluate({
             options: weightOptions,
-            walletAddress: wallet,
-            ctx: { chain: weightChain, blockNumber: sampleBlock }
+            wallet: { address: wallet, sampleBlock },
+            ctx: weightCtx
         });
         return score;
     };

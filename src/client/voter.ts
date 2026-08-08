@@ -42,9 +42,9 @@ import type { RuleRegistry } from "../rules/types.js";
 import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
+import { makePersistentRuleCache } from "../rules/cache.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
-import { makePersistentGateResultCache, purgeExpiredGateResults } from "../verify/gate-result-cache.js";
 import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
 import { makeStorage } from "../storage/node.js";
 import type { LruStorage, SnapshotStorage } from "../storage/types.js";
@@ -376,7 +376,7 @@ interface ResolvedDeps {
     /**
      * The voter's persisted gate results, shared across ALL contests (keys carry each
      * contest's rule hash, so two contests over one gate — a 5chan-style directory — share
-     * each other's reads; different rules cannot collide). See verify/gate-result-cache.ts.
+     * each other's reads; different rules cannot collide). See rules/cache.ts.
      */
     gateStore: LruStorage;
     /** The voter's persisted name resolutions, shared across all contests (pkc-js rule). */
@@ -994,14 +994,19 @@ class ContestEngine {
             isProvisional: (cid) => this.#isPending(cid)
         });
 
-        // One gate-result cache shared between the inline forward-gate verifier and the
-        // background chain verifier, so neither re-reads a (wallet, sampleBlock) the other
-        // settled — layered over the voter's persistent store, keyed under this contest's rule
-        // hash: the gate score is a pure function of (rule, chainId, wallet, sampleBlock), so
-        // hashing the canonical rule document + chainId is exactly the sharing boundary (two
-        // contests over one gate share reads; different gates cannot collide).
+        // The gate rule's memo (rules/cache.ts), shared between the inline forward-gate verifier
+        // and the background chain verifier so neither re-reads what the other settled — layered
+        // over the voter's persistent store and namespaced by the hash of the canonical rule
+        // reference + chainId. That hash is exactly the sharing boundary: two contests over one
+        // gate (a directory of boards on the same Pass) share each other's reads, while
+        // different gates, or one gate on different options, can never collide. What is stored
+        // under it, and for how long, is the rule's business, not the engine's.
         this.#ruleHash = sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.rule }));
-        const gateResultCache = makePersistentGateResultCache({ store: deps.gateStore, ruleHash: this.#ruleHash });
+        const gateCache = makePersistentRuleCache({ store: deps.gateStore, namespace: this.#ruleHash });
+        const weightCache = makePersistentRuleCache({
+            store: deps.gateStore,
+            namespace: sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.weight }))
+        });
         const verifier = makeBundleVerifier({
             criteria,
             criteriaCid: criteriaCidBytes,
@@ -1010,8 +1015,9 @@ class ContestEngine {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            gateResultCache,
-            nameResolutionCache: deps.nameResolutionCache
+            ruleCache: gateCache,
+            nameResolutionCache: deps.nameResolutionCache,
+            readHead: ({ chain }) => this.#readHead({ chain })
         });
         // The gate/transport are (re)built on join(); the store, crdt, caches, verifier, and
         // background verifier are stable per contest, so they survive re-joins of the topic.
@@ -1025,8 +1031,9 @@ class ContestEngine {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            gateResultCache,
+            ruleCache: gateCache,
             nameResolutionCache: deps.nameResolutionCache,
+            readHead: ({ chain }) => this.#readHead({ chain }),
             cache: this.#cache,
             onGateVerified: (cid) => this.#settleCheck(cid, "chainVerified"),
             onNameResolved: (cid) => this.#settleCheck(cid, "nameResolved"),
@@ -1040,6 +1047,8 @@ class ContestEngine {
             registry: deps.registry,
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
+            readHead: ({ chain }) => this.#readHead({ chain }),
+            ruleCache: weightCache,
             current: () =>
                 this.#crdt
                     .currentEntries(this.#currentBucketCache)
@@ -1187,36 +1196,29 @@ class ContestEngine {
         const head = await this.#deps.readHead(this.#ruleChain);
         this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
         this.#headReadMs = Date.now();
-        this.#maybePurgeGateResults();
         return this.#currentBucketCache;
     }
 
-    /** The last purge's expiry boundary (oldest admissible sample block); 0 = never purged. */
-    #purgedSampleBlock = 0;
-
     /**
-     * Drop this rule's persisted gate results older than the oldest admissible sample block —
-     * provably dead: a score at bucket B is only ever consulted while bundles from B are within
-     * `voteExpiryBuckets` of head (see verify/gate-result-cache.ts `purgeExpiredGateResults`).
-     * Piggybacks on the head reads the engine does anyway (join-with-state, publish, tally)
-     * and re-runs only when the boundary advances past the last purged one — so an idle
-     * engine costs no chain read and no purge, and a steady head costs no key scan, but a
-     * long-lived engine still sheds entries as they expire instead of leaving them to the
-     * LRU backstop. Fire-and-forget by design.
+     * The current head on `chain`, handed to every rule as `ctx.head` (verify/bundle.ts,
+     * verify/background.ts, tally/tally.ts all take this seam). It goes through the voter-wide
+     * {@link ResolvedDeps.readHead} coalescer for the same reason {@link #refreshBucket} does:
+     * a rule that scores current state puts this on the verify path, so a directory-wide gossip
+     * burst would otherwise fire one `eth_blockNumber` per contest per message instead of
+     * sharing one in-flight read per chain.
      */
-    #maybePurgeGateResults(): void {
-        const oldestBucket = this.#currentBucketCache - this.criteria.voteExpiryBuckets;
-        if (oldestBucket <= 0) return;
-        const oldestSampleBlock = this.#bucketMath.sampleBlockForBucket(oldestBucket);
-        if (oldestSampleBlock <= this.#purgedSampleBlock) return;
-        this.#purgedSampleBlock = oldestSampleBlock;
-        void purgeExpiredGateResults({
-            store: this.#deps.gateStore,
-            ruleHash: this.#ruleHash,
-            oldestSampleBlock
-        });
+    async #readHead(args: { chain: ChainClient }): Promise<{ block: number }> {
+        return { block: Number(await this.#deps.readHead(args.chain)) };
     }
 
+    /**
+     * PURGE REMOVED — kept as a note because the old behaviour was load-bearing and its
+     * replacement lives elsewhere. Persisted gate entries used to be purged here, at the oldest
+     * admissible bucket sample block, because the engine knew every entry was keyed by one. It
+     * no longer knows: a rule chooses its own keys and epochs (rules/cache.ts), so only the rule
+     * can say what is dead — `erc5192-min-balance` purges its head-keyed entries as the head
+     * window rolls, and its pinned entries stay valid until the store\'s LRU bound reclaims them.
+     */
     /** `Date.now()` of the last gating-chain head read, memoizing {@link #nowBucket}. */
     #headReadMs = 0;
 

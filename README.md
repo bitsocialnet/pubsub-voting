@@ -24,7 +24,7 @@ This library does not start its own node. It consumes the host's running Helia n
 
 - **Settings live in the topic.** `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. Two peers on the same topic provably ran identical rules, so the network validates itself with no intermediary.
 - **Votes are a state-based grow-only CRDT.** A signed `Votes` bundle is a standalone dag-cbor block (no parent links); each wallet gossips its own bundle **inline as a live delta**, validated straight from the message bytes — no fetch toward the publisher. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves. Cold start and gap-fill exchange a tiny **root record** (libp2p-fetch pull + a slow topic heartbeat) and pull the checkpoint blocks behind it via directed bitswap from its advertisers.
-- **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the soulbound-NFT path — an `erc5192-min-balance` gate `rule` (the 5chan Pass: `balanceOf` **plus** an on-chain assertion that the contract declares its tokens locked) and `constant` weight (1 pass = 1 vote). A gate on a *transferable* asset would let one Pass back several concurrent votes, so the plain `erc721-min-balance` rule ships unregistered; balance-derived (token-weighted) voting is deferred. See [DESIGN.md, Does one Pass mean one vote?](./DESIGN.md#does-one-pass-mean-one-vote) and [ROADMAP.md](./ROADMAP.md).
+- **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the soulbound-NFT path — an `erc5192-min-balance` gate `rule` (the 5chan Pass: `balanceOf` **plus** an on-chain assertion that the contract declares its tokens locked, read at the verifier's head so a freshly-acquired Pass votes immediately) and `constant` weight (1 pass = 1 vote). A gate on a *transferable* asset would let one Pass back several concurrent votes, so the plain `erc721-min-balance` rule ships unregistered; balance-derived (token-weighted) voting is deferred. See [DESIGN.md, Does one Pass mean one vote?](./DESIGN.md#does-one-pass-mean-one-vote) and [ROADMAP.md](./ROADMAP.md).
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
 
@@ -35,7 +35,7 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`), a `blockstore` (else `MissingBlockstoreError`), and a libp2p fetch service at `libp2p.services.fetch` (else `MissingFetchError`) |
-| `chains` | `ChainClientFactory` | yes | resolves each chain a contest's criteria requires (`{ chain, chainId }`) to a viem `PublicClient`; rules read through it for the gate and weight. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that serves historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head and carries a multicall3 deployment in its viem `chain` config; return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
+| `chains` | `ChainClientFactory` | yes | resolves each chain a contest's criteria requires (`{ chain, chainId }`) to a viem `PublicClient`; rules read through it for the gate and weight. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that carries a multicall3 deployment in its viem `chain` config and serves **historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head** (the v1 gate reads the head first, but falls back to the block a ballot names — see [Custom rules](#custom-rules)); return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 | `dataPath` | `string \| false` | no | directory for the voter's persistent state (gate-result + name-resolution caches, and each joined contest's **checkpoint snapshot** — its last fully-verified winner-set, reloaded at join so a restart with no other peer online keeps the tally), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-voting` (better-sqlite3 under `{dataPath}/lru-storage/` + `{dataPath}/checkpoints.db`); in the browser the path is ignored and everything lives in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC, and restores each contest's checkpoint before the cold-start pull. A seeder should always set a stable path |
@@ -196,13 +196,13 @@ Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a
 
 ### Custom rules
 
-The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema and is evaluated at the bundle's bucket block. Chain-reading rules get `ctx.chain` — the viem `PublicClient` for their `options.chain` — and write their own reads (`readContract`, `getBalance`, ...), pinning each call to the sampled block with `blockNumber: BigInt(ctx.blockNumber)`. There is **one kind**: `evaluate → { score: bigint }`, a non-negative score where `0n` means "does not qualify" (a result object, not a bare `bigint`, so slot-specific fields can be added later). The criteria has two *slots* drawing from the one registry — the **rule** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `rule.score > 0n ? weight.score : 0n`. A rule that needs a threshold returns `0n` below it (so `erc5192-min-balance`'s optional `min` gates), which lets the same rule serve either slot. A chain-reading rule may also implement the optional `evaluateMany({ options, walletAddresses, ctx })` batch hook (same argument object as `evaluate`, with `walletAddresses` in place of `walletAddress`, returning one `RuleResult` per input wallet in order) — its semantics MUST equal mapping `evaluate` — which the background verifier uses to batch a cold join's gate reads (`erc5192-min-balance` implements it over multicall3, hoisting its one lock assertion out of the per-wallet reads; see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification)).
+The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema, its own reads (`readContract`, `getBalance`, ... through `ctx.chain`, the viem `PublicClient` for its `options.chain`), which block it reads at, and what it memoizes — see [What a rule owns](#what-a-rule-owns-its-block-and-its-cache) below. There is **one kind**: `evaluate → { score: bigint }`, a non-negative score where `0n` means "does not qualify" (a result object, not a bare `bigint`, so slot-specific fields can be added later). The criteria has two *slots* drawing from the one registry — the **rule** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `rule.score > 0n ? weight.score : 0n`. A rule that needs a threshold returns `0n` below it (so `erc5192-min-balance`'s optional `min` gates), which lets the same rule serve either slot. A chain-reading rule may also implement the optional `evaluateMany({ options, wallets, ctx })` batch hook (`wallets` in place of `wallet`, returning `{ results }` — one per input wallet, in order) — its semantics MUST equal mapping `evaluate` — which the background verifier uses to batch a cold join's gate reads. The batch is simply everything pending, so its wallets need not share a `sampleBlock`: a rule reading the head scores them all at once, a rule reading pinned blocks groups them itself. (`erc5192-min-balance` implements it over multicall3, hoisting its one lock assertion out of the per-wallet reads; see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification).)
 
 Built-ins: `erc5192-min-balance` (v1) and `constant` (v1).
 
 Two chain-reading rules ship in the tree but are deliberately **not** built in, so a criteria naming either recuses via `UnknownRuleError` instead of silently gating on an asset that does not bound Sybils:
 
-- **`erc721-min-balance`** (exported) — a bare `balanceOf` on a *transferable* token. One token walked A → B → C inside one expiry window backs three concurrent live votes, since every bundle is verified at its own pinned block and the winner set is LWW-keyed per wallet. `erc5192-min-balance` is this rule plus `supportsInterface(0xb45a3c0e)`, which refuses a contract that does not declare its tokens locked.
+- **`erc721-min-balance`** (exported) — a bare `balanceOf` on a *transferable* token. One token walked A → B → C inside one expiry window backs three concurrent live votes, since each bundle is verified once, when it is merged, and the winner set is LWW-keyed per wallet. `erc5192-min-balance` is this rule plus `supportsInterface(0xb45a3c0e)`, which refuses a contract that does not declare its tokens locked.
 - **`erc20-balance`** (not exported) — the same amplification, reopened by fungibility, plus the open lazy-tally ceiling question for balance-derived weight.
 
 A host that wants a transferable gate anyway registers `erc721MinBalance` explicitly through the `rules` option below — the library stops blessing the configuration, it does not forbid it. `erc20-balance` is not exported at all, so a host that wants balance-weighting supplies its own rule of that `type`. See [DESIGN.md, Does one Pass mean one vote?](./DESIGN.md#does-one-pass-mean-one-vote).
@@ -216,8 +216,8 @@ import { z } from "zod";
 const seeditModAllowlist: Rule<{ type: "seedit-mod-allowlist"; allow: string[] }> = {
   type: "seedit-mod-allowlist",
   optionsSchema: z.object({ type: z.literal("seedit-mod-allowlist"), allow: z.array(z.string()) }),
-  async evaluate({ options, walletAddress }) {
-    return { score: options.allow.includes(walletAddress) ? 1n : 0n }; // gate: 1n admits, 0n rejects
+  async evaluate({ options, wallet }) {
+    return { score: options.allow.includes(wallet.address) ? 1n : 0n }; // gate: 1n admits, 0n rejects
   }
 };
 
@@ -228,6 +228,42 @@ const voter = new PubsubVoter({
 ```
 
 A custom `type` becomes part of `dag-cbor(criteria)`, so it is provably pinned to the topic it runs on, and a client that does not implement a `type` named in `criteria.requires.rules` throws `UnknownRuleError` and recuses itself rather than miscounting.
+
+#### What a rule owns: its block, and its cache
+
+A rule is handed the pinned block its ballot names, a lazy head reader, and its own memo, and decides for itself which to read and what to remember:
+
+```ts
+evaluate(args: { options: O; wallet: { address: string; sampleBlock: number }; ctx: ChainReadContext }): Promise<RuleResult>
+
+interface ChainReadContext {
+  chain: ChainClient;                        // the viem PublicClient for options.chain
+  head: () => Promise<{ block: number }>;    // this verifier's current block — lazy, coalesced
+  cache: RuleCache;                          // this rule's memo, persistent and shared across contests
+}
+```
+
+- **`wallet.sampleBlock`** is the bundle's bucketized block, already floored — the historical block every verifier agrees the ballot names. Read there and your score is identical on every verifier forever. It is *not* a claim about when the ballot was signed (it trails by up to `blocksPerBucket`).
+- **`ctx.head()`** is this verifier's current block. Read there and a wallet qualifies the moment it acquires the gating asset, instead of waiting for the next bucket boundary. Resolve it once per evaluation and pin your reads to that number — always pass an explicit `blockNumber: BigInt(...)`, or the read coalescer cannot batch you.
+- **`ctx.cache`** memoizes under a `key` you choose and an `epoch` that says when the answer stops being true (a moved epoch is how an entry expires; `purgeBelow` drops what is behind). **Chain-reading rules must use it** — it is what turns "one chain read per unique bundle" into "one read per key per epoch", so without it an ineligible wallet can make every peer on the topic pay an RPC round trip per fresh-signed bundle. `memoMany` reads only the misses, in one batched call.
+
+```ts
+const { values } = await ctx.cache.memoMany({
+  keys: wallets.map((w) => `bal/${w.toLowerCase()}`),
+  epoch: block,                                   // e.g. the pinned block, or a coarse head window
+  read: async ({ keys }) => ({ values: await readOnChain(keys) })
+});
+```
+
+`RuleResult` carries one field beyond the score:
+
+```ts
+interface RuleResult { score: bigint; penalize?: boolean }   // default true
+```
+
+**`penalize`** answers the one thing the library cannot: may a `0n` be blamed on the sender? `true` (the default) says every honest verifier computes this same `0n` — true of a read pinned to the block the bundle names — so the forward gate `reject`s the message (penalizing the delivering peer in gossipsub's scoring) and the verdict is cached as terminal. `false` says an honest peer could legitimately disagree, so the bundle is dropped `ignore`-class instead: no penalty, verdict uncached, and the background verifier re-examines it for a grace window before giving up.
+
+`erc5192-min-balance` reads the head first — so a freshly-acquired Pass counts immediately — falls back to `wallet.sampleBlock` when the head refuses (ERC-5192 does not forbid burning, and without the fallback a burn would erase votes retroactively for peers that had not verified them yet), memoizes each leg under its own epoch, and returns `penalize: false`, because at validation time it cannot attribute a `0n` to anyone: the peer that forwarded the vote verified it against *its* head. Every other rule in the tree reads `wallet.sampleBlock` and leaves `penalize` at its default — a transferable or fungible balance can decrease, so reading it at the head would silently invalidate votes already counted. See [DESIGN.md, What a rule owns](./DESIGN.md#what-a-rule-owns-and-what-the-pipeline-owns).
 
 ### Weighted voting (deferred)
 

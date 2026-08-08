@@ -22,11 +22,9 @@ import { makeVoteNode, makeBareNode, waitFor } from "./harness.js";
  *
  * The load-bearing step is stopping A before C joins: C is connected only to B, so every vote
  * C tallies can only have come from B's re-served checkpoint. The negative control pins the
- * other half of the contract: a bundle failing B's OWN chain gate is evicted by B's background
- * verifier and never reaches C, even though C's chain view would have accepted it — a relay
- * seeder serves what it verified, not what it was handed. (The pending-window serve gate —
- * unverified rows withheld — is unit-tested in client/voter.test.ts; racing it here would be
- * flaky by construction.)
+ * other half of the contract: a bundle failing B's OWN chain gate never becomes verified there,
+ * so it never reaches C even though C's chain view would have accepted it — a relay seeder
+ * serves what it verified, not what it was handed.
  *
  * Slow by design — excluded from `npm test`, run via `npm run test:integration`.
  */
@@ -158,13 +156,17 @@ describe("three-node relay (real PubsubVoter seeders)", () => {
     );
 
     it(
-        "a vote failing the relay seeder's chain gate is evicted there and never reaches the third joiner",
+        "a vote failing the relay seeder's chain gate is never served onward, so it does not reach the third joiner",
         async () => {
             const topic = await topicFor(bizCriteria());
             const a = await originSeeder(topic);
 
             // B's chain says the odd wallet holds no Pass: the background verifier confirms the
-            // other four and evicts the fifth, leaving KEY_B's row out of B's verified view.
+            // other four, while the fifth stays UNVERIFIED. Under the v1 gate's live evaluation
+            // view a `0n` reads as "not yet" and the bundle is held through a grace window before
+            // being dropped (rules/types.ts, RuleEvaluation) — but "never re-serve what you have
+            // not verified" bites immediately, so B withholds it from its checkpoint the whole
+            // time. That is the property this test is about, and it does not wait on the grace.
             const oddAddress = ODD_WALLET.address.toLowerCase();
             const b = await realVoterNode(topic, (wallet) => (wallet === oddAddress ? 0n : 1n));
             await b.libp2p.dial(a.libp2p.getMultiaddrs());
@@ -172,16 +174,16 @@ describe("three-node relay (real PubsubVoter seeders)", () => {
             await waitFor(
                 async () => {
                     const tally = await b.contest.getTally();
-                    return (
-                        tally.ranking.length === 1 &&
-                        tally.ranking[0]!.community.publicKey === KEY_A &&
-                        tally.ranking[0]!.weight === 4n &&
-                        tally.ranking[0]!.chainVerified
-                    );
+                    const good = tally.ranking.find((row) => row.community.publicKey === KEY_A);
+                    return good?.weight === 4n && good.chainVerified === true;
                 },
                 45_000,
-                "B to verify four votes and evict the gate-failing fifth"
+                "B to verify the four eligible votes"
             );
+            // The gate-failing vote is still in B's own tally, flagged unverified — held, not
+            // evicted, for the live gate's grace window.
+            const bTally = await b.contest.getTally();
+            expect(bTally.ranking.find((row) => row.community.publicKey === KEY_B)?.chainVerified).toBe(false);
 
             await a.stop();
 

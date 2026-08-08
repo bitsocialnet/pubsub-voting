@@ -3,10 +3,10 @@ import type { Criteria } from "../schema/criteria.js";
 import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
+import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
 import { UnknownRuleError } from "../errors.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
-import type { GateResultCache } from "./gate-result-cache.js";
 import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
 import type { BundleVerifier, BundleVerdict } from "./types.js";
 
@@ -17,8 +17,10 @@ import type { BundleVerifier, BundleVerdict } from "./types.js";
  *
  *   1. signature   (local, µs): recover the EIP-712 signer, must equal `bundle.address`.
  *   2. constraints (local, µs): `votes.length <= maxVotesPerAddress`, each vote in range.
- *   3. gate        (chain):     the `rule` scores the wallet `> 0n` at the bucket block.
- *                               `0n` -> not admitted -> drop.
+ *   3. gate        (chain):     the `rule` scores the wallet `> 0n`, at whichever block the rule
+ *                               itself reads (rules/types.ts). `0n` -> not admitted -> drop, as
+ *                               a `reject` when the rule blames the sender for it and an
+ *                               `ignore` when it does not.
  *   4. name        (network):   each vote's `community.name` (if any) must resolve to the
  *                               claimed `publicKey`; a squatted/absent name drops the bundle.
  *
@@ -47,13 +49,21 @@ export interface BundleVerifierDeps {
     /** Host-injected community-name resolvers (`PubsubVoterOptions.nameResolvers`). */
     nameResolvers: NameResolver[];
     /**
-     * Optional cache of gate results, keyed by `(wallet, sampleBlock)`. When present, a wallet's
-     * score at a bucket's sample block is read from chain at most once — a `0n` miss short-circuits
-     * a flood of fresh-signed bundles from an ineligible wallet, and a `> 0n` hit short-circuits an
-     * *eligible* wallet re-signing or cycling choices within a bucket. Both are deterministic,
-     * historical reads. Omitted ⇒ every novel bundle pays its own gate read (prior behaviour).
+     * This verifier's current head, handed to the rule as `ctx.head`. A rule scoring pinned
+     * historical state never calls it, so a pinned-only deployment does no head read at all.
+     * Defaults to a direct `getBlockNumber()` on the rule's own client; the voter injects its
+     * coalesced reader instead, so a directory-wide burst shares one read per chain (see
+     * client/voter.ts `makeHeadReader`).
      */
-    gateResultCache?: GateResultCache;
+    readHead?: (args: { chain: ChainClient }) => Promise<{ block: number }>;
+    /**
+     * The gate rule's memo (see rules/cache.ts), handed to it as `ctx.cache`. This is what keeps
+     * a wallet's gate read from repeating per bundle — an ineligible wallet minting fresh-signed
+     * bundles, or an eligible one cycling choices, costs one read per key per rule epoch rather
+     * than one per bundle. Defaults to a private in-memory cache (unit tests); the voter injects
+     * the persistent, contest-shared one.
+     */
+    ruleCache?: RuleCache;
     /**
      * Optional persistent cache of name resolutions (the pkc-js rule — see
      * verify/name-resolution-cache.ts). When present, a carried name is resolved live at most
@@ -64,16 +74,22 @@ export interface BundleVerifierDeps {
 }
 
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
-    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, gateResultCache, nameResolutionCache } =
-        deps;
+    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, nameResolutionCache } = deps;
 
-    // Resolve the gate `rule`, its options, and its chain client once. The rule reads at the
-    // bundle's bucket block, but which rule/chain to use is fixed by the criteria, so it need
-    // not be recomputed per bundle.
+    // Resolve the gate `rule`, its options and its chain client once: they are fixed by the
+    // criteria, so none of it is recomputed per bundle.
     const rule = registry[criteria.rule.type];
     if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
     const ruleOptions = rule.optionsSchema.parse(criteria.rule);
     const ruleChain = chainFor(tickerForRef(criteria, criteria.rule, ruleOptions));
+    const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
+    // The rule's whole world: its chain, this verifier's head (lazy — never read for a rule that
+    // does not want it), and its own memo. Which block it actually reads at is its business.
+    const ctx = {
+        chain: ruleChain,
+        head: () => readHead({ chain: ruleChain }),
+        cache: deps.ruleCache ?? makeMemoryRuleCache()
+    };
 
     // Stage 1, shared by `verify` and `verifyOffline`: signature + constraints, local and µs.
     const verifyOffline = async (bundle: VotesBundle) => {
@@ -91,23 +107,29 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             const offline = await verifyOffline(bundle);
             if (!offline.valid) return offline;
 
-            // 3. Gate (chain) — read the `rule` at the bucket's sample block. The score is a pure
-            //    function of a pinned historical block, so it is memoized per `(wallet, sampleBlock)`:
-            //    a cache hit short-circuits the chain read for a flood of fresh-signed bundles from
-            //    the same wallet, whether it is ineligible (`0n`, a `reject`) or eligible (`> 0n`,
-            //    re-signing / cycling choices within one bucket).
+            // 3. Gate (chain) — the rule scores this wallet, reading and memoizing however it
+            //    sees fit. The bundle's bucketized sample block is handed over as the pinned
+            //    block the ballot names; a rule scoring current state ignores it for `ctx.head`.
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
-            let score = await gateResultCache?.get(bundle.address, sampleBlock);
-            if (score === undefined) {
-                ({ score } = await rule.evaluate({
-                    options: ruleOptions,
-                    walletAddress: bundle.address,
-                    ctx: { chain: ruleChain, blockNumber: sampleBlock }
-                }));
-                gateResultCache?.set(bundle.address, sampleBlock, score);
-            }
+            const { score, penalize } = await rule.evaluate({
+                options: ruleOptions,
+                wallet: { address: bundle.address, sampleBlock },
+                ctx
+            });
             if (score === 0n) {
-                return { valid: false, disposition: "reject", reason: `not admitted: rule score is 0n at block ${sampleBlock}` };
+                // Disposition comes from the rule's own answer, never from the rule's identity.
+                // A `0n` the rule stands behind is identical on every honest verifier, so it is a
+                // `reject`: the sender is penalized and the verdict cached as terminal. A `0n` it
+                // will not blame anyone for — the rule read this verifier's head, where my view
+                // and yours legitimately differ — drops the bundle just the same but stays
+                // `ignore`-class: no penalty for a relayer that saw a fresher chain, and
+                // uncached, so it is re-judged rather than frozen (the same treatment community
+                // name resolution has always had, step 4 below).
+                return {
+                    valid: false,
+                    disposition: penalize === false ? "ignore" : "reject",
+                    reason: `not admitted: rule score is 0n`
+                };
             }
 
             // 4. Community-name resolution (network) — a carried name is a claim, verified against
