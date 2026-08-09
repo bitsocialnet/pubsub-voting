@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.2.1...v0.3.0) (2026-08-09)
+
+### ⚠ BREAKING CHANGES
+
+* **rules:** the `Rule` interface changed. `evaluate` takes
+`{ options, wallet: { address, sampleBlock }, ctx }` instead of
+`{ options, walletAddress, ctx }`; `evaluateMany` takes `{ wallets }` and
+returns `{ results }`; `ChainReadContext` is now `{ chain, head, cache }` with
+no `blockNumber`. A chain-reading custom rule must memoize through `ctx.cache`
+or it loses the read-amplification bound. `gate-result-cache.ts` is replaced by
+`rules/cache.ts`.
+
+### Features
+
+* **rules:** let a rule own its block and its cache, and gate on the head ([a43eecc](https://github.com/bitsocialnet/pubsub-voting/commit/a43eecce7c704a7dc57e8ce1c2f1b09a63612fa3))
+
+### Bug Fixes
+
+* **bench:** adapt the real-chain probe rule to evaluateMany's new shape ([a05b7d3](https://github.com/bitsocialnet/pubsub-voting/commit/a05b7d3475068034abe0032611b2f34006b3013a))
+* **client:** namespace the weight memo by the weight rule's own chain ([f68e8a8](https://github.com/bitsocialnet/pubsub-voting/commit/f68e8a8fff4b7139d7fdd527f9d5f934f39c74c7))
+* **rules:** call evaluateMany by name, not through `this` ([d6861ee](https://github.com/bitsocialnet/pubsub-voting/commit/d6861ee11c606fb70929ac7377c7f11bf61d8196)), closes [#29](https://github.com/bitsocialnet/pubsub-voting/issues/29)
+* **rules:** parallelize memoMany lookups; correct stale references ([8467f40](https://github.com/bitsocialnet/pubsub-voting/commit/8467f400d139f75272ec2b3dc63b31f2ef43b19e))
+
 ## [0.2.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.2.0...v0.2.1) (2026-08-07)
 
 ## [0.2.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.1.7...v0.2.0) (2026-08-07)
