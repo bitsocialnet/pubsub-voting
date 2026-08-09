@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { z } from "zod";
 import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
@@ -19,6 +20,8 @@ import {
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
+import type { Rule } from "../rules/types.js";
+import type { Criteria } from "../schema/criteria.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
     InvalidCommunityNameError,
@@ -2355,6 +2358,72 @@ describe("facade odds and ends", () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
         const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
         expect(vote.topic).toBe(await topicFor(bizCriteria()));
+        await voter.destroy();
+    });
+});
+
+describe("weight-rule cache namespacing", () => {
+    /**
+     * A weight rule that reads its score from the chain and memoizes it through `ctx.cache`,
+     * exactly as a real chain-reading rule must (rules/cache.ts). Its only job here is to be
+     * observably wrong if it is served another chain's memo.
+     */
+    const ChainWeightOptionsSchema = z.object({ type: z.literal("chain-weight"), chain: z.string() });
+    const chainWeight: Rule<z.infer<typeof ChainWeightOptionsSchema>> = {
+        type: "chain-weight",
+        optionsSchema: ChainWeightOptionsSchema,
+        async evaluate({ wallet, ctx }) {
+            const key = `w/${wallet.address}`;
+            const hit = await ctx.cache.get({ key, epoch: 1 });
+            if (hit.value !== undefined) return { score: BigInt(hit.value) };
+            const score = await ctx.chain.getBalance({
+                address: wallet.address as `0x${string}`,
+                blockNumber: BigInt(wallet.sampleBlock)
+            });
+            ctx.cache.set({ key, epoch: 1, value: score.toString() });
+            return { score };
+        }
+    };
+
+    /** Same gate ref and same weight ref; only the chain the weight ticker names differs. */
+    const criteriaWeighedOn = (govChainId: number): Criteria => ({
+        ...bizCriteria(),
+        weight: { type: "chain-weight", chain: "gov" },
+        requires: { rules: ["erc5192-min-balance", "chain-weight"], chains: { base: { chainId: 8453 }, gov: { chainId: govChainId } } }
+    });
+
+    /** The gate reads `readContract` on `base`; the weight reads `getBalance` on its own chain. */
+    const chainsByWeight = (weightByChainId: Record<number, bigint>): ChainClientFactory => {
+        return ({ chainId }) =>
+            ({
+                getBlockNumber: async () => 43200n,
+                getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+                getBalance: async () => weightByChainId[chainId] ?? 0n,
+                readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : 1n)
+            }) as unknown as ChainClient;
+    };
+
+    it("keys the weight memo by the WEIGHT chain, not the gate chain", async () => {
+        // Both contests share a gate on base/8453 and a byte-identical weight ref, so a namespace
+        // derived from the gate's chainId would be the same string for both — and the second
+        // contest would be served the first's score from a chain it never reads. A ticker is only
+        // a name local to a criteria document; what it binds to is what the memo must key on.
+        const voter = new PubsubVoter({
+            dataPath: false,
+            helia: fakeHelia(),
+            chains: chainsByWeight({ 1: 5n, 137: 9n }),
+            signer: fakeSigner(),
+            rules: { "chain-weight": chainWeight }
+        });
+
+        const onEth = criteriaWeighedOn(1);
+        const onPolygon = criteriaWeighedOn(137);
+        await (await voter.createContestVote({ criteria: onEth, votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: onPolygon, votes: VOTE })).publish();
+
+        // Same wallet, same weight ref, one shared gateStore — and still each contest's own chain.
+        expect((await (await voter.createContest({ criteria: onEth })).getTally()).ranking[0]?.weight).toBe(5n);
+        expect((await (await voter.createContest({ criteria: onPolygon })).getTally()).ranking[0]?.weight).toBe(9n);
         await voter.destroy();
     });
 });

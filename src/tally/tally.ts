@@ -79,6 +79,10 @@ export function makeTally(deps: TallyDeps): Tally {
     // The weight rule picks its own block exactly as the gate rule does (see rules/types.ts):
     // it is handed the bundle's pinned sample block and this verifier's head, and reads whichever
     // it needs. The tally never asks what kind of rule it is holding.
+    //
+    // `deps.ruleCache` MUST be namespaced by the weight rule's OWN chain, not the gating chain —
+    // `weightChain` here resolves through `criteria.weight`'s ticker, which may name a different
+    // entry of `requires.chains` (the voter derives it that way; see client/voter.ts).
     const weightCtx = {
         chain: weightChain,
         head: () => readHead({ chain: weightChain }),

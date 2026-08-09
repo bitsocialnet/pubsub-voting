@@ -18,9 +18,10 @@ import type { LruStorage } from "../storage/types.js";
  * The library still owns the mechanics, because they are not rule-specific and are easy to get
  * wrong: persistence under the voter's `dataPath`, the bounded in-memory front, and the
  * namespace. Every rule instance gets its own keyspace, namespaced by the rule's `type`, its
- * canonical options and the chain id — so two contests running the same gate share each other's
- * reads (a 5chan-style directory of 63 boards on one Pass is one read per wallet, not 63), while
- * two different gates, or the same gate on a different contract, can never collide.
+ * canonical options and the id of the chain IT reads (which for the weight rule need not be the
+ * gating chain) — so two contests running the same gate share each other's reads (a 5chan-style
+ * directory of 63 boards on one Pass is one read per wallet, not 63), while two different gates,
+ * or the same gate on a different contract or chain, can never collide.
  *
  * **Caching is not optional for a chain-reading rule.** It is what bounds the "one chain read per
  * unique bundle" amplifier: without it, an ineligible wallet can mint fresh-signed bundles and

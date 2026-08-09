@@ -1003,9 +1003,19 @@ class ContestEngine {
         // under it, and for how long, is the rule's business, not the engine's.
         this.#ruleHash = sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.rule }));
         const gateCache = makePersistentRuleCache({ store: deps.gateStore, namespace: this.#ruleHash });
+        // The weight rule gets its own namespace on the SAME terms — its canonical reference plus
+        // the id of the chain IT reads, which is not necessarily the gating chain. A ticker is
+        // just a name local to the criteria document, so two contests can spell the same weight
+        // ref while `requires.chains` binds that ticker to different chains; keying on the gate's
+        // chainId would let one serve the other's scores from the wrong chain.
+        const weight = deps.registry[criteria.weight.type];
+        if (!weight) throw new UnknownRuleError("weight", criteria.weight.type);
+        const weightTicker = tickerForRef(criteria, criteria.weight, weight.optionsSchema.parse(criteria.weight));
+        const weightChainId = criteria.requires.chains[weightTicker]?.chainId;
+        if (weightChainId === undefined) throw new Error(`no chain client for weight chain "${weightTicker}"`);
         const weightCache = makePersistentRuleCache({
             store: deps.gateStore,
-            namespace: sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.weight }))
+            namespace: sha256(encodeDagCbor({ chainId: weightChainId, rule: criteria.weight }))
         });
         const verifier = makeBundleVerifier({
             criteria,
