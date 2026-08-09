@@ -3,7 +3,7 @@ import { makeBackgroundVerifier, type BackgroundVerifierDeps } from "./backgroun
 import { makeMemoryRuleCache } from "../rules/cache.js";
 import { makeVerdictCache } from "./cache.js";
 import { Erc5192MinBalanceOptionsSchema } from "../rules/erc5192-min-balance.js";
-import type { Rule, RuleRegistry } from "../rules/types.js";
+import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bundleCid } from "../crdt/codec.js";
 import { bizCriteria } from "../test-fixtures.js";
@@ -54,7 +54,15 @@ function stubRule(
     // score at the verifier's head (like the v1 gate), otherwise at each ballot's pinned block.
     const blockFor = async (ctx: ChainReadContext, sampleBlock: number): Promise<number> =>
         opts.readHead ? (await ctx.head()).block : sampleBlock;
-    const result = (wallet: string) => ({ score: scoreFor(wallet), ...(opts.penalize === undefined ? {} : { penalize: opts.penalize }) });
+    const result = (wallet: string): RuleResult => {
+        const score = scoreFor(wallet);
+        if (score > 0n) return { success: true, score };
+        return {
+            success: false,
+            error: `stub gate: ${wallet} does not qualify`,
+            ...(opts.penalize === undefined ? {} : { penalize: opts.penalize })
+        };
+    };
     const rule: Rule = {
         type: "erc5192-min-balance",
         optionsSchema: Erc5192MinBalanceOptionsSchema,
@@ -197,7 +205,7 @@ describe("makeBackgroundVerifier", () => {
                         return { values: keys.map(() => "2") };
                     }
                 });
-                return { score: BigInt(values[0]!) };
+                return { success: true, score: BigInt(values[0]!) };
             }
         };
         const h = harness({ registry: { "erc5192-min-balance": rule } });
@@ -265,7 +273,7 @@ describe("makeBackgroundVerifier", () => {
                     failures--;
                     throw new Error("RPC down");
                 }
-                return { results: wallets.map(() => ({ score: 1n })) };
+                return { results: wallets.map((): RuleResult => ({ success: true, score: 1n })) };
             }
         };
         const h = harness({ registry: { "erc5192-min-balance": rule } });
@@ -313,7 +321,7 @@ describe("makeBackgroundVerifier", () => {
             optionsSchema: Erc5192MinBalanceOptionsSchema,
             async evaluate() {
                 if (failing) throw new Error("RPC down");
-                return { score: 1n };
+                return { success: true, score: 1n };
             }
         };
         const h = harness({ registry: { "erc5192-min-balance": rule } });

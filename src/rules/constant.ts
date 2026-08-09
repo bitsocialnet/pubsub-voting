@@ -18,6 +18,8 @@ export const constant: Rule<ConstantOptions> = {
     type: "constant",
     optionsSchema: ConstantOptionsSchema,
     async evaluate({ options }) {
-        return { score: BigInt(options.value) };
+        // `value` is schema-constrained positive, so this rule has no failing branch at all —
+        // in the rule slot it is the no-op gate that admits everyone.
+        return { success: true, score: BigInt(options.value) };
     }
 };

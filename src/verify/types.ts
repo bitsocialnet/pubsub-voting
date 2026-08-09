@@ -1,4 +1,5 @@
 import type { VotesBundle } from "../schema/votes.js";
+import type { RuleResult } from "../rules/types.js";
 
 /**
  * Verification interfaces, design only.
@@ -79,6 +80,16 @@ export interface BundleVerifier {
      * DESIGN.md "Background chain verification").
      */
     verifyOffline(bundle: VotesBundle): Promise<VerifyResult>;
+    /**
+     * Step 3 alone, for a wallet rather than a bundle: run the gate rule and hand back its raw
+     * {@link RuleResult}. Backs `Contest.checkEligibility`, so a client can ask "would this vote
+     * count?" through the very same rule instance, options, chain client, head reader and memo
+     * the forward gate uses — never a reimplementation of them.
+     *
+     * `sampleBlock` is the pinned block the prospective ballot would name (the caller's current
+     * bucket). A head-scoring rule ignores it exactly as it does during verification.
+     */
+    checkGate(args: { address: string; sampleBlock: number }): Promise<RuleResult>;
 }
 
 /**

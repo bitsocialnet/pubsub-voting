@@ -2,7 +2,7 @@ import { createPublicClient, decodeFunctionData, http, multicall3Abi } from "vie
 import { base } from "viem/chains";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import type { ChainClient, ChainClientFactory } from "../dist/chain/types.js";
-import type { Rule, RuleRegistry } from "../dist/rules/types.js";
+import type { Rule, RuleRegistry, RuleResult } from "../dist/rules/types.js";
 import { ERC5192_INTERFACE_ID, erc5192MinBalance, type Erc5192MinBalanceOptions } from "../dist/rules/erc5192-min-balance.js";
 import type { GatewayOp, GatewayRequest } from "./rpc-gateway.js";
 import type { VoteSigner } from "../dist/signer/types.js";
@@ -158,20 +158,22 @@ export function benchChains(): ChainClientFactory {
  * unconditionally (bench wallets are freshly generated and hold 0 of any real token, and the
  * real probe contract declares no lock; the read cost is the measurement, the verdict is not).
  */
+/** Keep a real score when the builtin admitted; otherwise admit anyway with a nominal `1n`. */
+const admit = (result: RuleResult): RuleResult => (result.success ? result : { success: true, score: 1n });
+
 export function benchRules(): RuleRegistry | undefined {
     if (!benchRpcUrl()) return undefined;
     const probe: Rule<Erc5192MinBalanceOptions> = {
         type: erc5192MinBalance.type,
         optionsSchema: erc5192MinBalance.optionsSchema,
-        // Only the score is overridden; everything else the builtin decided (notably
-        // `penalize`) is passed through, so the bench runs the real rule's semantics.
+        // The builtin does all the real reading; only its verdict is overridden, so the bench
+        // measures genuine chain work while the bench's empty wallets still get admitted.
         async evaluate(args) {
-            const result = await erc5192MinBalance.evaluate(args);
-            return { ...result, score: result.score > 0n ? result.score : 1n };
+            return admit(await erc5192MinBalance.evaluate(args));
         },
         async evaluateMany(args) {
             const { results } = await erc5192MinBalance.evaluateMany!(args);
-            return { results: results.map((result) => ({ ...result, score: result.score > 0n ? result.score : 1n })) };
+            return { results: results.map(admit) };
         }
     };
     return { [probe.type]: probe as Rule };

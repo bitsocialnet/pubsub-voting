@@ -1,7 +1,7 @@
 import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, getAddress } from "viem";
 import { z } from "zod";
 import { ChainTickerSchema } from "../schema/common.js";
-import { balanceOf, balancesOfBatched, canBatch, scoreOf } from "./nft-balance.js";
+import { balanceOf, balancesOfBatched, canBatch, scoreOf, shortfallError } from "./nft-balance.js";
 import type { ChainReadContext, Rule, RuleResult } from "./types.js";
 
 /**
@@ -99,6 +99,17 @@ const HEAD_EPOCH_BLOCKS = 30;
 const HEAD_PREFIX = "head/";
 const PINNED_PREFIX = "pin/";
 
+/**
+ * The voter-facing wording for every way this rule reaches `0n` ({@link RuleResult.error}).
+ *
+ * Deliberately generic and self-contained: the rule knows a contract address and a threshold, not
+ * that the deployment calls this token a "5chan Pass". A client renders these verbatim, which is
+ * the point — it then needs to know nothing about which block the rule read or what `min` is.
+ */
+const undeclaredError = (contract: string): string =>
+    `the gate contract ${contract} does not declare ERC-5192, so it gates nothing and no wallet can qualify ` +
+    `— this contest's criteria name a contract that is not soulbound`;
+
 /** One `supportsInterface(0xb45a3c0e)` at `block`. Revert/zero-data ⇒ "does not declare". */
 async function declaresErc5192(args: { contract: `0x${string}`; block: number; ctx: ChainReadContext }): Promise<{ declares: boolean }> {
     try {
@@ -134,9 +145,9 @@ async function scoreAt(args: {
     epoch: number;
     prefix: string;
     ctx: ChainReadContext;
-}): Promise<{ scores: bigint[] }> {
+}): Promise<{ scores: bigint[]; errors: Array<string | undefined> }> {
     const { contract, min, wallets, block, epoch, prefix, ctx } = args;
-    if (wallets.length === 0) return { scores: [] };
+    if (wallets.length === 0) return { scores: [], errors: [] };
 
     const [declared] = (
         await ctx.cache.memoMany({
@@ -150,7 +161,7 @@ async function scoreAt(args: {
     ).values;
     // A contract that does not claim its tokens are locked gates nothing: admit nobody rather
     // than gate on something transferable (see the rule doc above).
-    if (declared !== "1") return { scores: wallets.map(() => 0n) };
+    if (declared !== "1") return { scores: wallets.map(() => 0n), errors: wallets.map(() => undeclaredError(contract)) };
 
     const { values } = await ctx.cache.memoMany({
         keys: wallets.map((wallet) => `${prefix}bal/${wallet.toLowerCase()}`),
@@ -167,8 +178,24 @@ async function scoreAt(args: {
             return { values: balances.map((balance) => balance.toString()) };
         }
     });
-    return { scores: values.map((balance) => scoreOf(BigInt(balance), min)) };
+    const scores = values.map((balance) => scoreOf(BigInt(balance), min));
+    return {
+        scores,
+        errors: scores.map((score, i) => (score > 0n ? undefined : shortfallError(BigInt(values[i]!), min, contract)))
+    };
 }
+
+/** `{ success: true, score }` when the leg admitted, else the failing branch with its reason. */
+function resultOf(score: bigint, error: string | undefined): RuleResult {
+    // `penalize: false` on every failure: neither leg makes one attributable. The peer that
+    // forwarded a vote verified it against ITS head, and any peer ahead of us may legitimately
+    // see an acquisition we have not — and with burning possible, holding at neither block does
+    // not even prove the wallet never held.
+    return score > 0n ? { success: true, score } : { success: false, error: error ?? UNKNOWN_ERROR, penalize: false };
+}
+
+/** Unreachable: `scoreAt` pairs every non-positive score with a reason. Kept total, not thrown. */
+const UNKNOWN_ERROR = "this wallet does not qualify for this contest's gate";
 
 export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
     type: "erc5192-min-balance",
@@ -208,10 +235,15 @@ export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
      * head (a stale `0n` must not outlive {@link HEAD_EPOCH_BLOCKS}), while the pinned leg is a
      * historical read that is true forever and is keyed by the block itself.
      *
-     * **`penalize: false`** on every result: neither leg makes a `0n` attributable. The peer that
+     * **`penalize: false`** on every failure: neither leg makes one attributable. The peer that
      * forwarded a vote verified it against ITS head, and any peer ahead of us may legitimately
      * see an acquisition we have not — and with burning possible, not holding at either block
      * does not even prove the wallet never held.
+     *
+     * **Three distinct failures**, each with its own {@link RuleResult.error}: the contract does
+     * not declare ERC-5192 (so it gates nothing and no wallet can ever qualify), the wallet holds
+     * none, or it holds some but fewer than `min`. The fallback leg has the last word on a
+     * wallet's score, so it owns that wallet's reason too.
      */
     async evaluateMany({ options, wallets, ctx }) {
         const contract = getAddress(options.contract);
@@ -221,7 +253,7 @@ export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
         // Scoped to the head keys, so the permanently-valid pinned entries are left alone.
         ctx.cache.purgeBelow({ epoch, keyPrefix: HEAD_PREFIX });
 
-        const { scores } = await scoreAt({
+        const { scores, errors } = await scoreAt({
             contract,
             min: options.min,
             wallets: wallets.map((wallet) => wallet.address),
@@ -252,10 +284,14 @@ export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
                 });
                 indexes.forEach((at, i) => {
                     scores[at] = fallback.scores[i]!;
+                    // The fallback leg had the last word on the score, so it owns the reason too:
+                    // a wallet that holds none at the head but held some at its ballot's block is
+                    // admitted, and one that holds none at either gets the pinned leg's wording.
+                    errors[at] = fallback.errors[i];
                 });
             })
         );
 
-        return { results: scores.map((score) => ({ score, penalize: false })) };
+        return { results: scores.map((score, i) => resultOf(score, errors[i])) };
     }
 };

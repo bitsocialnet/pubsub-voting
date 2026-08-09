@@ -43,6 +43,7 @@ import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
 import { makePersistentRuleCache } from "../rules/cache.js";
+import { gateFailure, scoreOrZero } from "../rules/result.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
 import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
@@ -140,6 +141,22 @@ export interface PublishOutcome {
 }
 
 /** One contest's reactive read view: subscribe, keep the tally in sync, read it. */
+/**
+ * What {@link Contest.checkEligibility} found. Shaped like {@link RuleResult} on purpose — it is
+ * that result, surfaced — so the failing branch always carries a reason a client can display.
+ */
+export type EligibilityResult =
+    | {
+          eligible: true;
+          /** The wallet's gate score, `> 0n`. For a balance gate this is the holding itself. */
+          score: bigint;
+      }
+    | {
+          eligible: false;
+          /** The rule's own explanation, written for the voter. Render it verbatim. */
+          error: string;
+      };
+
 export interface Contest {
     /** The criteria document this contest runs (already validated). */
     readonly criteria: Criteria;
@@ -162,6 +179,29 @@ export interface Contest {
 
     /** Compute the current contest ranking fresh, bypassing the cache. */
     getTally(): Promise<ContestTally>;
+
+    /**
+     * Would this contest's gate admit `address` right now? Ask before signing, to tell a voter
+     * whether their ballot will count — and, when it will not, exactly why.
+     *
+     * This runs the contest's REAL gate rule through the same context the forward-gate and the
+     * background verifier use: the same chain client, the same coalesced head reader, the same
+     * memo. So it reads at whatever block the rule reads at, applies whatever threshold the rule
+     * applies, and returns the rule's own {@link RuleResult.error} wording verbatim. A client
+     * renders `error` and needs to know nothing about blocks, buckets or thresholds — which is
+     * the point: re-deriving any of that outside the rule is how a UI ends up confidently
+     * telling voters to wait for a window that no longer gates anything.
+     *
+     * It is a courtesy check, not a promise. Eligibility is a fact about the chain and can change
+     * between this call and the publish, and each peer verifies against its own view — so a
+     * `true` here can still be followed by a `VoteEvictedError` (which carries the same kind of
+     * reason). `publish()` deliberately does NOT call this: the gate is the network's decision,
+     * and refusing locally would only hide a vote the rest of the topic would have accepted.
+     *
+     * Costs one gate evaluation, usually served from the shared memo — the same read the verifier
+     * would do anyway, not an extra one.
+     */
+    checkEligibility(args: { address: string }): Promise<EligibilityResult>;
 
     /**
      * Fired when incoming votes change the state; `tally` carries the freshly recomputed
@@ -1252,6 +1292,22 @@ class ContestEngine {
         return sampleBucket <= (await this.#nowBucket());
     }
 
+    /**
+     * Run the gate rule for one wallet, against the ballot block a vote published NOW would carry
+     * — the engine half of {@link Contest.checkEligibility}.
+     *
+     * All the interesting decisions belong to the rule: this resolves the current bucket's sample
+     * block, hands it over, and translates the rule's own answer. It never looks at what kind of
+     * rule it is holding, so it stays correct for a head-scoring gate, a pinned one, or anything
+     * a host registers later.
+     */
+    async checkEligibility({ address }: { address: string }): Promise<EligibilityResult> {
+        const sampleBlock = this.#bucketMath.sampleBlockForBucket(await this.#nowBucket());
+        const result = await this.#verifier.checkGate({ address, sampleBlock });
+        const failed = gateFailure(result);
+        return failed ? { eligible: false, error: failed.error } : { eligible: true, score: scoreOrZero(result) };
+    }
+
     /** Hash of the current bucket boundary block on the gating (`rule`) chain (rolling tie seed). */
     async #bucketBlockHash(): Promise<Uint8Array> {
         const head = await this.#ruleChain.getBlockNumber();
@@ -2074,6 +2130,10 @@ class ContestView implements Contest {
 
     getTally(): Promise<ContestTally> {
         return this.#engine.computeTally();
+    }
+
+    checkEligibility(args: { address: string }): Promise<EligibilityResult> {
+        return this.#engine.checkEligibility(args);
     }
 
     /**

@@ -136,7 +136,12 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
         await a.transport.publishBundle(bytes);
 
         await waitFor(() => verdicts.length > 0, 15_000, "B to verify the gate-failing bundle");
-        expect(verdicts[0]).toMatchObject({ valid: false, disposition: "ignore", reason: expect.stringContaining("rule score is 0n") });
+        // The rule's own wording, carried through the real pipeline rather than a generic reason.
+        expect(verdicts[0]).toMatchObject({
+            valid: false,
+            disposition: "ignore",
+            reason: expect.stringContaining("holds none of the gate token")
+        });
         await delay(500); // let the gate's verdict reach gossipsub before the negative assertions
 
         expect(b.acceptedBundles).toHaveLength(0); // never delivered ⇒ never forwarded

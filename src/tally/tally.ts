@@ -7,6 +7,7 @@ import type { ChainClient, BucketMath } from "../chain/types.js";
 import type { BundleChecks } from "../verify/types.js";
 import { tickerForRef } from "../chain/ticker.js";
 import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
+import { scoreOrZero } from "../rules/result.js";
 import { UnknownRuleError } from "../errors.js";
 import type { Tally, ContestTally, CommunityTally } from "./types.js";
 
@@ -90,12 +91,15 @@ export function makeTally(deps: TallyDeps): Tally {
     };
     const weightFor = async (wallet: string, blockNumber: number): Promise<bigint> => {
         const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(blockNumber));
-        const { score } = await weight.evaluate({
-            options: weightOptions,
-            wallet: { address: wallet, sampleBlock },
-            ctx: weightCtx
-        });
-        return score;
+        // A weight rule that fails a wallet contributes nothing; it does NOT drop the vote —
+        // admission was the gate's decision, already made (see rules/result.ts).
+        return scoreOrZero(
+            await weight.evaluate({
+                options: weightOptions,
+                wallet: { address: wallet, sampleBlock },
+                ctx: weightCtx
+            })
+        );
     };
 
     /** The rolling tie seed for a community: sha256(bucketBlockHash ‖ publicKey bytes). */

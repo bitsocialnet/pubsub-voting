@@ -4,6 +4,7 @@ import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
 import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
+import { gateFailure, scoreOrZero } from "../rules/result.js";
 import { UnknownRuleError } from "../errors.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
@@ -17,10 +18,11 @@ import type { BundleVerifier, BundleVerdict } from "./types.js";
  *
  *   1. signature   (local, µs): recover the EIP-712 signer, must equal `bundle.address`.
  *   2. constraints (local, µs): `votes.length <= maxVotesPerAddress`, each vote in range.
- *   3. gate        (chain):     the `rule` scores the wallet `> 0n`, at whichever block the rule
- *                               itself reads (rules/types.ts). `0n` -> not admitted -> drop, as
- *                               a `reject` when the rule blames the sender for it and an
- *                               `ignore` when it does not.
+ *   3. gate        (chain):     the `rule` must return `success: true`, at whichever block the
+ *                               rule itself reads (rules/types.ts). A failure -> not admitted ->
+ *                               drop, as a `reject` when the rule blames the sender for it and an
+ *                               `ignore` when it does not, carrying the rule's own `error` text
+ *                               as the verdict reason so the voter is told what actually failed.
  *   4. name        (network):   each vote's `community.name` (if any) must resolve to the
  *                               claimed `publicKey`; a squatted/absent name drops the bundle.
  *
@@ -103,6 +105,10 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
 
     return {
         verifyOffline,
+        // The gate step on its own, against the SAME rule/options/ctx `verify` uses below — which
+        // is the entire value of exposing it: a caller asking "would this wallet's vote count?"
+        // can never drift from what the gate actually does.
+        checkGate: ({ address, sampleBlock }) => rule.evaluate({ options: ruleOptions, wallet: { address, sampleBlock }, ctx }),
         async verify(bundle: VotesBundle): Promise<BundleVerdict> {
             const offline = await verifyOffline(bundle);
             if (!offline.valid) return offline;
@@ -111,24 +117,29 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
             //    sees fit. The bundle's bucketized sample block is handed over as the pinned
             //    block the ballot names; a rule scoring current state ignores it for `ctx.head`.
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
-            const { score, penalize } = await rule.evaluate({
+            const gate = await rule.evaluate({
                 options: ruleOptions,
                 wallet: { address: bundle.address, sampleBlock },
                 ctx
             });
-            if (score === 0n) {
+            const gateFailed = gateFailure(gate);
+            if (gateFailed) {
                 // Disposition comes from the rule's own answer, never from the rule's identity.
-                // A `0n` the rule stands behind is identical on every honest verifier, so it is a
-                // `reject`: the sender is penalized and the verdict cached as terminal. A `0n` it
+                // A failure the rule stands behind is identical on every honest verifier, so it is
+                // a `reject`: the sender is penalized and the verdict cached as terminal. One it
                 // will not blame anyone for — the rule read this verifier's head, where my view
                 // and yours legitimately differ — drops the bundle just the same but stays
                 // `ignore`-class: no penalty for a relayer that saw a fresher chain, and
                 // uncached, so it is re-judged rather than frozen (the same treatment community
                 // name resolution has always had, step 4 below).
+                //
+                // The reason is the RULE's wording, verbatim: only it knows whether this wallet
+                // holds too few, holds none, or faces a contract that gates nothing, and that
+                // sentence is what reaches the voter through `VoteEvictedError`.
                 return {
                     valid: false,
-                    disposition: penalize === false ? "ignore" : "reject",
-                    reason: `not admitted: rule score is 0n`
+                    disposition: gateFailed.penalize ? "reject" : "ignore",
+                    reason: `not admitted: ${gateFailed.error}`
                 };
             }
 
@@ -162,7 +173,7 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
                 resolvedNames[name] = record.publicKey;
             }
 
-            return { valid: true, ruleScore: score, resolvedNames };
+            return { valid: true, ruleScore: scoreOrZero(gate), resolvedNames };
         }
     };
 }
