@@ -28,6 +28,10 @@ This library does not start its own node. It consumes the host's running Helia n
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
 
+## Research
+
+- [Token-gated ephemeral boards](./docs/research/token-gated-ephemeral-boards.md) explores an adjacent, ownerless discussion protocol derived from on-chain assets. It is research rather than part of this library's roadmap or wire format.
+
 ## Usage
 
 The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects its seams into a single `PubsubVoter`:
