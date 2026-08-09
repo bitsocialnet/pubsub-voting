@@ -33,7 +33,7 @@ Run it yourself: `BENCH_HOST=<ssh-host> npm run bench:cold-join` (see [run.mjs](
 
 ## Per-operation latency (seeder on a ~270 ms-RTT WAN host, cold joiner local, median of 5)
 
-**The table is the 2026-08-07 run** (the ERC-5192 gate); the dated notes under it are the
+**The table is the 2026-08-09 run** (the head-first gate); the dated notes under it are the
 re-measurement history, oldest first, and quote the numbers current *at their own date*.
 
 `N` is the number of **voters** (distinct wallets, one ballot each) in the contest's checkpoint. All
@@ -41,11 +41,11 @@ voters vote for one community, so the tally is one community of weight `N`.
 
 | N (voters) | router | connect | fetch | bitswap | verify+merge | gate-RPC | **START→TALLY** | **START→VERIFIED** |
 |-----------:|-------:|--------:|------:|--------:|-------------:|---------:|----------------:|-------------------:|
-| 1          | 1.00s  | 1.68s   | 0.60s | 0.00s   | 0.31s        | 2        | **2.64s**       | **2.94s**          |
-| 5          | 1.00s  | 1.66s   | 0.59s | 0.00s   | 0.32s        | 2        | **2.63s**       | **2.93s**          |
-| 10         | 1.00s  | 1.71s   | 0.62s | 0.00s   | 0.33s        | 2        | **2.72s**       | **3.02s**          |
-| 100        | 1.00s  | 1.73s   | 0.61s | 0.00s   | 0.47s        | 2        | **2.86s**       | **3.17s**          |
-| 1000       | 1.00s  | 1.69s   | 1.85s | 0.02s   | 2.18s        | 8        | **5.73s**       | **6.35s**          |
+| 1          | 1.00s  | 1.56s   | 0.49s | 0.00s   | 0.31s        | 3        | **2.42s**       | **3.02s**          |
+| 5          | 1.00s  | 1.59s   | 0.53s | 0.00s   | 0.32s        | 3        | **2.49s**       | **3.09s**          |
+| 10         | 1.00s  | 1.56s   | 0.51s | 0.00s   | 0.33s        | 3        | **2.45s**       | **3.05s**          |
+| 100        | 1.00s  | 1.56s   | 0.68s | 0.00s   | 0.48s        | 3        | **2.76s**       | **3.37s**          |
+| 1000       | 1.00s  | 1.56s   | 1.14s | 0.02s   | 2.05s        | 9        | **4.89s**       | **6.16s**          |
 | 10000†     | 1.00s  | 1.59s   | 1.98s | 9.17s   | 12.35s       | —        | **18.95s**      | —                  |
 
 *Historical — the first baseline of this rig. Measured 2026-07-12 (direct public dial, no SSH tunnel; **median of 5** — WAN jitter at this RTT is
@@ -101,6 +101,27 @@ answer — the payload moved from bitswap into fetch rather than getting cheaper
 `START→TALLY` improved ~0.3–0.5s (3.08s → 2.64s at N=1). Not bisected; only the read-count and
 chunk-boundary effects above are attributable to the gate change.*
 
+*Re-measured 2026-08-09 (median of 5, the table above) with the **head-first gate** — the rule reads
+the chain head first and falls back to the ballot's pinned block (DESIGN.md "What a rule owns, and what
+the pipeline owns"). The attributable cost is **one extra RPC round trip, entirely after render**:
+`gate-RPC` goes 2 → 3 at N ≤ 100 and 8 → 9 at N=1000, and the `START→VERIFIED` − `START→TALLY` gap
+doubles from **+0.30s to +0.60s** at N ≤ 100 (exactly two 270 ms charges instead of one). Inner `reads`
+is unchanged at **N+1** (2 / 6 / 11 / 101 / 1001), so this is a round trip, not extra reads.
+
+The extra trip is **not** the head read (`head` stays 1 at N ≤ 100, 3 at N=1000): it is `multicall`
+going 1 → 2, because the ERC-5192 lock probe is no longer folded into the same `aggregate3` as the
+balances. `scoreAt` awaits the probe before issuing the balance batch — its answer decides whether the
+balances are read at all — so the probe is still hoisted to one read per (contract, epoch) across a
+whole checkpoint's wallets, but it now costs its own round trip rather than riding along. Re-folding it
+(issue the probe concurrently and discard the balances if the contract does not declare) would return
+`gate-RPC` to 2 at N ≤ 100; not done here.
+
+`START→TALLY` improved at every N (2.64s → 2.42s at N=1, 5.73s → 4.89s at N=1000). That is **not
+attributable to this change** — nothing in it touches the pull path — and tracks a uniformly quieter
+network on the day: `connect` fell ~0.13s at every N (1.68s → 1.56s at N=1) and `fetch` at N=1000 fell
+1.85s → 1.14s (write→read 1.48s → 0.84s), which is also what pulls `START→VERIFIED` at N=1000 down
+(6.35s → 6.16s) despite the extra round trip.*
+
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
 gateway and background chain verification existed, hence no gate-RPC/VERIFIED values) — a realistic
@@ -154,16 +175,16 @@ multistream-select negotiation vs the request write→response read — to find 
 
 | N (voters) | fetch | negotiate (mss) | write→read |
 |-----------:|------:|----------------:|-----------:|
-| 1          | 0.60s | 0.37s           | 0.22s      |
-| 5          | 0.59s | 0.38s           | 0.21s      |
-| 10         | 0.62s | 0.39s           | 0.25s      |
-| 100        | 0.61s | 0.38s           | 0.22s      |
-| 1000       | 1.85s | 0.39s           | 1.48s      |
+| 1          | 0.49s | 0.31s           | 0.18s      |
+| 5          | 0.53s | 0.32s           | 0.18s      |
+| 10         | 0.51s | 0.33s           | 0.18s      |
+| 100        | 0.68s | 0.32s           | 0.37s      |
+| 1000       | 1.14s | 0.31s           | 0.84s      |
 
-**At N ≤ 100 the multistream-select negotiation (~0.4 s, ~1–2 RTT) dominates the fetch, not the
+**At N ≤ 100 the multistream-select negotiation (~0.3 s, ~1–2 RTT) dominates the fetch, not the
 actual request/response (~0.2 s, ~1 RTT).** (At N=1000 it no longer does — the bulk answer now
-carries the checkpoint blocks inline, so write→read is payload-bound at ~1.5 s while negotiation
-stays flat at ~0.4 s. The negotiation cost below is the *flat* term, and it is what dominates every
+carries the checkpoint blocks inline, so write→read is payload-bound at ~0.8 s while negotiation
+stays flat at ~0.3 s. The negotiation cost below is the *flat* term, and it is what dominates every
 small contest.) This is the `mss.select` handshake `connection.newStream` runs
 before the fetch stream is usable. libp2p exposes an optimistic 0-RTT path (`newStream({
 negotiateFully: false })`) that would cut ~1 RTT here, but it is a **no-op in the host's pinned stack**
@@ -187,28 +208,29 @@ host muxer/libp2p upgrade and is tracked as deferred pkc-js work (DESIGN.md, "De
 
 ### Reading the numbers
 
-- **Cold join renders in ~3.0–3.4 s for a small contest and ~5.5 s at 1000 voters** over a real
-  intercontinental link, and **chain-verifies one RPC round trip later (~+0.3 s at N ≤ 100, +0 s at
+- **Cold join renders in ~2.4–2.8 s for a small contest and ~4.9 s at 1000 voters** over a real
+  intercontinental link, and **chain-verifies two RPC round trips later (~+0.6 s at N ≤ 100, +1.3 s at
   N=1000)**. Small-`N` joins are network-bound and flat; at 1000 the per-voter offline verify work
   starts to dominate.
-- **The gate reads never gate the render.** `gate-RPC` grows with distinct wallets (2 round trips at
-  N ≤ 10, 5 at N=100, 38 at N=1000 — viem chunks one logical multicall into parallel ~1 KB `aggregate3`
-  posts) but runs in the background; unbatched-and-serial the N=1000 reads alone would be ~270 s.
+- **The gate reads never gate the render.** `gate-RPC` grows with distinct wallets (3 round trips at
+  N ≤ 100 — one head read plus the lock probe and the balance `aggregate3` — and 9 at N=1000, where
+  1001 reads are 6 chunks of ≤200) but runs in the background; unbatched-and-serial the N=1000 reads
+  alone would be ~270 s.
 - **The router is not the bottleneck** — a fixed 1 s, paid once. The remaining cost is RTT-bound
-  steps: the connection **handshake (~1.6 s)**, the root-record **fetch (~0.4–0.6 s)**, and **bitswap
-  (~0.6–1.0 s, one block round-trip)**. WAN jitter is real at this RTT — individual repeats still
-  spike (a single N=1 fetch hit 1.5 s), which is why this baseline takes the median of 5.
-- **bitswap is one round-trip, not two** (the chunk-index piggyback), so it is no longer the
-  dominant small-contest lever. The remaining avoidable network cost is the **fetch's
-  multistream-select negotiation** (~1–2 RTT of its ~0.4–0.6 s — see the sub-phase table), but removing
-  it needs a host muxer/libp2p change, not a library change.
+  steps: the connection **handshake (~1.6 s)** and the root-record **fetch (~0.5–1.1 s)**. WAN jitter
+  is real at this RTT — individual repeats still spike (a single N=5 join hit 5.45 s against a 2.49 s
+  median), which is why this baseline takes the median of 5.
+- **bitswap is 0.00 s at N ≤ 100** — the bulk fetch answer carries the checkpoint blocks inline, so
+  the payload moved into `fetch` rather than costing a separate round trip. The remaining avoidable
+  network cost is the **fetch's multistream-select negotiation** (~1–2 RTT, a flat ~0.3 s — see the
+  sub-phase table), but removing it needs a host muxer/libp2p change, not a library change.
 - **verify+merge scales with `N`** as expected (~0.3 s flat floor → ~2.1 s at 1000: signature
   recoveries plus decode/merge, all offline) and is the dominant term only at 1000.
 
 ## For contrast
 
 - **Loopback floor (~0 ms RTT):** the same cold join runs in **~1.1 s** (dominated by the simulated
-  1 s router latency). The ~3.0–5.5 s WAN figure is almost entirely round-trip cost — exactly what
+  1 s router latency). The ~2.4–4.9 s WAN figure is almost entirely round-trip cost — exactly what
   loopback would have hidden.
 - **Instant-fake chain, inline chase verification (superseded, the previous baseline):** gate reads
   cost ~0 ms and ran inline in the chase, so `START→TALLY` (3.6–4.1 s small-N, 5.6 s at N=1000) was
