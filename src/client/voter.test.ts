@@ -594,7 +594,8 @@ describe("Contest read view + tally", () => {
         await vi.waitFor(() => expect(voteErrors.length).toBeGreaterThan(0));
         const error = voteErrors[0] as VoteEvictedError;
         expect(error).toBeInstanceOf(VoteEvictedError);
-        expect(error.verdict.reason).toContain("rule score is 0n");
+        // The rule's own wording reaches the publisher verbatim — not a generic "score is 0n".
+        expect(error.verdict.reason).toContain("holds none of the gate token");
         expect(error.bundle).toBe(vote.bundle); // names the exact publish that was evicted
         expect(vote.publishingState).toBe("failed"); // flipped post hoc
         // The same error reaches a long-lived contest view, and the tally recounted without it.
@@ -2362,6 +2363,77 @@ describe("facade odds and ends", () => {
     });
 });
 
+describe("Contest.checkEligibility", () => {
+    const WALLET = "0x000000000000000000000000000000000000aaaa";
+
+    it("reports the gate score for a wallet the REAL rule admits", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 3n }), signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        expect(await contest.checkEligibility({ address: WALLET })).toEqual({ eligible: true, score: 3n });
+        await voter.destroy();
+    });
+
+    it("returns the RULE's own reason when it refuses — no block or bucket wording", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const result = await contest.checkEligibility({ address: WALLET });
+
+        expect(result.eligible).toBe(false);
+        const { error } = result as { error: string };
+        // Verbatim from erc5192-min-balance, so a client renders it without knowing the rule.
+        expect(error).toContain("holds none of the gate token");
+        // The whole point of moving this into the library: a caller can no longer be tempted to
+        // parse blocks out of it, and nothing here invites them to wait for a "voting window".
+        expect(error).not.toMatch(/block|window|bucket/i);
+        await voter.destroy();
+    });
+
+    it("goes through the SAME rule instance the verifier uses, so it shares the gate memo", async () => {
+        // One read for the check, and the publish that follows re-uses it rather than paying
+        // again — the check is the verifier's read, not an extra one.
+        let balanceReads = 0;
+        const chains: ChainClientFactory = () =>
+            ({
+                getBlockNumber: async () => 43200n,
+                getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+                readContract: async ({ functionName }: { functionName?: string } = {}) => {
+                    if (functionName === "supportsInterface") return true;
+                    balanceReads += 1;
+                    return 1n;
+                }
+            }) as unknown as ChainClient;
+
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        expect(await contest.checkEligibility({ address: WALLET })).toMatchObject({ eligible: true });
+        expect(balanceReads).toBe(1);
+        expect(await contest.checkEligibility({ address: WALLET })).toMatchObject({ eligible: true });
+        expect(balanceReads).toBe(1); // served from the rule's own memo
+        await voter.destroy();
+    });
+
+    it("admits a wallet holding at the head but NOT at the current bucket's block", async () => {
+        // The regression this whole surface exists for: a Pass acquired mid-window. The head leg
+        // admits, so the answer must be `eligible` — the pre-0.3.0 answer was "not yet, wait an
+        // hour", which the hand-rolled client check kept saying long after it stopped being true.
+        const bucketBlock = 43200;
+        const chains: ChainClientFactory = () =>
+            ({
+                getBlockNumber: async () => BigInt(bucketBlock + 700),
+                getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+                readContract: async ({ functionName, blockNumber }: { functionName?: string; blockNumber?: bigint } = {}) => {
+                    if (functionName === "supportsInterface") return true;
+                    return blockNumber !== undefined && blockNumber <= BigInt(bucketBlock) ? 0n : 1n;
+                }
+            }) as unknown as ChainClient;
+
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        expect(await contest.checkEligibility({ address: WALLET })).toEqual({ eligible: true, score: 1n });
+        await voter.destroy();
+    });
+});
+
 describe("weight-rule cache namespacing", () => {
     /**
      * A weight rule that reads its score from the chain and memoizes it through `ctx.cache`,
@@ -2375,13 +2447,13 @@ describe("weight-rule cache namespacing", () => {
         async evaluate({ wallet, ctx }) {
             const key = `w/${wallet.address}`;
             const hit = await ctx.cache.get({ key, epoch: 1 });
-            if (hit.value !== undefined) return { score: BigInt(hit.value) };
+            if (hit.value !== undefined) return { success: true, score: BigInt(hit.value) };
             const score = await ctx.chain.getBalance({
                 address: wallet.address as `0x${string}`,
                 blockNumber: BigInt(wallet.sampleBlock)
             });
             ctx.cache.set({ key, epoch: 1, value: score.toString() });
-            return { score };
+            return { success: true, score };
         }
     };
 

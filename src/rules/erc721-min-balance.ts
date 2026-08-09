@@ -1,7 +1,7 @@
 import { getAddress } from "viem";
 import { z } from "zod";
 import { ChainTickerSchema } from "../schema/common.js";
-import { balanceOf, balancesOfBatched, canBatch, scoreOf } from "./nft-balance.js";
+import { balanceOf, balancesOfBatched, canBatch, scoreOf, shortfallError } from "./nft-balance.js";
 import type { Rule, RuleResult } from "./types.js";
 
 /**
@@ -34,6 +34,16 @@ export const Erc721MinBalanceOptionsSchema = z.object({
 
 export type Erc721MinBalanceOptions = z.infer<typeof Erc721MinBalanceOptionsSchema>;
 
+/**
+ * One pinned-block balance as a {@link RuleResult}. `penalize` is left at its default `true`:
+ * this rule reads the block the bundle itself names, so every honest verifier computes the same
+ * answer forever and a failure IS attributable to whoever sent it.
+ */
+function pinnedResult(balance: bigint, min: number, contract: string): RuleResult {
+    const score = scoreOf(balance, min);
+    return score > 0n ? { success: true, score } : { success: false, error: shortfallError(balance, min, contract) };
+}
+
 export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
     type: "erc721-min-balance",
     optionsSchema: Erc721MinBalanceOptionsSchema,
@@ -51,7 +61,7 @@ export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
             block: wallet.sampleBlock,
             ctx
         });
-        return { score: scoreOf(balance, options.min) };
+        return pinnedResult(balance, options.min, getAddress(options.contract));
     },
     async evaluateMany({ options, wallets, ctx }) {
         const contract = getAddress(options.contract);
@@ -60,7 +70,7 @@ export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
         // a group it is multicall3 `aggregate3` batching (chunking policy in nft-balance.ts) —
         // the path the background chain verifier rides on a cold join; a client that cannot
         // batch takes the per-wallet fallback.
-        const scores = new Array<bigint>(wallets.length);
+        const results = new Array<RuleResult | undefined>(wallets.length);
         const byBlock = new Map<number, number[]>();
         wallets.forEach((wallet, i) => byBlock.set(wallet.sampleBlock, [...(byBlock.get(wallet.sampleBlock) ?? []), i]));
         await Promise.all(
@@ -74,10 +84,10 @@ export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
                           )
                       };
                 indexes.forEach((at, i) => {
-                    scores[at] = scoreOf(balances[i]!, options.min);
+                    results[at] = pinnedResult(balances[i]!, options.min, contract);
                 });
             })
         );
-        return { results: scores.map((score): RuleResult => ({ score })) };
+        return { results: results.map((result) => result!) };
     }
 };

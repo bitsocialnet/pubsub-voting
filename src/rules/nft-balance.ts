@@ -34,6 +34,20 @@ export function scoreOf(balance: bigint, min: number): bigint {
 }
 
 /**
+ * The voter-facing wording for a token-count shortfall ({@link RuleResult.error}), shared by
+ * every balance-scored rule so they explain themselves identically.
+ *
+ * Deliberately generic: a rule knows a contract address and a threshold, not that the deployment
+ * calls this token a "5chan Pass". A client renders it verbatim, which is the point — it then
+ * needs to know nothing about which block the rule read or what `min` is.
+ */
+export function shortfallError(balance: bigint, min: number, contract: string): string {
+    return balance === 0n
+        ? `this wallet holds none of the gate token (${contract})`
+        : `this wallet holds ${balance} of the gate token (${contract}), but ${min} are required`;
+}
+
+/**
  * True when the client can run multicall3 `aggregate3` batches — it needs both the action and
  * its chain's multicall3 deployment. A client built without a `chain` (or on a chain without
  * multicall3) takes the per-wallet path instead.

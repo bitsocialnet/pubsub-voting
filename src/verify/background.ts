@@ -6,6 +6,7 @@ import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import { tickerForRef } from "../chain/ticker.js";
 import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
 import { GATE_GRACE_MS, GATE_RETRY_MS } from "./gate-grace.js";
+import { gateFailure, scoreOrZero } from "../rules/result.js";
 import { UnknownRuleError } from "../errors.js";
 import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
 import type { VerdictCache } from "./cache.js";
@@ -123,11 +124,14 @@ interface QueueItem extends PendingBundle {
     gateNotified: boolean;
     ruleScore: bigint;
     resolvedNames: Record<string, string>;
-    /** The rule's verdict on whether its `0n` may be blamed on the sender (RuleResult.penalize). */
-    gatePenalize: boolean;
+    /**
+     * The rule's failure for this wallet, or `undefined` once it passed the gate — the rule's own
+     * `error` wording plus whether it may be blamed on the sender (rules/result.ts).
+     */
+    gateFailed: { error: string; penalize: boolean } | undefined;
     /**
      * `Date.now()` when this item was first enqueued — the clock for the grace window (see
-     * verify/gate-grace.ts). Only read when a gate scores `0n` and blames nobody for it.
+     * verify/gate-grace.ts). Only read when the gate fails and blames nobody for it.
      */
     queuedAt: number;
 }
@@ -210,8 +214,8 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         for (const item of pending) {
             const key = `${item.bundle.address.toLowerCase()}:${sampleBlockFor(item.bundle)}`;
             const result = results[at.get(key)!]!;
-            item.ruleScore = result.score;
-            item.gatePenalize = result.penalize !== false;
+            item.gateFailed = gateFailure(result);
+            item.ruleScore = scoreOrZero(result);
             item.gateDone = true;
         }
     }
@@ -280,13 +284,13 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 requeue.push(item); // gate read never happened (infra) — retry the whole item
                 continue;
             }
-            if (item.ruleScore === 0n) {
-                if (item.gatePenalize) {
+            if (item.gateFailed) {
+                if (item.gateFailed.penalize) {
                     // Provable, deterministic reject — safe to cache so a re-publish short-circuits.
                     const verdict: VerifyFail = {
                         valid: false,
                         disposition: "reject",
-                        reason: `not admitted: rule score is 0n`
+                        reason: `not admitted: ${item.gateFailed.error}`
                     };
                     cache.set(item.cid, verdict);
                     deps.onEvict(item.cid, verdict);
@@ -294,7 +298,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                     continue;
                 }
                 // The rule declined to blame anyone (see rules/types.ts, RuleResult.penalize):
-                // `0n` means "not yet", not "no". The wallet may have acquired the gate asset in
+                // the failure means "not yet", not "no". The wallet may have acquired the asset in
                 // a block this verifier has not seen, or may acquire it a moment from now — a
                 // client that signs the instant it mints races its own transaction. Evicting here
                 // would make whether a vote counts depend on whose RPC was a few blocks ahead, so
@@ -310,7 +314,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 const verdict: VerifyFail = {
                     valid: false,
                     disposition: "ignore",
-                    reason: `not admitted: rule score is 0n, and still 0n after the grace window`
+                    reason: `not admitted: ${item.gateFailed.error} (still true after the grace window)`
                 };
                 deps.onEvict(item.cid, verdict);
                 settle(item);
@@ -393,7 +397,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                     gateDone: false,
                     gateNotified: false,
                     ruleScore: 0n,
-                    gatePenalize: true,
+                    gateFailed: undefined,
                     resolvedNames: {},
                     queuedAt: Date.now()
                 });

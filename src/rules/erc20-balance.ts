@@ -1,4 +1,4 @@
-import { erc20Abi, getAddress, parseUnits } from "viem";
+import { erc20Abi, formatUnits, getAddress, parseUnits } from "viem";
 import { z } from "zod";
 import { ChainTickerSchema } from "../schema/common.js";
 import type { Rule } from "./types.js";
@@ -55,6 +55,12 @@ export const erc20Balance: Rule<Erc20BalanceOptions> = {
             blockNumber: BigInt(wallet.sampleBlock)
         });
         const minUnits = parseUnits(options.min.toString(), options.decimals);
-        return { score: raw >= minUnits ? raw : 0n };
+        if (raw >= minUnits) return { success: true, score: raw };
+        return {
+            success: false,
+            error:
+                `this wallet holds ${formatUnits(raw, options.decimals)} of the gate token ` +
+                `(${getAddress(options.contract)}), but ${options.min} is required`
+        };
     }
 };

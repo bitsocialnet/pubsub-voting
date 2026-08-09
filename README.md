@@ -87,6 +87,31 @@ await contest.update();                                   // join the topic, col
 // await contest.stop();                                  // leave the topic
 ```
 
+### Will this wallet's vote count?
+
+Ask the contest before signing. `checkEligibility` runs the contest's **real gate rule** through
+the same chain client, head reader and memo the forward gate uses, so it reads at whatever block
+that rule reads at and applies whatever threshold it applies. When it refuses, the `error` is the
+rule's own wording — render it verbatim:
+
+```ts
+const check = await contest.checkEligibility({ address: wallet });
+if (check.eligible) {
+    show(`eligible — holds ${check.score}`);
+} else {
+    show(check.error);   // e.g. "this wallet holds none of the gate token (0x13d4…91b9)"
+}
+```
+
+Do **not** reimplement this by reading balances yourself: which block counts is the rule's
+business and changes when the rule changes. A client that hard-codes "peers verify at the bucket
+boundary" keeps telling voters to wait for a window that a head-reading gate no longer imposes.
+
+It is a courtesy check, not a promise — eligibility can change between the check and the publish,
+and each peer verifies against its own chain view. `publish()` deliberately does not call it: the
+gate is the network's decision, and a rejection still surfaces after the fact as
+`VoteEvictedError`, carrying the same kind of reason.
+
 Each ranking row carries one flag **per deferred verification operation** (mirroring pkc-js's
 `nameResolved`), and every background settlement re-fires `update` — so a leaderboard can render
 provisional rows immediately and refine them in place:
@@ -196,7 +221,7 @@ Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a
 
 ### Custom rules
 
-The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema, its own reads (`readContract`, `getBalance`, ... through `ctx.chain`, the viem `PublicClient` for its `options.chain`), which block it reads at, and what it memoizes — see [What a rule owns](#what-a-rule-owns-its-block-and-its-cache) below. There is **one kind**: `evaluate → { score: bigint }`, a non-negative score where `0n` means "does not qualify" (a result object, not a bare `bigint`, so slot-specific fields can be added later). The criteria has two *slots* drawing from the one registry — the **rule** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `rule.score > 0n ? weight.score : 0n`. A rule that needs a threshold returns `0n` below it (so `erc5192-min-balance`'s optional `min` gates), which lets the same rule serve either slot. A chain-reading rule may also implement the optional `evaluateMany({ options, wallets, ctx })` batch hook (`wallets` in place of `wallet`, returning `{ results }` — one per input wallet, in order) — its semantics MUST equal mapping `evaluate` — which the background verifier uses to batch a cold join's gate reads. The batch is simply everything pending, so its wallets need not share a `sampleBlock`: a rule reading the head scores them all at once, a rule reading pinned blocks groups them itself. (`erc5192-min-balance` implements it over multicall3, hoisting its one lock assertion out of the per-wallet reads; see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification).)
+The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema, its own reads (`readContract`, `getBalance`, ... through `ctx.chain`, the viem `PublicClient` for its `options.chain`), which block it reads at, and what it memoizes — see [What a rule owns](#what-a-rule-owns-its-block-and-its-cache) below. There is **one kind**: `evaluate → RuleResult`, either `{ success: true, score }` with a positive score or `{ success: false, error }` — where `error` is the voter-facing reason the rule refused. The criteria has two *slots* drawing from the one registry — the **rule** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `rule.success ? weight.score : 0n`. A rule that needs a threshold fails below it (so `erc5192-min-balance`'s optional `min` gates), which lets the same rule serve either slot. A chain-reading rule may also implement the optional `evaluateMany({ options, wallets, ctx })` batch hook (`wallets` in place of `wallet`, returning `{ results }` — one per input wallet, in order) — its semantics MUST equal mapping `evaluate` — which the background verifier uses to batch a cold join's gate reads. The batch is simply everything pending, so its wallets need not share a `sampleBlock`: a rule reading the head scores them all at once, a rule reading pinned blocks groups them itself. (`erc5192-min-balance` implements it over multicall3, hoisting its one lock assertion out of the per-wallet reads; see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification).)
 
 Built-ins: `erc5192-min-balance` (v1) and `constant` (v1).
 
@@ -217,7 +242,9 @@ const seeditModAllowlist: Rule<{ type: "seedit-mod-allowlist"; allow: string[] }
   type: "seedit-mod-allowlist",
   optionsSchema: z.object({ type: z.literal("seedit-mod-allowlist"), allow: z.array(z.string()) }),
   async evaluate({ options, wallet }) {
-    return { score: options.allow.includes(wallet.address) ? 1n : 0n }; // gate: 1n admits, 0n rejects
+    return options.allow.includes(wallet.address)
+      ? { success: true, score: 1n }
+      : { success: false, error: "this wallet is not on the moderator allowlist" }; // shown to the voter
   }
 };
 
@@ -255,15 +282,19 @@ const { values } = await ctx.cache.memoMany({
 });
 ```
 
-`RuleResult` carries one field beyond the score:
+`RuleResult` is a discriminated union, shaped like pkc-js's `ChallengeResult`:
 
 ```ts
-interface RuleResult { score: bigint; penalize?: boolean }   // default true
+type RuleResult =
+  | { success: true;  score: bigint }                          // score MUST be > 0n
+  | { success: false; error: string; penalize?: boolean };     // penalize default true
 ```
 
-**`penalize`** answers the one thing the library cannot: may a `0n` be blamed on the sender? `true` (the default) says every honest verifier computes this same `0n` — true of a read pinned to the block the bundle names — so the forward gate `reject`s the message (penalizing the delivering peer in gossipsub's scoring) and the verdict is cached as terminal. `false` says an honest peer could legitimately disagree, so the bundle is dropped `ignore`-class instead: no penalty, verdict uncached, and the background verifier re-examines it for a grace window before giving up.
+**`error` is required on the failing branch**, because only the rule knows why a wallet fell short — it holds none, it holds too few, the contract gates nothing. That sentence is what the library shows the voter: it becomes the verdict reason, so it reaches the publisher on `VoteEvictedError.verdict.reason`, and it is what `contest.checkEligibility()` returns. Write it about the wallet ("this wallet holds none of the gate token"), not about the library, and leave block numbers out unless a voter can act on them. Making it optional would mean every UI re-deriving the rule's thresholds and block choice to say anything useful — which is exactly the coupling `ctx` and `RuleCache` exist to remove.
 
-`erc5192-min-balance` reads the head first — so a freshly-acquired Pass counts immediately — falls back to `wallet.sampleBlock` when the head refuses (ERC-5192 does not forbid burning, and without the fallback a burn would erase votes retroactively for peers that had not verified them yet), memoizes each leg under its own epoch, and returns `penalize: false`, because at validation time it cannot attribute a `0n` to anyone: the peer that forwarded the vote verified it against *its* head. Every other rule in the tree reads `wallet.sampleBlock` and leaves `penalize` at its default — a transferable or fungible balance can decrease, so reading it at the head would silently invalidate votes already counted. See [DESIGN.md, What a rule owns](./DESIGN.md#what-a-rule-owns-and-what-the-pipeline-owns).
+**`penalize`** answers the one thing the library cannot: may the failure be blamed on the sender? `true` (the default) says every honest verifier computes this same failure — true of a read pinned to the block the bundle names — so the forward gate `reject`s the message (penalizing the delivering peer in gossipsub's scoring) and the verdict is cached as terminal. `false` says an honest peer could legitimately disagree, so the bundle is dropped `ignore`-class instead: no penalty, verdict uncached, and the background verifier re-examines it for a grace window before giving up.
+
+`erc5192-min-balance` reads the head first — so a freshly-acquired Pass counts immediately — falls back to `wallet.sampleBlock` when the head refuses (ERC-5192 does not forbid burning, and without the fallback a burn would erase votes retroactively for peers that had not verified them yet), memoizes each leg under its own epoch, and returns `penalize: false`, because at validation time it cannot attribute a failure to anyone: the peer that forwarded the vote verified it against *its* head. Every other rule in the tree reads `wallet.sampleBlock` and leaves `penalize` at its default — a transferable or fungible balance can decrease, so reading it at the head would silently invalidate votes already counted. See [DESIGN.md, What a rule owns](./DESIGN.md#what-a-rule-owns-and-what-the-pipeline-owns).
 
 ### Weighted voting (deferred)
 

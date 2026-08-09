@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { scoreOrZero } from "../rules/result.js";
 import { makeVoteCrdt } from "./crdt.js";
 import { makeMemoryBundleStore } from "./store.js";
 import { makeBucketMath } from "../chain/bucket.js";
@@ -116,11 +117,11 @@ describe("Sybil amplification: one transferable asset, N concurrent votes (#27)"
             [FIRST + 1, WALLET_B],
             [FIRST + 2, WALLET_C]
         ] as const) {
-            const { score } = await erc721MinBalance.evaluate({ options, wallet: at(wallet, bucket), ctx: ctxAt(chain) });
+            const score = scoreOrZero(await erc721MinBalance.evaluate({ options, wallet: at(wallet, bucket), ctx: ctxAt(chain) }));
             expect(score).toBe(1n); // the gate is satisfied — the wallet really did hold the token then
         }
         // ...and each is a stranger at the others' blocks, so nothing about the sequence looks odd.
-        const { score } = await erc721MinBalance.evaluate({ options, wallet: at(WALLET_A, FIRST + 2), ctx: ctxAt(chain) });
+        const score = scoreOrZero(await erc721MinBalance.evaluate({ options, wallet: at(WALLET_A, FIRST + 2), ctx: ctxAt(chain) }));
         expect(score).toBe(0n);
     });
 
@@ -158,7 +159,7 @@ describe("Sybil amplification: one transferable asset, N concurrent votes (#27)"
                 erc5192MinBalance.evaluate({ options: gate, wallet: at(String(wallet), Number(bucket)), ctx: ctxAt(chain) })
             )
         );
-        expect(scores.map((s) => s.score)).toEqual([0n, 0n, 0n]);
+        expect(scores.map(scoreOrZero)).toEqual([0n, 0n, 0n]);
         // The assertion is about the CONTRACT, not the wallet: declare the lock and the same
         // holders are admitted again (a locked contract cannot produce the transfers above).
         // A no longer holds at the head, so this also exercises the rule's pinned fallback: the
@@ -166,7 +167,7 @@ describe("Sybil amplification: one transferable asset, N concurrent votes (#27)"
         // `evaluateMany`). Admitting "held then OR holds now" is exactly v1's pinned admission
         // widened by the head leg, so it opens no amplification the ERC-5192 assertion above does
         // not already refuse.
-        const { score } = await erc5192MinBalance.evaluate({ options: gate, wallet: at(WALLET_A, FIRST), ctx: ctxAt(chain5192) });
+        const score = scoreOrZero(await erc5192MinBalance.evaluate({ options: gate, wallet: at(WALLET_A, FIRST), ctx: ctxAt(chain5192) }));
         expect(score).toBe(1n);
     });
 });
@@ -183,7 +184,7 @@ describe("Sybil amplification: one fungible balance, N concurrent votes (#28)", 
             [FIRST + 2, WALLET_C]
         ] as const;
         for (const [bucket, wallet] of wallets) {
-            const { score } = await erc20Balance.evaluate({ options, wallet: at(wallet, bucket), ctx: ctxAt(chain) });
+            const score = scoreOrZero(await erc20Balance.evaluate({ options, wallet: at(wallet, bucket), ctx: ctxAt(chain) }));
             expect(score).toBeGreaterThan(0n); // each read is true at its own pinned block
         }
 
@@ -208,7 +209,7 @@ describe("Sybil amplification: one fungible balance, N concurrent votes (#28)", 
                 wallet: { address: wallet, sampleBlock: Math.max(0, pinned - holdWindowBlocks) },
                 ctx: ctxAt(chain)
             });
-            return now.score > 0n && then.score > 0n;
+            return scoreOrZero(now) > 0n && scoreOrZero(then) > 0n;
         };
         // A held the balance for the whole window; B and C acquired it inside the window and fail
         // their own `pinned − H` read — which is what collapses three votes back to one.

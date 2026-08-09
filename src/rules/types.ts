@@ -13,50 +13,82 @@ import type { RuleCache } from "./cache.js";
  * entries shadow builtins). The criteria still has two slots that draw from this one
  * registry:
  *
- *   - rule slot:   the score is a GATE. `> 0n` admits the wallet, `0n` rejects it.
- *   - weight slot: the score is the vote's MAGNITUDE.
+ *   - rule slot:   the result is a GATE. `success: true` admits the wallet, `success: false`
+ *                  rejects it and must say why ({@link RuleResult.error}).
+ *   - weight slot: a successful result's `score` is the vote's MAGNITUDE; a failure is zero
+ *                  weight.
  *
- * Final vote value = `evaluate(rule).score === 0n ? 0n : evaluate(weight).score`.
- *
- * A single numeric return covers both roles: a rule that needs a threshold
- * (min Passes, min balance) bakes it in by returning 0n when the wallet falls short.
- * That is why the gate slot does not need a separate boolean kind.
+ * One return shape covers both roles: a rule that needs a threshold (min Passes, min balance)
+ * bakes it in by failing when the wallet falls short, so the gate slot needs no separate kind.
  */
 
 /**
- * The result of one evaluation. `score` is a non-negative `bigint`; `0n` means "does not
- * qualify" (rejected in the rule slot, no weight in the weight slot). It is an
- * object, not a bare `bigint`, so slot-specific fields can be added without changing the
- * signature again — e.g. a self-declared `ceiling` for balance-derived weight, which the
- * lazy tally needs as a wire-side upper bound (see DESIGN.md "Open questions").
+ * The result of one evaluation: a wallet either qualifies with a score, or it does not and the
+ * rule says why.
+ *
+ * Modelled on pkc-js's `ChallengeResult` (community/schema.ts) — a `success` discriminant, with
+ * `error` REQUIRED on the failing branch. Making it required is the whole point: only the rule
+ * knows why a wallet fell short, and if that reason is optional it will simply be omitted, which
+ * leaves the pipeline with one undifferentiated "score is 0n" and forces every UI to re-derive
+ * the rule's thresholds and block choice to say anything useful. That duplication is exactly what
+ * {@link ChainReadContext} and {@link RuleCache} exist to prevent everywhere else, and it is what
+ * broke when the gate moved from a pinned block to the head: a client's hand-rolled explanation
+ * kept telling voters to wait for a window that no longer gated anything.
+ *
+ *   - rule slot:   `success: true` admits the wallet; `success: false` rejects it.
+ *   - weight slot: `success: true` carries the vote's MAGNITUDE; `success: false` is zero weight.
+ *
+ * Final vote value = gate `success: false` ? `0n` : weight `success` ? weight `score` : `0n`.
+ *
+ * `score` MUST be `> 0n` on the success branch — "qualifies, with no weight" is not a state this
+ * models, and the pipeline treats a non-positive success score as a rule bug and refuses the
+ * wallet rather than silently admitting a zero-weight vote.
  */
-export interface RuleResult {
-    score: bigint;
-    /**
-     * May a `0n` be blamed on the sender? Default `true`.
-     *
-     * The pipeline has two decisions to make about a `0n` that the rule cannot make for it —
-     * whether the gossip forward-gate `reject`s the message (which penalizes the delivering peer
-     * through gossipsub's invalid-message score, eventually pruning and graylisting it) or
-     * merely `ignore`s it, and whether the background verifier evicts the bundle at once or
-     * holds it for a grace window. Both hinge on one thing only the rule knows: is this `0n`
-     * attributable?
-     *
-     * `true` (the default) says every honest verifier necessarily computes this same `0n` — true
-     * of a read pinned to a historical block, since the block is named by the bundle and the
-     * chain's history does not move. The bundle is dropped, the sender penalized, the verdict
-     * cached as terminal.
-     *
-     * `false` says an honest peer could legitimately disagree, so nobody may be blamed. The
-     * bundle is still dropped, but `ignore`-class — no penalty, verdict uncached, and the
-     * background verifier re-examines it for a grace window before giving up. This is what a
-     * rule scoring the chain head must return: the peer that forwarded the vote verified it
-     * against ITS head, and any peer ahead of us can legitimately see an acquisition we have
-     * not. Penalizing there punishes honest relayers for being current — and does so exactly
-     * when a wallet has just acquired the gate asset, which is when peer heads straddle.
-     */
-    penalize?: boolean;
-}
+export type RuleResult =
+    | {
+          success: true;
+          /** The wallet's magnitude. MUST be `> 0n`. */
+          score: bigint;
+      }
+    | {
+          success: false;
+          /**
+           * Why this wallet does not qualify, phrased for the person who cast (or is about to
+           * cast) the vote. Surfaces on `VerifyFail.reason`, on `VoteEvictedError.verdict`, and
+           * from `Contest.checkEligibility`, so a client renders it verbatim and stays correct
+           * across rule changes it knows nothing about.
+           *
+           * Write it as a statement about the wallet, not about the library: "this wallet holds
+           * none of the gate token", not "gate rule returned 0". Do not cite block numbers unless
+           * they are actionable — a voter can do nothing with a sample block.
+           */
+          error: string;
+          /**
+           * May this failure be blamed on the peer that sent the vote? Default `true`.
+           *
+           * The pipeline has two decisions the rule cannot make for it — whether the gossip
+           * forward-gate `reject`s the message (penalizing the delivering peer through
+           * gossipsub's invalid-message score, eventually pruning and graylisting it) or merely
+           * `ignore`s it, and whether the background verifier evicts the bundle at once or holds
+           * it for a grace window. Both hinge on one thing only the rule knows: is this failure
+           * attributable?
+           *
+           * `true` (the default) says every honest verifier necessarily computes this same
+           * failure — true of a read pinned to a historical block, since the block is named by
+           * the bundle and the chain's history does not move. The bundle is dropped, the sender
+           * penalized, the verdict cached as terminal.
+           *
+           * `false` says an honest peer could legitimately disagree, so nobody may be blamed. The
+           * bundle is still dropped, but `ignore`-class — no penalty, verdict uncached, and the
+           * background verifier re-examines it for a grace window before giving up. This is what
+           * a rule scoring the chain head must return: the peer that forwarded the vote verified
+           * it against ITS head, and any peer ahead of us can legitimately see an acquisition we
+           * have not. Penalizing there punishes honest relayers for being current — and does so
+           * exactly when a wallet has just acquired the gate asset, which is when peer heads
+           * straddle.
+           */
+          penalize?: boolean;
+      };
 
 /** Everything a rule needs to read chain state and remember what it read. */
 export interface ChainReadContext {
@@ -104,8 +136,8 @@ export interface RuleWallet {
 
 /**
  * The one rule kind. `O` is the validated options type (from its `optionsSchema`).
- * `evaluate` returns a `RuleResult` whose `score` is a non-negative `bigint`; `0n`
- * means "does not qualify" (rejected in the rule slot, no weight in the weight slot).
+ * `evaluate` returns a {@link RuleResult}: either `{ success: true, score }` with `score > 0n`,
+ * or `{ success: false, error }` — "does not qualify", with the reason the voter is shown.
  */
 export interface Rule<O = unknown> {
     readonly type: string;
