@@ -42,13 +42,17 @@ export type Erc20BalanceOptions = z.infer<typeof Erc20BalanceOptionsSchema>;
 export const erc20Balance: Rule<Erc20BalanceOptions> = {
     type: "erc20-balance",
     optionsSchema: Erc20BalanceOptionsSchema,
-    async evaluate({ options, walletAddress, ctx }) {
+    // Scores at the bundle's OWN pinned block: a fungible balance is the least stable score
+    // there is — it moves in both directions with every transfer — so it may not be read at the
+    // head, and a `0n` here is attributable (`penalize` stays at its default). See registry.ts
+    // for why this rule is unregistered regardless.
+    async evaluate({ options, wallet, ctx }) {
         const raw = await ctx.chain.readContract({
             address: getAddress(options.contract),
             abi: erc20Abi,
             functionName: "balanceOf",
-            args: [getAddress(walletAddress)],
-            blockNumber: BigInt(ctx.blockNumber)
+            args: [getAddress(wallet.address)],
+            blockNumber: BigInt(wallet.sampleBlock)
         });
         const minUnits = parseUnits(options.min.toString(), options.decimals);
         return { score: raw >= minUnits ? raw : 0n };

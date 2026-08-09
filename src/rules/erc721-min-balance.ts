@@ -37,18 +37,47 @@ export type Erc721MinBalanceOptions = z.infer<typeof Erc721MinBalanceOptionsSche
 export const erc721MinBalance: Rule<Erc721MinBalanceOptions> = {
     type: "erc721-min-balance",
     optionsSchema: Erc721MinBalanceOptionsSchema,
-    async evaluate({ options, walletAddress, ctx }) {
-        const balance = await balanceOf(getAddress(options.contract), walletAddress, ctx);
+    // Scores at the bundle's OWN pinned block, and deliberately not at the head: a transferable
+    // balance can go DOWN, so a vote admitted today would silently become invalid the moment the
+    // token moved, and whether it still counted would depend on when each peer last looked. A
+    // pinned read is identical on every verifier forever, which is what leaves `penalize` at its
+    // default — a `0n` here IS attributable to the sender. That difference is a second,
+    // independent reason this rule stays out of `builtinRegistry`, on top of the Sybil
+    // amplification described in registry.ts.
+    async evaluate({ options, wallet, ctx }) {
+        const { balance } = await balanceOf({
+            contract: getAddress(options.contract),
+            wallet: wallet.address,
+            block: wallet.sampleBlock,
+            ctx
+        });
         return { score: scoreOf(balance, options.min) };
     },
-    async evaluateMany({ options, walletAddresses, ctx }) {
+    async evaluateMany({ options, wallets, ctx }) {
         const contract = getAddress(options.contract);
-        // Multicall3 `aggregate3` batching (see nft-balance.ts for the chunking policy) — the
-        // path the background chain verifier rides on a cold join. A client that cannot batch
-        // takes the per-wallet fallback.
-        const balances = canBatch(ctx)
-            ? await balancesOfBatched(contract, walletAddresses, ctx)
-            : await Promise.all(walletAddresses.map((wallet) => balanceOf(contract, wallet, ctx)));
-        return balances.map((balance): RuleResult => ({ score: scoreOf(balance, options.min) }));
+        // Grouped by sample block, because a batch is no longer guaranteed to share one: the
+        // pipeline hands over whatever is pending and each rule groups the way it reads. Within
+        // a group it is multicall3 `aggregate3` batching (chunking policy in nft-balance.ts) —
+        // the path the background chain verifier rides on a cold join; a client that cannot
+        // batch takes the per-wallet fallback.
+        const scores = new Array<bigint>(wallets.length);
+        const byBlock = new Map<number, number[]>();
+        wallets.forEach((wallet, i) => byBlock.set(wallet.sampleBlock, [...(byBlock.get(wallet.sampleBlock) ?? []), i]));
+        await Promise.all(
+            [...byBlock].map(async ([block, indexes]) => {
+                const group = indexes.map((i) => wallets[i]!.address);
+                const { balances } = canBatch({ ctx }).batchable
+                    ? await balancesOfBatched({ contract, wallets: group, block, ctx })
+                    : {
+                          balances: await Promise.all(
+                              group.map(async (wallet) => (await balanceOf({ contract, wallet, block, ctx })).balance)
+                          )
+                      };
+                indexes.forEach((at, i) => {
+                    scores[at] = scoreOf(balances[i]!, options.min);
+                });
+            })
+        );
+        return { results: scores.map((score): RuleResult => ({ score })) };
     }
 };

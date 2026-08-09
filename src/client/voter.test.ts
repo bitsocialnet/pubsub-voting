@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { z } from "zod";
 import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
 import type { PeerId } from "@libp2p/interface";
 import { PubsubVoter, republishIntervalBuckets, makeHeadReader, type PublishingState } from "./voter.js";
+import { GATE_GRACE_MS, GATE_RETRY_MS } from "../verify/gate-grace.js";
 import {
     decodeVoteMessage,
     decodeRootRecord,
@@ -18,6 +20,8 @@ import {
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
+import type { Rule } from "../rules/types.js";
+import type { Criteria } from "../schema/criteria.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
     InvalidCommunityNameError,
@@ -340,6 +344,12 @@ describe("createContestVote (publish path)", () => {
 });
 
 describe("Contest read view + tally", () => {
+    // Fake timers installed by a test that then fails an assertion would otherwise leak into
+    // every later test in this block, turning one failure into a cascade.
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
     it("returns an empty ranking for a contest with no votes (no chain reads)", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
@@ -410,32 +420,32 @@ describe("Contest read view + tally", () => {
         await voterB.destroy();
     });
 
-    it("re-purges persisted gate results when the expiry horizon advances past the last purge", async () => {
+    it("purges persisted gate entries the rule declares dead as its head epoch rolls", async () => {
+        // Purging moved INTO the rule with the keys: the engine no longer knows what an entry is
+        // keyed by, so only the rule can say what is unreachable. `erc5192-min-balance` keys its
+        // head reads by a coarse head window and drops everything behind the current one
+        // (rules/cache.ts `purgeBelow`), so a long-lived node sheds them instead of leaving them
+        // to the store's LRU backstop.
         const { mkdtempSync } = await import("node:fs");
         const { tmpdir } = await import("node:os");
         const { join } = await import("node:path");
         const { makeStorage } = await import("../storage/node.js");
         const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
 
-        // Head starts at bucket 40, so the first head read already purges (boundary: bucket 10).
-        let block = 43200n * 40n;
+        let block = 43200n * 40n; // divisible by the rule's 30-block epoch, so the epoch is this
         const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: advancingChains(() => block), signer: fakeSigner() });
         await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
         const contest = await voter.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
 
-        // The settled gate read persisted a score keyed to bucket 40's sample block (WAL mode
-        // admits this second read-only connection alongside the voter's own).
         const reader = makeStorage({ dataPath }).openLru({ cacheName: "gate-results", maxItems: 50_000 });
-        const bucket40Key = (keys: string[]) => keys.find((k) => k.endsWith(`:${43200 * 40}`));
-        await vi.waitFor(async () => expect(bucket40Key(await reader.keys())).toBeDefined());
+        const firstEpochKey = (keys: string[]) => keys.find((k) => k.includes("head/") && k.endsWith(`:${43200 * 40}`));
+        await vi.waitFor(async () => expect(firstEpochKey(await reader.keys())).toBeDefined());
 
-        // The head advances to bucket 71: bucket 40 falls out of the 30-bucket expiry window,
-        // so the head read piggybacked on this tally must purge again — not only once per
-        // engine lifetime — and drop the now-dead entry.
-        block = 43200n * 71n;
-        await contest.getTally();
-        await vi.waitFor(async () => expect(bucket40Key(await reader.keys())).toBeUndefined());
+        // The head moves past the window, and the next gate read purges what it left behind.
+        block += 300n;
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await vi.waitFor(async () => expect(firstEpochKey(await reader.keys())).toBeUndefined());
         await voter.destroy();
     });
 
@@ -483,12 +493,24 @@ describe("Contest read view + tally", () => {
         await contest.stop();
     });
 
-    it("evicts an own vote whose wallet fails the gate (score 0n), recounting the tally", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
-        const contest = await voter.createContest({ criteria: bizCriteria() });
-        // The local tally converges to the network's view: an ineligible vote does not stick.
-        await vi.waitFor(async () => expect((await contest.getTally()).ranking).toEqual([]));
+    it("holds an own vote whose wallet fails the LIVE gate, then evicts it when the grace window closes", async () => {
+        // The v1 gate scores at the head and refuses to blame a `0n` on anyone (rules/types.ts,
+        // RuleResult.penalize), so it reads as
+        // "not yet", not "no": a client that signs the instant it acquires the Pass races its
+        // own transaction, and this verifier's head may simply be behind. The vote is therefore
+        // kept and re-examined for a grace window — and only then dropped, so the local tally
+        // still converges to the network's view of an ineligible wallet.
+        vi.useFakeTimers();
+        try {
+            const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            expect((await contest.getTally()).ranking).toHaveLength(1); // still pending, not evicted
+            await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
+            expect((await contest.getTally()).ranking).toEqual([]);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it("publish() rejects InvalidCommunityNameError when the carried name resolves to a different key", async () => {
@@ -555,6 +577,7 @@ describe("Contest read view + tally", () => {
     });
 
     it("surfaces VoteEvictedError on the vote AND the contest when the gate evicts an own publish", async () => {
+        vi.useFakeTimers();
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const contestErrors: unknown[] = [];
@@ -566,6 +589,8 @@ describe("Contest read view + tally", () => {
         vote.on("error", (e) => voteErrors.push(e));
         await vote.publish(); // resolves on the offline checks; the gate read lands in the background
 
+        // Past the live gate's grace window (see the "not yet" test above), the eviction is final.
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
         await vi.waitFor(() => expect(voteErrors.length).toBeGreaterThan(0));
         const error = voteErrors[0] as VoteEvictedError;
         expect(error).toBeInstanceOf(VoteEvictedError);
@@ -576,6 +601,7 @@ describe("Contest read view + tally", () => {
         await vi.waitFor(() => expect(contestErrors.some((e) => e instanceof VoteEvictedError)).toBe(true));
         expect((await contest.getTally()).ranking).toEqual([]);
         await contest.stop();
+        vi.useRealTimers();
     });
 
     it("publishes through a resolver outage, then surfaces VoteEvictedError when the name turns out mismatched", async () => {
@@ -2332,6 +2358,72 @@ describe("facade odds and ends", () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
         const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
         expect(vote.topic).toBe(await topicFor(bizCriteria()));
+        await voter.destroy();
+    });
+});
+
+describe("weight-rule cache namespacing", () => {
+    /**
+     * A weight rule that reads its score from the chain and memoizes it through `ctx.cache`,
+     * exactly as a real chain-reading rule must (rules/cache.ts). Its only job here is to be
+     * observably wrong if it is served another chain's memo.
+     */
+    const ChainWeightOptionsSchema = z.object({ type: z.literal("chain-weight"), chain: z.string() });
+    const chainWeight: Rule<z.infer<typeof ChainWeightOptionsSchema>> = {
+        type: "chain-weight",
+        optionsSchema: ChainWeightOptionsSchema,
+        async evaluate({ wallet, ctx }) {
+            const key = `w/${wallet.address}`;
+            const hit = await ctx.cache.get({ key, epoch: 1 });
+            if (hit.value !== undefined) return { score: BigInt(hit.value) };
+            const score = await ctx.chain.getBalance({
+                address: wallet.address as `0x${string}`,
+                blockNumber: BigInt(wallet.sampleBlock)
+            });
+            ctx.cache.set({ key, epoch: 1, value: score.toString() });
+            return { score };
+        }
+    };
+
+    /** Same gate ref and same weight ref; only the chain the weight ticker names differs. */
+    const criteriaWeighedOn = (govChainId: number): Criteria => ({
+        ...bizCriteria(),
+        weight: { type: "chain-weight", chain: "gov" },
+        requires: { rules: ["erc5192-min-balance", "chain-weight"], chains: { base: { chainId: 8453 }, gov: { chainId: govChainId } } }
+    });
+
+    /** The gate reads `readContract` on `base`; the weight reads `getBalance` on its own chain. */
+    const chainsByWeight = (weightByChainId: Record<number, bigint>): ChainClientFactory => {
+        return ({ chainId }) =>
+            ({
+                getBlockNumber: async () => 43200n,
+                getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+                getBalance: async () => weightByChainId[chainId] ?? 0n,
+                readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : 1n)
+            }) as unknown as ChainClient;
+    };
+
+    it("keys the weight memo by the WEIGHT chain, not the gate chain", async () => {
+        // Both contests share a gate on base/8453 and a byte-identical weight ref, so a namespace
+        // derived from the gate's chainId would be the same string for both — and the second
+        // contest would be served the first's score from a chain it never reads. A ticker is only
+        // a name local to a criteria document; what it binds to is what the memo must key on.
+        const voter = new PubsubVoter({
+            dataPath: false,
+            helia: fakeHelia(),
+            chains: chainsByWeight({ 1: 5n, 137: 9n }),
+            signer: fakeSigner(),
+            rules: { "chain-weight": chainWeight }
+        });
+
+        const onEth = criteriaWeighedOn(1);
+        const onPolygon = criteriaWeighedOn(137);
+        await (await voter.createContestVote({ criteria: onEth, votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: onPolygon, votes: VOTE })).publish();
+
+        // Same wallet, same weight ref, one shared gateStore — and still each contest's own chain.
+        expect((await (await voter.createContest({ criteria: onEth })).getTally()).ranking[0]?.weight).toBe(5n);
+        expect((await (await voter.createContest({ criteria: onPolygon })).getTally()).ranking[0]?.weight).toBe(9n);
         await voter.destroy();
     });
 });

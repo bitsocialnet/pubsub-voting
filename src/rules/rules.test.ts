@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { BaseError, ContractFunctionExecutionError, ContractFunctionRevertedError, HttpRequestError, createPublicClient, http } from "viem";
 import type { ChainClient } from "../chain/types.js";
 import type { ChainReadContext, Rule } from "./types.js";
+import { makeMemoryRuleCache } from "./cache.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
 import { ERC5192_INTERFACE_ID, erc5192MinBalance } from "./erc5192-min-balance.js";
 import { constant } from "./constant.js";
@@ -21,8 +22,20 @@ function ctxWith(balances: { erc20?: bigint; erc721?: bigint; declares?: boolean
     const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
     chain.readContract = (async ({ functionName }: { functionName?: string } = {}) =>
         functionName === "supportsInterface" ? (balances.declares ?? true) : balance) as ChainClient["readContract"];
-    return { chain, blockNumber: 100 };
+    return ctxOver(chain);
 }
+
+/** The pinned block a test bundle names, and the head the verifier is at. */
+const SAMPLE_BLOCK = 100;
+const HEAD_BLOCK = 130;
+
+/** A rule context around `chain`: a fixed head and a private memo (see rules/cache.ts). */
+function ctxOver(chain: ChainClient, head = HEAD_BLOCK): ChainReadContext {
+    return { chain, head: async () => ({ block: head }), cache: makeMemoryRuleCache() };
+}
+
+/** One wallet as the rules now take it: an address plus the pinned block its ballot names. */
+const at = (address: string, sampleBlock = SAMPLE_BLOCK) => ({ address, sampleBlock });
 
 describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () => {
     const options = { type: "erc5192-min-balance" as const, chain: "base", contract: "0x00000000000000000000000000000000000000fa", min: 2 };
@@ -52,43 +65,70 @@ describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () =
     }
 
     it("scores the holding when the contract declares ERC-5192 and the wallet is at or above min", async () => {
-        const { score } = await erc5192MinBalance.evaluate({ options, walletAddress: wallet, ctx: ctxWith({ erc721: 3n }) });
+        const { score, penalize } = await erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxWith({ erc721: 3n }) });
         expect(score).toBe(3n);
+        // Never attributable: this rule scores at the verifier's head, where honest peers differ
+        // (see rules/types.ts, RuleResult.penalize).
+        expect(penalize).toBe(false);
     });
 
     it("scores 0 below min (rejected)", async () => {
-        const { score } = await erc5192MinBalance.evaluate({ options, walletAddress: wallet, ctx: ctxWith({ erc721: 1n }) });
+        const { score, penalize } = await erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxWith({ erc721: 1n }) });
         expect(score).toBe(0n);
+        expect(penalize).toBe(false);
     });
 
-    it("probes supportsInterface(0xb45a3c0e) at the SAME pinned block as the balance", async () => {
+    it("scores at the HEAD, probing supportsInterface at that same block", async () => {
+        // The whole point of reading the head: a Pass acquired since the ballot's bucket boundary
+        // counts immediately. The lock probe rides the same block so both fold into one multicall.
         const { chain, reads } = probeChain({ balance: 5n });
-        await erc5192MinBalance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: 100 } });
+        await erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxOver(chain) });
         const probe = reads.find((r) => r.functionName === "supportsInterface");
         expect(probe).toBeDefined();
         expect(probe!.args).toEqual([ERC5192_INTERFACE_ID]);
-        expect(reads.every((r) => r.block === 100n)).toBe(true);
+        expect(reads.every((r) => r.block === BigInt(HEAD_BLOCK))).toBe(true);
+        expect(reads.some((r) => r.block === BigInt(SAMPLE_BLOCK))).toBe(false); // no fallback needed
+    });
+
+    it("falls back to the ballot's own pinned block when the head says 0n", async () => {
+        // ERC-5192 forbids transfers while locked but says nothing about BURNING, so a holding
+        // can disappear. Without this leg a burn would erase votes retroactively for every peer
+        // that had not verified them yet; with it, a vote that was valid when cast stays valid.
+        let holdsAtHead = false;
+        const { chain, reads } = probeChain({ balance: 5n });
+        const readContract = chain.readContract;
+        chain.readContract = (async (args: { functionName: string; blockNumber?: bigint }) => {
+            if (args.functionName === "balanceOf" && args.blockNumber === BigInt(HEAD_BLOCK) && !holdsAtHead) {
+                reads.push({ functionName: args.functionName, args: [], block: args.blockNumber });
+                return 0n;
+            }
+            return readContract(args as Parameters<typeof readContract>[0]);
+        }) as ChainClient["readContract"];
+
+        const { score } = await erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxOver(chain) });
+        expect(score).toBe(5n);
+        expect(reads.some((r) => r.functionName === "balanceOf" && r.block === BigInt(SAMPLE_BLOCK))).toBe(true);
     });
 
     // The regression guard for issue #27: if the gate ever points at a contract that does not even
     // CLAIM its tokens are locked, it must admit nobody rather than silently gate on a transferable
     // asset (see crdt/amplification.test.ts for what that would allow).
     it("scores 0n when the contract does not declare ERC-5192, however large the balance", async () => {
-        const { score } = await erc5192MinBalance.evaluate({ options, walletAddress: wallet, ctx: ctxWith({ erc721: 1000n, declares: false }) });
+        const { score } = await erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxWith({ erc721: 1000n, declares: false }) });
         expect(score).toBe(0n);
     });
 
     it("scores 0n for EVERY wallet in a batch when the contract does not declare ERC-5192", async () => {
         const wallets = [wallet, "0x000000000000000000000000000000000000bbbb"];
         const { chain } = probeChain({ declares: false, balance: 9n, multicall: true });
-        const results = await erc5192MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc5192MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(results.map((r) => r.score)).toEqual([0n, 0n]);
     });
 
     it("evaluateMany hoists ONE supportsInterface probe for the whole batch", async () => {
         const wallets = Array.from({ length: 5 }, (_, i) => `0x${(i + 1).toString(16).padStart(40, "0")}`);
         const { chain, reads } = probeChain({ balance: 5n, multicall: true });
-        const results = await erc5192MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc5192MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(results.map((r) => r.score)).toEqual(wallets.map(() => 5n));
         expect(reads.filter((r) => r.functionName === "supportsInterface")).toHaveLength(1);
         expect(reads.filter((r) => r.functionName === "balanceOf")).toHaveLength(wallets.length);
@@ -97,7 +137,7 @@ describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () =
     it("evaluateMany falls back to per-wallet balances on a client without multicall3, still probing once", async () => {
         const wallets = [wallet, "0x000000000000000000000000000000000000bbbb"];
         const { chain, reads } = probeChain({ balance: 5n });
-        const results = await erc5192MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc5192MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(results.map((r) => r.score)).toEqual([5n, 5n]);
         expect(reads.filter((r) => r.functionName === "supportsInterface")).toHaveLength(1);
         expect(reads.filter((r) => r.functionName === "balanceOf")).toHaveLength(2);
@@ -115,7 +155,7 @@ describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () =
                 throw reverted;
             }
         });
-        const { score } = await erc5192MinBalance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: 100 } });
+        const { score } = await erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxOver(chain) });
         expect(score).toBe(0n);
     });
 
@@ -133,7 +173,7 @@ describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () =
                 throw offline;
             }
         });
-        await expect(erc5192MinBalance.evaluate({ options, walletAddress: wallet, ctx: { chain, blockNumber: 100 } })).rejects.toBeInstanceOf(BaseError);
+        await expect(erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxOver(chain) })).rejects.toBeInstanceOf(BaseError);
     });
 });
 
@@ -141,12 +181,12 @@ describe("erc721-min-balance (unregistered: a bare, transferable gate)", () => {
     const options = { type: "erc721-min-balance" as const, chain: "base", contract: "0x00000000000000000000000000000000000000fa", min: 2 };
 
     it("scores the holding when at or above min (admitted, and usable as weight)", async () => {
-        const { score } = await erc721MinBalance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc721: 3n }) });
+        const { score } = await erc721MinBalance.evaluate({ options, wallet: at("0x000000000000000000000000000000000000aaaa"), ctx: ctxWith({ erc721: 3n }) });
         expect(score).toBe(3n);
     });
 
     it("scores 0 below min (rejected)", async () => {
-        const { score } = await erc721MinBalance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc721: 1n }) });
+        const { score } = await erc721MinBalance.evaluate({ options, wallet: at("0x000000000000000000000000000000000000aaaa"), ctx: ctxWith({ erc721: 1n }) });
         expect(score).toBe(0n);
     });
 
@@ -168,7 +208,7 @@ describe("erc721-min-balance (unregistered: a bare, transferable gate)", () => {
             return 0n;
         }) as ChainClient["readContract"];
 
-        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc721MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(results.map((r) => r.score)).toEqual([3n, 0n, 2n]); // same semantics as mapped evaluate
         expect(multicalls).toBe(1);
         expect(reads).toBe(0);
@@ -193,7 +233,7 @@ describe("erc721-min-balance (unregistered: a bare, transferable gate)", () => {
             return contracts.map(({ args }) => BigInt(parseInt(args[0].slice(2), 16)) + 1n);
         }) as unknown as ChainClient["multicall"];
 
-        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc721MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(chunkSizes).toEqual([200, 200, 50]);
         expect(maxInFlight).toBeLessThanOrEqual(2);
         expect(results.map((r) => r.score)).toEqual(wallets.map((_, i) => BigInt(i) + 2n));
@@ -215,7 +255,7 @@ describe("erc721-min-balance (unregistered: a bare, transferable gate)", () => {
             return contracts.map(() => 5n);
         }) as unknown as ChainClient["multicall"];
 
-        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc721MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(results).toHaveLength(400);
         expect(results.every((r) => r.score === 5n)).toBe(true);
         // Chunk 0 read once; chunk 1 (wallet 200) failed once then retried — never chunk 0 again.
@@ -232,7 +272,7 @@ describe("erc721-min-balance (unregistered: a bare, transferable gate)", () => {
             return 5n;
         }) as ChainClient["readContract"];
 
-        const results = await erc721MinBalance.evaluateMany!({ options, walletAddresses: wallets, ctx: { chain, blockNumber: 100 } });
+        const { results } = await erc721MinBalance.evaluateMany!({ options, wallets: wallets.map((w) => at(w)), ctx: ctxOver(chain) });
         expect(results.map((r) => r.score)).toEqual([5n, 5n]);
         expect(reads).toBe(2);
     });
@@ -248,13 +288,13 @@ describe("constant", () => {
 describe("erc20-balance (weight, and gate when min is set)", () => {
     it("returns raw base units as the magnitude (ordering-preserving; min default 0)", async () => {
         const options = { type: "erc20-balance" as const, chain: "base", contract: "0x0000000000000000000000000000000000000b50", decimals: 6, min: 0 };
-        const { score } = await erc20Balance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc20: 1_500_000n }) });
+        const { score } = await erc20Balance.evaluate({ options, wallet: at("0x000000000000000000000000000000000000aaaa"), ctx: ctxWith({ erc20: 1_500_000n }) });
         expect(score).toBe(1_500_000n);
     });
 
     it("scores 0 below min (gate role)", async () => {
         const options = { type: "erc20-balance" as const, chain: "base", contract: "0x0000000000000000000000000000000000000b50", decimals: 6, min: 100 };
-        const { score } = await erc20Balance.evaluate({ options, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({ erc20: 1_500_000n }) }); // 1.5 tokens < 100
+        const { score } = await erc20Balance.evaluate({ options, wallet: at("0x000000000000000000000000000000000000aaaa"), ctx: ctxWith({ erc20: 1_500_000n }) }); // 1.5 tokens < 100
         expect(score).toBe(0n);
     });
 });

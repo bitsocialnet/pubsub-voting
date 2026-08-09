@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { makeBundleVerifier } from "./bundle.js";
-import { makeGateResultCache, type GateResultCache } from "./gate-result-cache.js";
+import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import { builtinRegistry } from "../rules/registry.js";
+import { erc721MinBalance } from "../rules/erc721-min-balance.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bizCriteria } from "../test-fixtures.js";
 import type { ChainClient, NameResolver } from "../chain/types.js";
@@ -44,6 +45,12 @@ function fakeChain(balance: bigint, onRead?: () => void, declares = true): Chain
         async readContract({ functionName }: { functionName?: string } = {}) {
             onRead?.();
             return functionName === "supportsInterface" ? declares : balance;
+        },
+        // The v1 gate declares a LIVE evaluation view, so the verifier reads the head to know
+        // which block to score at (rules/types.ts, ChainReadContext.head). Kept a few blocks past the
+        // bundle's own `blockNumber`, as a real head is.
+        async getBlockNumber() {
+            return BigInt(BLOCK + 5);
         }
     } as unknown as ChainClient;
 }
@@ -58,9 +65,7 @@ function resolver(map: Record<string, string>): NameResolver {
     };
 }
 
-function verifier(
-    over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; gateResultCache?: GateResultCache } = {}
-) {
+function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; ruleCache?: RuleCache } = {}) {
     return makeBundleVerifier({
         criteria: bizCriteria(),
         criteriaCid: CRITERIA_CID,
@@ -69,7 +74,7 @@ function verifier(
         chainFor: () => fakeChain(over.balance ?? 1n, over.onRead),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [resolver(over.names ?? {})],
-        gateResultCache: over.gateResultCache
+        ruleCache: over.ruleCache
     });
 }
 
@@ -81,18 +86,72 @@ describe("makeBundleVerifier", () => {
         if (verdict.valid) expect(verdict.ruleScore).toBe(1n);
     });
 
-    it("rejects a wallet the gate does not admit (rule score 0n)", async () => {
+    it("drops a wallet the gate does not admit (rule score 0n) as ignore, not reject", async () => {
+        // The v1 gate scores at the verifier's head, and heads differ
+        // between peers: a wallet that acquired the Pass three blocks ago is `0n` here and
+        // `> 0n` for whoever forwarded the bundle. Penalizing that relayer would punish it for
+        // being ahead, so an unprovable gate miss drops the bundle `ignore`-class and uncached.
         const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 0n }).verify(bundle);
         expect(verdict.valid).toBe(false);
-        if (!verdict.valid) expect(verdict.disposition).toBe("reject"); // gate miss is provable
+        if (!verdict.valid) expect(verdict.disposition).toBe("ignore");
     });
 
-    it("rejects every wallet when the gate contract does not declare ERC-5192", async () => {
+    it("rejects a pinned rule's gate miss (an attributable 0n IS penalizable)", async () => {
+        // The counterpart to the case above, and the reason the disposition comes from the rule's
+        // own answer rather than being hardcoded: a score pinned to a historical block is
+        // identical on every verifier forever, so its `0n` is a `reject` the sender earns.
+        const criteria = { ...bizCriteria(), rule: { ...bizCriteria().rule, type: erc721MinBalance.type } };
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
+        const verdict = await makeBundleVerifier({
+            criteria,
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: { ...builtinRegistry, [erc721MinBalance.type]: erc721MinBalance },
+            chainFor: () => fakeChain(0n),
+            bucketMath: makeBucketMath(criteria.blocksPerBucket),
+            nameResolvers: []
+        }).verify(bundle);
+        expect(verdict.valid).toBe(false);
+        if (!verdict.valid) expect(verdict.disposition).toBe("reject");
+    });
+
+    it("scores the v1 gate at the verifier's head, not at the bundle's bucket block", async () => {
+        // The point of reading the head: a wallet whose Pass is invisible at the bundle's bucket
+        // boundary (a day old, at 5chan's bounds) but present at the head is admitted NOW. The
+        // stub reads `blockNumber` back so the assertion is about which block was asked for.
+        const blocks: number[] = [];
+        const chain = {
+            async readContract({ functionName, blockNumber }: { functionName?: string; blockNumber?: bigint } = {}) {
+                blocks.push(Number(blockNumber));
+                return functionName === "supportsInterface" ? true : 1n;
+            },
+            async getBlockNumber() {
+                return BigInt(BLOCK + 5);
+            }
+        } as unknown as ChainClient;
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
+        const verdict = await makeBundleVerifier({
+            criteria: bizCriteria(),
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: builtinRegistry,
+            chainFor: () => chain,
+            bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
+            nameResolvers: []
+        }).verify(bundle);
+        expect(verdict.valid).toBe(true);
+        expect(new Set(blocks)).toEqual(new Set([BLOCK + 5]));
+        // ...and emphatically NOT the bundle's bucket sample block, which is 0 here.
+        expect(blocks).not.toContain(0);
+    });
+
+    it("drops every wallet when the gate contract does not declare ERC-5192", async () => {
         // The gate would otherwise be a bare `balanceOf` on a transferable asset, which one holder
         // can walk through several wallets for several concurrent votes (issue #27, vector in
         // crdt/amplification.test.ts). A contract that does not claim its tokens are locked is a
-        // provable chain fact, so this is a `reject` like any other gate miss.
+        // chain fact — but this rule refuses to blame a `0n` on the sender either way
+            // (`penalize: false`), so it drops `ignore`-class rather than penalizing.
         const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await makeBundleVerifier({
             criteria: bizCriteria(),
@@ -104,26 +163,30 @@ describe("makeBundleVerifier", () => {
             nameResolvers: []
         }).verify(bundle);
         expect(verdict.valid).toBe(false);
-        if (!verdict.valid) expect(verdict.disposition).toBe("reject");
+        if (!verdict.valid) expect(verdict.disposition).toBe("ignore");
     });
 
-    it("caches a gate miss by (wallet, sampleBlock) so a second bundle skips the chain read", async () => {
+    it("memoizes a gate miss through the rule's cache, so a second bundle skips the chain read", async () => {
         let reads = 0;
-        const gateResultCache = makeGateResultCache();
-        const v = verifier({ balance: 0n, onRead: () => reads++, gateResultCache });
+        const ruleCache = makeMemoryRuleCache();
+        const v = verifier({ balance: 0n, onRead: () => reads++, ruleCache });
         // Two DISTINCT bundles (different community) from the same wallet at the same block: the
-        // first pays the gate read, the second short-circuits on the cached `0n` result.
+        // first pays the reads, the second short-circuits entirely on the rule's memo.
         const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
+        const reveal = reads;
         const second = await v.verify(await signedBundle([{ community: { publicKey: KEY_B }, vote: 1 }]));
         expect(first.valid).toBe(false);
         expect(second.valid).toBe(false);
-        expect(reads).toBe(2); // only the first bundle hit the chain (lock probe + balanceOf)
+        // Four reads for the first bundle: the head leg (lock probe + balanceOf) refuses, then the
+        // pinned fallback repeats both at the ballot's own block (erc5192-min-balance.ts).
+        expect(reveal).toBe(4);
+        expect(reads).toBe(reveal); // ...and the second bundle read nothing at all
     });
 
-    it("caches a gate HIT by (wallet, sampleBlock) so an eligible wallet's re-vote skips the read", async () => {
+    it("memoizes a gate HIT so an eligible wallet's re-vote skips the read", async () => {
         let reads = 0;
-        const gateResultCache = makeGateResultCache();
-        const v = verifier({ balance: 1n, onRead: () => reads++, gateResultCache });
+        const ruleCache = makeMemoryRuleCache();
+        const v = verifier({ balance: 1n, onRead: () => reads++, ruleCache });
         // An eligible wallet cycling choices in the same bucket must not re-read the chain per
         // fresh bundle — the `> 0n` score is memoized just like the `0n` miss.
         const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
