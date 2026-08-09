@@ -341,6 +341,12 @@ describe("createContestVote (publish path)", () => {
 });
 
 describe("Contest read view + tally", () => {
+    // Fake timers installed by a test that then fails an assertion would otherwise leak into
+    // every later test in this block, turning one failure into a cascade.
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
     it("returns an empty ranking for a contest with no votes (no chain reads)", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
         const contest = await voter.createContest({ criteria: bizCriteria() });

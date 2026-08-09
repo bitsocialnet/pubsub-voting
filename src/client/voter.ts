@@ -1217,7 +1217,7 @@ class ContestEngine {
      * admissible bucket sample block, because the engine knew every entry was keyed by one. It
      * no longer knows: a rule chooses its own keys and epochs (rules/cache.ts), so only the rule
      * can say what is dead — `erc5192-min-balance` purges its head-keyed entries as the head
-     * window rolls, and its pinned entries stay valid until the store\'s LRU bound reclaims them.
+     * window rolls, and its pinned entries stay valid until the store's LRU bound reclaims them.
      */
     /** `Date.now()` of the last gating-chain head read, memoizing {@link #nowBucket}. */
     #headReadMs = 0;

@@ -162,11 +162,12 @@ describe("three-node relay (real PubsubVoter seeders)", () => {
             const a = await originSeeder(topic);
 
             // B's chain says the odd wallet holds no Pass: the background verifier confirms the
-            // other four, while the fifth stays UNVERIFIED. Under the v1 gate's live evaluation
-            // view a `0n` reads as "not yet" and the bundle is held through a grace window before
-            // being dropped (rules/types.ts, RuleEvaluation) — but "never re-serve what you have
-            // not verified" bites immediately, so B withholds it from its checkpoint the whole
-            // time. That is the property this test is about, and it does not wait on the grace.
+            // other four, while the fifth stays UNVERIFIED. The v1 gate declines to blame its
+            // `0n` on anyone, so it reads as "not yet" and the bundle is held through a grace
+            // window before being dropped (rules/types.ts, RuleResult.penalize) — but "never
+            // re-serve what you have not verified" bites immediately, so B withholds it from its
+            // checkpoint the whole time. That is the property this test is about, and it does not
+            // wait on the grace.
             const oddAddress = ODD_WALLET.address.toLowerCase();
             const b = await realVoterNode(topic, (wallet) => (wallet === oddAddress ? 0n : 1n));
             await b.libp2p.dial(a.libp2p.getMultiaddrs());
@@ -180,10 +181,13 @@ describe("three-node relay (real PubsubVoter seeders)", () => {
                 45_000,
                 "B to verify the four eligible votes"
             );
-            // The gate-failing vote is still in B's own tally, flagged unverified — held, not
-            // evicted, for the live gate's grace window.
+            // B never marks the gate-failing vote verified. Deliberately NOT asserted as a
+            // surviving `chainVerified: false` row: the `waitFor` above may burn up to 45 s of a
+            // 120 s grace window (GATE_GRACE_MS, not overridable through the voter), so on a
+            // loaded runner the row may already have been evicted. Either state satisfies the
+            // property — what must never happen is B counting it.
             const bTally = await b.contest.getTally();
-            expect(bTally.ranking.find((row) => row.community.publicKey === KEY_B)?.chainVerified).toBe(false);
+            expect(bTally.ranking.find((row) => row.community.publicKey === KEY_B)?.chainVerified).not.toBe(true);
 
             await a.stop();
 

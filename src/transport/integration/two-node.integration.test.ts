@@ -69,8 +69,9 @@ async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] =
         chainFor: () =>
             ({
                 readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : passBalance),
-                // The v1 gate declares a LIVE evaluation view, so the verifier reads the head to
-                // decide which block to score at (rules/types.ts, RuleEvaluation).
+                // The v1 gate reads the head first and only falls back to the ballot's pinned
+                // block, so this stub serves the live head read (rules/types.ts,
+                // ChainReadContext.head).
                 getBlockNumber: async () => BigInt(criteria.blocksPerBucket * 2 + 7)
             }) as unknown as ChainClient,
         bucketMath: makeBucketMath(criteria.blocksPerBucket),
@@ -140,10 +141,11 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
 
         expect(b.acceptedBundles).toHaveLength(0); // never delivered ⇒ never forwarded
         expect(b.crdt.current(0)).toHaveLength(0); // and never merged
-        // `ignore`, not `reject`: the v1 gate scores at the verifier's head (rules/types.ts,
-        // RuleEvaluation), and A's head may legitimately be ahead of B's — a wallet that acquired
-        // the Pass moments ago reads 0n here and >0n there. So the sender keeps its score and the
-        // verdict stays uncached, leaving the bundle re-evaluable once B's own view catches up.
+        // `ignore`, not `reject`: the v1 gate scores at the verifier's head and declines to blame
+        // a `0n` on anyone (rules/types.ts, RuleResult.penalize), and A's head may legitimately be
+        // ahead of B's — a wallet that acquired the Pass moments ago reads 0n here and >0n there.
+        // So the sender keeps its score and the verdict stays uncached, leaving the bundle
+        // re-evaluable once B's own view catches up.
         expect(b.pubsub.getScore(a.peerId)).toBeGreaterThanOrEqual(0);
         expect(b.cache.has(cid)).toBe(false);
 

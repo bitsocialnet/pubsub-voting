@@ -165,7 +165,15 @@ export function makePersistentRuleCache(args: { store: LruStorage; namespace: st
     return cache;
 }
 
-/** The shared {@link RuleCache.memoMany} body: read the misses once, in order, then memoize. */
+/**
+ * The shared {@link RuleCache.memoMany} body: read the misses once, in order, then memoize.
+ *
+ * The lookups are issued CONCURRENTLY, not one at a time. In the persistent cache a miss on the
+ * in-memory front falls through to a store round trip, so awaiting each key in turn would cost a
+ * cold join one serial store hit per wallet before its single batched chain read even starts —
+ * exactly the shape of the first `memoMany` after a restart, when the front is empty by
+ * definition. Order is preserved explicitly instead of by loop sequencing.
+ */
 async function memoManyOver(
     cache: RuleCache,
     args: { keys: string[]; epoch: number; read: (args: { keys: string[] }) => Promise<{ values: string[] }> }
@@ -174,21 +182,27 @@ async function memoManyOver(
     const values = new Array<string | undefined>(keys.length);
     const missing: string[] = [];
     const missingAt: number[][] = [];
-    const seen = new Map<string, number>();
+
+    // Unique keys first, each remembering every position it occupies, so a duplicate key is
+    // looked up once and read once.
+    const positions = new Map<string, number[]>();
     for (let i = 0; i < keys.length; i++) {
         const key = keys[i]!;
-        const already = seen.get(key);
-        if (already !== undefined) {
-            missingAt[already]?.push(i); // a duplicate key is read once, not twice
-            continue;
-        }
-        const { value } = await cache.get({ key, epoch });
+        const at = positions.get(key);
+        if (at) at.push(i);
+        else positions.set(key, [i]);
+    }
+    const unique = [...positions.keys()];
+    const hits = await Promise.all(unique.map((key) => cache.get({ key, epoch })));
+    for (let u = 0; u < unique.length; u++) {
+        const key = unique[u]!;
+        const at = positions.get(key)!;
+        const { value } = hits[u]!;
         if (value !== undefined) {
-            values[i] = value;
+            for (const i of at) values[i] = value;
             continue;
         }
-        seen.set(key, missing.length);
-        missingAt.push([i]);
+        missingAt.push(at);
         missing.push(key);
     }
     if (missing.length > 0) {

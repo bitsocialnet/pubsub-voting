@@ -375,8 +375,9 @@ describe("makeBackgroundVerifier: a rule that scores at the head (rules/types.ts
 
     it("admits a bundle whose wallet acquires the asset before the grace closes", async () => {
         // The fresh-mint case the live view exists for: the wallet is 0n at the head of the
-        // first round and >0n a moment later. The gate-result cache key is a coarse head window
-        // (verify/live-gate.ts), so the second read only happens once the head has moved past it.
+        // first round and >0n a moment later. This stub does not memoize, so every re-examination
+        // re-reads; a real rule keys its memo by a coarse head window (rules/cache.ts) and only
+        // re-reads once the head has moved past it.
         const wallet = padAddress("0xbee").toLowerCase();
         const scores: Record<string, bigint | Error> = { [wallet]: 0n };
         const { rule, calls } = liveRule(scores);

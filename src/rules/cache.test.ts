@@ -161,6 +161,35 @@ describe("makePersistentRuleCache", () => {
         expect(await cold.get({ key: "k", epoch: 1 })).toEqual({ value: undefined }); // a broken read = a re-read
     });
 
+    it("issues its memoMany lookups concurrently — a cold front does not serialize N store reads", async () => {
+        // The restart case: the memory front is empty by definition, so every key falls through
+        // to the store. Awaiting them one at a time would put N store round trips in front of the
+        // single batched chain read a cold join is waiting on.
+        const store = fakeStore();
+        const started: string[] = [];
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        store.getItem = async (key) => {
+            started.push(key);
+            await held;
+            return undefined;
+        };
+        const cache = makePersistentRuleCache({ store, namespace: "n" });
+        const done = cache.memoMany({
+            keys: ["a", "b", "c", "d", "a"],
+            epoch: 5,
+            read: async ({ keys }) => ({ values: keys.map((key) => `v-${key}`) })
+        });
+
+        // All four unique lookups are in flight while the first is still unresolved; the serial
+        // version would sit at one. The repeated "a" is deduped, so it is four and not five.
+        await vi.waitFor(() => expect(started).toHaveLength(4));
+        release();
+        expect(await done).toEqual({ values: ["v-a", "v-b", "v-c", "v-d", "v-a"] });
+    });
+
     it("purges dead persisted entries, and re-purges only when the epoch advances", async () => {
         const store = fakeStore();
         const removed: string[] = [];
