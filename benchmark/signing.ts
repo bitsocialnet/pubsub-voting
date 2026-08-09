@@ -163,13 +163,15 @@ export function benchRules(): RuleRegistry | undefined {
     const probe: Rule<Erc5192MinBalanceOptions> = {
         type: erc5192MinBalance.type,
         optionsSchema: erc5192MinBalance.optionsSchema,
+        // Only the score is overridden; everything else the builtin decided (notably
+        // `penalize`) is passed through, so the bench runs the real rule's semantics.
         async evaluate(args) {
-            const { score } = await erc5192MinBalance.evaluate(args);
-            return { score: score > 0n ? score : 1n };
+            const result = await erc5192MinBalance.evaluate(args);
+            return { ...result, score: result.score > 0n ? result.score : 1n };
         },
         async evaluateMany(args) {
-            const results = await erc5192MinBalance.evaluateMany!(args);
-            return results.map(({ score }) => ({ score: score > 0n ? score : 1n }));
+            const { results } = await erc5192MinBalance.evaluateMany!(args);
+            return { results: results.map((result) => ({ ...result, score: result.score > 0n ? result.score : 1n })) };
         }
     };
     return { [probe.type]: probe as Rule };
