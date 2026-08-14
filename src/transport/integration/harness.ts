@@ -187,8 +187,8 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         verify: (bundle) => verifyImpl(bundle),
         verifyOffline: (bundle) => verifyImpl(bundle),
         // These harness nodes drive the transport, not the eligibility surface; nothing here
-        // calls checkGate, so it admits rather than pretending to model a gate.
-        checkGate: async () => ({ success: true, score: 1n })
+        // calls checkGates, so it admits rather than pretending to model a gate.
+        checkGates: async () => ({ kind: "leaf", leaf: 0, satisfied: true, score: 1n, penalize: false })
     };
 
     const admit = async ({ cid, bytes }: { cid: CID; bytes: Uint8Array; bundle: VotesBundle }): Promise<void> => {

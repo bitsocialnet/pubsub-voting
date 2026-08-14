@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import { makeBackgroundVerifier, type BackgroundVerifierDeps } from "./background.js";
 import { makeMemoryRuleCache } from "../rules/cache.js";
 import { makeVerdictCache } from "./cache.js";
@@ -119,7 +120,7 @@ function harness(over: Partial<BackgroundVerifierDeps> & { registry?: RuleRegist
         chainFor: () => ({}) as unknown as ChainClient,
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [],
-        ruleCache,
+        ruleCaches: [ruleCache],
         cache,
         onGateVerified: (cid) => gateVerified.push(cid.toString()),
         onNameResolved: (cid) => nameResolved.push(cid.toString()),
@@ -427,5 +428,87 @@ describe("makeBackgroundVerifier: a rule that scores at the head (rules/types.ts
         expect(h.evicted).toEqual([{ cid: entry.cid.toString(), disposition: "ignore" }]);
         expect(h.cache.get(entry.cid)).toBeUndefined();
         expect(h.verifier.pendingCount()).toBe(0);
+    });
+});
+
+/**
+ * A composite gate through the REAL background verifier: the leaves are batched independently and
+ * their answers folded (rules/gate.ts), so the eviction, its reason and its disposition are what
+ * the whole tree says — not what any one rule said.
+ */
+describe("composite gates", () => {
+    /** A one-answer rule under an arbitrary `type`, so a gate can name two distinct rules. */
+    function fixedRule(type: string, answer: RuleResult): Rule {
+        return {
+            type,
+            optionsSchema: z.looseObject({ type: z.string() }),
+            evaluate: async () => answer
+        };
+    }
+    const ok: RuleResult = { success: true, score: 1n };
+    const composite = (kind: "all" | "any") => ({
+        ...bizCriteria(),
+        gate: { [kind]: [{ rule: { type: "holds-pass" } }, { rule: { type: "not-banned" } }] } as never
+    });
+
+    it("evicts on ONE attributable failure inside an `all`, naming only the rules that explain it", async () => {
+        const h = harness({
+            criteria: composite("all"),
+            registry: {
+                "holds-pass": fixedRule("holds-pass", ok),
+                "not-banned": fixedRule("not-banned", { success: false, error: "this wallet is banned from the board" })
+            }
+        });
+        const entry = await pending(bundle("0xbad"));
+        h.verifier.enqueue([entry]);
+        await h.verifier.idle();
+
+        // Attributable (the rule left `penalize` at its default), so terminal: evicted at once,
+        // reject-class, and cached so a re-publish short-circuits.
+        expect(h.evicted).toEqual([{ cid: entry.cid.toString(), disposition: "reject" }]);
+        const verdict = h.cache.get(entry.cid);
+        expect(verdict).toMatchObject({ valid: false, disposition: "reject" });
+        expect((verdict as { reason: string }).reason).toContain("banned from the board");
+        // The satisfied leaf is not in the blame set — the wallet is not missing the Pass.
+        expect((verdict as { failures: { type: string }[] }).failures.map((f) => f.type)).toEqual(["not-banned"]);
+    });
+
+    it("holds an `any` whose alternatives failed for reasons NOBODY is blamed for", async () => {
+        // One alternative is attributable, the other is not — so a peer looking at a fresher chain
+        // may legitimately see a wallet this gate admits, and penalizing it would punish honest
+        // relaying. The bundle is held through the grace window instead of evicted `reject`.
+        const h = harness({
+            criteria: composite("any"),
+            registry: {
+                "holds-pass": fixedRule("holds-pass", { success: false, error: "holds none of the gate token", penalize: false }),
+                "not-banned": fixedRule("not-banned", { success: false, error: "this wallet is banned from the board" })
+            },
+            gateGraceMs: 15,
+            gateRetryMs: 5
+        });
+        const entry = await pending(bundle("0xbad"));
+        h.verifier.enqueue([entry]);
+        await h.verifier.idle();
+
+        expect(h.evicted).toEqual([{ cid: entry.cid.toString(), disposition: "ignore" }]);
+        expect(h.cache.get(entry.cid)).toBeUndefined(); // uncached — judged fresh next time
+        expect(h.gateVerified).toEqual([]);
+    });
+
+    it("admits when EITHER alternative of an `any` passes, and never re-reads the settled tree", async () => {
+        const h = harness({
+            criteria: composite("any"),
+            registry: {
+                "holds-pass": fixedRule("holds-pass", { success: false, error: "holds none of the gate token", penalize: false }),
+                "not-banned": fixedRule("not-banned", ok)
+            }
+        });
+        const entry = await pending(bundle("0xfeed"));
+        h.verifier.enqueue([entry]);
+        await h.verifier.idle();
+
+        expect(h.evicted).toEqual([]);
+        expect(h.gateVerified).toEqual([entry.cid.toString()]);
+        expect(h.cache.get(entry.cid)).toMatchObject({ valid: true, ruleScore: 1n });
     });
 });

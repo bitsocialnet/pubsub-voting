@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { topicFor, criteriaCid, TOPIC_PREFIX } from "./topic.js";
 import type { Criteria } from "./schema/criteria.js";
-import { bizCriteria } from "./test-fixtures.js";
+import { bizCriteria, bizGateRef } from "./test-fixtures.js";
 
 describe("topicFor", () => {
     it("is namespaced and a valid CIDv1 dag-cbor", async () => {
@@ -23,7 +23,7 @@ describe("topicFor", () => {
         const reordered: Criteria = {
             requires: base.requires,
             weight: base.weight,
-            rule: base.rule,
+            gate: base.gate,
             voteExpiryBuckets: base.voteExpiryBuckets,
             blocksPerBucket: base.blocksPerBucket,
             maxVotesPerAddress: base.maxVotesPerAddress,
@@ -44,7 +44,7 @@ describe("topicFor", () => {
         const a = bizCriteria();
         const b: Criteria = {
             ...bizCriteria(),
-            rule: { ...bizCriteria().rule, min: 2 }
+            gate: { rule: { ...bizGateRef(), min: 2 } }
         };
         expect(await topicFor(a)).not.toBe(await topicFor(b));
     });

@@ -1,6 +1,8 @@
 import type { Criteria } from "../schema/criteria.js";
 import type { RuleRegistry } from "./types.js";
-import { UnknownRuleError } from "../errors.js";
+import { gateLeaves } from "./gate.js";
+import { tickerForRef } from "../chain/ticker.js";
+import { GateChainMismatchError, UnknownRuleError } from "../errors.js";
 import { erc5192MinBalance } from "./erc5192-min-balance.js";
 import { constant } from "./constant.js";
 
@@ -66,19 +68,36 @@ export function resolveRegistry(overrides?: RuleRegistry): RuleRegistry {
 }
 
 /**
- * Validate a criteria document against a resolved registry: the `rule` and
- * `weight` refs must name rules this registry implements, their options must
+ * Validate a criteria document against a resolved registry: every leaf of the `gate` tree and the
+ * `weight` ref must name rules this registry implements, their options must
  * parse against the rule's own schema, and every name in `requires.rules`
  * must be resolvable (so an out-of-date client recuses itself instead of miscounting).
  *
- * Throws `UnknownRuleError` / a zod error on the first failure. This is a check,
- * not a transform: it never mutates `criteria`, so the topic-bearing bytes are untouched
+ * It also enforces that every gate leaf reads the SAME chain. The contest has exactly one clock:
+ * `blocksPerBucket`, a ballot's `blockNumber`, the sample block handed to every rule, and the
+ * tie-break seed block are all numbers on the gating chain. A leaf reading a different chain would
+ * be handed a block number from someone else's history and would silently answer about the wrong
+ * block. Multi-chain gating needs an explicit clock field first (see DESIGN.md "Open questions");
+ * until then this is a loud authoring error rather than a subtle miscount.
+ *
+ * Throws `UnknownRuleError` / `GateChainMismatchError` / a zod error on the first failure. This is
+ * a check, not a transform: it never mutates `criteria`, so the topic-bearing bytes are untouched
  * (option defaults applied here do not leak back into the encoded criteria).
  */
 export function validateCriteriaRules(criteria: Criteria, registry: RuleRegistry): void {
-    const rule = registry[criteria.rule.type];
-    if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
-    rule.optionsSchema.parse(criteria.rule);
+    let gateTicker: { ticker: string; type: string } | undefined;
+    for (const ref of gateLeaves(criteria.gate)) {
+        const rule = registry[ref.type];
+        if (!rule) throw new UnknownRuleError("gate", ref.type);
+        const ticker = tickerForRef(criteria, ref, rule.optionsSchema.parse(ref));
+        if (gateTicker && gateTicker.ticker !== ticker) {
+            throw new GateChainMismatchError(
+                { type: gateTicker.type, chain: gateTicker.ticker },
+                { type: ref.type, chain: ticker }
+            );
+        }
+        gateTicker ??= { ticker, type: ref.type };
+    }
 
     const weight = registry[criteria.weight.type];
     if (!weight) throw new UnknownRuleError("weight", criteria.weight.type);

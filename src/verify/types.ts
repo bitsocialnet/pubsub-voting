@@ -1,5 +1,5 @@
 import type { VotesBundle } from "../schema/votes.js";
-import type { RuleResult } from "../rules/types.js";
+import type { GateResult } from "../rules/gate.js";
 
 /**
  * Verification interfaces, design only.
@@ -32,7 +32,19 @@ import type { RuleResult } from "../rules/types.js";
  */
 export type VerdictDisposition = "reject" | "ignore";
 export type VerifyOk = { valid: true };
-export type VerifyFail = { valid: false; disposition: VerdictDisposition; reason: string };
+export type VerifyFail = {
+    valid: false;
+    disposition: VerdictDisposition;
+    reason: string;
+    /**
+     * Present when the GATE refused: one entry per rule whose failure explains the refusal
+     * (rules/gate.ts `gateBlame` — not every failed leaf, since one inside a satisfied `any`
+     * cost the wallet nothing). `reason` is these same sentences joined, kept so a caller that
+     * only renders a string needs no change; this is the structured form, so a client listing
+     * "what you are missing" never has to split one.
+     */
+    failures?: readonly { type: string; error: string }[];
+};
 export type VerifyResult = VerifyOk | VerifyFail;
 
 /** Stage 1: ballot signature only. No chain access. */
@@ -81,15 +93,18 @@ export interface BundleVerifier {
      */
     verifyOffline(bundle: VotesBundle): Promise<VerifyResult>;
     /**
-     * Step 3 alone, for a wallet rather than a bundle: run the gate rule and hand back its raw
-     * {@link RuleResult}. Backs `Contest.checkEligibility`, so a client can ask "would this vote
-     * count?" through the very same rule instance, options, chain client, head reader and memo
-     * the forward gate uses — never a reimplementation of them.
+     * Step 3 alone, for a wallet rather than a bundle: score EVERY leaf of the gate tree and hand
+     * back the folded {@link GateResult}. Backs `Contest.checkEligibility`, so a client can ask
+     * "would this vote count?" through the very same rule instances, options, chain clients, head
+     * reader and memos the forward gate uses — never a reimplementation of them.
+     *
+     * Unlike `verify`, this never short-circuits: a caller asking which rules a wallet fails needs
+     * all of their answers, not just the first one that settled the outcome.
      *
      * `sampleBlock` is the pinned block the prospective ballot would name (the caller's current
      * bucket). A head-scoring rule ignores it exactly as it does during verification.
      */
-    checkGate(args: { address: string; sampleBlock: number }): Promise<RuleResult>;
+    checkGates(args: { address: string; sampleBlock: number }): Promise<GateResult>;
 }
 
 /**

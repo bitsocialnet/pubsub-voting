@@ -7,7 +7,7 @@ import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.
 import { builtinRegistry } from "../rules/registry.js";
 import { erc721MinBalance } from "../rules/erc721-min-balance.js";
 import { makeBucketMath } from "../chain/bucket.js";
-import { bizCriteria } from "../test-fixtures.js";
+import { bizCriteria, bizGateRef } from "../test-fixtures.js";
 import type { ChainClient, NameResolver } from "../chain/types.js";
 
 // The anvil/hardhat test account #1 (holds no funds) — signs test bundles reproducibly.
@@ -65,7 +65,7 @@ function resolver(map: Record<string, string>): NameResolver {
     };
 }
 
-function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; ruleCache?: RuleCache } = {}) {
+function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<string, string>; ruleCaches?: readonly RuleCache[] } = {}) {
     return makeBundleVerifier({
         criteria: bizCriteria(),
         criteriaCid: CRITERIA_CID,
@@ -74,7 +74,7 @@ function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<
         chainFor: () => fakeChain(over.balance ?? 1n, over.onRead),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [resolver(over.names ?? {})],
-        ruleCache: over.ruleCache
+        ruleCaches: over.ruleCaches
     });
 }
 
@@ -101,7 +101,7 @@ describe("makeBundleVerifier", () => {
         // The counterpart to the case above, and the reason the disposition comes from the rule's
         // own answer rather than being hardcoded: a score pinned to a historical block is
         // identical on every verifier forever, so its `0n` is a `reject` the sender earns.
-        const criteria = { ...bizCriteria(), rule: { ...bizCriteria().rule, type: erc721MinBalance.type } };
+        const criteria = { ...bizCriteria(), gate: { rule: { ...bizGateRef(), type: erc721MinBalance.type } } };
         const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await makeBundleVerifier({
             criteria,
@@ -169,7 +169,7 @@ describe("makeBundleVerifier", () => {
     it("memoizes a gate miss through the rule's cache, so a second bundle skips the chain read", async () => {
         let reads = 0;
         const ruleCache = makeMemoryRuleCache();
-        const v = verifier({ balance: 0n, onRead: () => reads++, ruleCache });
+        const v = verifier({ balance: 0n, onRead: () => reads++, ruleCaches: [ruleCache] });
         // Two DISTINCT bundles (different community) from the same wallet at the same block: the
         // first pays the reads, the second short-circuits entirely on the rule's memo.
         const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
@@ -186,7 +186,7 @@ describe("makeBundleVerifier", () => {
     it("memoizes a gate HIT so an eligible wallet's re-vote skips the read", async () => {
         let reads = 0;
         const ruleCache = makeMemoryRuleCache();
-        const v = verifier({ balance: 1n, onRead: () => reads++, ruleCache });
+        const v = verifier({ balance: 1n, onRead: () => reads++, ruleCaches: [ruleCache] });
         // An eligible wallet cycling choices in the same bucket must not re-read the chain per
         // fresh bundle — the `> 0n` score is memoized just like the `0n` miss.
         const first = await v.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));

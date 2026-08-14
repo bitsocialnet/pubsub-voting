@@ -1,13 +1,11 @@
 import type { CID } from "multiformats/cid";
 import type { VotesBundle } from "../schema/votes.js";
 import type { Criteria } from "../schema/criteria.js";
-import type { RuleRegistry, RuleWallet } from "../rules/types.js";
+import type { RuleRegistry, RuleResult, RuleWallet } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
-import { tickerForRef } from "../chain/ticker.js";
-import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
+import type { RuleCache } from "../rules/cache.js";
 import { GATE_GRACE_MS, GATE_RETRY_MS } from "./gate-grace.js";
-import { gateFailure, scoreOrZero } from "../rules/result.js";
-import { UnknownRuleError } from "../errors.js";
+import { evaluateGate, gateBlame, gatePenalize, gateReason, gateScore, resolveGate, type GateResult } from "../rules/gate.js";
 import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
 import type { VerdictCache } from "./cache.js";
 import type { VerifyFail } from "./types.js";
@@ -63,10 +61,11 @@ export interface BackgroundVerifierDeps {
     bucketMath: BucketMath;
     nameResolvers: NameResolver[];
     /**
-     * The gate rule's memo, handed to it as `ctx.cache` (rules/cache.ts). Shared with the inline
-     * forward-gate verifier, so neither re-reads what the other settled.
+     * One memo per gate leaf, in `gateLeaves` order, handed to each rule as `ctx.cache`
+     * (rules/cache.ts). Shared with the inline forward-gate verifier, so neither re-reads what
+     * the other settled.
      */
-    ruleCache?: RuleCache;
+    ruleCaches?: readonly RuleCache[];
     /**
      * This verifier's current head, handed to the rule as `ctx.head`. Resolved by the rule at
      * most once per batch, so a round stays batchable. Never called by a rule that scores pinned
@@ -117,18 +116,18 @@ export interface BackgroundChainVerifier {
 const RETRY_BASE_MS = 2_000;
 const RETRY_CAP_MS = 60_000;
 
-/** Internal queue item: `gateDone`/`ruleScore` survive an infra retry so no stage re-runs. */
+/** Internal queue item: `gateDone`/`gate` survive an infra retry so no stage re-runs. */
 interface QueueItem extends PendingBundle {
     gateDone: boolean;
     /** True once `onGateVerified` fired, so a name-stage retry does not re-notify. */
     gateNotified: boolean;
-    ruleScore: bigint;
     resolvedNames: Record<string, string>;
     /**
-     * The rule's failure for this wallet, or `undefined` once it passed the gate — the rule's own
-     * `error` wording plus whether it may be blamed on the sender (rules/result.ts).
+     * The folded gate tree for this wallet, or `undefined` before the gate stage ran. Carries
+     * every leaf's answer, so the reason, the blame set and the penalize decision are all read
+     * off the one structure (rules/gate.ts) rather than recomputed per call site.
      */
-    gateFailed: { error: string; penalize: boolean } | undefined;
+    gate: GateResult | undefined;
     /**
      * `Date.now()` when this item was first enqueued — the clock for the grace window (see
      * verify/gate-grace.ts). Only read when the gate fails and blames nobody for it.
@@ -143,19 +142,10 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     const gateGraceMs = deps.gateGraceMs ?? GATE_GRACE_MS;
     const gateRetryMs = deps.gateRetryMs ?? GATE_RETRY_MS;
 
-    // Resolve the gate `rule`, its options, and its chain once (same shape as verify/bundle.ts).
-    // The re-binding after the guard keeps the non-undefined narrowing inside the closures below.
-    const maybeRule = registry[criteria.rule.type];
-    if (!maybeRule) throw new UnknownRuleError("rule", criteria.rule.type);
-    const rule = maybeRule;
-    const ruleOptions = rule.optionsSchema.parse(criteria.rule);
-    const ruleChain = chainFor(tickerForRef(criteria, criteria.rule, ruleOptions));
+    // Resolve every gate leaf — rule, options, chain, memo — once (same call as verify/bundle.ts,
+    // so the two verifiers cannot resolve a gate differently).
     const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
-    const ctx = {
-        chain: ruleChain,
-        head: () => readHead({ chain: ruleChain }),
-        cache: deps.ruleCache ?? makeMemoryRuleCache()
-    };
+    const leaves = resolveGate({ criteria, registry, chainFor, readHead, caches: deps.ruleCaches });
 
     const queue: QueueItem[] = [];
     /** CIDs queued or in-flight, so a re-chased root cannot double-verify a bundle. */
@@ -183,15 +173,22 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     }
 
     /**
-     * Gate stage for one round's batch: hand every not-yet-gated wallet to the rule at once —
-     * `evaluateMany` when it has one, `limit`-bounded per-wallet `evaluate` otherwise — and
-     * record each score with the rule's own verdict on whether a `0n` is attributable.
+     * Gate stage for one round's batch: hand every not-yet-gated wallet to EACH gate leaf at once
+     * — `evaluateMany` when the rule has one, `limit`-bounded per-wallet `evaluate` otherwise —
+     * then fold each item's leaf answers into its verdict.
      *
-     * No grouping and no cache lookups here any more: which block each wallet is read at, and
-     * what may be memoized under which key, are the rule's decisions (rules/types.ts,
-     * rules/cache.ts). Duplicate wallets are still collapsed before the call, because that is a
-     * property of THIS batch rather than of any rule. Throws on the FIRST infra failure: the
-     * round's unfinished items are re-queued by the caller.
+     * Note this deliberately does NOT short-circuit the tree the way the inline gate does. Here
+     * the axis of batching is the rule, not the wallet: one `evaluateMany` per leaf covers the
+     * whole round, so scoring every leaf costs one round trip per leaf no matter how many wallets
+     * are pending, while short-circuiting per wallet would fragment those batches into
+     * per-wallet reads. Collecting all is the cheaper shape on this path, and it is also what
+     * gives every item a complete blame set.
+     *
+     * No grouping and no cache lookups here: which block each wallet is read at, and what may be
+     * memoized under which key, are the rule's decisions (rules/types.ts, rules/cache.ts).
+     * Duplicate wallets are still collapsed before the calls, because that is a property of THIS
+     * batch rather than of any rule. Throws on the FIRST infra failure: the round's unfinished
+     * items are re-queued by the caller.
      */
     async function gateStage(items: QueueItem[]): Promise<void> {
         const pending = items.filter((item) => !item.gateDone);
@@ -207,15 +204,24 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             wallets.push(wallet);
         }
 
-        const results = rule.evaluateMany
-            ? (await rule.evaluateMany({ options: ruleOptions, wallets, ctx })).results
-            : await Promise.all(wallets.map((wallet) => limit(() => rule.evaluate({ options: ruleOptions, wallet, ctx }))));
+        // One batched call per leaf, the leaves in parallel: each is a single multicall for the
+        // whole round, and the voter's per-client in-flight budget still bounds what reaches an RPC.
+        const byLeaf: RuleResult[][] = await Promise.all(
+            leaves.map(({ rule, options, ctx }) =>
+                rule.evaluateMany
+                    ? rule.evaluateMany({ options, wallets, ctx }).then(({ results }) => results)
+                    : Promise.all(wallets.map((wallet) => limit(() => rule.evaluate({ options, wallet, ctx }))))
+            )
+        );
 
         for (const item of pending) {
-            const key = `${item.bundle.address.toLowerCase()}:${sampleBlockFor(item.bundle)}`;
-            const result = results[at.get(key)!]!;
-            item.gateFailed = gateFailure(result);
-            item.ruleScore = scoreOrZero(result);
+            const wallet = at.get(`${item.bundle.address.toLowerCase()}:${sampleBlockFor(item.bundle)}`)!;
+            // Every leaf is already scored, so this "evaluation" reads the batch — no chain work.
+            item.gate = await evaluateGate({
+                node: criteria.gate,
+                evaluate: async (leaf) => byLeaf[leaf]![wallet]!,
+                collectAll: true
+            });
             item.gateDone = true;
         }
     }
@@ -284,20 +290,29 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 requeue.push(item); // gate read never happened (infra) — retry the whole item
                 continue;
             }
-            if (item.gateFailed) {
-                if (item.gateFailed.penalize) {
+            if (item.gate !== undefined && item.gate.satisfied !== true) {
+                // The rules' own wording, narrowed to the failures that explain the refusal, plus
+                // the recursive answer to "may this be blamed on the sender" (rules/gate.ts).
+                const failures = gateBlame(item.gate).map((leaf) => ({
+                    type: leaves[leaf.leaf]!.ref.type,
+                    error: leaf.error ?? ""
+                }));
+                const reason = gateReason(item.gate);
+                if (gatePenalize(item.gate)) {
                     // Provable, deterministic reject — safe to cache so a re-publish short-circuits.
                     const verdict: VerifyFail = {
                         valid: false,
                         disposition: "reject",
-                        reason: `not admitted: ${item.gateFailed.error}`
+                        reason: `not admitted: ${reason}`,
+                        failures
                     };
                     cache.set(item.cid, verdict);
                     deps.onEvict(item.cid, verdict);
                     settle(item);
                     continue;
                 }
-                // The rule declined to blame anyone (see rules/types.ts, RuleResult.penalize):
+                // No failure the gate will blame anyone for (see rules/types.ts, RuleResult.penalize,
+                // and rules/gate.ts for how that folds through `all`/`any`):
                 // the failure means "not yet", not "no". The wallet may have acquired the asset in
                 // a block this verifier has not seen, or may acquire it a moment from now — a
                 // client that signs the instant it mints races its own transaction. Evicting here
@@ -314,7 +329,8 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 const verdict: VerifyFail = {
                     valid: false,
                     disposition: "ignore",
-                    reason: `not admitted: ${item.gateFailed.error} (still true after the grace window)`
+                    reason: `not admitted: ${reason} (still true after the grace window)`,
+                    failures
                 };
                 deps.onEvict(item.cid, verdict);
                 settle(item);
@@ -336,7 +352,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             }
             if (item.bundle.votes.some((v) => v.community.name)) deps.onNameResolved(item.cid);
             // Fully settled: store the terminal valid verdict (same shape the forward-gate caches).
-            cache.set(item.cid, { valid: true, ruleScore: item.ruleScore, resolvedNames: item.resolvedNames });
+            cache.set(item.cid, { valid: true, ruleScore: gateScore(item.gate!), resolvedNames: item.resolvedNames });
             settle(item);
         }
 
@@ -396,8 +412,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                     ...entry,
                     gateDone: false,
                     gateNotified: false,
-                    ruleScore: 0n,
-                    gateFailed: undefined,
+                    gate: undefined,
                     resolvedNames: {},
                     queuedAt: Date.now()
                 });

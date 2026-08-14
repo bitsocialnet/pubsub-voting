@@ -21,13 +21,13 @@ export class NotImplementedError extends Error {
 
 /**
  * Thrown when a criteria document names a rule `type` this client does not
- * implement (in the `rule`/`weight` slot or in `requires.rules`). A
+ * implement (in a `gate` leaf, the `weight` slot, or in `requires.rules`). A
  * client that hits this is too old (or missing a host override) and must recuse
  * itself from the contest rather than miscount. See DESIGN.md "Rules".
  */
 export class UnknownRuleError extends Error {
     constructor(
-        readonly slot: "rule" | "weight" | "requires",
+        readonly slot: "gate" | "weight" | "requires",
         readonly type: string
     ) {
         super(
@@ -36,6 +36,30 @@ export class UnknownRuleError extends Error {
                 `or recuse this contest. Built-ins: see registry.ts.`
         );
         this.name = "UnknownRuleError";
+    }
+}
+
+/**
+ * Thrown by `createContest` / `createContestVote` when two leaves of the `gate` tree read
+ * different chains.
+ *
+ * A contest has one clock: `blocksPerBucket`, the ballot's `blockNumber`, the sample block every
+ * rule is handed, and the tie-break seed block are all numbers on the gating chain. A leaf reading
+ * a second chain would be handed a block number out of someone else's history — not an error any
+ * rule can detect, so the document is refused up front instead. Gating across chains needs an
+ * explicit clock field in the criteria first; see DESIGN.md "Open questions".
+ */
+export class GateChainMismatchError extends Error {
+    constructor(
+        readonly first: { type: string; chain: string },
+        readonly second: { type: string; chain: string }
+    ) {
+        super(
+            `The criteria gate mixes chains: rule "${first.type}" reads "${first.chain}" but rule ` +
+                `"${second.type}" reads "${second.chain}". Every gate leaf must read the chain whose ` +
+                `blocks the contest's buckets are counted in.`
+        );
+        this.name = "GateChainMismatchError";
     }
 }
 

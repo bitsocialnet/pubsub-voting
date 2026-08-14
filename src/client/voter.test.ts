@@ -20,7 +20,7 @@ import {
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
-import type { Rule } from "../rules/types.js";
+import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import type { Criteria } from "../schema/criteria.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
@@ -38,6 +38,7 @@ import { topicFor } from "../topic.js";
 import { blockForBytes } from "../checkpoint/codec.js";
 import {
     bizCriteria,
+    bizGateRef,
     fakeHelia,
     fakeHeliaWithoutPubsub,
     fakeHeliaWithoutBlockstore,
@@ -2369,7 +2370,12 @@ describe("Contest.checkEligibility", () => {
     it("reports the gate score for a wallet the REAL rule admits", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 3n }), signer: fakeSigner() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
-        expect(await contest.checkEligibility({ address: WALLET })).toEqual({ eligible: true, score: 3n });
+        const result = await contest.checkEligibility({ address: WALLET });
+        expect(result).toMatchObject({ eligible: true, score: 3n });
+        // One rule in the gate, so one check — and it carries that rule's own score and identity.
+        expect(result.checks).toHaveLength(1);
+        expect(result.checks[0]).toMatchObject({ type: "erc5192-min-balance", satisfied: true, score: 3n });
+        expect(result.gate).toMatchObject({ kind: "leaf", satisfied: true });
         await voter.destroy();
     });
 
@@ -2412,6 +2418,101 @@ describe("Contest.checkEligibility", () => {
         await voter.destroy();
     });
 
+    /**
+     * A composite gate: two rules, each answering only about itself, with the criteria composing
+     * them. What a client needs back is not "eligible: false" but WHICH requirements are missing —
+     * and, under `any`, which failures are noise.
+     */
+    describe("composite gates", () => {
+        const answering = (answers: Record<string, RuleResult>): RuleRegistry =>
+            Object.fromEntries(
+                Object.entries(answers).map(([type, answer]) => [
+                    type,
+                    { type, optionsSchema: z.looseObject({ type: z.string() }), evaluate: async () => answer }
+                ])
+            );
+        const gate = (kind: "all" | "any"): Criteria => ({
+            ...bizCriteria(),
+            gate: { [kind]: [{ rule: { type: "holds-pass" } }, { rule: { type: "not-banned" } }] } as never
+        });
+        const contestOn = async (criteria: Criteria, rules: RuleRegistry) => {
+            const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), rules });
+            return { voter, contest: await voter.createContest({ criteria }) };
+        };
+        const PASS: RuleResult = { success: true, score: 4n };
+        const BANNED: RuleResult = { success: false, error: "this wallet is banned from the board" };
+        const NO_PASS: RuleResult = { success: false, error: "this wallet holds none of the gate token", penalize: false };
+
+        it("lists EVERY failing requirement of an `all`, each with its own rule's wording", async () => {
+            const { voter, contest } = await contestOn(gate("all"), answering({ "holds-pass": NO_PASS, "not-banned": BANNED }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result.eligible).toBe(false);
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.failures.map((f) => f.type)).toEqual(["holds-pass", "not-banned"]);
+            expect(result.failures.map((f) => f.error)).toEqual([NO_PASS.error, BANNED.error]);
+            // Both rules ran even though the first already settled it — naming each failure is
+            // what this call is for, so it never short-circuits the way the forward gate does.
+            expect(result.checks).toHaveLength(2);
+            expect(result.checks.every((check) => check.satisfied === false)).toBe(true);
+            // ...and the joined string still exists for a caller that only renders one.
+            expect(result.error).toBe(`${NO_PASS.error}; ${BANNED.error}`);
+            await voter.destroy();
+        });
+
+        it("reports only the unmet requirement when the other is met", async () => {
+            const { voter, contest } = await contestOn(gate("all"), answering({ "holds-pass": PASS, "not-banned": BANNED }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.failures.map((f) => f.type)).toEqual(["not-banned"]);
+            // The satisfied leaf is still reported — a UI can show the checklist, ticks and all.
+            expect(result.checks.map((c) => [c.type, c.satisfied])).toEqual([
+                ["holds-pass", true],
+                ["not-banned", false]
+            ]);
+            await voter.destroy();
+        });
+
+        it("blames NOTHING for a failed alternative when the wallet qualifies another way", async () => {
+            // The reason `failures` is not `checks.filter(failed)`: this wallet holds no Pass, is
+            // eligible as a moderator, and must not be told to go and buy a Pass.
+            const { voter, contest } = await contestOn(gate("any"), answering({ "holds-pass": NO_PASS, "not-banned": PASS }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result).toMatchObject({ eligible: true, score: 4n }); // `any` scores the best route
+            expect(result.checks.map((c) => c.satisfied)).toEqual([false, true]);
+            await voter.destroy();
+        });
+
+        it("names every alternative when an `any` refuses — each is a road not taken", async () => {
+            const { voter, contest } = await contestOn(gate("any"), answering({ "holds-pass": NO_PASS, "not-banned": BANNED }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.failures.map((f) => f.type)).toEqual(["holds-pass", "not-banned"]);
+            // The tree comes back shaped like the criteria, so a client can render the real
+            // requirement ("either of these") rather than an undifferentiated list.
+            expect(result.gate).toMatchObject({ kind: "any", satisfied: false });
+            await voter.destroy();
+        });
+
+        it("gives each leaf a distinct ruleId, even for two leaves of the same rule type", async () => {
+            // `type` is not a key: a gate may name one rule twice on different options, and a UI
+            // keying rows by `type` would collapse them. The id is the leaf's canonical bytes.
+            const criteria: Criteria = {
+                ...bizCriteria(),
+                gate: { all: [{ rule: { ...bizGateRef(), min: 1 } }, { rule: { ...bizGateRef(), min: 5 } }] }
+            };
+            const { voter, contest } = await contestOn(criteria, {});
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result.checks.map((c) => c.type)).toEqual(["erc5192-min-balance", "erc5192-min-balance"]);
+            expect(new Set(result.checks.map((c) => c.ruleId)).size).toBe(2);
+            await voter.destroy();
+        });
+    });
+
     it("admits a wallet holding at the head but NOT at the current bucket's block", async () => {
         // The regression this whole surface exists for: a Pass acquired mid-window. The head leg
         // admits, so the answer must be `eligible` — the pre-0.3.0 answer was "not yet, wait an
@@ -2429,7 +2530,7 @@ describe("Contest.checkEligibility", () => {
 
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
-        expect(await contest.checkEligibility({ address: WALLET })).toEqual({ eligible: true, score: 1n });
+        expect(await contest.checkEligibility({ address: WALLET })).toMatchObject({ eligible: true, score: 1n });
         await voter.destroy();
     });
 });

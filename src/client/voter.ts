@@ -1,5 +1,5 @@
 import pLimit from "p-limit";
-import { CriteriaSchema, type Criteria } from "../schema/criteria.js";
+import { CriteriaSchema, type Criteria, type RuleRef } from "../schema/criteria.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
 import { coalescingChainFactory } from "../chain/coalescer.js";
@@ -43,7 +43,7 @@ import { resolveRegistry, validateCriteriaRules } from "../rules/registry.js";
 import { makeVoteCrdt } from "../crdt/crdt.js";
 import type { VoteCrdt } from "../crdt/types.js";
 import { makePersistentRuleCache } from "../rules/cache.js";
-import { gateFailure, scoreOrZero } from "../rules/result.js";
+import { gateBlame, gateLeaves, gateReason, gateScore, type GateResult } from "../rules/gate.js";
 import { makeBundleVerifier } from "../verify/bundle.js";
 import { makeVerdictCache } from "../verify/cache.js";
 import { makeNameResolutionCache, type NameResolutionCache } from "../verify/name-resolution-cache.js";
@@ -140,21 +140,61 @@ export interface PublishOutcome {
     readonly recipientCount: number;
 }
 
-/** One contest's reactive read view: subscribe, keep the tally in sync, read it. */
 /**
- * What {@link Contest.checkEligibility} found. Shaped like {@link RuleResult} on purpose — it is
- * that result, surfaced — so the failing branch always carries a reason a client can display.
+ * One rule's answer about one wallet, as {@link Contest.checkEligibility} reports it.
+ * Shaped like {@link RuleResult} on purpose — it is that result, surfaced — so a failure always
+ * carries a sentence a client can display.
+ */
+export interface EligibilityCheck {
+    /**
+     * Stable identity of this rule INSTANCE: the hash of its canonical criteria reference plus
+     * the id of the chain it reads — the same key that namespaces its memo. Use it as the render
+     * key: two leaves can share a `type` on different options, so `type` alone is not unique.
+     */
+    readonly ruleId: string;
+    /** The rule `type` this leaf names, for grouping and labelling. */
+    readonly type: string;
+    /** `undefined` when the evaluation never needed this rule's answer (never on this call). */
+    readonly satisfied: boolean | undefined;
+    /** This rule's score for the wallet; `0n` unless it passed. */
+    readonly score: bigint;
+    /** The rule's own explanation, written for the voter. Render it verbatim. */
+    readonly error?: string;
+}
+
+/**
+ * The gate tree with each node's verdict — the same shape as `criteria.gate`, so a client can
+ * render the real requirement ("the Pass AND not banned", "the Pass OR moderator") instead of a
+ * flat list that cannot express it.
+ */
+export type EligibilityNode =
+    | ({ kind: "leaf" } & EligibilityCheck)
+    | { kind: "all" | "any"; satisfied: boolean | undefined; children: EligibilityNode[] };
+
+/**
+ * What {@link Contest.checkEligibility} found.
+ *
+ * `checks` is every rule in the gate, in document order. `failures` is the subset that EXPLAINS a
+ * refusal, which is not the same thing: a rule that failed inside a satisfied `any` branch cost
+ * the wallet nothing, and telling someone to go acquire an asset they do not need is worse than
+ * saying nothing. Render `failures`; use `gate` when the shape of the requirement matters.
  */
 export type EligibilityResult =
     | {
           eligible: true;
-          /** The wallet's gate score, `> 0n`. For a balance gate this is the holding itself. */
+          /** The gate's folded score (min across an `all`, max across an `any`), always `> 0n`. */
           score: bigint;
+          readonly checks: readonly EligibilityCheck[];
+          readonly gate: EligibilityNode;
       }
     | {
           eligible: false;
-          /** The rule's own explanation, written for the voter. Render it verbatim. */
+          /** The blame set's reasons joined — the one-string form, for a caller that wants one. */
           error: string;
+          /** The rules whose failure explains the refusal. Never empty on this branch. */
+          readonly failures: readonly EligibilityCheck[];
+          readonly checks: readonly EligibilityCheck[];
+          readonly gate: EligibilityNode;
       };
 
 export interface Contest {
@@ -182,15 +222,18 @@ export interface Contest {
 
     /**
      * Would this contest's gate admit `address` right now? Ask before signing, to tell a voter
-     * whether their ballot will count — and, when it will not, exactly why.
+     * whether their ballot will count — and, when it will not, exactly which rules refused.
      *
-     * This runs the contest's REAL gate rule through the same context the forward-gate and the
-     * background verifier use: the same chain client, the same coalesced head reader, the same
-     * memo. So it reads at whatever block the rule reads at, applies whatever threshold the rule
-     * applies, and returns the rule's own {@link RuleResult.error} wording verbatim. A client
-     * renders `error` and needs to know nothing about blocks, buckets or thresholds — which is
+     * This runs the contest's REAL gate rules through the same context the forward-gate and the
+     * background verifier use: the same chain clients, the same coalesced head reader, the same
+     * memos. So it reads at whatever block each rule reads at, applies whatever thresholds they
+     * apply, and returns their own {@link RuleResult.error} wording verbatim. A client renders
+     * those sentences and needs to know nothing about blocks, buckets or thresholds — which is
      * the point: re-deriving any of that outside the rule is how a UI ends up confidently
      * telling voters to wait for a window that no longer gates anything.
+     *
+     * Every leaf is evaluated, even once the outcome is settled, because naming each failure is
+     * what this call is for (the forward gate, which only needs the verdict, stops early instead).
      *
      * It is a courtesy check, not a promise. Eligibility is a fact about the chain and can change
      * between this call and the publish, and each peer verifies against its own view — so a
@@ -198,8 +241,8 @@ export interface Contest {
      * reason). `publish()` deliberately does NOT call this: the gate is the network's decision,
      * and refusing locally would only hide a vote the rest of the topic would have accepted.
      *
-     * Costs one gate evaluation, usually served from the shared memo — the same read the verifier
-     * would do anyway, not an extra one.
+     * Costs one evaluation per gate rule, usually served from the shared memos — the same reads
+     * the verifier would do anyway, not extra ones.
      */
     checkEligibility(args: { address: string }): Promise<EligibilityResult>;
 
@@ -1014,12 +1057,16 @@ class ContestEngine {
             })
         );
 
-        // The gating (`rule`) chain fixes the ballot's chainId and the tie-break seed chain.
-        const rule = deps.registry[criteria.rule.type];
-        if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
-        const ruleTicker = tickerForRef(criteria, criteria.rule, rule.optionsSchema.parse(criteria.rule));
+        // The gating chain fixes the ballot's chainId and the tie-break seed chain. Every gate
+        // leaf reads it — `validateCriteriaRules` refused the document otherwise, since the
+        // contest counts its buckets in exactly one chain's blocks — so leaf 0 names it for all.
+        const gateRefs = gateLeaves(criteria.gate);
+        const firstRef = gateRefs[0]!; // GateSchema cannot produce a tree with no leaves
+        const rule = deps.registry[firstRef.type];
+        if (!rule) throw new UnknownRuleError("gate", firstRef.type);
+        const ruleTicker = tickerForRef(criteria, firstRef, rule.optionsSchema.parse(firstRef));
         const ruleChain = this.#chainClients[ruleTicker];
-        if (!ruleChain) throw new Error(`no chain client for gating (\`rule\`) chain "${ruleTicker}"`);
+        if (!ruleChain) throw new Error(`no chain client for the gating chain "${ruleTicker}"`);
         this.#ruleChain = ruleChain;
         this.#chainId = criteria.requires.chains[ruleTicker]!.chainId;
 
@@ -1034,15 +1081,18 @@ class ContestEngine {
             isProvisional: (cid) => this.#isPending(cid)
         });
 
-        // The gate rule's memo (rules/cache.ts), shared between the inline forward-gate verifier
-        // and the background chain verifier so neither re-reads what the other settled — layered
-        // over the voter's persistent store and namespaced by the hash of the canonical rule
-        // reference + chainId. That hash is exactly the sharing boundary: two contests over one
-        // gate (a directory of boards on the same Pass) share each other's reads, while
-        // different gates, or one gate on different options, can never collide. What is stored
-        // under it, and for how long, is the rule's business, not the engine's.
-        this.#ruleHash = sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.rule }));
-        const gateCache = makePersistentRuleCache({ store: deps.gateStore, namespace: this.#ruleHash });
+        // One memo per gate leaf (rules/cache.ts), each shared between the inline forward-gate
+        // verifier and the background chain verifier so neither re-reads what the other settled —
+        // layered over the voter's persistent store and namespaced by the hash of that leaf's
+        // canonical rule reference + chainId. That hash is exactly the sharing boundary: two
+        // contests over one gate rule (a directory of boards on the same Pass) share each other's
+        // reads, while different rules, or one rule on different options, can never collide —
+        // which is also what keeps two leaves of ONE gate apart. What is stored under it, and for
+        // how long, is the rule's business, not the engine's. The same hash is each leaf's public
+        // `ruleId` in `checkEligibility`.
+        this.#gateRefs = gateRefs;
+        this.#ruleIds = gateRefs.map((ref) => sha256(encodeDagCbor({ chainId: this.#chainId, rule: ref })));
+        const gateCaches = this.#ruleIds.map((namespace) => makePersistentRuleCache({ store: deps.gateStore, namespace }));
         // The weight rule gets its own namespace on the SAME terms — its canonical reference plus
         // the id of the chain IT reads, which is not necessarily the gating chain. A ticker is
         // just a name local to the criteria document, so two contests can spell the same weight
@@ -1065,7 +1115,7 @@ class ContestEngine {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            ruleCache: gateCache,
+            ruleCaches: gateCaches,
             nameResolutionCache: deps.nameResolutionCache,
             readHead: ({ chain }) => this.#readHead({ chain })
         });
@@ -1081,7 +1131,7 @@ class ContestEngine {
             chainFor: (ticker) => this.#chainFor(ticker),
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
-            ruleCache: gateCache,
+            ruleCaches: gateCaches,
             nameResolutionCache: deps.nameResolutionCache,
             readHead: ({ chain }) => this.#readHead({ chain }),
             cache: this.#cache,
@@ -1108,8 +1158,10 @@ class ContestEngine {
     }
 
     readonly #store: ReturnType<typeof makeBlockstoreBundleStore>;
-    /** Hash of the canonical gate rule + chainId — this contest's keyspace in the shared gate store. */
-    readonly #ruleHash: string;
+    /** Per gate leaf: hash of its canonical rule ref + chainId — its keyspace in the shared gate store. */
+    readonly #ruleIds: string[];
+    /** The gate's leaf refs in document order, aligned with {@link #ruleIds}. */
+    readonly #gateRefs: RuleRef[];
     readonly #cache: ReturnType<typeof makeVerdictCache>;
     readonly #acceptedDedup: ReturnType<typeof makeAcceptedDedup>;
     readonly #verifier: ReturnType<typeof makeBundleVerifier>;
@@ -1293,19 +1345,51 @@ class ContestEngine {
     }
 
     /**
-     * Run the gate rule for one wallet, against the ballot block a vote published NOW would carry
-     * — the engine half of {@link Contest.checkEligibility}.
+     * Run the gate for one wallet, against the ballot block a vote published NOW would carry —
+     * the engine half of {@link Contest.checkEligibility}.
      *
-     * All the interesting decisions belong to the rule: this resolves the current bucket's sample
-     * block, hands it over, and translates the rule's own answer. It never looks at what kind of
-     * rule it is holding, so it stays correct for a head-scoring gate, a pinned one, or anything
-     * a host registers later.
+     * All the interesting decisions belong to the rules: this resolves the current bucket's sample
+     * block, hands it over, and translates their own answers. It never looks at what kind of rules
+     * it is holding, so it stays correct for a head-scoring gate, a pinned one, a composite of
+     * both, or anything a host registers later.
      */
     async checkEligibility({ address }: { address: string }): Promise<EligibilityResult> {
         const sampleBlock = this.#bucketMath.sampleBlockForBucket(await this.#nowBucket());
-        const result = await this.#verifier.checkGate({ address, sampleBlock });
-        const failed = gateFailure(result);
-        return failed ? { eligible: false, error: failed.error } : { eligible: true, score: scoreOrZero(result) };
+        const gate = await this.#verifier.checkGates({ address, sampleBlock });
+        const checks = new Map<number, EligibilityCheck>();
+        const node = this.#toEligibilityNode(gate, checks);
+        // Document order, not evaluation order: the leaves as the criteria lists them.
+        const ordered = [...checks.entries()].sort(([a], [b]) => a - b).map(([, check]) => check);
+        if (gate.satisfied === true) return { eligible: true, score: gateScore(gate), checks: ordered, gate: node };
+        return {
+            eligible: false,
+            error: gateReason(gate),
+            // The blame set, not every failed leaf: a failure inside a satisfied `any` explains
+            // nothing the voter can act on (rules/gate.ts `gateBlame`).
+            failures: gateBlame(gate).map((leaf) => checks.get(leaf.leaf)!),
+            checks: ordered,
+            gate: node
+        };
+    }
+
+    /** Project one evaluated gate node onto the public shape, collecting its leaves by index. */
+    #toEligibilityNode(result: GateResult, checks: Map<number, EligibilityCheck>): EligibilityNode {
+        if (result.kind !== "leaf") {
+            return {
+                kind: result.kind,
+                satisfied: result.satisfied,
+                children: result.children.map((child) => this.#toEligibilityNode(child, checks))
+            };
+        }
+        const check: EligibilityCheck = {
+            ruleId: this.#ruleIds[result.leaf]!,
+            type: this.#gateRefs[result.leaf]!.type,
+            satisfied: result.satisfied,
+            score: result.score,
+            ...(result.error === undefined ? {} : { error: result.error })
+        };
+        checks.set(result.leaf, check);
+        return { kind: "leaf", ...check };
     }
 
     /** Hash of the current bucket boundary block on the gating (`rule`) chain (rolling tie seed). */

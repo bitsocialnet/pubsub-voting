@@ -36,6 +36,74 @@ export const RuleRefSchema = z.looseObject({
 });
 
 /**
+ * The gate: a boolean tree over rule references, deciding who may vote.
+ *
+ * A leaf wraps one {@link RuleRefSchema}; `all` and `any` compose leaves into conjunction and
+ * disjunction, so a contest can require "holds the Pass AND is not on the deny list", or "holds
+ * the Pass OR is a moderator", without either rule knowing the other exists. Composition is the
+ * document's business, never a rule's: a rule still answers exactly one question about one wallet
+ * (see rules/types.ts), and `rules/gate.ts` folds the answers.
+ *
+ * The leaf is WRAPPED (`{ rule: { type, ... } }`) rather than bare because {@link RuleRefSchema}
+ * is loose by design — a custom rule may carry an option named `all` or `any`, which would make a
+ * bare leaf structurally ambiguous with a branch exactly when someone writes such a rule.
+ *
+ * Canonicity constraints, all of them load-bearing rather than stylistic. The topic is the CID of
+ * these bytes, so any document that differs in bytes but not in meaning is a silent topic FORK —
+ * two peers running identical rules on two topics, each invisible to the other:
+ *   - a branch needs at least TWO children, so `{ all: [X] }` cannot exist alongside `X`;
+ *   - depth is capped at {@link MAX_GATE_DEPTH} and leaves at {@link MAX_GATE_LEAVES}, because a
+ *     criteria document is attacker-supplied input that every peer parses and evaluates.
+ */
+export interface GateLeaf {
+    rule: RuleRef;
+}
+export interface GateAll {
+    all: GateNode[];
+}
+export interface GateAny {
+    any: GateNode[];
+}
+export type GateNode = GateLeaf | GateAll | GateAny;
+
+/** Maximum nesting depth of the gate tree (a leaf alone is depth 1). */
+export const MAX_GATE_DEPTH = 4;
+/** Maximum number of rule references in one gate tree. */
+export const MAX_GATE_LEAVES = 8;
+
+const GateNodeSchema: z.ZodType<GateNode> = z.lazy(() =>
+    z.union([
+        z.strictObject({ rule: RuleRefSchema }),
+        z.strictObject({ all: z.array(GateNodeSchema).min(2) }),
+        z.strictObject({ any: z.array(GateNodeSchema).min(2) })
+    ])
+);
+
+/** Depth (a leaf is 1) and leaf count of a gate tree, in one walk. */
+function gateShape(node: GateNode): { depth: number; leaves: number } {
+    if ("rule" in node) return { depth: 1, leaves: 1 };
+    const children = "all" in node ? node.all : node.any;
+    let depth = 0;
+    let leaves = 0;
+    for (const child of children) {
+        const shape = gateShape(child);
+        depth = Math.max(depth, shape.depth);
+        leaves += shape.leaves;
+    }
+    return { depth: depth + 1, leaves };
+}
+
+export const GateSchema = GateNodeSchema.superRefine((node, ctx) => {
+    const { depth, leaves } = gateShape(node);
+    if (depth > MAX_GATE_DEPTH) {
+        ctx.addIssue({ code: "custom", message: `gate tree is ${depth} levels deep; the maximum is ${MAX_GATE_DEPTH}` });
+    }
+    if (leaves > MAX_GATE_LEAVES) {
+        ctx.addIssue({ code: "custom", message: `gate tree names ${leaves} rules; the maximum is ${MAX_GATE_LEAVES}` });
+    }
+});
+
+/**
  * One chain the contest reads, by ticker. Part of the dependency manifest.
  *
  * Only the `chainId` is here — it is consensus-critical (bound into every EIP-712 ballot
@@ -86,8 +154,11 @@ export const CriteriaSchema = z
         blocksPerBucket: z.number().int().positive(),
         /** How many buckets a bundle stays valid after its blockNumber. */
         voteExpiryBuckets: z.number().int().positive(),
-        /** Who may vote (gates a wallet in or out). */
-        rule: RuleRefSchema,
+        /**
+         * Who may vote (gates a wallet in or out): one rule, or a boolean tree of them.
+         * A single-rule gate is spelled `{ rule: { type, ... } }` — see {@link GateSchema}.
+         */
+        gate: GateSchema,
         /** How much an eligible vote counts. */
         weight: RuleRefSchema,
         /** Dependency manifest + version negotiation. */

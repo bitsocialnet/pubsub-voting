@@ -40,6 +40,11 @@ export * from "./rules/registry.js";
 // owns the store, the bound and the purge. A custom chain-reading rule MUST memoize through it —
 // see rules/cache.ts and README "Custom rules".
 export { makeMemoryRuleCache, makePersistentRuleCache, type RuleCache } from "./rules/cache.js";
+// The gate tree. `gateLeaves` enumerates a criteria's rules in document order without evaluating
+// anything (labelling a requirements list, say); the fold itself is the library's, so composition
+// cannot drift between the forward gate, the background verifier and `checkEligibility`.
+export { gateLeaves } from "./rules/gate.js";
+export type { GateResult, GateLeafResult } from "./rules/gate.js";
 
 // Implemented runtime: encoding, topic, errors, identity seam, facade.
 export * from "./encoding/canonical.js";
