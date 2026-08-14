@@ -80,7 +80,7 @@ Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingF
 
 ### Read a tally reactively (no signer needed)
 
-`createContest` mints a per-contest read object; `update()` starts syncing and it emits `update` (carrying a fresh `tally`) and `error`, just like a plebbit-js `subplebbit`:
+`createContest` mints a per-contest read object; `update()` starts syncing and it emits `update` (carrying a fresh `tally`) and `error`, just like a pkc-js `community`:
 
 ```ts
 const contest = await voter.createContest({ criteria });  // criteria: the contest's full document (strictly validated here)
@@ -140,7 +140,7 @@ Repeated `createContest` calls with byte-identical criteria return the same `Con
 
 ### Publish or withdraw a vote (needs a signer)
 
-`createContestVote` mints a publishable ballot; `publish()` signs and broadcasts it once and emits `publishingstatechange`, like a plebbit-js publication:
+`createContestVote` mints a publishable ballot; `publish()` signs and broadcasts it once and emits `publishingstatechange`, like a pkc-js publication:
 
 ```ts
 const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });

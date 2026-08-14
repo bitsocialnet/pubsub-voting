@@ -94,16 +94,16 @@ export function republishIntervalBuckets(criteria: Criteria): number {
 }
 
 /**
- * Public facade — three objects, mirroring pkc-js / plebbit-js:
+ * Public facade — three objects, mirroring pkc-js:
  *   - {@link PubsubVoter} (`VoteClient`): the factory. Holds the host-injected dependencies once
  *     and owns one engine per contest, keyed by topic. A contest is addressed by its full criteria
  *     document — `createContest({ criteria })` validates it and derives the topic — so a directory
  *     host like 5chan authors its 63 documents however it likes (e.g. merged from a local
  *     manifest) and creates each contest, without wiring dependencies 63 times.
  *   - {@link Contest} (`createContest`): one contest's reactive **read** view. `update()` starts
- *     syncing and emits `update` (carrying a fresh `tally`) / `error`, like `subplebbit.update()`.
+ *     syncing and emits `update` (carrying a fresh `tally`) / `error`, like `community.update()`.
  *   - {@link ContestVote} (`createContestVote`): one publishable **ballot**. `publish()` signs and
- *     broadcasts it once, emitting `publishingstatechange` / `error`, like a plebbit publication.
+ *     broadcasts it once, emitting `publishingstatechange` / `error`, like a pkc publication.
  *
  * The injected seams (helia, chains, signer, nameResolvers) are the ONLY host contact surface, so
  * the same core runs under pkc-js, plebbit, or a raw node. The host passes its running Helia node
