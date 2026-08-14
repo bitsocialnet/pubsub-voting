@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ChainTickerSchema } from "./common.js";
+import { encodeCanonical } from "../encoding/canonical.js";
 
 /**
  * The criteria document.
@@ -52,8 +53,18 @@ export const RuleRefSchema = z.looseObject({
  * these bytes, so any document that differs in bytes but not in meaning is a silent topic FORK —
  * two peers running identical rules on two topics, each invisible to the other:
  *   - a branch needs at least TWO children, so `{ all: [X] }` cannot exist alongside `X`;
+ *   - a branch may not REPEAT a child (compared by canonical bytes, so two leaves of one rule type
+ *     on different options stay distinct requirements) — a repeat says nothing the shorter tree
+ *     does not;
+ *   - a branch may not nest a branch of its OWN kind: `{ all: [{ all: [A, B] }, C] }` admits,
+ *     scores, blames and penalizes exactly as `{ all: [A, B, C] }` does, since min and `some` are
+ *     associative, so the nesting carries no meaning and only new bytes;
  *   - depth is capped at {@link MAX_GATE_DEPTH} and leaves at {@link MAX_GATE_LEAVES}, because a
  *     criteria document is attacker-supplied input that every peer parses and evaluates.
+ *
+ * Child ORDER is deliberately significant rather than normalized away: it is what the lazy forward
+ * gate evaluates in, so it decides which rule's chain read is paid first and the order failures are
+ * reported. Two orderings are two documents, and an author picks the one that reads best.
  */
 export interface GateLeaf {
     rule: RuleRef;
@@ -79,28 +90,46 @@ const GateNodeSchema: z.ZodType<GateNode> = z.lazy(() =>
     ])
 );
 
-/** Depth (a leaf is 1) and leaf count of a gate tree, in one walk. */
-function gateShape(node: GateNode): { depth: number; leaves: number } {
-    if ("rule" in node) return { depth: 1, leaves: 1 };
+/** Depth (a leaf is 1), leaf count, and the redundant spellings, in one walk. */
+function gateShape(node: GateNode): { depth: number; leaves: number; redundant: string | undefined } {
+    if ("rule" in node) return { depth: 1, leaves: 1, redundant: undefined };
+    const kind = "all" in node ? "all" : "any";
     const children = "all" in node ? node.all : node.any;
     let depth = 0;
     let leaves = 0;
+    let redundant: string | undefined;
+    // Canonical bytes are the identity: two children that encode identically ARE the same
+    // requirement, however differently they were written.
+    const seen = new Set<string>();
     for (const child of children) {
         const shape = gateShape(child);
         depth = Math.max(depth, shape.depth);
         leaves += shape.leaves;
+        redundant ??= shape.redundant;
+        if (kind in child) {
+            redundant ??= `a \`${kind}\` nested directly inside an \`${kind}\` says nothing its parent does not; inline its children`;
+        }
+        const bytes = bytesToHex(encodeCanonical(child));
+        if (seen.has(bytes)) redundant ??= `a \`${kind}\` repeats one of its children; drop the duplicate`;
+        seen.add(bytes);
     }
-    return { depth: depth + 1, leaves };
+    return { depth: depth + 1, leaves, redundant };
 }
 
+const bytesToHex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
 export const GateSchema = GateNodeSchema.superRefine((node, ctx) => {
-    const { depth, leaves } = gateShape(node);
+    const { depth, leaves, redundant } = gateShape(node);
     if (depth > MAX_GATE_DEPTH) {
         ctx.addIssue({ code: "custom", message: `gate tree is ${depth} levels deep; the maximum is ${MAX_GATE_DEPTH}` });
     }
     if (leaves > MAX_GATE_LEAVES) {
         ctx.addIssue({ code: "custom", message: `gate tree names ${leaves} rules; the maximum is ${MAX_GATE_LEAVES}` });
     }
+    // Every redundant spelling is a topic fork waiting to happen: it means the same thing as a
+    // shorter tree while encoding to different bytes, so two authors expressing one contest can
+    // land on two topics. Same reason a branch may not have a single child.
+    if (redundant !== undefined) ctx.addIssue({ code: "custom", message: `gate tree has a redundant spelling: ${redundant}` });
 });
 
 /**

@@ -56,7 +56,7 @@ gate: { any: [{ rule: passRule }, { rule: moderatorRule }] }          // any one
 gate: { all: [{ any: [{ rule: passRule }, { rule: moderatorRule }] }, { rule: notBannedRule }] }
 ```
 
-Each rule still answers one question about one wallet and knows nothing about the others; the document composes them. A branch needs **at least two** children (so `{ all: [X] }` cannot become a second spelling of `X` — and a second topic for one contest), nests at most 4 deep with at most 8 rules in total, and every leaf must read the **same chain** (`GateChainMismatchError` otherwise: the contest counts its buckets in one chain's blocks, and that is the block each rule is handed).
+Each rule still answers one question about one wallet and knows nothing about the others; the document composes them. Because the topic is the CID of these bytes, the schema rejects every spelling that would mean the same as a shorter tree — a branch needs **at least two** children, may not repeat a child, and may not nest a branch of its own kind (`{ all: [{ all: [A, B] }, C] }` is just `{ all: [A, B, C] }`) — since each would put one contest on two topics. Trees nest at most 4 deep with at most 8 rules in total, and every leaf must read the **same chain** (`GateChainMismatchError` otherwise: the contest counts its buckets in one chain's blocks, and that is the block each rule is handed). Child order is significant and is the order the forward gate evaluates in, so put the cheapest or most discriminating rule first.
 
 ### Construct a voter
 

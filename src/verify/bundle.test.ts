@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import { privateKeyToAccount } from "viem/accounts";
 import { makeBundleVerifier } from "./bundle.js";
 import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
 import { ballotTypedData } from "../signer/eip712.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
 import { builtinRegistry } from "../rules/registry.js";
+import type { Rule, RuleResult } from "../rules/types.js";
 import { erc721MinBalance } from "../rules/erc721-min-balance.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bizCriteria, bizGateRef } from "../test-fixtures.js";
@@ -232,5 +234,104 @@ describe("makeBundleVerifier", () => {
         const bundle = await signedBundle([]);
         const verdict = await verifier({ balance: 1n }).verify(bundle);
         expect(verdict.valid).toBe(true);
+    });
+});
+
+/**
+ * A composite gate through the INLINE forward-gate path — the one gossipsub runs before
+ * re-forwarding. It differs from the background verifier's in that it evaluates LAZILY, so both
+ * the fold's output and what it declined to read are properties worth pinning here.
+ */
+describe("composite gates on the forward-gate path", () => {
+    /** A one-answer rule under an arbitrary `type`, recording every wallet it was asked about. */
+    function fixedRule(type: string, answer: RuleResult, asked: string[]): Rule {
+        return {
+            type,
+            optionsSchema: z.looseObject({ type: z.string() }),
+            evaluate: async ({ wallet }) => {
+                asked.push(type);
+                void wallet;
+                return answer;
+            }
+        };
+    }
+    const ok: RuleResult = { success: true, score: 3n };
+    const compositeVerifier = (kind: "all" | "any", rules: Record<string, RuleResult>, asked: string[]) =>
+        makeBundleVerifier({
+            criteria: { ...bizCriteria(), gate: { [kind]: Object.keys(rules).map((type) => ({ rule: { type } })) } as never },
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: Object.fromEntries(Object.entries(rules).map(([type, answer]) => [type, fixedRule(type, answer, asked)])),
+            chainFor: () => fakeChain(1n),
+            bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
+            nameResolvers: []
+        });
+
+    it("admits only when the whole tree does, and folds the score", async () => {
+        const asked: string[] = [];
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
+        // `all` scores the binding constraint...
+        const both = await compositeVerifier("all", { a: ok, b: { success: true, score: 9n } }, asked).verify(bundle);
+        expect(both).toMatchObject({ valid: true, ruleScore: 3n });
+        // ...and `any` the best route, admitting despite a failed alternative.
+        const either = await compositeVerifier("any", { a: { success: false, error: "no" }, b: { success: true, score: 9n } }, asked).verify(
+            bundle
+        );
+        expect(either).toMatchObject({ valid: true, ruleScore: 9n });
+    });
+
+    it("stops at the deciding leaf, so a composite gate costs only the rules it needed", async () => {
+        // The forward gate runs once per incoming vote and every leaf is a chain read, which is
+        // why this path is lazy where the batched background verifier is not.
+        const asked: string[] = [];
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
+        await compositeVerifier("all", { a: { success: false, error: "no" }, b: ok }, asked).verify(bundle);
+        expect(asked).toEqual(["a"]); // `b` was never read
+    });
+
+    it("carries the blame set and the folded disposition into the verdict", async () => {
+        const asked: string[] = [];
+        const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
+        // Both alternatives of an `any` fail; one blames nobody, so the whole refusal blames
+        // nobody — `ignore`, not `reject` (rules/gate.ts `gatePenalize`).
+        const verdict = await compositeVerifier(
+            "any",
+            { a: { success: false, error: "wallet is banned" }, b: { success: false, error: "holds no Pass", penalize: false } },
+            asked
+        ).verify(bundle);
+
+        expect(verdict.valid).toBe(false);
+        if (verdict.valid) throw new Error("expected a refusal");
+        expect(verdict.disposition).toBe("ignore");
+        // Both alternatives are named: each is a road this wallet could have taken and did not.
+        expect(verdict.failures?.map((f) => f.type)).toEqual(["a", "b"]);
+        expect(verdict.reason).toContain("wallet is banned");
+        expect(verdict.reason).toContain("holds no Pass");
+    });
+
+    it("gives each leaf its own memo, so same-type leaves cannot read each other's answers", async () => {
+        // Two leaves of ONE rule type on different options are different questions. Sharing a
+        // keyspace would let a `min: 1` leaf answer for a `min: 5` one — silently, and only for
+        // rules that key their memo by wallet alone.
+        let reads = 0;
+        const criteria = {
+            ...bizCriteria(),
+            gate: { all: [{ rule: { ...bizGateRef(), min: 1 } }, { rule: { ...bizGateRef(), min: 5 } }] }
+        };
+        const verdict = await makeBundleVerifier({
+            criteria,
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: builtinRegistry,
+            chainFor: () => fakeChain(3n, () => reads++),
+            bucketMath: makeBucketMath(criteria.blocksPerBucket),
+            nameResolvers: []
+        }).verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
+
+        // Holding 3 satisfies `min: 1` but not `min: 5`, so the gate must refuse. If the two
+        // leaves shared a memo the second would never have run its own reads at all.
+        expect(verdict.valid).toBe(false);
+        if (!verdict.valid) expect(verdict.failures?.[0]?.error).toContain("5 are required");
+        expect(reads).toBeGreaterThan(2); // both leaves paid for their own reads
     });
 });

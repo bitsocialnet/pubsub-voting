@@ -597,6 +597,9 @@ describe("Contest read view + tally", () => {
         expect(error).toBeInstanceOf(VoteEvictedError);
         // The rule's own wording reaches the publisher verbatim — not a generic "score is 0n".
         expect(error.verdict.reason).toContain("holds none of the gate token");
+        // ...and structured, so a client lists what is missing instead of splitting a sentence.
+        expect(error.verdict.failures?.map((f) => f.type)).toEqual(["erc5192-min-balance"]);
+        expect(error.verdict.failures?.[0]?.error).toContain("holds none of the gate token");
         expect(error.bundle).toBe(vote.bundle); // names the exact publish that was evicted
         expect(vote.publishingState).toBe("failed"); // flipped post hoc
         // The same error reaches a long-lived contest view, and the tally recounted without it.
@@ -2494,6 +2497,35 @@ describe("Contest.checkEligibility", () => {
             // The tree comes back shaped like the criteria, so a client can render the real
             // requirement ("either of these") rather than an undifferentiated list.
             expect(result.gate).toMatchObject({ kind: "any", satisfied: false });
+            await voter.destroy();
+        });
+
+        it("returns the tree shaped like the criteria, nesting and all", async () => {
+            // A flat list cannot express "either of these, and also that one" — which is exactly
+            // what a client needs to render a requirement a voter can act on.
+            const criteria: Criteria = {
+                ...bizCriteria(),
+                gate: { all: [{ any: [{ rule: { type: "holds-pass" } }, { rule: { type: "moderator" } }] }, { rule: { type: "not-banned" } }] } as never
+            };
+            const { voter, contest } = await contestOn(
+                criteria,
+                answering({ "holds-pass": NO_PASS, moderator: PASS, "not-banned": BANNED })
+            );
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.gate).toMatchObject({
+                kind: "all",
+                satisfied: false,
+                children: [
+                    { kind: "any", satisfied: true, children: [{ type: "holds-pass", satisfied: false }, { type: "moderator", satisfied: true }] },
+                    { kind: "leaf", type: "not-banned", satisfied: false }
+                ]
+            });
+            // The satisfied `any` explains nothing, so only the banned rule is blamed — even
+            // though `checks` still reports all three leaves.
+            expect(result.failures.map((f) => f.type)).toEqual(["not-banned"]);
+            expect(result.checks).toHaveLength(3);
             await voter.destroy();
         });
 

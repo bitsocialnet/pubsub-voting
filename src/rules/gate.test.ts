@@ -84,6 +84,13 @@ describe("evaluateGate", () => {
         expect(asked.sort()).toEqual([0, 1, 2]);
     });
 
+    it("asks each leaf at most once — callers memoize on that contract", async () => {
+        const node: GateNode = { all: [ref("a"), { any: [ref("b"), ref("c")] }] };
+        const { asked } = await run(node, [pass(1n), fail("no"), pass(2n)], true);
+        expect(asked.slice().sort()).toEqual([0, 1, 2]);
+        expect(new Set(asked).size).toBe(asked.length);
+    });
+
     it("treats a rule that reports success with no score as a failure, not a zero-weight admit", async () => {
         const { result } = await run(ref("a"), [{ success: true, score: 0n }]);
         expect(result.satisfied).toBe(false);

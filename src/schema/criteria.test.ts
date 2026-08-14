@@ -35,10 +35,30 @@ describe("CriteriaSchema gate", () => {
     });
 
     it("caps depth: a criteria document is attacker-supplied input every peer parses", () => {
+        // Alternating kinds, because an `all` directly inside an `all` is itself rejected below.
         let deep: GateNode = { all: [leaf(1), leaf(2)] };
-        for (let level = 3; level <= MAX_GATE_DEPTH; level += 1) deep = { all: [deep, leaf(level)] };
+        for (let level = 3; level <= MAX_GATE_DEPTH; level += 1) {
+            deep = level % 2 === 1 ? { any: [deep, leaf(level)] } : { all: [deep, leaf(level)] };
+        }
         expect(() => CriteriaSchema.parse(withGate(deep))).not.toThrow(); // exactly at the cap
-        expect(() => CriteriaSchema.parse(withGate({ all: [deep, leaf(9)] }))).toThrow();
+        expect(() => CriteriaSchema.parse(withGate({ any: [deep, leaf(9)] }))).toThrow();
+    });
+
+    it("rejects the redundant spellings that would fork a topic without changing the meaning", () => {
+        // Each of these means exactly what a shorter tree means, and encodes to different bytes —
+        // so two authors expressing one contest would land on two topics. The single-child case
+        // above is the same family; these are the ones a plain arity check misses.
+        expect(() => CriteriaSchema.parse(withGate({ all: [leaf(1), leaf(1)] }))).toThrow(/repeats one of its children/);
+        expect(() => CriteriaSchema.parse(withGate({ any: [leaf(1), leaf(2), leaf(1)] }))).toThrow(/repeats one of its children/);
+        // `{ all: [{ all: [A, B] }, C] }` admits, scores, blames and penalizes identically to
+        // `{ all: [A, B, C] }` — min and `some` are associative, so the nesting carries nothing.
+        expect(() => CriteriaSchema.parse(withGate({ all: [{ all: [leaf(1), leaf(2)] }, leaf(3)] }))).toThrow(/nested directly inside/);
+        expect(() => CriteriaSchema.parse(withGate({ any: [{ any: [leaf(1), leaf(2)] }, leaf(3)] }))).toThrow(/nested directly inside/);
+        // A DIFFERENT kind nested inside is the whole point of a tree, and stays legal.
+        expect(() => CriteriaSchema.parse(withGate({ all: [{ any: [leaf(1), leaf(2)] }, leaf(3)] }))).not.toThrow();
+        // Duplication is by canonical bytes, so two leaves of one type on different options are
+        // distinct requirements, not a repeat.
+        expect(() => CriteriaSchema.parse(withGate({ all: [leaf(1), leaf(2)] }))).not.toThrow();
     });
 
     it("caps the leaf count", () => {
