@@ -34,8 +34,10 @@ import {
     VoteEvictedError,
     VoterDestroyedError
 } from "../errors.js";
-import { topicFor } from "../topic.js";
-import { blockForBytes } from "../checkpoint/codec.js";
+import { topicFor, criteriaCid } from "../topic.js";
+import { blockForBytes, encodeCheckpoint } from "../checkpoint/codec.js";
+import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../signer/eip712.js";
+import { privateKeyToAccount } from "viem/accounts";
 import {
     bizCriteria,
     fakeHelia,
@@ -1797,6 +1799,113 @@ describe("root-record fetch protocol", () => {
             await voter.stop();
             expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
         });
+    });
+});
+
+describe("cold-join chase: a pulled checkpoint is re-verified per bundle, never trusted", () => {
+    // Two anvil/hardhat wallets signing REAL EIP-712 ballots, voting for different communities so
+    // each wallet's fate is visible as its own tally row. The serving peer is honest about the
+    // bytes (both bundles pass the offline checks) — what it cannot do is make OUR gate say yes.
+    const GOOD_WALLET = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+    const BAD_WALLET = privateKeyToAccount("0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a");
+
+    /** A genuinely-signed one-vote ballot at block 10 (bucket 0 — live against head 43200, expiry 30). */
+    async function signedBundle(wallet: typeof GOOD_WALLET, publicKey: string) {
+        const votes = [{ community: { publicKey }, vote: 1 }];
+        const cid = await criteriaCid(bizCriteria());
+        const typedData = ballotTypedData({ criteriaCid: cid.bytes, chainId: 8453, votes, blockNumber: 10 });
+        return { address: wallet.address, votes, blockNumber: 10, signature: { signature: await wallet.signTypedData(typedData), type: EIP712_SIGNATURE_TYPE } };
+    }
+
+    /** Our chain view: `zeroFor` holds no Pass, everyone else holds one (at head AND at the pinned block). */
+    function gateChains(zeroFor: string): ChainClientFactory {
+        const client = {
+            getBlockNumber: async () => 43200n,
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async ({ functionName, args }: { functionName?: string; args?: readonly unknown[] } = {}) =>
+                functionName === "supportsInterface" ? true : String(args?.[0] ?? "").toLowerCase() === zeroFor ? 0n : 1n
+        };
+        return () => client as unknown as ChainClient;
+    }
+
+    it("counts a chased bundle provisionally, then evicts the one whose wallet fails OUR gate — and re-serves neither until it has", async () => {
+        vi.useFakeTimers();
+        try {
+            const bundles = [await signedBundle(GOOD_WALLET, VALID_KEY), await signedBundle(BAD_WALLET, OTHER_KEY)];
+            const { root, chunks, blocks } = await encodeCheckpoint(bundles);
+
+            // The seeder's blocks, served by content address: a chunk's bytes are what they hash
+            // to, so the peer cannot smuggle anything past `decodeCheckpoint` — but the bundles
+            // INSIDE them are just claims until this node reads the chain itself.
+            const served = new Map(blocks.map((block) => [block.cid.toString(), block.bytes]));
+            const blockstore = {
+                get: async (cid: CID) => {
+                    const bytes = served.get(cid.toString());
+                    if (bytes === undefined) throw new Error("no block");
+                    return bytes;
+                },
+                put: async (cid: CID, bytes: Uint8Array) => {
+                    served.set(cid.toString(), bytes);
+                    return cid;
+                },
+                has: async (cid: CID) => served.has(cid.toString())
+            };
+            let topic = ""; // filled from the contest below; the fixture reads `records` per request
+            const record: FetchRootRecord = { version: ROOT_RECORD_VERSION, root, chunks, count: 2, sizeBytes: 200 };
+            const pubsub: PubsubService = {
+                publish: async () => undefined,
+                subscribe: () => {},
+                unsubscribe: () => {},
+                getSubscribers: () => [{ toString: () => "seeder" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
+                addEventListener: () => {},
+                removeEventListener: () => {},
+                topicValidators: new Map()
+            };
+            const helia = {
+                libp2p: { services: { pubsub, fetch: rootFetchService({ records: () => ({ [topic]: record }) }) } },
+                blockstore
+            } as unknown as HeliaInstance;
+
+            const voter = new PubsubVoter({ dataPath: false, helia, chains: gateChains(BAD_WALLET.address.toLowerCase()) });
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            topic = contest.topic;
+            const asRootRecord = contest as unknown as { rootRecord(): Promise<{ count: number }> };
+            await contest.update(); // the join fires the cold-start pull, which chases the served root
+
+            // Both bundles are admitted on the OFFLINE checks alone and counted immediately — the
+            // cold join renders before any chain read. Neither row is `chainVerified` yet: the
+            // peer's word bought admission, not verification.
+            await vi.waitFor(async () => expect((await contest.getTally()).ranking).toHaveLength(2));
+            const provisional = await contest.getTally();
+            expect(provisional.ranking.every((row) => row.chainVerified)).toBe(false);
+
+            // The gate read lands: our chain admits the good wallet, and NEVER the bad one.
+            await vi.waitFor(async () => {
+                const tally = await contest.getTally();
+                expect(tally.ranking.find((row) => row.community.publicKey === VALID_KEY)?.chainVerified).toBe(true);
+            });
+            const settled = await contest.getTally();
+            expect(settled.ranking.find((row) => row.community.publicKey === OTHER_KEY)?.chainVerified).not.toBe(true);
+            // ...and while that one is unsettled it is counted LOCALLY but withheld from what we
+            // serve: the checkpoint encoder takes only fully verified bundles, so a relayer passes
+            // on what it verified, never what it was handed (the three-node relay test's e2e
+            // property, here at the unit level).
+            expect(settled.ranking).toHaveLength(2);
+            expect((await asRootRecord.rootRecord()).count).toBe(1);
+
+            // The v1 gate blames its `0n` on nobody, so the bundle is held and re-examined; only
+            // once the grace window closes is it dropped — uncached, so a re-publish is judged fresh.
+            await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
+            const final = await contest.getTally();
+            expect(final.ranking).toHaveLength(1);
+            expect(final.ranking[0]?.community.publicKey).toBe(VALID_KEY);
+            expect(final.ranking[0]?.weight).toBe(1n);
+            // Now that nothing is pending, the surviving bundle — and only it — is served onward.
+            expect((await asRootRecord.rootRecord()).count).toBe(1);
+            await voter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 
