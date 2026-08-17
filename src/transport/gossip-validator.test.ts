@@ -43,7 +43,7 @@ async function makeRootRecord(): Promise<RootRecord> {
     return { version: ROOT_RECORD_VERSION, root: await bundleCid(bundle("0xcc")), count: 3, sizeBytes: 700 };
 }
 
-const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, ruleScore: 1n, resolvedNames: {} }) };
+const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, resolvedNames: {} }) };
 const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
 
 function gate(over: Partial<GossipGateDeps> = {}) {
@@ -114,7 +114,7 @@ describe("makeGossipGate — bundle deltas", () => {
     it("accepts a re-published known-valid bundle for one hash — no re-verify, no re-admit", async () => {
         const { cid, message } = await makeDelta("0x1");
         const cache = makeVerdictCache();
-        cache.set(cid, { valid: true, ruleScore: 1n, resolvedNames: {} });
+        cache.set(cid, { valid: true, resolvedNames: {} });
         let verifies = 0;
         let admits = 0;
         const g = gate({
@@ -122,7 +122,7 @@ describe("makeGossipGate — bundle deltas", () => {
             verifier: {
                 verify: async () => {
                     verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                    return { valid: true, resolvedNames: {} };
                 }
             },
             admit: async () => {
@@ -145,7 +145,7 @@ describe("makeGossipGate — bundle deltas", () => {
             verifier: {
                 verify: async () => {
                     verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                    return { valid: true, resolvedNames: {} };
                 }
             }
         });
@@ -222,7 +222,7 @@ describe("makeGossipGate — bundle deltas", () => {
             verifier: {
                 verify: async () => {
                     verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                    return { valid: true, resolvedNames: {} };
                 }
             }
         });
@@ -274,7 +274,7 @@ describe("makeGossipGate — bundle deltas", () => {
             verifier: {
                 verify: async () => {
                     verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                    return { valid: true, resolvedNames: {} };
                 }
             }
         });
@@ -296,7 +296,7 @@ describe("makeGossipGate — bundle deltas", () => {
             verifier: {
                 verify: async () => {
                     verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} }; // would "pass" if ever run
+                    return { valid: true, resolvedNames: {} }; // would "pass" if ever run
                 }
             },
             admit: async ({ cid }) => {
@@ -329,7 +329,7 @@ describe("makeGossipGate — root records", () => {
             verifier: {
                 verify: async () => {
                     verifies++;
-                    return { valid: true, ruleScore: 1n, resolvedNames: {} };
+                    return { valid: true, resolvedNames: {} };
                 }
             },
             admit: async () => {

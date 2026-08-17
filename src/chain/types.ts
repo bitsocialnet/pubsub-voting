@@ -20,17 +20,18 @@ import type { PublicClient } from "viem";
  */
 export type ChainClient = PublicClient;
 
-/** chainTicker -> client, built from `criteria.requires.chains`. */
-export type ChainClients = Record<string, ChainClient>;
-
 /**
- * Factory the host provides: resolve a chain named by the criteria (`requires.chains`,
- * ticker + chainId) to a viem `PublicClient`. The RPC endpoint is the HOST's setting —
- * deliberately not part of the criteria document (see schema/criteria.ts,
- * `ChainConfigSchema`) — so this factory is where ticker/chainId meets the gateways this
- * client trusts (typically `createPublicClient({ chain, transport: http(myRpcUrl) })`).
+ * Factory the host provides: resolve the chain a contest counts in (`criteria.bucketChainId`)
+ * to a viem `PublicClient`. The RPC endpoint is the HOST's setting — deliberately not part of
+ * the criteria document (see schema/criteria.ts, `bucketChainId`) — so this factory is where a
+ * chain id meets the gateways this client trusts (typically
+ * `createPublicClient({ chain, transport: http(myRpcUrl) })`).
  *
- * Return `undefined` (or throw) when no RPC is configured for the named chain: the voter
+ * Keyed by chain ID alone, because that is the identity the criteria carries and the EIP-712
+ * ballot domain is signed over. A contest reads exactly one chain: every gate rule and the
+ * weight rule are handed this client (see DESIGN.md "One clock").
+ *
+ * Return `undefined` (or throw) when no RPC is configured for that chain: the voter
  * then throws `MissingChainClientError` at the create seam (`createContest` /
  * `createContestVote`) — this client must recuse the contest rather than miscount.
  *
@@ -41,7 +42,7 @@ export type ChainClients = Record<string, ChainClient>;
  * state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head (gate reads pin
  * to bucket sample blocks) and carries a multicall3 deployment in its viem `chain` config.
  */
-export type ChainClientFactory = (args: { chain: string; chainId: number }) => ChainClient | undefined;
+export type ChainClientFactory = (args: { chainId: number }) => ChainClient | undefined;
 
 /**
  * A community-name resolver the host injects (`PubsubVoterOptions.nameResolvers`). The

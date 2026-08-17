@@ -27,20 +27,19 @@ export function bizCriteria(): Criteria {
         contestId: "biz",
         voteSchema: { min: 1, max: 1 },
         maxVotesPerAddress: 1,
+        bucketChainId: 8453,
         blocksPerBucket: 43200,
         voteExpiryBuckets: 30,
         gate: {
             rule: {
                 type: "erc5192-min-balance",
-                chain: "base",
                 contract: "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
                 min: 1
             }
         },
         weight: { type: "constant", value: 1 },
         requires: {
-            rules: ["erc5192-min-balance", "constant"],
-            chains: { base: { chainId: 8453 } }
+            rules: ["erc5192-min-balance", "constant"]
         }
     };
 }
@@ -221,11 +220,14 @@ export function realSigner(): VoteSigner {
  * `functionName`: `supportsInterface` answers the ERC-5192 declaration (always true — the Pass is
  * soulbound), everything else answers `balance`.
  */
-export function stubChains(over: { blockNumber?: bigint; balance?: bigint } = {}): ChainClientFactory {
+export function stubChains(over: { blockNumber?: bigint; balance?: bigint; onRead?: () => void } = {}): ChainClientFactory {
     const client = {
         getBlockNumber: async () => over.blockNumber ?? 43200n,
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-        readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : (over.balance ?? 1n))
+        readContract: async ({ functionName }: { functionName?: string } = {}) => {
+            over.onRead?.();
+            return functionName === "supportsInterface" ? true : (over.balance ?? 1n);
+        }
     };
     return () => client as unknown as ChainClient;
 }

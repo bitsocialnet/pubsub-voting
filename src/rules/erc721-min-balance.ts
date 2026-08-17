@@ -1,6 +1,5 @@
 import { getAddress } from "viem";
 import { z } from "zod";
-import { ChainTickerSchema } from "../schema/common.js";
 import { balanceOf, balancesOfBatched, canBatch, scoreOf, shortfallError } from "./nft-balance.js";
 import type { Rule, RuleResult } from "./types.js";
 
@@ -27,7 +26,6 @@ import type { Rule, RuleResult } from "./types.js";
 
 export const Erc721MinBalanceOptionsSchema = z.object({
     type: z.literal("erc721-min-balance"),
-    chain: ChainTickerSchema,
     contract: z.string(),
     min: z.number().int().positive().default(1)
 });

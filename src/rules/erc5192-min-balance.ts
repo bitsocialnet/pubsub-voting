@@ -1,6 +1,5 @@
 import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, getAddress } from "viem";
 import { z } from "zod";
-import { ChainTickerSchema } from "../schema/common.js";
 import { balanceOf, balancesOfBatched, canBatch, scoreOf, shortfallError } from "./nft-balance.js";
 import type { ChainReadContext, Rule, RuleResult } from "./types.js";
 
@@ -57,7 +56,6 @@ const erc165Abi = [
 
 export const Erc5192MinBalanceOptionsSchema = z.object({
     type: z.literal("erc5192-min-balance"),
-    chain: ChainTickerSchema,
     contract: z.string(),
     min: z.number().int().positive().default(1)
 });

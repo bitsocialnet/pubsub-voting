@@ -4,10 +4,12 @@ import { encodeBundle, bundleCidForBytes } from "../../crdt/codec.js";
 import type { BundleVerdict, BundleVerifier } from "../../verify/types.js";
 import { makeBundleVerifier } from "../../verify/bundle.js";
 import { builtinRegistry } from "../../rules/registry.js";
+import { erc721MinBalance } from "../../rules/erc721-min-balance.js";
 import { makeBucketMath } from "../../chain/bucket.js";
 import { ballotTypedData, EIP712_SIGNATURE_TYPE } from "../../signer/eip712.js";
 import { criteriaCid } from "../../topic.js";
-import { bizCriteria } from "../../test-fixtures.js";
+import { bizCriteria, bizGateRef } from "../../test-fixtures.js";
+import type { Criteria } from "../../schema/criteria.js";
 import type { ChainClient, NameResolver } from "../../chain/types.js";
 import type { Vote, VotesBundle } from "../../schema/votes.js";
 import { makeVoteNode, connectNodes, waitFor, delay, sampleBundle, type VoteNode, type VoteNodeOptions } from "./harness.js";
@@ -35,11 +37,11 @@ const KEY_B = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust";
 const ADDR = "0x1111111111111111111111111111111111111111";
 
 const reject = (): BundleVerdict => ({ valid: false, disposition: "reject", reason: "test reject" });
-const accept = (): BundleVerdict => ({ valid: true, ruleScore: 1n, resolvedNames: {} });
+const accept = (): BundleVerdict => ({ valid: true, resolvedNames: {} });
 
 // --- Real-verifier fixtures (the soulbound ERC-5192 "5chan Pass" gate over bizCriteria) ---------
 
-// The gating chain's chainId, as bizCriteria() pins it (requires.chains.base.chainId).
+// The chain the contest counts in, as bizCriteria() pins it (bucketChainId).
 const BIZ_CHAIN_ID = 8453;
 // The anvil/hardhat test account #1 — signs real EIP-712 ballots reproducibly (as in verify/bundle.test.ts).
 const wallet = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
@@ -66,7 +68,7 @@ async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] =
         criteriaCid: (await criteriaCid(criteria)).bytes,
         chainId: BIZ_CHAIN_ID,
         registry: builtinRegistry,
-        chainFor: () =>
+        chain:
             ({
                 readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : passBalance),
                 // The v1 gate reads the head first and only falls back to the ballot's pinned
@@ -77,6 +79,49 @@ async function realVerifier(passBalance: bigint, nameResolvers: NameResolver[] =
         bucketMath: makeBucketMath(criteria.blocksPerBucket),
         nameResolvers
     });
+}
+
+// --- Composite-gate fixtures (a tree, not one rule) ---------------------------------------------
+
+/**
+ * A second gate rule, on its own contract, whose failure IS attributable: `erc721-min-balance`
+ * reads the ballot's pinned block, so its `0n` is identical on every honest verifier and it leaves
+ * `penalize` at the default. Pairing it with the head-reading (unattributable) Pass rule is what
+ * makes the `all`/`any` asymmetry observable in gossipsub's scoring rather than only in a fold.
+ */
+const MOD_CONTRACT = `0x${"ab".repeat(20)}`;
+const MOD_RULE = { type: "erc721-min-balance", contract: MOD_CONTRACT, min: 1 };
+
+const compositeCriteria = (gate: unknown): Criteria => ({ ...bizCriteria(), gate }) as Criteria;
+
+/** The real pipeline over a composite gate; each rule's contract gets its own stubbed balance. */
+async function compositeVerifier(criteria: Criteria, balances: { pass: bigint; mod: bigint }): Promise<BundleVerifier> {
+    return makeBundleVerifier({
+        criteria,
+        criteriaCid: (await criteriaCid(criteria)).bytes,
+        chainId: BIZ_CHAIN_ID,
+        // `erc721-min-balance` is deliberately not a builtin (issue #27); a host opts in explicitly.
+        registry: { ...builtinRegistry, "erc721-min-balance": erc721MinBalance },
+        chain:
+            ({
+                readContract: async ({ address, functionName }: { address?: string; functionName?: string } = {}) => {
+                    if (functionName === "supportsInterface") return true;
+                    return address?.toLowerCase() === MOD_CONTRACT ? balances.mod : balances.pass;
+                },
+                getBlockNumber: async () => BigInt(criteria.blocksPerBucket * 2 + 7)
+            }) as unknown as ChainClient,
+        bucketMath: makeBucketMath(criteria.blocksPerBucket),
+        nameResolvers: []
+    });
+}
+
+/** A genuinely-signed ballot for an arbitrary criteria document (its CID is bound into the domain). */
+async function signedFor(criteria: Criteria, blockNumber: number): Promise<VotesBundle> {
+    const votes: Vote[] = [{ community: { publicKey: KEY_A }, vote: 1 }];
+    const cid = await criteriaCid(criteria);
+    const typedData = ballotTypedData({ criteriaCid: cid.bytes, chainId: BIZ_CHAIN_ID, votes, blockNumber });
+    const signature = await wallet.signTypedData(typedData);
+    return { address: wallet.address, votes, blockNumber, signature: { signature, type: EIP712_SIGNATURE_TYPE } };
 }
 
 /** A `.bso` registry that instantly maps every name to `publicKey` (as in client/voter.test.ts). */
@@ -163,6 +208,77 @@ describe("two-node gossipsub (real @libp2p/gossipsub)", () => {
         await waitFor(() => a.crdt.current(0).length === 1, 15_000, "A to merge the Pass-holder's bundle");
         // The binary bundle codec round-trips the address lowercased (EIP-55 casing is display-only).
         expect(a.crdt.current(0)[0]?.address).toBe(wallet.address.toLowerCase());
+    });
+
+    it("an `any` refusal blames nobody when ONE alternative is unprovable: dropped, sender unpenalized, uncached", async () => {
+        // The fold's most consequential claim, on real gossipsub scoring rather than in a unit
+        // test: `erc721-min-balance` alone would earn the sender a `reject` (its `0n` is pinned to
+        // the ballot's block, so every honest verifier computes it). Inside an `any` whose other
+        // alternative is the head-reading Pass rule, it must NOT — a peer with a fresher view may
+        // be looking at a wallet this gate admits, and penalizing it would punish honest relaying.
+        const { a, b } = await connectedPair();
+        const criteria = compositeCriteria({ any: [{ rule: bizGateRef() }, { rule: MOD_RULE }] });
+        const gated = await compositeVerifier(criteria, { pass: 0n, mod: 0n });
+        const verdicts: BundleVerdict[] = [];
+        b.setVerifier(async (bundle) => {
+            const verdict = await gated.verify(bundle);
+            verdicts.push(verdict);
+            return verdict;
+        });
+
+        const bytes = encodeBundle(await signedFor(criteria, 10));
+        const cid = await bundleCidForBytes(bytes);
+        await a.transport.publishBundle(bytes);
+
+        await waitFor(() => verdicts.length > 0, 15_000, "B to verify the composite-gate bundle");
+        expect(verdicts[0]).toMatchObject({ valid: false, disposition: "ignore" });
+        // Both alternatives are named: each is a road this wallet could have taken and did not.
+        expect((verdicts[0] as { failures?: { type: string }[] }).failures?.map((f) => f.type)).toEqual([
+            "erc5192-min-balance",
+            "erc721-min-balance"
+        ]);
+        await delay(500); // let the verdict reach gossipsub before the negative assertions
+
+        expect(b.acceptedBundles).toHaveLength(0); // never delivered ⇒ never forwarded
+        expect(b.crdt.current(0)).toHaveLength(0);
+        expect(b.pubsub.getScore(a.peerId)).toBeGreaterThanOrEqual(0); // NOT reject-scored
+        expect(b.cache.has(cid)).toBe(false); // uncached ⇒ re-evaluable once a view catches up
+
+        // Positive control through the same tree: the wallet qualifies the OTHER way (no Pass, but
+        // it holds the moderator token), so the `any` admits and the vote merges.
+        const admitted = await compositeVerifier(criteria, { pass: 0n, mod: 1n });
+        a.setVerifier((bundle) => admitted.verify(bundle));
+        await b.transport.publishBundle(encodeBundle(await signedFor(criteria, 11)));
+        await waitFor(() => a.crdt.current(0).length === 1, 15_000, "A to merge the moderator's bundle");
+    });
+
+    it("an `all` closed by an attributable failure IS reject-scored, and names only the rule that closed it", async () => {
+        // The other half of the asymmetry: one attributable failure is enough for an `all`, since
+        // that rule alone shuts the gate identically everywhere. The Pass leaf passes here, so the
+        // blame set must name the moderator rule and nothing else — a wallet is never told to go
+        // and acquire something it already has.
+        const { a, b } = await connectedPair();
+        const criteria = compositeCriteria({ all: [{ rule: bizGateRef() }, { rule: MOD_RULE }] });
+        const gated = await compositeVerifier(criteria, { pass: 1n, mod: 0n });
+        const verdicts: BundleVerdict[] = [];
+        b.setVerifier(async (bundle) => {
+            const verdict = await gated.verify(bundle);
+            verdicts.push(verdict);
+            return verdict;
+        });
+
+        await a.transport.publishBundle(encodeBundle(await signedFor(criteria, 10)));
+
+        await waitFor(() => verdicts.length > 0, 15_000, "B to verify the composite-gate bundle");
+        expect(verdicts[0]).toMatchObject({ valid: false, disposition: "reject" });
+        expect((verdicts[0] as { failures?: { type: string }[] }).failures?.map((f) => f.type)).toEqual(["erc721-min-balance"]);
+        // ...and the reason is that rule's own sentence, naming ITS contract, not the Pass's.
+        expect((verdicts[0] as { reason: string }).reason.toLowerCase()).toContain(MOD_CONTRACT);
+        // A `reject` must move the sender's score negative on the receiver (P4) — the folded
+        // disposition, not any single rule's, is what gossipsub acts on.
+        await waitFor(() => b.pubsub.getScore(a.peerId) < 0, 15_000, "B to penalize A's peer score");
+        expect(b.acceptedBundles).toHaveLength(0);
+        expect(b.crdt.current(0)).toHaveLength(0);
     });
 
     it("a name mapped to a DIFFERENT key is dropped at the relay: not forwarded, uncached, absent from the served checkpoint", async () => {

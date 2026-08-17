@@ -58,17 +58,20 @@ export interface OfflineBundleVerifier {
 }
 
 /**
- * A passing full-bundle verdict. Beyond `valid: true` it carries the work the gate already
- * did so downstream stages need not redo it:
- *   - `ruleScore`: the gate `rule`'s score for the voting wallet at the bucket block
- *     (always `> 0n` here — `0n` would have failed the gate).
- *   - `resolvedNames`: for each vote that carried a `community.name`, the `publicKey` the name
- *     resolved to (equal to the claimed key, since a mismatch fails the gate). Votes with no
- *     name are absent. Lets a UI show a verified name without re-resolving.
+ * A passing full-bundle verdict. Beyond `valid: true` it carries the work the gate already did so
+ * downstream stages need not redo it: `resolvedNames` maps each vote that carried a
+ * `community.name` to the `publicKey` the name resolved to (equal to the claimed key, since a
+ * mismatch fails the gate). Votes with no name are absent. Lets a UI show a verified name without
+ * re-resolving.
+ *
+ * The gate's folded SCORE is deliberately not here. Nothing downstream reads it — a vote's
+ * magnitude comes from `criteria.weight`, never from the gate — and a number no one consumes grows
+ * semantics by accident, which a min-across-`all` fold over unrelated rules ("holds 5" and "not
+ * banned = 1") cannot survive. A client that wants per-rule scores asks `checkEligibility`, which
+ * reports each leaf's own.
  */
 export interface BundleVerdictValid {
     valid: true;
-    ruleScore: bigint;
     resolvedNames: Record<string, string>;
 }
 
@@ -116,7 +119,7 @@ export interface BundleVerifier {
  * constraints) are never recorded here — they are synchronous preconditions for admission, so
  * an admitted bundle has always passed them.
  *
- *   - `chainVerified`: the gate `rule` scored the wallet `> 0n` at the bucket block. `false`
+ *   - `chainVerified`: the gate admitted the wallet at the bucket block. `false`
  *     means "not yet read", never "failed" — a failed gate evicts the bundle instead.
  *   - `nameResolved`: `undefined` when the bundle carries no `community.name`; `false` while
  *     the carried name is unresolved; `true` once it resolved to the claimed `publicKey`. A

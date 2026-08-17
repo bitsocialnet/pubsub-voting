@@ -9,7 +9,7 @@ import { ERC5192_INTERFACE_ID, erc5192MinBalance } from "./erc5192-min-balance.j
 import { constant } from "./constant.js";
 import { erc20Balance } from "./erc20-balance.js";
 import { resolveRegistry, validateCriteriaRules, builtinRegistry, V1_BUILTIN_RULE_TYPES } from "./registry.js";
-import { GateChainMismatchError, UnknownRuleError } from "../errors.js";
+import { UnknownRuleError } from "../errors.js";
 import { bizCriteria, bizGateRef } from "../test-fixtures.js";
 
 /**
@@ -394,21 +394,7 @@ describe("registry: validateCriteriaRules", () => {
         expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(UnknownRuleError);
     });
 
-    it("refuses a gate whose leaves read different chains — a contest has exactly one clock", () => {
-        // Every block number in the protocol (bucket boundaries, the ballot's `blockNumber`, the
-        // sample block each rule is handed) is a number on the gating chain. A second chain's
-        // leaf would be handed a block out of someone else's history and could not detect it, so
-        // the document is refused up front rather than quietly answering about the wrong block.
-        const base = bizCriteria();
-        const criteria = {
-            ...base,
-            gate: { all: [{ rule: bizGateRef() }, { rule: { ...bizGateRef(), chain: "eth" } }] },
-            requires: { ...base.requires, chains: { ...base.requires.chains, eth: { chainId: 1 } } }
-        };
-        expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(GateChainMismatchError);
-    });
-
-    it("accepts a composite gate whose leaves agree on the chain", () => {
+    it("accepts a composite gate of two leaves on the same rule with different options", () => {
         const criteria = {
             ...bizCriteria(),
             gate: { any: [{ rule: bizGateRef() }, { rule: { ...bizGateRef(), contract: `0x${"cd".repeat(20)}` } }] }

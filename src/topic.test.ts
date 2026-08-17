@@ -26,6 +26,7 @@ describe("topicFor", () => {
             gate: base.gate,
             voteExpiryBuckets: base.voteExpiryBuckets,
             blocksPerBucket: base.blocksPerBucket,
+            bucketChainId: base.bucketChainId,
             maxVotesPerAddress: base.maxVotesPerAddress,
             voteSchema: base.voteSchema,
             contestId: base.contestId,

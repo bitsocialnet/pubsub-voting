@@ -40,46 +40,18 @@ export class UnknownRuleError extends Error {
 }
 
 /**
- * Thrown by `createContest` / `createContestVote` when two leaves of the `gate` tree read
- * different chains.
- *
- * A contest has one clock: `blocksPerBucket`, the ballot's `blockNumber`, the sample block every
- * rule is handed, and the tie-break seed block are all numbers on the gating chain. A leaf reading
- * a second chain would be handed a block number out of someone else's history — not an error any
- * rule can detect, so the document is refused up front instead. Gating across chains needs an
- * explicit clock field in the criteria first; see DESIGN.md "Open questions".
- */
-export class GateChainMismatchError extends Error {
-    constructor(
-        readonly first: { type: string; chain: string },
-        readonly second: { type: string; chain: string }
-    ) {
-        super(
-            `The criteria gate mixes chains: rule "${first.type}" reads "${first.chain}" but rule ` +
-                `"${second.type}" reads "${second.chain}". Every gate leaf must read the chain whose ` +
-                `blocks the contest's buckets are counted in.`
-        );
-        this.name = "GateChainMismatchError";
-    }
-}
-
-/**
- * Thrown by `createContest` / `createContestVote` when the criteria's dependency manifest
- * names a chain (`requires.chains`) the host's `ChainClientFactory` cannot resolve to a
- * client (it returned `undefined`). RPC endpoints are client-local settings, not part of
+ * Thrown by `createContest` / `createContestVote` when the host's `ChainClientFactory` cannot
+ * resolve the contest's `bucketChainId` to a client (it returned `undefined`). RPC endpoints are client-local settings, not part of
  * the criteria document, so a client with no gateway configured for a required chain must
  * recuse the contest rather than miscount — the chain-side twin of `UnknownRuleError`.
  */
 export class MissingChainClientError extends Error {
-    constructor(
-        readonly chain: string,
-        readonly chainId: number
-    ) {
+    constructor(readonly chainId: number) {
         super(
-            `No chain client for "${chain}" (chainId ${chainId}), which this contest's criteria ` +
-                `requires. RPC endpoints are client settings, not part of the criteria document: ` +
-                `configure the \`chains\` factory (PubsubVoterOptions.chains) to return a viem ` +
-                `PublicClient for this chain, or recuse this contest.`
+            `No chain client for chainId ${chainId}, which this contest counts its buckets in ` +
+                `(\`criteria.bucketChainId\`). RPC endpoints are client settings, not part of the ` +
+                `criteria document: configure the \`chains\` factory (PubsubVoterOptions.chains) to ` +
+                `return a viem PublicClient for this chain, or recuse this contest.`
         );
         this.name = "MissingChainClientError";
     }

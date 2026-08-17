@@ -1,7 +1,7 @@
 import type { Criteria, GateNode, RuleRef } from "../schema/criteria.js";
 import type { ChainReadContext, Rule, RuleRegistry, RuleResult } from "./types.js";
 import type { ChainClient } from "../chain/types.js";
-import { tickerForRef } from "../chain/ticker.js";
+import { encodeCanonical } from "../encoding/canonical.js";
 import { makeMemoryRuleCache, type RuleCache } from "./cache.js";
 import { UnknownRuleError } from "../errors.js";
 import { gateFailure, scoreOrZero } from "./result.js";
@@ -38,12 +38,22 @@ export interface ResolvedGateLeaf {
     options: unknown;
     /** The rule's whole world: its chain, this verifier's head, its own memo. */
     ctx: ChainReadContext;
+    /**
+     * The QUESTION this leaf asks, as the canonical bytes of its reference. Two leaves with the
+     * same key are one question in two positions — legal, and the only way to write "any two of
+     * these three" (schema/criteria.ts) — so they must be evaluated once, not once each.
+     */
+    key: string;
 }
 
 /**
- * Resolve every gate leaf once per contest: its rule, its parsed options, the chain it reads and
- * the memo it computes through. Shared by the inline verifier and the background verifier so the
- * two cannot resolve a gate differently — the same reason the fold above lives in one file.
+ * Resolve every gate leaf once per contest: its rule, its parsed options and the memo it computes
+ * through. Shared by the inline verifier and the background verifier so the two cannot resolve a
+ * gate differently — the same reason the fold above lives in one file.
+ *
+ * There is one `chain` because a contest has one clock (`criteria.bucketChainId`): every rule is
+ * handed block numbers counted in it, so a rule reading a second chain would be answering about
+ * the wrong history. See DESIGN.md "One clock".
  *
  * `caches` is per leaf in {@link gateLeaves} order (the voter's persistent, per-rule namespaces);
  * omitted, each leaf gets a private in-memory memo, which is what unit tests want.
@@ -51,23 +61,45 @@ export interface ResolvedGateLeaf {
 export function resolveGate(args: {
     criteria: Criteria;
     registry: RuleRegistry;
-    chainFor: (ticker: string) => ChainClient;
+    chain: ChainClient;
     readHead: (args: { chain: ChainClient }) => Promise<{ block: number }>;
     caches?: readonly RuleCache[] | undefined;
 }): ResolvedGateLeaf[] {
-    const { criteria, registry, chainFor, readHead, caches } = args;
+    const { criteria, registry, chain, readHead, caches } = args;
     return gateLeaves(criteria.gate).map((ref, index) => {
         const rule = registry[ref.type];
         if (!rule) throw new UnknownRuleError("gate", ref.type);
         const options = rule.optionsSchema.parse(ref);
-        const chain = chainFor(tickerForRef(criteria, ref, options));
         return {
             ref,
             rule,
             options,
-            ctx: { chain, head: () => readHead({ chain }), cache: caches?.[index] ?? makeMemoryRuleCache() }
+            ctx: { chain, head: () => readHead({ chain }), cache: caches?.[index] ?? makeMemoryRuleCache() },
+            key: Array.from(encodeCanonical(ref), (byte) => byte.toString(16).padStart(2, "0")).join("")
         };
     });
+}
+
+/**
+ * Which leaves ask the same question, computed once per contest.
+ *
+ * `representatives` lists one leaf index per DISTINCT question, and `ofLeaf[i]` is the position in
+ * that list which leaf `i` maps to. Callers evaluate the representatives and fan the answers back
+ * out, so a rule named twice in one gate costs one evaluation and one batched chain read — not
+ * one per position. Without this the duplicate is not merely wasted CPU: the two positions race,
+ * so both miss the rule's memo before either writes it.
+ */
+export function dedupeLeaves(leaves: readonly ResolvedGateLeaf[]): { representatives: number[]; ofLeaf: number[] } {
+    const at = new Map<string, number>();
+    const representatives: number[] = [];
+    const ofLeaf = leaves.map((leaf, index) => {
+        const seen = at.get(leaf.key);
+        if (seen !== undefined) return seen;
+        at.set(leaf.key, representatives.length);
+        representatives.push(index);
+        return representatives.length - 1;
+    });
+    return { representatives, ofLeaf };
 }
 
 /** The tree with its leaves numbered, so evaluation order cannot shift what a leaf index means. */

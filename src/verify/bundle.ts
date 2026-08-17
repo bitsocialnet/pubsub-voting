@@ -1,9 +1,9 @@
 import type { VotesBundle } from "../schema/votes.js";
 import type { Criteria } from "../schema/criteria.js";
-import type { RuleRegistry } from "../rules/types.js";
+import type { RuleRegistry, RuleResult } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import type { RuleCache } from "../rules/cache.js";
-import { evaluateGate, gateBlame, gatePenalize, gateReason, gateScore, resolveGate } from "../rules/gate.js";
+import { dedupeLeaves, evaluateGate, gateBlame, gatePenalize, gateReason, resolveGate } from "../rules/gate.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
 import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
@@ -38,12 +38,12 @@ export interface BundleVerifierDeps {
     criteria: Criteria;
     /** The criteria document's CID bytes (`(await criteriaCid(criteria)).bytes`) — signature binding. */
     criteriaCid: Uint8Array;
-    /** The rule chain's numeric chainId (bound in the ballot domain). */
+    /** The contest's numeric chainId (`criteria.bucketChainId`, bound in the ballot domain). */
     chainId: number;
     /** Resolved rule registry (built-ins + host overrides). */
     registry: RuleRegistry;
-    /** Resolve a chain ticker (e.g. "base") to its viem client. */
-    chainFor: (ticker: string) => ChainClient;
+    /** The contest's one chain client — every rule reads it (DESIGN.md "One clock"). */
+    chain: ChainClient;
     /** Bucket math for `criteria.blocksPerBucket`. */
     bucketMath: BucketMath;
     /** Host-injected community-name resolvers (`PubsubVoterOptions.nameResolvers`). */
@@ -76,16 +76,31 @@ export interface BundleVerifierDeps {
 }
 
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
-    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, nameResolutionCache } = deps;
+    const { criteria, criteriaCid, chainId, registry, chain, bucketMath, nameResolvers, nameResolutionCache } = deps;
 
-    // Resolve every gate leaf — rule, options, chain client, memo — once: they are fixed by the
-    // criteria, so none of it is recomputed per bundle.
-    const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
-    const leaves = resolveGate({ criteria, registry, chainFor, readHead, caches: deps.ruleCaches });
-    /** Score one leaf for one wallet. The evaluator calls each index at most once. */
-    const scoreLeaf = (wallet: { address: string; sampleBlock: number }) => (leaf: number) => {
-        const { rule, options, ctx } = leaves[leaf]!;
-        return rule.evaluate({ options, wallet, ctx });
+    // Resolve every gate leaf — rule, options, memo — once: they are fixed by the criteria, so
+    // none of it is recomputed per bundle. Same for which leaves ask the same question.
+    const readHead = deps.readHead ?? (async ({ chain: client }: { chain: ChainClient }) => ({ block: Number(await client.getBlockNumber()) }));
+    const leaves = resolveGate({ criteria, registry, chain, readHead, caches: deps.ruleCaches });
+    const { ofLeaf } = dedupeLeaves(leaves);
+
+    /**
+     * Score one leaf for one wallet, sharing one answer between leaves that ask the same question
+     * (`dedupeLeaves`). The per-wallet map is what makes the sharing real: the fold evaluates
+     * leaves concurrently, so two positions of one rule would otherwise both miss its memo before
+     * either wrote to it.
+     */
+    const scoreLeaf = (wallet: { address: string; sampleBlock: number }) => {
+        const asked = new Map<number, Promise<RuleResult>>();
+        return (leaf: number) => {
+            const question = ofLeaf[leaf]!;
+            const already = asked.get(question);
+            if (already) return already;
+            const { rule, options, ctx } = leaves[leaf]!;
+            const answer = rule.evaluate({ options, wallet, ctx });
+            asked.set(question, answer);
+            return answer;
+        };
     };
 
     // Stage 1, shared by `verify` and `verifyOffline`: signature + constraints, local and µs.
@@ -191,7 +206,7 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
                 resolvedNames[name] = record.publicKey;
             }
 
-            return { valid: true, ruleScore: gateScore(gate), resolvedNames };
+            return { valid: true, resolvedNames };
         }
     };
 }

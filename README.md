@@ -39,24 +39,24 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`), a `blockstore` (else `MissingBlockstoreError`), and a libp2p fetch service at `libp2p.services.fetch` (else `MissingFetchError`) |
-| `chains` | `ChainClientFactory` | yes | resolves each chain a contest's criteria requires (`{ chain, chainId }`) to a viem `PublicClient`; rules read through it for the gate and weight. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that carries a multicall3 deployment in its viem `chain` config and serves **historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head** (the v1 gate reads the head first, but falls back to the block a ballot names — see [Custom rules](#custom-rules)); return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
+| `chains` | `ChainClientFactory` | yes | resolves the chain a contest counts in (`{ chainId }`, from `criteria.bucketChainId`) to a viem `PublicClient`; every gate rule and the weight rule read through it. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that carries a multicall3 deployment in its viem `chain` config and serves **historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head** (the v1 gate reads the head first, but falls back to the block a ballot names — see [Custom rules](#custom-rules)); return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 | `dataPath` | `string \| false` | no | directory for the voter's persistent state (gate-result + name-resolution caches, and each joined contest's **checkpoint snapshot** — its last fully-verified winner-set, reloaded at join so a restart with no other peer online keeps the tally), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-voting` (better-sqlite3 under `{dataPath}/lru-storage/` + `{dataPath}/checkpoints.db`); in the browser the path is ignored and everything lives in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC, and restores each contest's checkpoint before the cold-start pull. A seeder should always set a stable path |
 | `httpRouterUrls` | `string[]` | no | Delegated Routing V1 router base URLs to **announce provider records to** (one unsigned `PUT /routing/v1/providers` per router; `Keys` batches every joined contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced on root changes, and on address changes). **Seeders only**: absent/empty means never announce (the default — plain clients are not dialable), and the browser build never announces regardless. The node must be publicly **reachable** (its listening port open/forwarded/published), but it does not need to know its own public IP: private, loopback, and link-local addrs are filtered client-side, and when nothing survives — the normal zero-config case behind NAT or a Docker bridge, and even on public-IP hosts, since libp2p withholds unconfirmed public addrs pending AutoNAT — the announcer sends the wildcard sentinels (`/ip4/0.0.0.0/...`, `/ip6/::/...`) that the router rewrites to the PUT's observed source IP, exactly as kubo announces work. Configured `addresses.announce` values (concrete public addrs, DNS/AutoTLS, or a kubo-style wildcard) are used as-is. Only a loopback-only node announces nothing. *Querying* needs no URLs here — cold-join discovery uses the injected node's `libp2p.contentRouting`, which the host wires its routers into |
 
-A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry + the `chains` factory: an unimplemented rule throws `UnknownRuleError`, an unresolvable required chain throws `MissingChainClientError` — recuse, don't miscount), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists. The document names each required chain only by ticker + `chainId`; RPC endpoints stay out of it, so operators can swap gateways without forking the topic.
+A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry + the `chains` factory: an unimplemented rule throws `UnknownRuleError`, an unresolvable required chain throws `MissingChainClientError` — recuse, don't miscount), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists. The document names its chain only by `bucketChainId`; RPC endpoints stay out of it, so operators can swap gateways without forking the topic.
 
 Who may vote is the document's `gate` — one rule, or a boolean tree of them:
 
 ```ts
-gate: { rule: { type: "erc5192-min-balance", chain: "base", contract: "0x13d4…91b9", min: 1 } }
+gate: { rule: { type: "erc5192-min-balance", contract: "0x13d4…91b9", min: 1 } }
 gate: { all: [{ rule: passRule }, { rule: notBannedRule }] }          // every rule must admit
 gate: { any: [{ rule: passRule }, { rule: moderatorRule }] }          // any one of them admits
 gate: { all: [{ any: [{ rule: passRule }, { rule: moderatorRule }] }, { rule: notBannedRule }] }
 ```
 
-Each rule still answers one question about one wallet and knows nothing about the others; the document composes them. Because the topic is the CID of these bytes, the schema rejects every spelling that would mean the same as a shorter tree — a branch needs **at least two** children, may not repeat a child, and may not nest a branch of its own kind (`{ all: [{ all: [A, B] }, C] }` is just `{ all: [A, B, C] }`) — since each would put one contest on two topics. Trees nest at most 4 deep with at most 8 rules in total, and every leaf must read the **same chain** (`GateChainMismatchError` otherwise: the contest counts its buckets in one chain's blocks, and that is the block each rule is handed). Child order is significant and is the order the forward gate evaluates in, so put the cheapest or most discriminating rule first.
+Each rule still answers one question about one wallet and knows nothing about the others; the document composes them. Because the topic is the CID of these bytes, the schema rejects the spellings that would mean the same as a shorter tree — a branch needs **at least two** children, may not repeat a child, and may not nest a branch of its own kind (`{ all: [{ all: [A, B] }, C] }` is just `{ all: [A, B, C] }`) — since each would put one contest on two topics. A rule may appear in two different branches, which is how a gate says "any two of these three": `{ any: [{ all: [A, B] }, { all: [A, C] }, { all: [B, C] }] }`. Trees nest at most 4 deep with at most 8 rules in total. No rule names a chain: every one of them reads the chain the contest counts in (`bucketChainId`), which is the chain the block each rule is handed comes from. Child order is significant and is the order the forward gate evaluates in, so put the cheapest or most discriminating rule first.
 
 ### Construct a voter
 
@@ -72,12 +72,12 @@ const viemChainFactory = (): ChainClientFactory => {
   const clients: Record<number, ReturnType<typeof createPublicClient>> = {
     [base.id]: createPublicClient({ chain: base, transport: http("https://my-trusted-base-rpc.example") })
   };
-  return ({ chainId }) => clients[chainId]; // undefined → recuse contests requiring that chain
+  return ({ chainId }) => clients[chainId]; // undefined → recuse contests counting in that chain
 };
 
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
-  chains: viemChainFactory(),   // ({ chain, chainId }) => viem PublicClient | undefined
+  chains: viemChainFactory(),   // ({ chainId }) => viem PublicClient | undefined
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
   dataPath: "/path/to/data",    // optional; persistent state: caches + checkpoint snapshots (default {cwd}/.bitsocial-pubsub-voting; false → in-memory)
@@ -123,15 +123,27 @@ single verdict:
 
 | field | what it is |
 | --- | --- |
-| `checks` | every rule in the gate, in document order: `{ ruleId, type, satisfied, score, error? }` |
+| `checks` | every rule in the gate, in document order: `{ leaf, ruleId, type, satisfied, score, error? }` |
 | `failures` | the rules whose failure **explains** the refusal — render these |
 | `gate` | the same tree as `criteria.gate`, each node carrying its `satisfied`, for rendering the real requirement |
 | `error` | `failures` joined into one sentence, for a caller that only wants a string |
 
 `failures` is deliberately **not** `checks.filter(c => !c.satisfied)`. Under `any`, a wallet that
 qualifies as a moderator also "fails" the Pass rule — telling it to go and buy a Pass would be
-worse than saying nothing. Key rows by `ruleId`, not `type`: one gate may name the same rule twice
-on different options.
+worse than saying nothing.
+
+Key rows by **`leaf`** — the rule's position in the gate, and the only field guaranteed unique in
+one result. `type` is not (a gate may name one rule twice on different options) and neither is
+`ruleId` (a gate may name the same rule in two branches). Use `ruleId` to compare *across* results
+instead: equal ids are one question, so a directory of 63 boards gated on one Pass shows the same
+id everywhere, and shares one chain read behind it.
+
+A check's `satisfied` is `true`, `false`, or **`undefined`** — the last meaning that rule's chain
+read failed and the gate was decided without it. Render it as unknown, never as a requirement the
+wallet is missing: nothing was learned about them. A wallet admitted by a branch that did answer
+still gets `eligible: true` while an unrelated contract's RPC is down; the call throws only when
+the gate cannot be decided without the rule that failed, because at that point there is no honest
+answer to give.
 
 Do **not** reimplement this by reading balances yourself: which block counts is the rule's
 business and changes when the rule changes. A client that hard-codes "peers verify at the bucket

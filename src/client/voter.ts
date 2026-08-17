@@ -1,10 +1,9 @@
 import pLimit from "p-limit";
 import { CriteriaSchema, type Criteria, type RuleRef } from "../schema/criteria.js";
 import { VotesBundleSchema, type Vote, type VotesBundle } from "../schema/votes.js";
-import type { ChainClient, ChainClientFactory, ChainClients, NameResolver } from "../chain/types.js";
+import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
 import { coalescingChainFactory } from "../chain/coalescer.js";
 import { makeBucketMath } from "../chain/bucket.js";
-import { tickerForRef } from "../chain/ticker.js";
 import type {
     BlockstoreLike,
     FetchServiceLike,
@@ -147,14 +146,26 @@ export interface PublishOutcome {
  */
 export interface EligibilityCheck {
     /**
-     * Stable identity of this rule INSTANCE: the hash of its canonical criteria reference plus
-     * the id of the chain it reads — the same key that namespaces its memo. Use it as the render
-     * key: two leaves can share a `type` on different options, so `type` alone is not unique.
+     * This leaf's position in the gate, depth-first in document order — the render key, and the
+     * only field guaranteed unique within one result. `type` is not (a gate may name one rule
+     * twice on different options) and neither is `ruleId` (a gate may name the SAME rule in two
+     * branches, which is how "any two of these three" is written).
+     */
+    readonly leaf: number;
+    /**
+     * Stable identity of this rule INSTANCE — the hash of its canonical criteria reference plus
+     * the id of the chain it reads, which is also the namespace of its memo. Equal ids mean one
+     * question, so they are what to compare ACROSS results: two contests of a 63-board directory
+     * gated on one Pass share this id, and share every chain read behind it. Within one gate two
+     * leaves may share it; use {@link leaf} to tell them apart.
      */
     readonly ruleId: string;
     /** The rule `type` this leaf names, for grouping and labelling. */
     readonly type: string;
-    /** `undefined` when the evaluation never needed this rule's answer (never on this call). */
+    /**
+     * `undefined` when this rule has no answer: its chain read failed and the gate was decided
+     * without it. Render it as unknown, never as a failure — nothing was learned about the wallet.
+     */
     readonly satisfied: boolean | undefined;
     /** This rule's score for the wallet; `0n` unless it passed. */
     readonly score: bigint;
@@ -355,10 +366,10 @@ export interface PubsubVoterOptions {
      */
     helia: HeliaInstance;
     /**
-     * Resolves a chain named by a contest's criteria (`requires.chains`, ticker + chainId)
-     * to a viem `PublicClient`. Which RPC gateway to use is THIS client's setting — RPC URLs
+     * Resolves the chain a contest counts in (`criteria.bucketChainId`) to a viem
+     * `PublicClient`. Which RPC gateway to use is THIS client's setting — RPC URLs
      * are deliberately not part of the criteria document, so this factory is where the host
-     * maps chains to the endpoints it trusts. Return one shared client per chain (memoized),
+     * maps chain ids to the endpoints it trusts. Return one shared client per chain (memoized),
      * and `undefined` for a chain with no RPC configured — `createContest` /
      * `createContestVote` then throws `MissingChainClientError` (recuse, don't miscount).
      * See `ChainClientFactory` (src/chain/types.ts) for the full contract.
@@ -975,13 +986,10 @@ class ContestEngine {
     readonly readOnly: boolean;
 
     readonly #deps: ResolvedDeps;
-    /** Chain clients for this contest, built from `criteria.requires.chains` via the factory. */
-    readonly #chainClients: ChainClients;
-
     readonly #criteriaCid: Uint8Array;
-    /** The gating (`rule`) chain's numeric chainId, bound into every ballot signature. */
+    /** The contest's chain id (`criteria.bucketChainId`), bound into every ballot signature. */
     readonly #chainId: number;
-    /** The gating (`rule`) chain client, also the seed chain for the tally's tie-break block hash. */
+    /** The contest's one chain client, also the seed chain for the tally's tie-break block hash. */
     readonly #ruleChain: ChainClient;
     readonly #bucketMath: ReturnType<typeof makeBucketMath>;
     readonly #crdt: VoteCrdt;
@@ -1050,28 +1058,15 @@ class ContestEngine {
         this.readOnly = deps.signer === undefined;
         this.#deps = deps;
         this.#criteriaCid = criteriaCidBytes;
-        // Resolve every chain the manifest requires, eagerly: a client with no RPC configured
-        // for one of them must find out at the create seam (recuse), not on its first verify.
-        this.#chainClients = Object.fromEntries(
-            Object.entries(criteria.requires.chains).map(([chain, config]): [string, ChainClient] => {
-                const client = deps.chains({ chain, chainId: config.chainId });
-                if (client === undefined) throw new MissingChainClientError(chain, config.chainId);
-                return [chain, client];
-            })
-        );
-
-        // The gating chain fixes the ballot's chainId and the tie-break seed chain. Every gate
-        // leaf reads it — `validateCriteriaRules` refused the document otherwise, since the
-        // contest counts its buckets in exactly one chain's blocks — so leaf 0 names it for all.
+        // The contest's ONE chain (`bucketChainId`): it fixes the ballot's chainId, the blocks the
+        // buckets count, the block every rule is handed, and the tie-break seed. Resolved eagerly,
+        // so a client with no RPC configured for it finds out at the create seam (and recuses)
+        // rather than on its first verify.
+        this.#chainId = criteria.bucketChainId;
+        const chain = deps.chains({ chainId: this.#chainId });
+        if (chain === undefined) throw new MissingChainClientError(this.#chainId);
+        this.#ruleChain = chain;
         const gateRefs = gateLeaves(criteria.gate);
-        const firstRef = gateRefs[0]!; // GateSchema cannot produce a tree with no leaves
-        const rule = deps.registry[firstRef.type];
-        if (!rule) throw new UnknownRuleError("gate", firstRef.type);
-        const ruleTicker = tickerForRef(criteria, firstRef, rule.optionsSchema.parse(firstRef));
-        const ruleChain = this.#chainClients[ruleTicker];
-        if (!ruleChain) throw new Error(`no chain client for the gating chain "${ruleTicker}"`);
-        this.#ruleChain = ruleChain;
-        this.#chainId = criteria.requires.chains[ruleTicker]!.chainId;
 
         this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
         const store = makeBlockstoreBundleStore(deps.blockstore);
@@ -1089,33 +1084,29 @@ class ContestEngine {
         // layered over the voter's persistent store and namespaced by the hash of that leaf's
         // canonical rule reference + chainId. That hash is exactly the sharing boundary: two
         // contests over one gate rule (a directory of boards on the same Pass) share each other's
-        // reads, while different rules, or one rule on different options, can never collide —
-        // which is also what keeps two leaves of ONE gate apart. What is stored under it, and for
-        // how long, is the rule's business, not the engine's. The same hash is each leaf's public
-        // `ruleId` in `checkEligibility`.
+        // reads, while different rules, or one rule on different options, can never collide. What
+        // is stored under it, and for how long, is the rule's business, not the engine's. The same
+        // hash is each leaf's public `ruleId` in `checkEligibility` — NOT unique within one gate,
+        // because a rule may be named in two branches, and two positions of one question SHOULD
+        // share a keyspace (see `dedupeLeaves`).
         this.#gateRefs = gateRefs;
         this.#ruleIds = gateRefs.map((ref) => sha256(encodeDagCbor({ chainId: this.#chainId, rule: ref })));
         const gateCaches = this.#ruleIds.map((namespace) => makePersistentRuleCache({ store: deps.gateStore, namespace }));
-        // The weight rule gets its own namespace on the SAME terms — its canonical reference plus
-        // the id of the chain IT reads, which is not necessarily the gating chain. A ticker is
-        // just a name local to the criteria document, so two contests can spell the same weight
-        // ref while `requires.chains` binds that ticker to different chains; keying on the gate's
-        // chainId would let one serve the other's scores from the wrong chain.
+        // The weight rule gets its own namespace on the same terms: its canonical reference plus
+        // this contest's chain id. It reads the same chain as everything else here — a weight rule
+        // on a second chain is the same open question as a gate leaf on one.
         const weight = deps.registry[criteria.weight.type];
         if (!weight) throw new UnknownRuleError("weight", criteria.weight.type);
-        const weightTicker = tickerForRef(criteria, criteria.weight, weight.optionsSchema.parse(criteria.weight));
-        const weightChainId = criteria.requires.chains[weightTicker]?.chainId;
-        if (weightChainId === undefined) throw new Error(`no chain client for weight chain "${weightTicker}"`);
         const weightCache = makePersistentRuleCache({
             store: deps.gateStore,
-            namespace: sha256(encodeDagCbor({ chainId: weightChainId, rule: criteria.weight }))
+            namespace: sha256(encodeDagCbor({ chainId: this.#chainId, rule: criteria.weight }))
         });
         const verifier = makeBundleVerifier({
             criteria,
             criteriaCid: criteriaCidBytes,
             chainId: this.#chainId,
             registry: deps.registry,
-            chainFor: (ticker) => this.#chainFor(ticker),
+            chain: this.#ruleChain,
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
             ruleCaches: gateCaches,
@@ -1131,7 +1122,7 @@ class ContestEngine {
         this.#background = makeBackgroundVerifier({
             criteria,
             registry: deps.registry,
-            chainFor: (ticker) => this.#chainFor(ticker),
+            chain: this.#ruleChain,
             bucketMath: this.#bucketMath,
             nameResolvers: deps.nameResolvers,
             ruleCaches: gateCaches,
@@ -1148,7 +1139,7 @@ class ContestEngine {
         this.#tally = makeTally({
             criteria,
             registry: deps.registry,
-            chainFor: (ticker) => this.#chainFor(ticker),
+            chain: this.#ruleChain,
             bucketMath: this.#bucketMath,
             readHead: ({ chain }) => this.#readHead({ chain }),
             ruleCache: weightCache,
@@ -1276,12 +1267,6 @@ class ContestEngine {
         this.#emitError(error);
     }
 
-    #chainFor(ticker: string): ChainClient {
-        const client = this.#chainClients[ticker];
-        if (!client) throw new Error(`no chain client configured for chain "${ticker}"`);
-        return client;
-    }
-
     /**
      * Read the gating-chain head and update {@link #currentBucketCache}; returns the bucket.
      *
@@ -1385,6 +1370,7 @@ class ContestEngine {
             };
         }
         const check: EligibilityCheck = {
+            leaf: result.leaf,
             ruleId: this.#ruleIds[result.leaf]!,
             type: this.#gateRefs[result.leaf]!.type,
             satisfied: result.satisfied,
@@ -1395,7 +1381,7 @@ class ContestEngine {
         return { kind: "leaf", ...check };
     }
 
-    /** Hash of the current bucket boundary block on the gating (`rule`) chain (rolling tie seed). */
+    /** Hash of the current bucket boundary block on the contest's chain (rolling tie seed). */
     async #bucketBlockHash(): Promise<Uint8Array> {
         const head = await this.#ruleChain.getBlockNumber();
         const boundary = this.#bucketMath.sampleBlockForBucket(this.#bucketMath.bucketForBlock(Number(head)));

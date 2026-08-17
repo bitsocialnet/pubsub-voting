@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { ChainTickerSchema } from "./common.js";
 import { encodeCanonical } from "../encoding/canonical.js";
 
 /**
@@ -20,7 +19,7 @@ import { encodeCanonical } from "../encoding/canonical.js";
  */
 
 /** Inclusive numeric bounds for a single `vote` value. v1 is { min: 1, max: 1 }. */
-export const VoteRangeSchema = z.object({
+export const VoteRangeSchema = z.strictObject({
     min: z.number().int(),
     max: z.number().int()
 });
@@ -54,8 +53,13 @@ export const RuleRefSchema = z.looseObject({
  * two peers running identical rules on two topics, each invisible to the other:
  *   - a branch needs at least TWO children, so `{ all: [X] }` cannot exist alongside `X`;
  *   - a branch may not REPEAT a child (compared by canonical bytes, so two leaves of one rule type
- *     on different options stay distinct requirements) — a repeat says nothing the shorter tree
- *     does not;
+ *     on different options stay distinct requirements) — a repeat among siblings says nothing the
+ *     shorter tree does not. Across BRANCHES a rule may repeat, deliberately: that is how a gate
+ *     expresses a requirement no repetition-free tree can ("any two of these three" is
+ *     `{ any: [{ all: [A, B] }, { all: [A, C] }, { all: [B, C] }] }`). The price is that some
+ *     redundant spellings survive — `{ all: [{ any: [A, B] }, A] }` is `A` by absorption — so a
+ *     leaf's identity is NOT unique within a gate, and its position is what identifies it
+ *     (`EligibilityCheck.leaf`);
  *   - a branch may not nest a branch of its OWN kind: `{ all: [{ all: [A, B] }, C] }` admits,
  *     scores, blames and penalizes exactly as `{ all: [A, B, C] }` does, since min and `some` are
  *     associative, so the nesting carries no meaning and only new bytes;
@@ -99,7 +103,8 @@ function gateShape(node: GateNode): { depth: number; leaves: number; redundant: 
     let leaves = 0;
     let redundant: string | undefined;
     // Canonical bytes are the identity: two children that encode identically ARE the same
-    // requirement, however differently they were written.
+    // requirement, however differently they were written. Siblings only — a rule repeated in
+    // another branch is how a gate expresses "any two of these three".
     const seen = new Set<string>();
     for (const child of children) {
         const shape = gateShape(child);
@@ -118,48 +123,68 @@ function gateShape(node: GateNode): { depth: number; leaves: number; redundant: 
 
 const bytesToHex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 
-export const GateSchema = GateNodeSchema.superRefine((node, ctx) => {
-    const { depth, leaves, redundant } = gateShape(node);
-    if (depth > MAX_GATE_DEPTH) {
-        ctx.addIssue({ code: "custom", message: `gate tree is ${depth} levels deep; the maximum is ${MAX_GATE_DEPTH}` });
-    }
-    if (leaves > MAX_GATE_LEAVES) {
-        ctx.addIssue({ code: "custom", message: `gate tree names ${leaves} rules; the maximum is ${MAX_GATE_LEAVES}` });
-    }
-    // Every redundant spelling is a topic fork waiting to happen: it means the same thing as a
-    // shorter tree while encoding to different bytes, so two authors expressing one contest can
-    // land on two topics. Same reason a branch may not have a single child.
-    if (redundant !== undefined) ctx.addIssue({ code: "custom", message: `gate tree has a redundant spelling: ${redundant}` });
-});
-
 /**
- * One chain the contest reads, by ticker. Part of the dependency manifest.
- *
- * Only the `chainId` is here — it is consensus-critical (bound into every EIP-712 ballot
- * domain and defining which chain the rules read). RPC endpoints are deliberately NOT part
- * of the criteria: which gateway a client trusts is client-local transport configuration
- * (`PubsubVoterOptions.chains` maps ticker/chainId to a client), and two honest verifiers
- * reading the same pinned block through different gateways compute identical results. Keeping
- * URLs out means an operator can swap a dead RPC provider without changing the document's
- * bytes — i.e. without forking the topic and orphaning the contest's votes.
- *
- * Strict on purpose: the topic is derived from the PARSED document, so an unknown key must
- * fail loudly here — a plain (stripping) object would silently drop it and derive a different
- * topic than the author's raw document implies. This also makes pre-v1 documents that still
- * carry `rpcUrls` a loud error instead of a silent re-topic.
+ * Structural bounds, checked on the RAW value before the recursive schema ever descends into it.
+ * {@link GateNodeSchema} is `z.lazy` and {@link gateShape} recurses, so a pathological document
+ * overflows the stack long before any cap can fire — and a `RangeError` escaping `safeParse`
+ * breaks the one guarantee that call makes. This walk is iterative and stops at the first node
+ * past a bound; anything within them it passes through untouched, so the real schema still
+ * produces the precise error for an ordinary authoring mistake.
  */
-export const ChainConfigSchema = z.strictObject({
-    chainId: z.number().int().positive()
-});
+const MAX_GATE_NODES = MAX_GATE_LEAVES * 2;
+function checkGateBounds(raw: unknown, ctx: z.RefinementCtx): void {
+    const stack: { node: unknown; depth: number }[] = [{ node: raw, depth: 1 }];
+    let nodes = 0;
+    while (stack.length > 0) {
+        const { node, depth } = stack.pop()!;
+        if (depth > MAX_GATE_DEPTH) {
+            ctx.addIssue({ code: "custom", message: `gate tree is more than ${MAX_GATE_DEPTH} levels deep` });
+            return;
+        }
+        nodes += 1;
+        if (nodes > MAX_GATE_NODES) {
+            ctx.addIssue({ code: "custom", message: `gate tree has more than ${MAX_GATE_NODES} nodes` });
+            return;
+        }
+        if (typeof node !== "object" || node === null) continue; // not a node; the schema says so
+        const branch = node as { all?: unknown; any?: unknown };
+        const children = Array.isArray(branch.all) ? branch.all : branch.any;
+        if (!Array.isArray(children)) continue;
+        for (const child of children) stack.push({ node: child, depth: depth + 1 });
+    }
+}
+
+export const GateSchema = z
+    .unknown()
+    .superRefine(checkGateBounds)
+    .pipe(GateNodeSchema)
+    .superRefine((node, ctx) => {
+        const { depth, leaves, redundant } = gateShape(node);
+        if (depth > MAX_GATE_DEPTH) {
+            ctx.addIssue({ code: "custom", message: `gate tree is ${depth} levels deep; the maximum is ${MAX_GATE_DEPTH}` });
+        }
+        if (leaves > MAX_GATE_LEAVES) {
+            ctx.addIssue({ code: "custom", message: `gate tree names ${leaves} rules; the maximum is ${MAX_GATE_LEAVES}` });
+        }
+        // Every redundant spelling is a topic fork waiting to happen: it means the same thing as a
+        // shorter tree while encoding to different bytes, so two authors expressing one contest can
+        // land on two topics. Same reason a branch may not have a single child.
+        if (redundant !== undefined) ctx.addIssue({ code: "custom", message: `gate tree has a redundant spelling: ${redundant}` });
+    });
 
 /**
  * The dependency manifest. A client reads this on join and checks that it
  * implements every named rule; if not, it is too old and must recuse
  * itself rather than miscount. This is how criteria upgrades fork cleanly.
+ *
+ * Strict for the same reason the top level is: the topic is derived from the PARSED document, so
+ * an unknown key must fail loudly rather than be stripped — a stripping schema would drop it and
+ * derive a different topic from the one the author's bytes imply. That is what makes a document
+ * still carrying the pre-`bucketChainId` `chains` map (or the even older `rpcUrls`) an error
+ * instead of a silent re-topic.
  */
-export const RequiresSchema = z.object({
-    rules: z.array(z.string().min(1)).nonempty(),
-    chains: z.record(ChainTickerSchema, ChainConfigSchema)
+export const RequiresSchema = z.strictObject({
+    rules: z.array(z.string().min(1)).nonempty()
 });
 
 export const CriteriaSchema = z
@@ -179,6 +204,28 @@ export const CriteriaSchema = z
          * always allowed as withdrawal/abstention regardless of this cap.
          */
         maxVotesPerAddress: z.number().int().positive(),
+        /**
+         * The chain whose blocks this contest counts in, by numeric chain id.
+         *
+         * The contest has exactly ONE clock, and this names it: `blocksPerBucket` and
+         * `voteExpiryBuckets` are measured in its blocks, a ballot's `blockNumber` and the
+         * `sampleBlock` every rule is handed are numbers on it, the tie-break seed is the hash of
+         * its bucket boundary block, and its id is bound into every EIP-712 ballot domain.
+         *
+         * It is a chain ID rather than a ticker because that is the identity the signature domain
+         * already carries — a ticker is a label local to a document, and two documents spelling
+         * one chain differently would be two topics for one contest. Rules do not name a chain at
+         * all: they read this one. Gating across several chains is future work, and needs an
+         * answer for what block a rule on a SECOND chain is handed before it can ship — see
+         * DESIGN.md "Open questions".
+         *
+         * RPC endpoints are deliberately not part of the criteria: which gateway a client trusts
+         * is client-local configuration (`PubsubVoterOptions.chains` maps this id to a client),
+         * and two honest verifiers reading the same pinned block through different gateways
+         * compute identical results. That keeps an operator's dead-RPC swap from forking the
+         * topic and orphaning the contest's votes.
+         */
+        bucketChainId: z.number().int().positive(),
         /** Block bucket size; all verifiers price the same block per bucket. */
         blocksPerBucket: z.number().int().positive(),
         /** How many buckets a bundle stays valid after its blockNumber. */
@@ -197,6 +244,5 @@ export const CriteriaSchema = z
 
 export type VoteRange = z.infer<typeof VoteRangeSchema>;
 export type RuleRef = z.infer<typeof RuleRefSchema>;
-export type ChainConfig = z.infer<typeof ChainConfigSchema>;
 export type Requires = z.infer<typeof RequiresSchema>;
 export type Criteria = z.infer<typeof CriteriaSchema>;

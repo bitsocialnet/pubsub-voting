@@ -6,15 +6,14 @@ import { z } from "zod";
  * There is no pkc-js author in this library: a vote is signed directly by the
  * gating-chain wallet that holds the Pass/ERC-20 (see DESIGN.md "Identity: the
  * voting wallet, nothing else"). What survives from the old author/wallet schema is
- * two small, identity-agnostic primitives reused across the wire:
- *   - `ChainTickerSchema`: the chain identifier ("base", "eth", ...) used by criteria
- *     and chain-reading rules.
+ * one small, identity-agnostic primitive reused across the wire:
  *   - `SignatureSchema`: the detached `{ signature, type }` shape (kept from pkc-js),
  *     here carrying the wallet's EIP-712 ballot signature.
+ *
+ * Chains are named by numeric `chainId` (`criteria.bucketChainId`), never by ticker: a ticker is
+ * a label local to a document, and two documents spelling one chain differently would be two
+ * topics for one contest.
  */
-
-/** Chain ticker is unrestricted ("base", "eth", ...), matching pkc-js. */
-export const ChainTickerSchema = z.string().min(1);
 
 /**
  * A detached signature with an explicit scheme tag. For a Votes bundle the `type` is

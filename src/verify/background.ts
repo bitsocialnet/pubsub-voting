@@ -5,7 +5,7 @@ import type { RuleRegistry, RuleResult, RuleWallet } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
 import type { RuleCache } from "../rules/cache.js";
 import { GATE_GRACE_MS, GATE_RETRY_MS } from "./gate-grace.js";
-import { evaluateGate, gateBlame, gatePenalize, gateReason, gateScore, resolveGate, type GateResult } from "../rules/gate.js";
+import { dedupeLeaves, evaluateGate, gateBlame, gatePenalize, gateReason, resolveGate, type GateResult } from "../rules/gate.js";
 import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
 import type { VerdictCache } from "./cache.js";
 import type { VerifyFail } from "./types.js";
@@ -57,7 +57,8 @@ export interface PendingBundle {
 export interface BackgroundVerifierDeps {
     criteria: Criteria;
     registry: RuleRegistry;
-    chainFor: (ticker: string) => ChainClient;
+    /** The contest's one chain client — every rule reads it (DESIGN.md "One clock"). */
+    chain: ChainClient;
     bucketMath: BucketMath;
     nameResolvers: NameResolver[];
     /**
@@ -69,7 +70,7 @@ export interface BackgroundVerifierDeps {
     /**
      * This verifier's current head, handed to the rule as `ctx.head`. Resolved by the rule at
      * most once per batch, so a round stays batchable. Never called by a rule that scores pinned
-     * historical state. Defaults to the rule chain's own `getBlockNumber()`; the voter injects
+     * historical state. Defaults to the contest chain's own `getBlockNumber()`; the voter injects
      * its coalesced reader.
      */
     readHead?: (args: { chain: ChainClient }) => Promise<{ block: number }>;
@@ -136,7 +137,7 @@ interface QueueItem extends PendingBundle {
 }
 
 export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): BackgroundChainVerifier {
-    const { criteria, registry, chainFor, bucketMath, nameResolvers, nameResolutionCache, cache, limit } = deps;
+    const { criteria, registry, chain, bucketMath, nameResolvers, nameResolutionCache, cache, limit } = deps;
     const retryBaseMs = deps.retryBaseMs ?? RETRY_BASE_MS;
     const retryCapMs = deps.retryCapMs ?? RETRY_CAP_MS;
     const gateGraceMs = deps.gateGraceMs ?? GATE_GRACE_MS;
@@ -144,8 +145,10 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
 
     // Resolve every gate leaf — rule, options, chain, memo — once (same call as verify/bundle.ts,
     // so the two verifiers cannot resolve a gate differently).
-    const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
-    const leaves = resolveGate({ criteria, registry, chainFor, readHead, caches: deps.ruleCaches });
+    const readHead = deps.readHead ?? (async ({ chain: client }: { chain: ChainClient }) => ({ block: Number(await client.getBlockNumber()) }));
+    const leaves = resolveGate({ criteria, registry, chain, readHead, caches: deps.ruleCaches });
+    // Which leaves ask the same question: a rule named twice in one gate is batched once.
+    const { representatives, ofLeaf } = dedupeLeaves(leaves);
 
     const queue: QueueItem[] = [];
     /** CIDs queued or in-flight, so a re-chased root cannot double-verify a bundle. */
@@ -204,14 +207,17 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             wallets.push(wallet);
         }
 
-        // One batched call per leaf, the leaves in parallel: each is a single multicall for the
-        // whole round, and the voter's per-client in-flight budget still bounds what reaches an RPC.
-        const byLeaf: RuleResult[][] = await Promise.all(
-            leaves.map(({ rule, options, ctx }) =>
-                rule.evaluateMany
+        // One batched call per distinct QUESTION, those in parallel: each is a single multicall
+        // for the whole round, and the voter's per-client in-flight budget still bounds what
+        // reaches an RPC. A rule named twice in one gate ("any two of these three") is asked once
+        // and its answer fanned back out to both positions.
+        const byQuestion: RuleResult[][] = await Promise.all(
+            representatives.map((leaf) => {
+                const { rule, options, ctx } = leaves[leaf]!;
+                return rule.evaluateMany
                     ? rule.evaluateMany({ options, wallets, ctx }).then(({ results }) => results)
-                    : Promise.all(wallets.map((wallet) => limit(() => rule.evaluate({ options, wallet, ctx }))))
-            )
+                    : Promise.all(wallets.map((wallet) => limit(() => rule.evaluate({ options, wallet, ctx }))));
+            })
         );
 
         for (const item of pending) {
@@ -219,7 +225,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             // Every leaf is already scored, so this "evaluation" reads the batch — no chain work.
             item.gate = await evaluateGate({
                 node: criteria.gate,
-                evaluate: async (leaf) => byLeaf[leaf]![wallet]!,
+                evaluate: async (leaf) => byQuestion[ofLeaf[leaf]!]![wallet]!,
                 collectAll: true
             });
             item.gateDone = true;
@@ -352,7 +358,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             }
             if (item.bundle.votes.some((v) => v.community.name)) deps.onNameResolved(item.cid);
             // Fully settled: store the terminal valid verdict (same shape the forward-gate caches).
-            cache.set(item.cid, { valid: true, ruleScore: gateScore(item.gate!), resolvedNames: item.resolvedNames });
+            cache.set(item.cid, { valid: true, resolvedNames: item.resolvedNames });
             settle(item);
         }
 

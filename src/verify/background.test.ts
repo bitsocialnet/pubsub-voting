@@ -117,7 +117,7 @@ function harness(over: Partial<BackgroundVerifierDeps> & { registry?: RuleRegist
     const verifier = makeBackgroundVerifier({
         criteria: bizCriteria(),
         registry: over.registry ?? { "erc5192-min-balance": stubRule({}).rule },
-        chainFor: () => ({}) as unknown as ChainClient,
+        chain: ({}) as unknown as ChainClient,
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [],
         ruleCaches: [ruleCache],
@@ -148,7 +148,7 @@ describe("makeBackgroundVerifier", () => {
         expect(h.gateVerified).toHaveLength(3);
         expect(h.evicted).toHaveLength(0);
         // Terminal valid verdicts are cached so a later re-publish short-circuits at the gate.
-        expect(h.cache.get(entries[0]!.cid)).toMatchObject({ valid: true, ruleScore: 1n });
+        expect(h.cache.get(entries[0]!.cid)).toMatchObject({ valid: true });
         expect(h.verifier.pendingCount()).toBe(0);
     });
 
@@ -214,7 +214,7 @@ describe("makeBackgroundVerifier", () => {
         h.verifier.enqueue([await pending(first)]);
         await h.verifier.idle();
         expect(reads).toBe(1);
-        expect(h.cache.get(await bundleCid(first))).toMatchObject({ valid: true, ruleScore: 2n });
+        expect(h.cache.get(await bundleCid(first))).toMatchObject({ valid: true });
 
         // A DIFFERENT bundle from the same wallet at the same block: no read at all this time.
         h.verifier.enqueue([await pending(bundle("0x1", { publicKey: KEY_B }))]);
@@ -509,6 +509,142 @@ describe("composite gates", () => {
 
         expect(h.evicted).toEqual([]);
         expect(h.gateVerified).toEqual([entry.cid.toString()]);
-        expect(h.cache.get(entry.cid)).toMatchObject({ valid: true, ruleScore: 1n });
+        expect(h.cache.get(entry.cid)).toMatchObject({ valid: true });
+    });
+});
+
+/**
+ * The batching contract for a composite gate. This path deliberately scores every leaf instead of
+ * short-circuiting, and the reason is entirely about the axis of batching: one `evaluateMany` per
+ * leaf covers a whole round's wallets, so collecting all costs one round trip per leaf however
+ * many bundles are pending — whereas short-circuiting per wallet would fragment those batches
+ * back into per-wallet reads. If that ever stops holding, the justification for `collectAll` here
+ * goes with it.
+ */
+describe("composite gates: batching and per-leaf memos", () => {
+    /** A batched rule that records each call, and can be made to throw like a failing RPC. */
+    function batchedRule(type: string, answer: RuleResult, opts: { throws?: boolean } = {}) {
+        const calls: string[][] = [];
+        const caches: unknown[] = [];
+        const rule: Rule = {
+            type,
+            optionsSchema: z.looseObject({ type: z.string() }),
+            evaluate: async () => answer,
+            async evaluateMany({ wallets, ctx }) {
+                calls.push(wallets.map((wallet) => wallet.address));
+                caches.push(ctx.cache);
+                if (opts.throws) throw new Error(`${type}: RPC down`);
+                return { results: wallets.map(() => answer) };
+            }
+        };
+        return { rule, calls, caches };
+    }
+    const ok: RuleResult = { success: true, score: 1n };
+    const compositeCriteria = {
+        ...bizCriteria(),
+        gate: { all: [{ rule: { type: "holds-pass" } }, { rule: { type: "not-banned" } }] } as never
+    };
+
+    it("makes exactly ONE evaluateMany per leaf per round, each over the whole round's wallets", async () => {
+        const pass = batchedRule("holds-pass", ok);
+        const banned = batchedRule("not-banned", ok);
+        const h = harness({
+            criteria: compositeCriteria,
+            registry: { "holds-pass": pass.rule, "not-banned": banned.rule }
+        });
+        const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2")), pending(bundle("0x3"))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        const wallets = entries.map((entry) => entry.bundle.address);
+        expect(pass.calls).toEqual([wallets]);
+        expect(banned.calls).toEqual([wallets]);
+        expect(h.gateVerified).toHaveLength(3);
+    });
+
+    it("collapses duplicate wallets once per leaf, not once per leaf per bundle", async () => {
+        // Two bundles from ONE wallet in one bucket (a re-vote): the batch is a property of the
+        // round, so each leaf still asks about that wallet exactly once.
+        const pass = batchedRule("holds-pass", ok);
+        const banned = batchedRule("not-banned", ok);
+        const h = harness({
+            criteria: compositeCriteria,
+            registry: { "holds-pass": pass.rule, "not-banned": banned.rule }
+        });
+        const entries = await Promise.all([pending(bundle("0x9")), pending(bundle("0x9", { publicKey: KEY_B }))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        expect(pass.calls).toEqual([[padAddress("0x9")]]);
+        expect(banned.calls).toEqual([[padAddress("0x9")]]);
+    });
+
+    it("asks a rule named in TWO branches once, not once per position", async () => {
+        // "Any two of these three" repeats every rule across branches (schema/criteria.ts). The
+        // batching axis is the question, not the position: six leaves, three distinct rules, three
+        // batched calls — each still covering the whole round's wallets.
+        const a = batchedRule("a", ok);
+        const b = batchedRule("b", ok);
+        const c = batchedRule("c", ok);
+        const twoOfThree = {
+            ...bizCriteria(),
+            gate: {
+                any: [
+                    { all: [{ rule: { type: "a" } }, { rule: { type: "b" } }] },
+                    { all: [{ rule: { type: "a" } }, { rule: { type: "c" } }] },
+                    { all: [{ rule: { type: "b" } }, { rule: { type: "c" } }] }
+                ]
+            }
+        } as never;
+        const h = harness({ criteria: twoOfThree, registry: { a: a.rule, b: b.rule, c: c.rule } });
+        const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2"))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        const wallets = entries.map((entry) => entry.bundle.address);
+        expect(a.calls).toEqual([wallets]);
+        expect(b.calls).toEqual([wallets]);
+        expect(c.calls).toEqual([wallets]);
+        expect(h.gateVerified).toHaveLength(2);
+    });
+
+    it("hands each leaf the memo at its OWN index", async () => {
+        // `ruleCaches` is positional, and the inline verifier resolves the same leaves from the
+        // same document — so a misalignment here would quietly serve one rule's answers to
+        // another. Each leaf must see the store the voter namespaced for it.
+        const pass = batchedRule("holds-pass", ok);
+        const banned = batchedRule("not-banned", ok);
+        const caches = [makeMemoryRuleCache(), makeMemoryRuleCache()];
+        const h = harness({
+            criteria: compositeCriteria,
+            registry: { "holds-pass": pass.rule, "not-banned": banned.rule },
+            ruleCaches: caches
+        });
+        h.verifier.enqueue([await pending(bundle("0x1"))]);
+        await h.verifier.idle();
+
+        expect(pass.caches).toEqual([caches[0]]);
+        expect(banned.caches).toEqual([caches[1]]);
+    });
+
+    it("re-queues the round when a leaf's read fails, rather than deciding the gate without it", async () => {
+        // An unreadable leaf is not an answer. Even though the OTHER leaf of this `any` admitted,
+        // the item stays pending and un-evicted: a verdict reached on a read that never happened
+        // is exactly what the retry exists to avoid.
+        const flaky = batchedRule("holds-pass", ok, { throws: true });
+        const banned = batchedRule("not-banned", ok);
+        const h = harness({
+            criteria: { ...bizCriteria(), gate: { any: [{ rule: { type: "holds-pass" } }, { rule: { type: "not-banned" } }] } as never },
+            registry: { "holds-pass": flaky.rule, "not-banned": banned.rule }
+        });
+        const entry = await pending(bundle("0x1"));
+        h.verifier.enqueue([entry]);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        expect(h.evicted).toHaveLength(0); // infra is nobody's verdict
+        expect(h.cache.get(entry.cid)).toBeUndefined();
+        expect(h.gateVerified).toEqual([]);
+        expect(h.errors.length).toBeGreaterThan(0);
+        expect(h.verifier.pendingCount()).toBe(1);
     });
 });

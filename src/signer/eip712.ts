@@ -18,7 +18,7 @@ import type { Vote } from "../schema/votes.js";
  *   - `votes`: each community (`{ name, publicKey }`) + numeric vote.
  *   - `blockNumber`: the LWW key and the bucketized block every verifier reads at.
  *
- * The `domain.chainId` is the gating (`rule`) chain, giving cross-chain/cross-app domain
+ * The `domain.chainId` is the contest's `bucketChainId`, giving cross-chain/cross-app domain
  * separation for free. This module is pure: no key material, no network, no viem import
  * — it only shapes the object both sides feed to viem.
  */
@@ -88,7 +88,7 @@ function bytesToHex(bytes: Uint8Array): `0x${string}` {
 export function ballotTypedData(args: {
     /** The criteria CID's raw binary bytes (`(await criteriaCid(criteria)).bytes`). */
     criteriaCid: Uint8Array;
-    /** The gating (`rule`) chain's numeric chainId (`criteria.requires.chains[chain].chainId`). */
+    /** The chain the contest counts in (`criteria.bucketChainId`). */
     chainId: number;
     votes: Vote[];
     blockNumber: number;

@@ -55,7 +55,7 @@ const BLOCKS_PER_BUCKET = 43_200;
 const VOTE_EXPIRY_BUCKETS = 30;
 
 /** A permissive default verifier; individual tests swap it via {@link VoteNode.setVerifier}. */
-const okVerifier = (): BundleVerdict => ({ valid: true, ruleScore: 1n, resolvedNames: {} });
+const okVerifier = (): BundleVerdict => ({ valid: true, resolvedNames: {} });
 
 /** The gossipsub peer-score methods used for assertions — on the concrete class, not the interface. */
 interface ScoreOps {

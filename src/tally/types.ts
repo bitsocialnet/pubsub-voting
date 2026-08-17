@@ -23,7 +23,7 @@ export interface CommunityTally {
     /** Summed weight of upvotes counted so far, in rule score units (`bigint`). */
     weight: bigint;
     /**
-     * True once every bundle contributing to this row has had its gate `rule` confirmed `> 0n`
+     * True once every bundle contributing to this row has had its gate confirmed
      * by an on-chain read at its bucket block. `false` means at least one contribution is still
      * awaiting its background gate read — never that one failed (a failed gate evicts the
      * bundle and recounts the row).

@@ -1,7 +1,17 @@
 import { describe, it, expect } from "vitest";
 import type { GateNode } from "../schema/criteria.js";
 import type { RuleResult } from "./types.js";
-import { evaluateGate, gateBlame, gateLeaves, gatePenalize, gateReason, gateScore, indexGate } from "./gate.js";
+import {
+    dedupeLeaves,
+    evaluateGate,
+    gateBlame,
+    gateLeaves,
+    gatePenalize,
+    gateReason,
+    gateScore,
+    indexGate,
+    type ResolvedGateLeaf
+} from "./gate.js";
 
 /**
  * The gate fold, offline: how N per-rule answers become one admission decision, one reason, one
@@ -264,3 +274,31 @@ describe("a leaf whose read failed", () => {
     });
 });
 
+/**
+ * Two positions, one question. A gate may name the same rule in more than one branch — that is
+ * how "any two of these three" is written (schema/criteria.ts) — and the pipeline must ask it
+ * once. Not merely to save work: the fold evaluates leaves concurrently, so two positions would
+ * both miss the rule's own memo before either wrote to it, and the coalescer can only dedupe
+ * reads that are actually identical calls.
+ */
+describe("dedupeLeaves", () => {
+    const leafFor = (key: string): ResolvedGateLeaf => ({ key }) as ResolvedGateLeaf;
+
+    it("maps every position to its question, keeping first-seen order", () => {
+        const { representatives, ofLeaf } = dedupeLeaves(["a", "b", "a", "c", "b"].map(leafFor));
+        expect(representatives).toEqual([0, 1, 3]); // first position of a, b, c
+        expect(ofLeaf).toEqual([0, 1, 0, 2, 1]);
+    });
+
+    it("is the identity when every leaf is distinct", () => {
+        const { representatives, ofLeaf } = dedupeLeaves(["a", "b", "c"].map(leafFor));
+        expect(representatives).toEqual([0, 1, 2]);
+        expect(ofLeaf).toEqual([0, 1, 2]);
+    });
+
+    it("collapses a 'two of three' gate to its three distinct questions", () => {
+        // { any: [{all:[A,B]}, {all:[A,C]}, {all:[B,C]}] } — six positions, three questions.
+        const { representatives } = dedupeLeaves(["a", "b", "a", "c", "b", "c"].map(leafFor));
+        expect(representatives).toHaveLength(3);
+    });
+});

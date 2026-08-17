@@ -200,7 +200,7 @@ describe("makeRootChaser", () => {
         const { root, getBlock } = await checkpointOf([rejected, known]);
         const cache = makeVerdictCache();
         cache.set(await bundleCid(rejected), { valid: false, disposition: "reject", reason: "known bad" });
-        cache.set(await bundleCid(known), { valid: true, ruleScore: 1n, resolvedNames: {} });
+        cache.set(await bundleCid(known), { valid: true, resolvedNames: {} });
         let verifies = 0;
         const h = harness({
             getBlock,

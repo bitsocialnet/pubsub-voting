@@ -40,7 +40,7 @@ function makeDeps(
     return {
         criteria: bizCriteria(),
         registry: builtinRegistry,
-        chainFor: () => countingChain(spies.onRead ?? (() => {})),
+        chain: countingChain(spies.onRead ?? (() => {})),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         current: () => entries,
         bucketBlockHash: async () => {

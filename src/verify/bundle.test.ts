@@ -73,7 +73,7 @@ function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<
         criteriaCid: CRITERIA_CID,
         chainId: CHAIN_ID,
         registry: builtinRegistry,
-        chainFor: () => fakeChain(over.balance ?? 1n, over.onRead),
+        chain: fakeChain(over.balance ?? 1n, over.onRead),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [resolver(over.names ?? {})],
         ruleCaches: over.ruleCaches
@@ -85,7 +85,6 @@ describe("makeBundleVerifier", () => {
         const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         const verdict = await verifier({ balance: 1n }).verify(bundle);
         expect(verdict.valid).toBe(true);
-        if (verdict.valid) expect(verdict.ruleScore).toBe(1n);
     });
 
     it("drops a wallet the gate does not admit (rule score 0n) as ignore, not reject", async () => {
@@ -110,7 +109,7 @@ describe("makeBundleVerifier", () => {
             criteriaCid: CRITERIA_CID,
             chainId: CHAIN_ID,
             registry: { ...builtinRegistry, [erc721MinBalance.type]: erc721MinBalance },
-            chainFor: () => fakeChain(0n),
+            chain: fakeChain(0n),
             bucketMath: makeBucketMath(criteria.blocksPerBucket),
             nameResolvers: []
         }).verify(bundle);
@@ -138,7 +137,7 @@ describe("makeBundleVerifier", () => {
             criteriaCid: CRITERIA_CID,
             chainId: CHAIN_ID,
             registry: builtinRegistry,
-            chainFor: () => chain,
+            chain: chain,
             bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
             nameResolvers: []
         }).verify(bundle);
@@ -160,7 +159,7 @@ describe("makeBundleVerifier", () => {
             criteriaCid: CRITERIA_CID,
             chainId: CHAIN_ID,
             registry: builtinRegistry,
-            chainFor: () => fakeChain(1000n, undefined, false),
+            chain: fakeChain(1000n, undefined, false),
             bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
             nameResolvers: []
         }).verify(bundle);
@@ -262,7 +261,7 @@ describe("composite gates on the forward-gate path", () => {
             criteriaCid: CRITERIA_CID,
             chainId: CHAIN_ID,
             registry: Object.fromEntries(Object.entries(rules).map(([type, answer]) => [type, fixedRule(type, answer, asked)])),
-            chainFor: () => fakeChain(1n),
+            chain: fakeChain(1n),
             bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
             nameResolvers: []
         });
@@ -272,12 +271,12 @@ describe("composite gates on the forward-gate path", () => {
         const bundle = await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]);
         // `all` scores the binding constraint...
         const both = await compositeVerifier("all", { a: ok, b: { success: true, score: 9n } }, asked).verify(bundle);
-        expect(both).toMatchObject({ valid: true, ruleScore: 3n });
+        expect(both).toMatchObject({ valid: true });
         // ...and `any` the best route, admitting despite a failed alternative.
         const either = await compositeVerifier("any", { a: { success: false, error: "no" }, b: { success: true, score: 9n } }, asked).verify(
             bundle
         );
-        expect(either).toMatchObject({ valid: true, ruleScore: 9n });
+        expect(either).toMatchObject({ valid: true });
     });
 
     it("stops at the deciding leaf, so a composite gate costs only the rules it needed", async () => {
@@ -323,7 +322,7 @@ describe("composite gates on the forward-gate path", () => {
             criteriaCid: CRITERIA_CID,
             chainId: CHAIN_ID,
             registry: builtinRegistry,
-            chainFor: () => fakeChain(3n, () => reads++),
+            chain: fakeChain(3n, () => reads++),
             bucketMath: makeBucketMath(criteria.blocksPerBucket),
             nameResolvers: []
         }).verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
@@ -333,5 +332,95 @@ describe("composite gates on the forward-gate path", () => {
         expect(verdict.valid).toBe(false);
         if (!verdict.valid) expect(verdict.failures?.[0]?.error).toContain("5 are required");
         expect(reads).toBeGreaterThan(2); // both leaves paid for their own reads
+    });
+
+    it("evaluates a rule named in two branches once per wallet", async () => {
+        // The inline path's half of the same contract: "any two of these three" has six positions
+        // and three questions, and the forward gate runs per incoming vote, so asking a question
+        // twice would double this path's chain reads for every message.
+        const asked: string[] = [];
+        const verifier = makeBundleVerifier({
+            criteria: {
+                ...bizCriteria(),
+                gate: {
+                    any: [
+                        { all: [{ rule: { type: "a" } }, { rule: { type: "b" } }] },
+                        { all: [{ rule: { type: "a" } }, { rule: { type: "c" } }] },
+                        { all: [{ rule: { type: "b" } }, { rule: { type: "c" } }] }
+                    ]
+                }
+            } as never,
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: {
+                a: fixedRule("a", ok, asked),
+                b: fixedRule("b", ok, asked),
+                c: fixedRule("c", { success: false, error: "no" }, asked)
+            },
+            chain: fakeChain(1n),
+            bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
+            nameResolvers: []
+        });
+
+        const verdict = await verifier.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]));
+        expect(verdict.valid).toBe(true); // the first alternative (a AND b) admits
+        // `a` and `b` answered once each; `c` was never needed, since the first branch decided it.
+        expect(asked).toEqual(["a", "b"]);
+    });
+
+    it("lets a failed chain read fail the VERIFY, rather than folding it into a refusal", async () => {
+        // The counterpart to `checkGates`, which tolerates an unreadable leaf. On this path it
+        // must not: a verdict is a statement to the network, and one reached because a read never
+        // happened would evict a vote (or penalize its sender) over an outage. The caller treats
+        // a throw as infra and re-queues the bundle instead.
+        const asked: string[] = [];
+        const failing: Rule = {
+            type: "flaky",
+            optionsSchema: z.looseObject({ type: z.string() }),
+            evaluate: async () => {
+                throw new Error("rpc: 429 too many requests");
+            }
+        };
+        const verifier = makeBundleVerifier({
+            criteria: { ...bizCriteria(), gate: { any: [{ rule: { type: "flaky" } }, { rule: { type: "b" } }] } as never },
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: { flaky: failing, b: fixedRule("b", ok, asked) },
+            chain: fakeChain(1n),
+            bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
+            nameResolvers: []
+        });
+
+        await expect(verifier.verify(await signedBundle([{ community: { publicKey: KEY_A }, vote: 1 }]))).rejects.toThrow(
+            "rpc: 429 too many requests"
+        );
+    });
+
+    it("answers checkGates from the branches that DID read, when a leaf's read fails", async () => {
+        // Same gate, same outage, different question. `checkGates` answers a person rather than
+        // the network, so a wallet admitted by an alternative that answered is told so instead of
+        // being handed an error it cannot act on.
+        const asked: string[] = [];
+        const failing: Rule = {
+            type: "flaky",
+            optionsSchema: z.looseObject({ type: z.string() }),
+            evaluate: async () => {
+                throw new Error("rpc: 429 too many requests");
+            }
+        };
+        const verifier = makeBundleVerifier({
+            criteria: { ...bizCriteria(), gate: { any: [{ rule: { type: "flaky" } }, { rule: { type: "b" } }] } as never },
+            criteriaCid: CRITERIA_CID,
+            chainId: CHAIN_ID,
+            registry: { flaky: failing, b: fixedRule("b", ok, asked) },
+            chain: fakeChain(1n),
+            bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
+            nameResolvers: []
+        });
+
+        const gate = await verifier.checkGates({ address: account.address, sampleBlock: 43200 });
+        expect(gate.satisfied).toBe(true);
+        if (gate.kind === "leaf") throw new Error("expected a branch");
+        expect(gate.children[0]).toMatchObject({ satisfied: undefined }); // unknown, never `false`
     });
 });
