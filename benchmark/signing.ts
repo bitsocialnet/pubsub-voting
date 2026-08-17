@@ -85,18 +85,19 @@ export function benchCriteria(): Criteria {
         contestId: "biz",
         voteSchema: { min: 1, max: 1 },
         maxVotesPerAddress: 1,
+        bucketChainId: 8453,
         blocksPerBucket: 43200,
         voteExpiryBuckets: 30,
-        rule: {
-            type: "erc5192-min-balance",
-            chain: "base",
-            contract: rpcUrl ? REAL_PROBE_CONTRACT : "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
-            min: 1
+        gate: {
+            rule: {
+                type: "erc5192-min-balance",
+                contract: rpcUrl ? REAL_PROBE_CONTRACT : "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
+                min: 1
+            }
         },
         weight: { type: "constant", value: 1 },
         requires: {
-            rules: ["erc5192-min-balance", "constant"],
-            chains: { base: { chainId: 8453 } }
+            rules: ["erc5192-min-balance", "constant"]
         }
     };
 }
@@ -294,12 +295,10 @@ export async function makeSigningContext(criteria: Criteria): Promise<SigningCon
     const cid = await criteriaCid(criteria);
     const bucketMath = makeBucketMath(criteria.blocksPerBucket);
     const bucket = bucketMath.bucketForBlock(Number(head));
-    // The benchmark criteria gates on a single chain; its chainId is bound into every ballot.
-    const chain = Object.values(criteria.requires.chains)[0];
-    if (!chain) throw new Error("bench criteria has no gating chain");
     return {
         criteriaCidBytes: cid.bytes,
-        chainId: chain.chainId,
+        // The chain the contest counts in; its id is bound into every ballot domain.
+        chainId: criteria.bucketChainId,
         blockNumber: bucketMath.sampleBlockForBucket(bucket)
     };
 }

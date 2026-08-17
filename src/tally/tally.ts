@@ -5,7 +5,6 @@ import type { VotesBundle } from "../schema/votes.js";
 import type { RuleRegistry } from "../rules/types.js";
 import type { ChainClient, BucketMath } from "../chain/types.js";
 import type { BundleChecks } from "../verify/types.js";
-import { tickerForRef } from "../chain/ticker.js";
 import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
 import { scoreOrZero } from "../rules/result.js";
 import { UnknownRuleError } from "../errors.js";
@@ -32,7 +31,8 @@ import type { Tally, ContestTally, CommunityTally } from "./types.js";
 export interface TallyDeps {
     criteria: Criteria;
     registry: RuleRegistry;
-    chainFor: (ticker: string) => ChainClient;
+    /** The contest's one chain client — the weight rule reads it too (DESIGN.md "One clock"). */
+    chain: ChainClient;
     bucketMath: BucketMath;
     /**
      * The CRDT's current bundles (one per wallet, LWW-resolved; empty-votes bundles are
@@ -68,25 +68,22 @@ function compareBytes(x: Uint8Array, y: Uint8Array): number {
 }
 
 export function makeTally(deps: TallyDeps): Tally {
-    const { criteria, registry, chainFor, bucketMath, current, bucketBlockHash } = deps;
-    const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
+    const { criteria, registry, chain, bucketMath, current, bucketBlockHash } = deps;
+    const readHead = deps.readHead ?? (async ({ chain: client }: { chain: ChainClient }) => ({ block: Number(await client.getBlockNumber()) }));
 
-    // Resolve the weight rule, its options, and its chain once (see verify/bundle.ts).
+    // Resolve the weight rule and its options once (see verify/bundle.ts).
     const weight = registry[criteria.weight.type];
     if (!weight) throw new UnknownRuleError("weight", criteria.weight.type);
     const weightOptions = weight.optionsSchema.parse(criteria.weight);
-    const weightChain = chainFor(tickerForRef(criteria, criteria.weight, weightOptions));
 
-    // The weight rule picks its own block exactly as the gate rule does (see rules/types.ts):
-    // it is handed the bundle's pinned sample block and this verifier's head, and reads whichever
-    // it needs. The tally never asks what kind of rule it is holding.
-    //
-    // `deps.ruleCache` MUST be namespaced by the weight rule's OWN chain, not the gating chain —
-    // `weightChain` here resolves through `criteria.weight`'s ticker, which may name a different
-    // entry of `requires.chains` (the voter derives it that way; see client/voter.ts).
+    // The weight rule picks its own block exactly as a gate rule does (see rules/types.ts): it is
+    // handed the bundle's pinned sample block and this verifier's head, and reads whichever it
+    // needs. The tally never asks what kind of rule it is holding. It reads the contest's one
+    // chain — a weight rule on a second chain is the same open question as a gate leaf on one
+    // (DESIGN.md "Open questions").
     const weightCtx = {
-        chain: weightChain,
-        head: () => readHead({ chain: weightChain }),
+        chain,
+        head: () => readHead({ chain }),
         cache: deps.ruleCache ?? makeMemoryRuleCache()
     };
     const weightFor = async (wallet: string, blockNumber: number): Promise<bigint> => {

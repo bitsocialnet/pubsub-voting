@@ -1,11 +1,9 @@
 import type { VotesBundle } from "../schema/votes.js";
 import type { Criteria } from "../schema/criteria.js";
-import type { RuleRegistry } from "../rules/types.js";
+import type { RuleRegistry, RuleResult } from "../rules/types.js";
 import type { ChainClient, BucketMath, NameResolver } from "../chain/types.js";
-import { tickerForRef } from "../chain/ticker.js";
-import { makeMemoryRuleCache, type RuleCache } from "../rules/cache.js";
-import { gateFailure, scoreOrZero } from "../rules/result.js";
-import { UnknownRuleError } from "../errors.js";
+import type { RuleCache } from "../rules/cache.js";
+import { dedupeLeaves, evaluateGate, gateBlame, gatePenalize, gateReason, resolveGate } from "../rules/gate.js";
 import { verifyBundleSignature } from "./signature.js";
 import { checkBundleConstraints } from "./constraints.js";
 import { resolveNameThroughCache, type NameResolutionCache } from "./name-resolution-cache.js";
@@ -40,12 +38,12 @@ export interface BundleVerifierDeps {
     criteria: Criteria;
     /** The criteria document's CID bytes (`(await criteriaCid(criteria)).bytes`) — signature binding. */
     criteriaCid: Uint8Array;
-    /** The rule chain's numeric chainId (bound in the ballot domain). */
+    /** The contest's numeric chainId (`criteria.bucketChainId`, bound in the ballot domain). */
     chainId: number;
     /** Resolved rule registry (built-ins + host overrides). */
     registry: RuleRegistry;
-    /** Resolve a chain ticker (e.g. "base") to its viem client. */
-    chainFor: (ticker: string) => ChainClient;
+    /** The contest's one chain client — every rule reads it (DESIGN.md "One clock"). */
+    chain: ChainClient;
     /** Bucket math for `criteria.blocksPerBucket`. */
     bucketMath: BucketMath;
     /** Host-injected community-name resolvers (`PubsubVoterOptions.nameResolvers`). */
@@ -59,13 +57,15 @@ export interface BundleVerifierDeps {
      */
     readHead?: (args: { chain: ChainClient }) => Promise<{ block: number }>;
     /**
-     * The gate rule's memo (see rules/cache.ts), handed to it as `ctx.cache`. This is what keeps
-     * a wallet's gate read from repeating per bundle — an ineligible wallet minting fresh-signed
-     * bundles, or an eligible one cycling choices, costs one read per key per rule epoch rather
-     * than one per bundle. Defaults to a private in-memory cache (unit tests); the voter injects
-     * the persistent, contest-shared one.
+     * One memo per gate leaf (see rules/cache.ts), in `gateLeaves` order, handed to each rule as
+     * its `ctx.cache`. This is what keeps a wallet's gate read from repeating per bundle — an
+     * ineligible wallet minting fresh-signed bundles, or an eligible one cycling choices, costs
+     * one read per key per rule epoch rather than one per bundle. Each leaf gets its OWN
+     * namespace, so two leaves of the same rule `type` on different options can never read each
+     * other's answers. Defaults to private in-memory caches (unit tests); the voter injects the
+     * persistent, contest-shared ones.
      */
-    ruleCache?: RuleCache;
+    ruleCaches?: readonly RuleCache[];
     /**
      * Optional persistent cache of name resolutions (the pkc-js rule — see
      * verify/name-resolution-cache.ts). When present, a carried name is resolved live at most
@@ -76,21 +76,31 @@ export interface BundleVerifierDeps {
 }
 
 export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
-    const { criteria, criteriaCid, chainId, registry, chainFor, bucketMath, nameResolvers, nameResolutionCache } = deps;
+    const { criteria, criteriaCid, chainId, registry, chain, bucketMath, nameResolvers, nameResolutionCache } = deps;
 
-    // Resolve the gate `rule`, its options and its chain client once: they are fixed by the
-    // criteria, so none of it is recomputed per bundle.
-    const rule = registry[criteria.rule.type];
-    if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
-    const ruleOptions = rule.optionsSchema.parse(criteria.rule);
-    const ruleChain = chainFor(tickerForRef(criteria, criteria.rule, ruleOptions));
-    const readHead = deps.readHead ?? (async ({ chain }: { chain: ChainClient }) => ({ block: Number(await chain.getBlockNumber()) }));
-    // The rule's whole world: its chain, this verifier's head (lazy — never read for a rule that
-    // does not want it), and its own memo. Which block it actually reads at is its business.
-    const ctx = {
-        chain: ruleChain,
-        head: () => readHead({ chain: ruleChain }),
-        cache: deps.ruleCache ?? makeMemoryRuleCache()
+    // Resolve every gate leaf — rule, options, memo — once: they are fixed by the criteria, so
+    // none of it is recomputed per bundle. Same for which leaves ask the same question.
+    const readHead = deps.readHead ?? (async ({ chain: client }: { chain: ChainClient }) => ({ block: Number(await client.getBlockNumber()) }));
+    const leaves = resolveGate({ criteria, registry, chain, readHead, caches: deps.ruleCaches });
+    const { ofLeaf } = dedupeLeaves(leaves);
+
+    /**
+     * Score one leaf for one wallet, sharing one answer between leaves that ask the same question
+     * (`dedupeLeaves`). The per-wallet map is what makes the sharing real: the fold evaluates
+     * leaves concurrently, so two positions of one rule would otherwise both miss its memo before
+     * either wrote to it.
+     */
+    const scoreLeaf = (wallet: { address: string; sampleBlock: number }) => {
+        const asked = new Map<number, Promise<RuleResult>>();
+        return (leaf: number) => {
+            const question = ofLeaf[leaf]!;
+            const already = asked.get(question);
+            if (already) return already;
+            const { rule, options, ctx } = leaves[leaf]!;
+            const answer = rule.evaluate({ options, wallet, ctx });
+            asked.set(question, answer);
+            return answer;
+        };
     };
 
     // Stage 1, shared by `verify` and `verifyOffline`: signature + constraints, local and µs.
@@ -105,25 +115,45 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
 
     return {
         verifyOffline,
-        // The gate step on its own, against the SAME rule/options/ctx `verify` uses below — which
-        // is the entire value of exposing it: a caller asking "would this wallet's vote count?"
-        // can never drift from what the gate actually does.
-        checkGate: ({ address, sampleBlock }) => rule.evaluate({ options: ruleOptions, wallet: { address, sampleBlock }, ctx }),
+        // The gate step on its own, against the SAME leaves/options/ctxs `verify` uses below —
+        // which is the entire value of exposing it: a caller asking "would this wallet's vote
+        // count?" can never drift from what the gate actually does. Every leaf is scored here
+        // (`collectAll`), because naming each failure is what this call is for.
+        async checkGates({ address, sampleBlock }) {
+            // A leaf whose read FAILED is not a leaf that said no. Under an `any`, refusing the
+            // whole check because one rule's RPC timed out would tell a wallet that qualifies
+            // through another branch that it is ineligible — over an outage it cannot act on. So
+            // a failed read is folded as unknown, and only if the tree cannot be decided without
+            // it does the original error surface (never a verdict invented from a missing read).
+            let firstError: unknown;
+            let failed = false;
+            const gate = await evaluateGate({
+                node: criteria.gate,
+                evaluate: scoreLeaf({ address, sampleBlock }),
+                collectAll: true,
+                tolerateLeafErrors: true,
+                onLeafError: (_leaf, error) => {
+                    if (!failed) [failed, firstError] = [true, error];
+                }
+            });
+            if (gate.satisfied === undefined) throw firstError;
+            return gate;
+        },
         async verify(bundle: VotesBundle): Promise<BundleVerdict> {
             const offline = await verifyOffline(bundle);
             if (!offline.valid) return offline;
 
-            // 3. Gate (chain) — the rule scores this wallet, reading and memoizing however it
-            //    sees fit. The bundle's bucketized sample block is handed over as the pinned
-            //    block the ballot names; a rule scoring current state ignores it for `ctx.head`.
+            // 3. Gate (chain) — each leaf rule scores this wallet, reading and memoizing however
+            //    it sees fit, and `all`/`any` fold the answers (rules/gate.ts). The bundle's
+            //    bucketized sample block is handed over as the pinned block the ballot names; a
+            //    rule scoring current state ignores it for `ctx.head`. Lazy on this path: a
+            //    determined tree stops, so a composite gate costs only the leaves it needed.
             const sampleBlock = bucketMath.sampleBlockForBucket(bucketMath.bucketForBlock(bundle.blockNumber));
-            const gate = await rule.evaluate({
-                options: ruleOptions,
-                wallet: { address: bundle.address, sampleBlock },
-                ctx
+            const gate = await evaluateGate({
+                node: criteria.gate,
+                evaluate: scoreLeaf({ address: bundle.address, sampleBlock })
             });
-            const gateFailed = gateFailure(gate);
-            if (gateFailed) {
+            if (gate.satisfied !== true) {
                 // Disposition comes from the rule's own answer, never from the rule's identity.
                 // A failure the rule stands behind is identical on every honest verifier, so it is
                 // a `reject`: the sender is penalized and the verdict cached as terminal. One it
@@ -133,13 +163,16 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
                 // uncached, so it is re-judged rather than frozen (the same treatment community
                 // name resolution has always had, step 4 below).
                 //
-                // The reason is the RULE's wording, verbatim: only it knows whether this wallet
-                // holds too few, holds none, or faces a contract that gates nothing, and that
-                // sentence is what reaches the voter through `VoteEvictedError`.
+                // The reason is the RULES' wording, verbatim: only they know whether this wallet
+                // holds too few, holds none, or faces a contract that gates nothing, and those
+                // sentences are what reach the voter through `VoteEvictedError` — narrowed to the
+                // failures that actually explain the refusal (`gateBlame`), so a wallet is never
+                // told to go acquire something a satisfied `any` branch never needed.
                 return {
                     valid: false,
-                    disposition: gateFailed.penalize ? "reject" : "ignore",
-                    reason: `not admitted: ${gateFailed.error}`
+                    disposition: gatePenalize(gate) ? "reject" : "ignore",
+                    reason: `not admitted: ${gateReason(gate)}`,
+                    failures: gateBlame(gate).map((leaf) => ({ type: leaves[leaf.leaf]!.ref.type, error: leaf.error ?? "" }))
                 };
             }
 
@@ -173,7 +206,7 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
                 resolvedNames[name] = record.publicKey;
             }
 
-            return { valid: true, ruleScore: scoreOrZero(gate), resolvedNames };
+            return { valid: true, resolvedNames };
         }
     };
 }

@@ -1,5 +1,6 @@
 import type { Criteria } from "../schema/criteria.js";
 import type { RuleRegistry } from "./types.js";
+import { gateLeaves } from "./gate.js";
 import { UnknownRuleError } from "../errors.js";
 import { erc5192MinBalance } from "./erc5192-min-balance.js";
 import { constant } from "./constant.js";
@@ -66,19 +67,27 @@ export function resolveRegistry(overrides?: RuleRegistry): RuleRegistry {
 }
 
 /**
- * Validate a criteria document against a resolved registry: the `rule` and
- * `weight` refs must name rules this registry implements, their options must
+ * Validate a criteria document against a resolved registry: every leaf of the `gate` tree and the
+ * `weight` ref must name rules this registry implements, their options must
  * parse against the rule's own schema, and every name in `requires.rules`
  * must be resolvable (so an out-of-date client recuses itself instead of miscounting).
  *
- * Throws `UnknownRuleError` / a zod error on the first failure. This is a check,
- * not a transform: it never mutates `criteria`, so the topic-bearing bytes are untouched
- * (option defaults applied here do not leak back into the encoded criteria).
+ * There is no chain to check: a rule names no chain at all, it reads the one the contest counts in
+ * (`criteria.bucketChainId`). That invariant is structural rather than validated — the class of
+ * "this leaf reads a different chain from the buckets" bug cannot be expressed. Gating across
+ * several chains is future work and needs an answer for what block a rule on a SECOND chain is
+ * handed; see DESIGN.md "Open questions".
+ *
+ * Throws `UnknownRuleError` / a zod error on the first failure. This is a check, not a transform:
+ * it never mutates `criteria`, so the topic-bearing bytes are untouched (option defaults applied
+ * here do not leak back into the encoded criteria).
  */
 export function validateCriteriaRules(criteria: Criteria, registry: RuleRegistry): void {
-    const rule = registry[criteria.rule.type];
-    if (!rule) throw new UnknownRuleError("rule", criteria.rule.type);
-    rule.optionsSchema.parse(criteria.rule);
+    for (const ref of gateLeaves(criteria.gate)) {
+        const rule = registry[ref.type];
+        if (!rule) throw new UnknownRuleError("gate", ref.type);
+        rule.optionsSchema.parse(ref);
+    }
 
     const weight = registry[criteria.weight.type];
     if (!weight) throw new UnknownRuleError("weight", criteria.weight.type);

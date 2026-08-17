@@ -24,7 +24,7 @@ This library does not start its own node. It consumes the host's running Helia n
 
 - **Settings live in the topic.** `topic = "bitsocial-votes/" + CID(dag-cbor(criteria))`. Two peers on the same topic provably ran identical rules, so the network validates itself with no intermediary.
 - **Votes are a state-based grow-only CRDT.** A signed `Votes` bundle is a standalone dag-cbor block (no parent links); each wallet gossips its own bundle **inline as a live delta**, validated straight from the message bytes — no fetch toward the publisher. State is a last-write-wins set keyed by wallet, so aggregation is a monotonic union: a peer can omit a vote but can never subtract one that an honest peer serves. Cold start and gap-fill exchange a tiny **root record** (libp2p-fetch pull + a slow topic heartbeat) and pull the checkpoint blocks behind it via directed bitswap from its advertisers.
-- **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier. v1 ships exactly the soulbound-NFT path — an `erc5192-min-balance` gate `rule` (the 5chan Pass: `balanceOf` **plus** an on-chain assertion that the contract declares its tokens locked, read at the verifier's head so a freshly-acquired Pass votes immediately) and `constant` weight (1 pass = 1 vote). A gate on a *transferable* asset would let one Pass back several concurrent votes, so the plain `erc721-min-balance` rule ships unregistered; balance-derived (token-weighted) voting is deferred. See [DESIGN.md, Does one Pass mean one vote?](./DESIGN.md#does-one-pass-mean-one-vote) and [ROADMAP.md](./ROADMAP.md).
+- **The gate and weight are data, not code.** A fixed rule registry (mirroring pkc-js's challenge registry) maps a `type` string to a verifier, and the criteria's `gate` composes those rules with `all` / `any` — so "the Pass, or a moderator, and not banned" is a document, not a custom rule. v1 ships exactly the soulbound-NFT path — an `erc5192-min-balance` gate (the 5chan Pass: `balanceOf` **plus** an on-chain assertion that the contract declares its tokens locked, read at the verifier's head so a freshly-acquired Pass votes immediately) and `constant` weight (1 pass = 1 vote). A gate on a *transferable* asset would let one Pass back several concurrent votes, so the plain `erc721-min-balance` rule ships unregistered; balance-derived (token-weighted) voting is deferred. See [DESIGN.md, Does one Pass mean one vote?](./DESIGN.md#does-one-pass-mean-one-vote) and [ROADMAP.md](./ROADMAP.md).
 
 See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists vote-dropping and how criteria upgrades fork cleanly.
 
@@ -39,13 +39,24 @@ The library never starts a node and never takes a host SDK (there is no `pkc` ar
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`), a `blockstore` (else `MissingBlockstoreError`), and a libp2p fetch service at `libp2p.services.fetch` (else `MissingFetchError`) |
-| `chains` | `ChainClientFactory` | yes | resolves each chain a contest's criteria requires (`{ chain, chainId }`) to a viem `PublicClient`; rules read through it for the gate and weight. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that carries a multicall3 deployment in its viem `chain` config and serves **historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head** (the v1 gate reads the head first, but falls back to the block a ballot names — see [Custom rules](#custom-rules)); return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
+| `chains` | `ChainClientFactory` | yes | resolves the chain a contest counts in (`{ chainId }`, from `criteria.bucketChainId`) to a viem `PublicClient`; every gate rule and the weight rule read through it. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that carries a multicall3 deployment in its viem `chain` config and serves **historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head** (the v1 gate reads the head first, but falls back to the block a ballot names — see [Custom rules](#custom-rules)); return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
 | `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 | `dataPath` | `string \| false` | no | directory for the voter's persistent state (gate-result + name-resolution caches, and each joined contest's **checkpoint snapshot** — its last fully-verified winner-set, reloaded at join so a restart with no other peer online keeps the tally), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-voting` (better-sqlite3 under `{dataPath}/lru-storage/` + `{dataPath}/checkpoints.db`); in the browser the path is ignored and everything lives in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC, and restores each contest's checkpoint before the cold-start pull. A seeder should always set a stable path |
 | `httpRouterUrls` | `string[]` | no | Delegated Routing V1 router base URLs to **announce provider records to** (one unsigned `PUT /routing/v1/providers` per router; `Keys` batches every joined contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced on root changes, and on address changes). **Seeders only**: absent/empty means never announce (the default — plain clients are not dialable), and the browser build never announces regardless. The node must be publicly **reachable** (its listening port open/forwarded/published), but it does not need to know its own public IP: private, loopback, and link-local addrs are filtered client-side, and when nothing survives — the normal zero-config case behind NAT or a Docker bridge, and even on public-IP hosts, since libp2p withholds unconfirmed public addrs pending AutoNAT — the announcer sends the wildcard sentinels (`/ip4/0.0.0.0/...`, `/ip6/::/...`) that the router rewrites to the PUT's observed source IP, exactly as kubo announces work. Configured `addresses.announce` values (concrete public addrs, DNS/AutoTLS, or a kubo-style wildcard) are used as-is. Only a loopback-only node announces nothing. *Querying* needs no URLs here — cold-join discovery uses the injected node's `libp2p.contentRouting`, which the host wires its routers into |
 
-A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry + the `chains` factory: an unimplemented rule throws `UnknownRuleError`, an unresolvable required chain throws `MissingChainClientError` — recuse, don't miscount), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists. The document names each required chain only by ticker + `chainId`; RPC endpoints stay out of it, so operators can swap gateways without forking the topic.
+A contest is addressed by its **full criteria document**, passed to `createContest` / `createContestVote`. The document is strictly validated there (`CriteriaSchema` + the rule registry + the `chains` factory: an unimplemented rule throws `UnknownRuleError`, an unresolvable required chain throws `MissingChainClientError` — recuse, don't miscount), and its canonical bytes derive the topic — so the exact document every participant shares is the only contest configuration that exists. The document names its chain only by `bucketChainId`; RPC endpoints stay out of it, so operators can swap gateways without forking the topic.
+
+Who may vote is the document's `gate` — one rule, or a boolean tree of them:
+
+```ts
+gate: { rule: { type: "erc5192-min-balance", contract: "0x13d4…91b9", min: 1 } }
+gate: { all: [{ rule: passRule }, { rule: notBannedRule }] }          // every rule must admit
+gate: { any: [{ rule: passRule }, { rule: moderatorRule }] }          // any one of them admits
+gate: { all: [{ any: [{ rule: passRule }, { rule: moderatorRule }] }, { rule: notBannedRule }] }
+```
+
+Each rule still answers one question about one wallet and knows nothing about the others; the document composes them. Because the topic is the CID of these bytes, the schema rejects the spellings that would mean the same as a shorter tree — a branch needs **at least two** children, may not repeat a child, and may not nest a branch of its own kind (`{ all: [{ all: [A, B] }, C] }` is just `{ all: [A, B, C] }`) — since each would put one contest on two topics. A rule may appear in two different branches, which is how a gate says "any two of these three": `{ any: [{ all: [A, B] }, { all: [A, C] }, { all: [B, C] }] }`. Trees nest at most 4 deep with at most 8 rules in total. No rule names a chain: every one of them reads the chain the contest counts in (`bucketChainId`), which is the chain the block each rule is handed comes from. Child order is significant and is the order the forward gate evaluates in, so put the cheapest or most discriminating rule first.
 
 ### Construct a voter
 
@@ -61,12 +72,12 @@ const viemChainFactory = (): ChainClientFactory => {
   const clients: Record<number, ReturnType<typeof createPublicClient>> = {
     [base.id]: createPublicClient({ chain: base, transport: http("https://my-trusted-base-rpc.example") })
   };
-  return ({ chainId }) => clients[chainId]; // undefined → recuse contests requiring that chain
+  return ({ chainId }) => clients[chainId]; // undefined → recuse contests counting in that chain
 };
 
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
-  chains: viemChainFactory(),   // ({ chain, chainId }) => viem PublicClient | undefined
+  chains: viemChainFactory(),   // ({ chainId }) => viem PublicClient | undefined
   signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
   dataPath: "/path/to/data",    // optional; persistent state: caches + checkpoint snapshots (default {cwd}/.bitsocial-pubsub-voting; false → in-memory)
@@ -93,19 +104,46 @@ await contest.update();                                   // join the topic, col
 
 ### Will this wallet's vote count?
 
-Ask the contest before signing. `checkEligibility` runs the contest's **real gate rule** through
-the same chain client, head reader and memo the forward gate uses, so it reads at whatever block
-that rule reads at and applies whatever threshold it applies. When it refuses, the `error` is the
-rule's own wording — render it verbatim:
+Ask the contest before signing. `checkEligibility` runs the contest's **real gate rules** through
+the same chain clients, head reader and memos the forward gate uses, so each reads at whatever
+block it reads at and applies whatever threshold it applies. When the gate refuses, the wording is
+the rules' own — render it verbatim:
 
 ```ts
 const check = await contest.checkEligibility({ address: wallet });
 if (check.eligible) {
     show(`eligible — holds ${check.score}`);
 } else {
-    show(check.error);   // e.g. "this wallet holds none of the gate token (0x13d4…91b9)"
+    for (const failure of check.failures) show(failure.error); // e.g. "this wallet holds none of the gate token (0x13d4…91b9)"
 }
 ```
+
+With a composite gate you get one entry per rule, so a client can show a checklist rather than a
+single verdict:
+
+| field | what it is |
+| --- | --- |
+| `checks` | every rule in the gate, in document order: `{ leaf, ruleId, type, satisfied, score, error? }` |
+| `failures` | the rules whose failure **explains** the refusal — render these |
+| `gate` | the same tree as `criteria.gate`, each node carrying its `satisfied`, for rendering the real requirement |
+| `error` | `failures` joined into one sentence, for a caller that only wants a string |
+
+`failures` is deliberately **not** `checks.filter(c => !c.satisfied)`. Under `any`, a wallet that
+qualifies as a moderator also "fails" the Pass rule — telling it to go and buy a Pass would be
+worse than saying nothing.
+
+Key rows by **`leaf`** — the rule's position in the gate, and the only field guaranteed unique in
+one result. `type` is not (a gate may name one rule twice on different options) and neither is
+`ruleId` (a gate may name the same rule in two branches). Use `ruleId` to compare *across* results
+instead: equal ids are one question, so a directory of 63 boards gated on one Pass shows the same
+id everywhere, and shares one chain read behind it.
+
+A check's `satisfied` is `true`, `false`, or **`undefined`** — the last meaning that rule's chain
+read failed and the gate was decided without it. Render it as unknown, never as a requirement the
+wallet is missing: nothing was learned about them. A wallet admitted by a branch that did answer
+still gets `eligible: true` while an unrelated contract's RPC is down; the call throws only when
+the gate cannot be decided without the rule that failed, because at that point there is no honest
+answer to give.
 
 Do **not** reimplement this by reading balances yourself: which block counts is the rule's
 business and changes when the rule changes. A client that hard-codes "peers verify at the bucket
@@ -225,7 +263,7 @@ Full, type-checked call patterns for a pkc-js host, a plebbit/seedit host, and a
 
 ### Custom rules
 
-The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema, its own reads (`readContract`, `getBalance`, ... through `ctx.chain`, the viem `PublicClient` for its `options.chain`), which block it reads at, and what it memoizes — see [What a rule owns](#what-a-rule-owns-its-block-and-its-cache) below. There is **one kind**: `evaluate → RuleResult`, either `{ success: true, score }` with a positive score or `{ success: false, error }` — where `error` is the voter-facing reason the rule refused. The criteria has two *slots* drawing from the one registry — the **rule** slot treats the score as a gate (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `rule.success ? weight.score : 0n`. A rule that needs a threshold fails below it (so `erc5192-min-balance`'s optional `min` gates), which lets the same rule serve either slot. A chain-reading rule may also implement the optional `evaluateMany({ options, wallets, ctx })` batch hook (`wallets` in place of `wallet`, returning `{ results }` — one per input wallet, in order) — its semantics MUST equal mapping `evaluate` — which the background verifier uses to batch a cold join's gate reads. The batch is simply everything pending, so its wallets need not share a `sampleBlock`: a rule reading the head scores them all at once, a rule reading pinned blocks groups them itself. (`erc5192-min-balance` implements it over multicall3, hoisting its one lock assertion out of the per-wallet reads; see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification).)
+The gate and weight are a single flat registry of rules, one `type` per file, mirroring the pkc-js challenge registry. Each rule owns its option schema, its own reads (`readContract`, `getBalance`, ... through `ctx.chain`, the viem `PublicClient` for its `options.chain`), which block it reads at, and what it memoizes — see [What a rule owns](#what-a-rule-owns-its-block-and-its-cache) below. There is **one kind**: `evaluate → RuleResult`, either `{ success: true, score }` with a positive score or `{ success: false, error }` — where `error` is the voter-facing reason the rule refused. The criteria has two *slots* drawing from the one registry — the **gate** slot treats the score as admission (`> 0n` admits), the **weight** slot as the vote's magnitude. A wallet's vote counts as `gate admits ? weight.score : 0n`. A rule never sees the gate it sits in: composition (`all` / `any`), which failures a voter is shown, and whether a refusal may be blamed on the sender are all folded by the library from what each rule returned. A rule that needs a threshold fails below it (so `erc5192-min-balance`'s optional `min` gates), which lets the same rule serve either slot. A chain-reading rule may also implement the optional `evaluateMany({ options, wallets, ctx })` batch hook (`wallets` in place of `wallet`, returning `{ results }` — one per input wallet, in order) — its semantics MUST equal mapping `evaluate` — which the background verifier uses to batch a cold join's gate reads. The batch is simply everything pending, so its wallets need not share a `sampleBlock`: a rule reading the head scores them all at once, a rule reading pinned blocks groups them itself. (`erc5192-min-balance` implements it over multicall3, hoisting its one lock assertion out of the per-wallet reads; see [DESIGN.md, Background chain verification](./DESIGN.md#background-chain-verification).)
 
 Built-ins: `erc5192-min-balance` (v1) and `constant` (v1).
 
@@ -297,6 +335,8 @@ type RuleResult =
 **`error` is required on the failing branch**, because only the rule knows why a wallet fell short — it holds none, it holds too few, the contract gates nothing. That sentence is what the library shows the voter: it becomes the verdict reason, so it reaches the publisher on `VoteEvictedError.verdict.reason`, and it is what `contest.checkEligibility()` returns. Write it about the wallet ("this wallet holds none of the gate token"), not about the library, and leave block numbers out unless a voter can act on them. Making it optional would mean every UI re-deriving the rule's thresholds and block choice to say anything useful — which is exactly the coupling `ctx` and `RuleCache` exist to remove.
 
 **`penalize`** answers the one thing the library cannot: may the failure be blamed on the sender? `true` (the default) says every honest verifier computes this same failure — true of a read pinned to the block the bundle names — so the forward gate `reject`s the message (penalizing the delivering peer in gossipsub's scoring) and the verdict is cached as terminal. `false` says an honest peer could legitimately disagree, so the bundle is dropped `ignore`-class instead: no penalty, verdict uncached, and the background verifier re-examines it for a grace window before giving up.
+
+Across a composite gate the library folds those answers, and the fold is not a simple OR. An `all` fails as soon as one child does, so **one** attributable failure makes the whole refusal attributable — that rule alone closes the gate identically everywhere. An `any` fails only when every alternative does, so it is attributable only if **every** one of them is: a single unprovable failure means a peer on a fresher chain may be looking at a wallet this gate would admit, and penalizing it would punish honest relaying.
 
 `erc5192-min-balance` reads the head first — so a freshly-acquired Pass counts immediately — falls back to `wallet.sampleBlock` when the head refuses (ERC-5192 does not forbid burning, and without the fallback a burn would erase votes retroactively for peers that had not verified them yet), memoizes each leg under its own epoch, and returns `penalize: false`, because at validation time it cannot attribute a failure to anyone: the peer that forwarded the vote verified it against *its* head. Every other rule in the tree reads `wallet.sampleBlock` and leaves `penalize` at its default — a transferable or fungible balance can decrease, so reading it at the head would silently invalidate votes already counted. See [DESIGN.md, What a rule owns](./DESIGN.md#what-a-rule-owns-and-what-the-pipeline-owns).
 

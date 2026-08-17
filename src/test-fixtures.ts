@@ -1,6 +1,6 @@
 import { createPublicClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import type { Criteria } from "./schema/criteria.js";
+import type { Criteria, RuleRef } from "./schema/criteria.js";
 import { ProtocolError, type PeerId } from "@libp2p/interface";
 import type { BlockstoreLike, FetchServiceLike, HeliaInstance, PubsubService } from "./transport/types.js";
 import type { ChainClient, ChainClientFactory } from "./chain/types.js";
@@ -27,20 +27,28 @@ export function bizCriteria(): Criteria {
         contestId: "biz",
         voteSchema: { min: 1, max: 1 },
         maxVotesPerAddress: 1,
+        bucketChainId: 8453,
         blocksPerBucket: 43200,
         voteExpiryBuckets: 30,
-        rule: {
-            type: "erc5192-min-balance",
-            chain: "base",
-            contract: "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
-            min: 1
+        gate: {
+            rule: {
+                type: "erc5192-min-balance",
+                contract: "0x13d41d6B8EA5C86096bb7a94C3557FCF184491b9",
+                min: 1
+            }
         },
         weight: { type: "constant", value: 1 },
         requires: {
-            rules: ["erc5192-min-balance", "constant"],
-            chains: { base: { chainId: 8453 } }
+            rules: ["erc5192-min-balance", "constant"]
         }
     };
+}
+
+/** The single rule ref inside `bizCriteria().gate` — the leaf a test overrides or composes with. */
+export function bizGateRef(): RuleRef {
+    const gate = bizCriteria().gate;
+    if (!("rule" in gate)) throw new Error("bizCriteria's gate is a single rule");
+    return gate.rule;
 }
 
 /** A no-op gossipsub service carrying an (empty) topic-validator map, as gossipsub exposes. */
@@ -212,11 +220,14 @@ export function realSigner(): VoteSigner {
  * `functionName`: `supportsInterface` answers the ERC-5192 declaration (always true — the Pass is
  * soulbound), everything else answers `balance`.
  */
-export function stubChains(over: { blockNumber?: bigint; balance?: bigint } = {}): ChainClientFactory {
+export function stubChains(over: { blockNumber?: bigint; balance?: bigint; onRead?: () => void } = {}): ChainClientFactory {
     const client = {
         getBlockNumber: async () => over.blockNumber ?? 43200n,
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
-        readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : (over.balance ?? 1n))
+        readContract: async ({ functionName }: { functionName?: string } = {}) => {
+            over.onRead?.();
+            return functionName === "supportsInterface" ? true : (over.balance ?? 1n);
+        }
     };
     return () => client as unknown as ChainClient;
 }

@@ -10,7 +10,7 @@ import { constant } from "./constant.js";
 import { erc20Balance } from "./erc20-balance.js";
 import { resolveRegistry, validateCriteriaRules, builtinRegistry, V1_BUILTIN_RULE_TYPES } from "./registry.js";
 import { UnknownRuleError } from "../errors.js";
-import { bizCriteria } from "../test-fixtures.js";
+import { bizCriteria, bizGateRef } from "../test-fixtures.js";
 
 /**
  * A ChainReadContext whose viem client returns a fixed `balanceOf`, for offline rule tests.
@@ -356,7 +356,7 @@ describe("registry: what v1 deliberately does NOT ship", () => {
 
     it("does not register the transferable ERC-721 gate (#27)", () => {
         expect(builtinRegistry["erc721-min-balance"]).toBeUndefined();
-        const criteria = { ...bizCriteria(), rule: { ...bizCriteria().rule, type: "erc721-min-balance" } };
+        const criteria = { ...bizCriteria(), gate: { rule: { ...bizGateRef(), type: "erc721-min-balance" } } };
         expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(UnknownRuleError);
     });
 
@@ -368,7 +368,7 @@ describe("registry: what v1 deliberately does NOT ship", () => {
 
     it("still lets a host opt in explicitly through the override map", () => {
         const registry = resolveRegistry({ "erc721-min-balance": erc721MinBalance, "erc20-balance": erc20Balance });
-        const criteria = { ...bizCriteria(), rule: { ...bizCriteria().rule, type: "erc721-min-balance" } };
+        const criteria = { ...bizCriteria(), gate: { rule: { ...bizGateRef(), type: "erc721-min-balance" } } };
         expect(() => validateCriteriaRules(criteria, registry)).not.toThrow();
     });
 
@@ -385,8 +385,21 @@ describe("registry: validateCriteriaRules", () => {
     });
 
     it("rejects an unknown rule type", () => {
-        const criteria = { ...bizCriteria(), rule: { type: "nope" } };
+        const criteria = { ...bizCriteria(), gate: { rule: { type: "nope" } } };
         expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(UnknownRuleError);
+    });
+
+    it("checks EVERY gate leaf, not just the first", () => {
+        const criteria = { ...bizCriteria(), gate: { all: [{ rule: bizGateRef() }, { rule: { type: "nope" } }] } };
+        expect(() => validateCriteriaRules(criteria, builtinRegistry)).toThrow(UnknownRuleError);
+    });
+
+    it("accepts a composite gate of two leaves on the same rule with different options", () => {
+        const criteria = {
+            ...bizCriteria(),
+            gate: { any: [{ rule: bizGateRef() }, { rule: { ...bizGateRef(), contract: `0x${"cd".repeat(20)}` } }] }
+        };
+        expect(() => validateCriteriaRules(criteria, builtinRegistry)).not.toThrow();
     });
 
     it("rejects an unknown name in requires.rules", () => {

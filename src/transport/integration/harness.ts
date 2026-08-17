@@ -55,7 +55,7 @@ const BLOCKS_PER_BUCKET = 43_200;
 const VOTE_EXPIRY_BUCKETS = 30;
 
 /** A permissive default verifier; individual tests swap it via {@link VoteNode.setVerifier}. */
-const okVerifier = (): BundleVerdict => ({ valid: true, ruleScore: 1n, resolvedNames: {} });
+const okVerifier = (): BundleVerdict => ({ valid: true, resolvedNames: {} });
 
 /** The gossipsub peer-score methods used for assertions — on the concrete class, not the interface. */
 interface ScoreOps {
@@ -187,8 +187,8 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         verify: (bundle) => verifyImpl(bundle),
         verifyOffline: (bundle) => verifyImpl(bundle),
         // These harness nodes drive the transport, not the eligibility surface; nothing here
-        // calls checkGate, so it admits rather than pretending to model a gate.
-        checkGate: async () => ({ success: true, score: 1n })
+        // calls checkGates, so it admits rather than pretending to model a gate.
+        checkGates: async () => ({ kind: "leaf", leaf: 0, satisfied: true, score: 1n, penalize: false })
     };
 
     const admit = async ({ cid, bytes }: { cid: CID; bytes: Uint8Array; bundle: VotesBundle }): Promise<void> => {

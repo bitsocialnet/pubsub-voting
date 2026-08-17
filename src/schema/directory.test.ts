@@ -29,16 +29,15 @@ describe("deriveDirectoryCriteria", () => {
                 {
                     contestId: "q",
                     name: "/q/ - Feedback",
-                    // A rule override must be COMPLETE: nothing of defaults.rule survives.
-                    // The chain stays "base": `requires.chains` is inherited from the defaults,
-                    // and a rule naming a chain that is not in it derives a document no client
-                    // could create (Contest resolves its gating chain client out of
-                    // `requires.chains` and throws when the ticker is missing).
-                    rule: { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 }
+                    // A gate override must be COMPLETE: nothing of defaults.gate survives.
+                    // No chain is named here or anywhere: the rule reads the contest's
+                    // `bucketChainId`, inherited from the defaults like every other field the
+                    // entry does not override.
+                    gate: { rule: { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 } }
                 }
             ])
         );
-        expect(criteria.rule).toEqual({ type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 });
+        expect(criteria.gate).toEqual({ rule: { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 } });
         // Untouched fields still inherit.
         expect(criteria.weight).toEqual(bizCriteria().weight);
     });
@@ -49,8 +48,8 @@ describe("deriveDirectoryCriteria", () => {
     });
 
     it("rejects a derived document that fails CriteriaSchema", () => {
-        // The entry drops `rule` from a manifest whose defaults never had one.
-        const { rule: _rule, ...defaultsWithoutRule } = bizCriteria();
+        // The entry drops `gate` from a manifest whose defaults never had one.
+        const { gate: _gate, ...defaultsWithoutRule } = bizCriteria();
         expect(() =>
             deriveDirectoryCriteria({ defaults: defaultsWithoutRule, contests: [{ contestId: "x" }] })
         ).toThrow();
@@ -89,11 +88,11 @@ describe("deriveDirectoryCriteria over a whole directory", () => {
         name: `/slot-${i}/ - Directory ${i}`
     }));
     // One slot gates harder than its siblings, proving the gate is per-contest, not global.
-    // Same chain as the inherited `requires.chains` — only the contract and threshold differ.
-    const strictGate = { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 };
+    // Same inherited `bucketChainId` — only the contract and threshold differ.
+    const strictGate = { rule: { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 } };
     const source = manifest([
         ...slots,
-        { contestId: OVERRIDDEN_SLOT, name: "/q/ - Feedback", rule: strictGate }
+        { contestId: OVERRIDDEN_SLOT, name: "/q/ - Feedback", gate: strictGate }
     ]) as { contests: unknown[] };
 
     it("derives every slot: one valid document per entry, all contestIds distinct", async () => {
@@ -108,10 +107,10 @@ describe("deriveDirectoryCriteria over a whole directory", () => {
     it("inherits the shared gate, except the one slot that overrides it", () => {
         const allCriteria = deriveDirectoryCriteria(source);
         const overridden = allCriteria.find((c) => c.contestId === OVERRIDDEN_SLOT);
-        expect(overridden?.rule).toEqual(strictGate);
+        expect(overridden?.gate).toEqual(strictGate);
         for (const criteria of allCriteria) {
             if (criteria.contestId === OVERRIDDEN_SLOT) continue;
-            expect(criteria.rule).toEqual(bizCriteria().rule);
+            expect(criteria.gate).toEqual(bizCriteria().gate);
         }
     });
 });

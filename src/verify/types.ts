@@ -1,5 +1,5 @@
 import type { VotesBundle } from "../schema/votes.js";
-import type { RuleResult } from "../rules/types.js";
+import type { GateResult } from "../rules/gate.js";
 
 /**
  * Verification interfaces, design only.
@@ -32,7 +32,19 @@ import type { RuleResult } from "../rules/types.js";
  */
 export type VerdictDisposition = "reject" | "ignore";
 export type VerifyOk = { valid: true };
-export type VerifyFail = { valid: false; disposition: VerdictDisposition; reason: string };
+export type VerifyFail = {
+    valid: false;
+    disposition: VerdictDisposition;
+    reason: string;
+    /**
+     * Present when the GATE refused: one entry per rule whose failure explains the refusal
+     * (rules/gate.ts `gateBlame` — not every failed leaf, since one inside a satisfied `any`
+     * cost the wallet nothing). `reason` is these same sentences joined, kept so a caller that
+     * only renders a string needs no change; this is the structured form, so a client listing
+     * "what you are missing" never has to split one.
+     */
+    failures?: readonly { type: string; error: string }[];
+};
 export type VerifyResult = VerifyOk | VerifyFail;
 
 /** Stage 1: ballot signature only. No chain access. */
@@ -46,17 +58,20 @@ export interface OfflineBundleVerifier {
 }
 
 /**
- * A passing full-bundle verdict. Beyond `valid: true` it carries the work the gate already
- * did so downstream stages need not redo it:
- *   - `ruleScore`: the gate `rule`'s score for the voting wallet at the bucket block
- *     (always `> 0n` here — `0n` would have failed the gate).
- *   - `resolvedNames`: for each vote that carried a `community.name`, the `publicKey` the name
- *     resolved to (equal to the claimed key, since a mismatch fails the gate). Votes with no
- *     name are absent. Lets a UI show a verified name without re-resolving.
+ * A passing full-bundle verdict. Beyond `valid: true` it carries the work the gate already did so
+ * downstream stages need not redo it: `resolvedNames` maps each vote that carried a
+ * `community.name` to the `publicKey` the name resolved to (equal to the claimed key, since a
+ * mismatch fails the gate). Votes with no name are absent. Lets a UI show a verified name without
+ * re-resolving.
+ *
+ * The gate's folded SCORE is deliberately not here. Nothing downstream reads it — a vote's
+ * magnitude comes from `criteria.weight`, never from the gate — and a number no one consumes grows
+ * semantics by accident, which a min-across-`all` fold over unrelated rules ("holds 5" and "not
+ * banned = 1") cannot survive. A client that wants per-rule scores asks `checkEligibility`, which
+ * reports each leaf's own.
  */
 export interface BundleVerdictValid {
     valid: true;
-    ruleScore: bigint;
     resolvedNames: Record<string, string>;
 }
 
@@ -81,15 +96,22 @@ export interface BundleVerifier {
      */
     verifyOffline(bundle: VotesBundle): Promise<VerifyResult>;
     /**
-     * Step 3 alone, for a wallet rather than a bundle: run the gate rule and hand back its raw
-     * {@link RuleResult}. Backs `Contest.checkEligibility`, so a client can ask "would this vote
-     * count?" through the very same rule instance, options, chain client, head reader and memo
-     * the forward gate uses — never a reimplementation of them.
+     * Step 3 alone, for a wallet rather than a bundle: score EVERY leaf of the gate tree and hand
+     * back the folded {@link GateResult}. Backs `Contest.checkEligibility`, so a client can ask
+     * "would this vote count?" through the very same rule instances, options, chain clients, head
+     * reader and memos the forward gate uses — never a reimplementation of them.
+     *
+     * Unlike `verify`, this never short-circuits: a caller asking which rules a wallet fails needs
+     * all of their answers, not just the first one that settled the outcome.
+     *
+     * Also unlike `verify`, a leaf whose chain read THROWS does not fail the call outright — it is
+     * folded as unknown, so a wallet admitted by a branch that did answer still gets its answer.
+     * The error is re-thrown only when the tree cannot be decided without that leaf.
      *
      * `sampleBlock` is the pinned block the prospective ballot would name (the caller's current
      * bucket). A head-scoring rule ignores it exactly as it does during verification.
      */
-    checkGate(args: { address: string; sampleBlock: number }): Promise<RuleResult>;
+    checkGates(args: { address: string; sampleBlock: number }): Promise<GateResult>;
 }
 
 /**
@@ -97,7 +119,7 @@ export interface BundleVerifier {
  * constraints) are never recorded here — they are synchronous preconditions for admission, so
  * an admitted bundle has always passed them.
  *
- *   - `chainVerified`: the gate `rule` scored the wallet `> 0n` at the bucket block. `false`
+ *   - `chainVerified`: the gate admitted the wallet at the bucket block. `false`
  *     means "not yet read", never "failed" — a failed gate evicts the bundle instead.
  *   - `nameResolved`: `undefined` when the bundle carries no `community.name`; `false` while
  *     the carried name is unresolved; `true` once it resolved to the claimed `publicKey`. A

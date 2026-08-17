@@ -20,7 +20,7 @@ import {
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
-import type { Rule } from "../rules/types.js";
+import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import type { Criteria } from "../schema/criteria.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
 import {
@@ -38,6 +38,7 @@ import { topicFor } from "../topic.js";
 import { blockForBytes } from "../checkpoint/codec.js";
 import {
     bizCriteria,
+    bizGateRef,
     fakeHelia,
     fakeHeliaWithoutPubsub,
     fakeHeliaWithoutBlockstore,
@@ -275,16 +276,17 @@ describe("PubsubVoter.createContest", () => {
         await expect(voter.createContest({ criteria: bizCriteria() })).rejects.toThrow(/chainId 8453/);
     });
 
-    it("rejects a pre-v1 criteria still carrying rpcUrls (loud error, never a silent re-topic)", async () => {
-        // RPC endpoints are client settings now; a stripping schema would silently derive a
-        // DIFFERENT topic from such a document, so the strict schema must fail it instead.
+    it("rejects a criteria still declaring requires.chains (loud error, never a silent re-topic)", async () => {
+        // Chains are named once, by `bucketChainId`. A document still carrying the old ticker map
+        // (with or without the even older `rpcUrls`) must fail loudly: a stripping schema would
+        // drop the key and derive a DIFFERENT topic from the one the author's bytes imply.
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
         const criteria = bizCriteria();
-        const withRpcUrls = {
+        const withChains = {
             ...criteria,
             requires: { ...criteria.requires, chains: { base: { chainId: 8453, rpcUrls: ["https://mainnet.base.org"] } } }
         } as unknown as ReturnType<typeof bizCriteria>;
-        await expect(voter.createContest({ criteria: withRpcUrls })).rejects.toThrow();
+        await expect(voter.createContest({ criteria: withChains })).rejects.toThrow();
     });
 });
 
@@ -596,6 +598,9 @@ describe("Contest read view + tally", () => {
         expect(error).toBeInstanceOf(VoteEvictedError);
         // The rule's own wording reaches the publisher verbatim — not a generic "score is 0n".
         expect(error.verdict.reason).toContain("holds none of the gate token");
+        // ...and structured, so a client lists what is missing instead of splitting a sentence.
+        expect(error.verdict.failures?.map((f) => f.type)).toEqual(["erc5192-min-balance"]);
+        expect(error.verdict.failures?.[0]?.error).toContain("holds none of the gate token");
         expect(error.bundle).toBe(vote.bundle); // names the exact publish that was evicted
         expect(vote.publishingState).toBe("failed"); // flipped post hoc
         // The same error reaches a long-lived contest view, and the tally recounted without it.
@@ -2369,7 +2374,12 @@ describe("Contest.checkEligibility", () => {
     it("reports the gate score for a wallet the REAL rule admits", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 3n }), signer: fakeSigner() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
-        expect(await contest.checkEligibility({ address: WALLET })).toEqual({ eligible: true, score: 3n });
+        const result = await contest.checkEligibility({ address: WALLET });
+        expect(result).toMatchObject({ eligible: true, score: 3n });
+        // One rule in the gate, so one check — and it carries that rule's own score and identity.
+        expect(result.checks).toHaveLength(1);
+        expect(result.checks[0]).toMatchObject({ type: "erc5192-min-balance", satisfied: true, score: 3n });
+        expect(result.gate).toMatchObject({ kind: "leaf", satisfied: true });
         await voter.destroy();
     });
 
@@ -2412,6 +2422,241 @@ describe("Contest.checkEligibility", () => {
         await voter.destroy();
     });
 
+    /**
+     * A composite gate: two rules, each answering only about itself, with the criteria composing
+     * them. What a client needs back is not "eligible: false" but WHICH requirements are missing —
+     * and, under `any`, which failures are noise.
+     */
+    describe("composite gates", () => {
+        const answering = (answers: Record<string, RuleResult>): RuleRegistry =>
+            Object.fromEntries(
+                Object.entries(answers).map(([type, answer]) => [
+                    type,
+                    { type, optionsSchema: z.looseObject({ type: z.string() }), evaluate: async () => answer }
+                ])
+            );
+        const gate = (kind: "all" | "any"): Criteria => ({
+            ...bizCriteria(),
+            gate: { [kind]: [{ rule: { type: "holds-pass" } }, { rule: { type: "not-banned" } }] } as never
+        });
+        const contestOn = async (criteria: Criteria, rules: RuleRegistry) => {
+            const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), rules });
+            return { voter, contest: await voter.createContest({ criteria }) };
+        };
+        const PASS: RuleResult = { success: true, score: 4n };
+        const BANNED: RuleResult = { success: false, error: "this wallet is banned from the board" };
+        const NO_PASS: RuleResult = { success: false, error: "this wallet holds none of the gate token", penalize: false };
+
+        it("lists EVERY failing requirement of an `all`, each with its own rule's wording", async () => {
+            const { voter, contest } = await contestOn(gate("all"), answering({ "holds-pass": NO_PASS, "not-banned": BANNED }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result.eligible).toBe(false);
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.failures.map((f) => f.type)).toEqual(["holds-pass", "not-banned"]);
+            expect(result.failures.map((f) => f.error)).toEqual([NO_PASS.error, BANNED.error]);
+            // Both rules ran even though the first already settled it — naming each failure is
+            // what this call is for, so it never short-circuits the way the forward gate does.
+            expect(result.checks).toHaveLength(2);
+            expect(result.checks.every((check) => check.satisfied === false)).toBe(true);
+            // ...and the joined string still exists for a caller that only renders one.
+            expect(result.error).toBe(`${NO_PASS.error}; ${BANNED.error}`);
+            await voter.destroy();
+        });
+
+        it("reports only the unmet requirement when the other is met", async () => {
+            const { voter, contest } = await contestOn(gate("all"), answering({ "holds-pass": PASS, "not-banned": BANNED }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.failures.map((f) => f.type)).toEqual(["not-banned"]);
+            // The satisfied leaf is still reported — a UI can show the checklist, ticks and all.
+            expect(result.checks.map((c) => [c.type, c.satisfied])).toEqual([
+                ["holds-pass", true],
+                ["not-banned", false]
+            ]);
+            await voter.destroy();
+        });
+
+        it("blames NOTHING for a failed alternative when the wallet qualifies another way", async () => {
+            // The reason `failures` is not `checks.filter(failed)`: this wallet holds no Pass, is
+            // eligible as a moderator, and must not be told to go and buy a Pass.
+            const { voter, contest } = await contestOn(gate("any"), answering({ "holds-pass": NO_PASS, "not-banned": PASS }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result).toMatchObject({ eligible: true, score: 4n }); // `any` scores the best route
+            expect(result.checks.map((c) => c.satisfied)).toEqual([false, true]);
+            await voter.destroy();
+        });
+
+        it("names every alternative when an `any` refuses — each is a road not taken", async () => {
+            const { voter, contest } = await contestOn(gate("any"), answering({ "holds-pass": NO_PASS, "not-banned": BANNED }));
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.failures.map((f) => f.type)).toEqual(["holds-pass", "not-banned"]);
+            // The tree comes back shaped like the criteria, so a client can render the real
+            // requirement ("either of these") rather than an undifferentiated list.
+            expect(result.gate).toMatchObject({ kind: "any", satisfied: false });
+            await voter.destroy();
+        });
+
+        it("returns the tree shaped like the criteria, nesting and all", async () => {
+            // A flat list cannot express "either of these, and also that one" — which is exactly
+            // what a client needs to render a requirement a voter can act on.
+            const criteria: Criteria = {
+                ...bizCriteria(),
+                gate: { all: [{ any: [{ rule: { type: "holds-pass" } }, { rule: { type: "moderator" } }] }, { rule: { type: "not-banned" } }] } as never
+            };
+            const { voter, contest } = await contestOn(
+                criteria,
+                answering({ "holds-pass": NO_PASS, moderator: PASS, "not-banned": BANNED })
+            );
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            if (result.eligible) throw new Error("expected a refusal");
+            expect(result.gate).toMatchObject({
+                kind: "all",
+                satisfied: false,
+                children: [
+                    { kind: "any", satisfied: true, children: [{ type: "holds-pass", satisfied: false }, { type: "moderator", satisfied: true }] },
+                    { kind: "leaf", type: "not-banned", satisfied: false }
+                ]
+            });
+            // The satisfied `any` explains nothing, so only the banned rule is blamed — even
+            // though `checks` still reports all three leaves.
+            expect(result.failures.map((f) => f.type)).toEqual(["not-banned"]);
+            expect(result.checks).toHaveLength(3);
+            await voter.destroy();
+        });
+
+        it("gives each leaf a distinct ruleId, even for two leaves of the same rule type", async () => {
+            // `type` is not a key: a gate may name one rule twice on different options, and a UI
+            // keying rows by `type` would collapse them. The id is the leaf's canonical bytes.
+            const criteria: Criteria = {
+                ...bizCriteria(),
+                gate: { all: [{ rule: { ...bizGateRef(), min: 1 } }, { rule: { ...bizGateRef(), min: 5 } }] }
+            };
+            const { voter, contest } = await contestOn(criteria, {});
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result.checks.map((c) => c.type)).toEqual(["erc5192-min-balance", "erc5192-min-balance"]);
+            expect(new Set(result.checks.map((c) => c.ruleId)).size).toBe(2);
+            await voter.destroy();
+        });
+
+        it("identifies a repeated rule by POSITION, and still reads the chain for it once", async () => {
+            // A gate may name one rule in two branches ("any two of these three"), so `ruleId` —
+            // the hash of the leaf's canonical ref — is deliberately NOT unique within a result.
+            // `leaf` is. And because that same hash namespaces the memo, the repeat is free: the
+            // two positions are one question, so they share one answer and one chain read.
+            let reads = 0;
+            const criteria = {
+                ...bizCriteria(),
+                gate: {
+                    any: [
+                        { all: [{ rule: bizGateRef() }, { rule: { ...bizGateRef(), min: 2 } }] },
+                        { all: [{ rule: bizGateRef() }, { rule: { ...bizGateRef(), min: 3 } }] }
+                    ]
+                }
+            };
+            const voter = new PubsubVoter({
+                dataPath: false,
+                helia: fakeHelia(),
+                chains: stubChains({ balance: 3n, onRead: () => reads++ })
+            });
+            const contest = await voter.createContest({ criteria: criteria as unknown as Criteria });
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            // Leaves 0 and 2 are the same rule on the same options: same id, different positions.
+            expect(result.checks.map((c) => c.leaf)).toEqual([0, 1, 2, 3]);
+            expect(result.checks[0]?.ruleId).toBe(result.checks[2]?.ruleId);
+            expect(new Set(result.checks.map((c) => c.ruleId)).size).toBe(3);
+            // The repeat is not free on the FIRST evaluation: `checkEligibility` scores every leaf
+            // concurrently, so both positions of the repeated rule miss the memo before either
+            // writes to it. It costs one extra read of one question, once per memo epoch.
+            const firstPass = reads;
+            expect(firstPass).toBeGreaterThan(0);
+            // From then on the shared namespace does its job — the same wallet, the same
+            // questions, and no further chain reads at all.
+            reads = 0;
+            await contest.checkEligibility({ address: WALLET });
+            expect(reads).toBe(0);
+            await voter.destroy();
+        });
+
+        it("still answers when one rule's chain read fails but another branch decided it", async () => {
+            // A chain read fails for reasons that say nothing about the wallet. This wallet is a
+            // moderator; refusing to answer because the Pass contract's RPC timed out would tell
+            // an eligible voter they are ineligible, over an outage they cannot act on.
+            const flaky: RuleRegistry = {
+                "holds-pass": {
+                    type: "holds-pass",
+                    optionsSchema: z.looseObject({ type: z.string() }),
+                    evaluate: async () => {
+                        throw new Error("rpc: 429 too many requests");
+                    }
+                },
+                moderator: { type: "moderator", optionsSchema: z.looseObject({ type: z.string() }), evaluate: async () => PASS }
+            };
+            const criteria: Criteria = {
+                ...bizCriteria(),
+                gate: { any: [{ rule: { type: "holds-pass" } }, { rule: { type: "moderator" } }] } as never
+            };
+            const { voter, contest } = await contestOn(criteria, flaky);
+            const result = await contest.checkEligibility({ address: WALLET });
+
+            expect(result).toMatchObject({ eligible: true, score: 4n });
+            // The unreadable rule reports unknown — never `false`, which a UI would render as a
+            // requirement to go and fix something that was never measured.
+            expect(result.checks.map((c) => [c.type, c.satisfied])).toEqual([
+                ["holds-pass", undefined],
+                ["moderator", true]
+            ]);
+            await voter.destroy();
+        });
+
+        it("surfaces the read failure itself when the gate cannot be decided without it", async () => {
+            // The other half: no branch answered, so there is no honest verdict to return. The
+            // caller gets the infra error rather than a refusal the wallet cannot act on.
+            const flaky: RuleRegistry = {
+                "holds-pass": {
+                    type: "holds-pass",
+                    optionsSchema: z.looseObject({ type: z.string() }),
+                    evaluate: async () => {
+                        throw new Error("rpc: 429 too many requests");
+                    }
+                },
+                "not-banned": { type: "not-banned", optionsSchema: z.looseObject({ type: z.string() }), evaluate: async () => PASS }
+            };
+            const { voter, contest } = await contestOn(gate("all"), flaky);
+            await expect(contest.checkEligibility({ address: WALLET })).rejects.toThrow("rpc: 429 too many requests");
+            await voter.destroy();
+        });
+
+        it("hands every leaf the contest's one chain, whatever a rule's options say", async () => {
+            // A rule does not name a chain: it reads the chain the contest counts in. So a leaf
+            // carrying a stray `chain` option is not a second chain to reconcile — it is an
+            // unknown option, and the whole class of "this leaf read someone else's history" bug
+            // cannot be expressed (DESIGN.md "One clock").
+            const seen: number[] = [];
+            const chains: ChainClientFactory = ({ chainId }) => {
+                seen.push(chainId);
+                return stubChains({ balance: 1n })({ chainId });
+            };
+            const criteria = {
+                ...bizCriteria(),
+                gate: { all: [{ rule: bizGateRef() }, { rule: { ...bizGateRef(), chain: "eth", min: 2 } }] }
+            } as unknown as Criteria;
+            const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+            const contest = await voter.createContest({ criteria });
+            await contest.checkEligibility({ address: WALLET });
+
+            expect(seen).toEqual([bizCriteria().bucketChainId]); // one client, resolved once
+            await voter.destroy();
+        });
+    });
+
     it("admits a wallet holding at the head but NOT at the current bucket's block", async () => {
         // The regression this whole surface exists for: a Pass acquired mid-window. The head leg
         // admits, so the answer must be `eligible` — the pre-0.3.0 answer was "not yet, wait an
@@ -2429,7 +2674,7 @@ describe("Contest.checkEligibility", () => {
 
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
-        expect(await contest.checkEligibility({ address: WALLET })).toEqual({ eligible: true, score: 1n });
+        expect(await contest.checkEligibility({ address: WALLET })).toMatchObject({ eligible: true, score: 1n });
         await voter.destroy();
     });
 });
@@ -2440,7 +2685,7 @@ describe("weight-rule cache namespacing", () => {
      * exactly as a real chain-reading rule must (rules/cache.ts). Its only job here is to be
      * observably wrong if it is served another chain's memo.
      */
-    const ChainWeightOptionsSchema = z.object({ type: z.literal("chain-weight"), chain: z.string() });
+    const ChainWeightOptionsSchema = z.object({ type: z.literal("chain-weight") });
     const chainWeight: Rule<z.infer<typeof ChainWeightOptionsSchema>> = {
         type: "chain-weight",
         optionsSchema: ChainWeightOptionsSchema,
@@ -2457,14 +2702,15 @@ describe("weight-rule cache namespacing", () => {
         }
     };
 
-    /** Same gate ref and same weight ref; only the chain the weight ticker names differs. */
-    const criteriaWeighedOn = (govChainId: number): Criteria => ({
+    /** Same gate ref and byte-identical weight ref; only the chain the CONTEST counts in differs. */
+    const criteriaWeighedOn = (chainId: number): Criteria => ({
         ...bizCriteria(),
-        weight: { type: "chain-weight", chain: "gov" },
-        requires: { rules: ["erc5192-min-balance", "chain-weight"], chains: { base: { chainId: 8453 }, gov: { chainId: govChainId } } }
+        bucketChainId: chainId,
+        weight: { type: "chain-weight" },
+        requires: { rules: ["erc5192-min-balance", "chain-weight"] }
     });
 
-    /** The gate reads `readContract` on `base`; the weight reads `getBalance` on its own chain. */
+    /** The gate reads `readContract`; the weight reads `getBalance` on the contest's own chain. */
     const chainsByWeight = (weightByChainId: Record<number, bigint>): ChainClientFactory => {
         return ({ chainId }) =>
             ({
@@ -2475,11 +2721,10 @@ describe("weight-rule cache namespacing", () => {
             }) as unknown as ChainClient;
     };
 
-    it("keys the weight memo by the WEIGHT chain, not the gate chain", async () => {
-        // Both contests share a gate on base/8453 and a byte-identical weight ref, so a namespace
-        // derived from the gate's chainId would be the same string for both — and the second
-        // contest would be served the first's score from a chain it never reads. A ticker is only
-        // a name local to a criteria document; what it binds to is what the memo must key on.
+    it("keys the weight memo by the CONTEST's chain, so two chains never share a score", async () => {
+        // Two contests with a byte-identical weight ref, counting in different chains. Keying the
+        // memo on the ref alone would make one namespace for both, and the second contest would be
+        // served the first's score from a chain it never reads.
         const voter = new PubsubVoter({
             dataPath: false,
             helia: fakeHelia(),
@@ -2494,6 +2739,7 @@ describe("weight-rule cache namespacing", () => {
         await (await voter.createContestVote({ criteria: onPolygon, votes: VOTE })).publish();
 
         // Same wallet, same weight ref, one shared gateStore — and still each contest's own chain.
+        // (The gate reads `readContract`, which every stub answers `1n`; only the weight differs.)
         expect((await (await voter.createContest({ criteria: onEth })).getTally()).ranking[0]?.weight).toBe(5n);
         expect((await (await voter.createContest({ criteria: onPolygon })).getTally()).ranking[0]?.weight).toBe(9n);
         await voter.destroy();

@@ -1,6 +1,5 @@
 import { erc20Abi, formatUnits, getAddress, parseUnits } from "viem";
 import { z } from "zod";
-import { ChainTickerSchema } from "../schema/common.js";
 import type { Rule } from "./types.js";
 
 /**
@@ -31,7 +30,6 @@ import type { Rule } from "./types.js";
  */
 export const Erc20BalanceOptionsSchema = z.object({
     type: z.literal("erc20-balance"),
-    chain: ChainTickerSchema,
     contract: z.string(),
     decimals: z.number().int().nonnegative().default(18),
     min: z.number().nonnegative().default(0)

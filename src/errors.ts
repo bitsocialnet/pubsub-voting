@@ -21,13 +21,13 @@ export class NotImplementedError extends Error {
 
 /**
  * Thrown when a criteria document names a rule `type` this client does not
- * implement (in the `rule`/`weight` slot or in `requires.rules`). A
+ * implement (in a `gate` leaf, the `weight` slot, or in `requires.rules`). A
  * client that hits this is too old (or missing a host override) and must recuse
  * itself from the contest rather than miscount. See DESIGN.md "Rules".
  */
 export class UnknownRuleError extends Error {
     constructor(
-        readonly slot: "rule" | "weight" | "requires",
+        readonly slot: "gate" | "weight" | "requires",
         readonly type: string
     ) {
         super(
@@ -40,22 +40,18 @@ export class UnknownRuleError extends Error {
 }
 
 /**
- * Thrown by `createContest` / `createContestVote` when the criteria's dependency manifest
- * names a chain (`requires.chains`) the host's `ChainClientFactory` cannot resolve to a
- * client (it returned `undefined`). RPC endpoints are client-local settings, not part of
+ * Thrown by `createContest` / `createContestVote` when the host's `ChainClientFactory` cannot
+ * resolve the contest's `bucketChainId` to a client (it returned `undefined`). RPC endpoints are client-local settings, not part of
  * the criteria document, so a client with no gateway configured for a required chain must
  * recuse the contest rather than miscount — the chain-side twin of `UnknownRuleError`.
  */
 export class MissingChainClientError extends Error {
-    constructor(
-        readonly chain: string,
-        readonly chainId: number
-    ) {
+    constructor(readonly chainId: number) {
         super(
-            `No chain client for "${chain}" (chainId ${chainId}), which this contest's criteria ` +
-                `requires. RPC endpoints are client settings, not part of the criteria document: ` +
-                `configure the \`chains\` factory (PubsubVoterOptions.chains) to return a viem ` +
-                `PublicClient for this chain, or recuse this contest.`
+            `No chain client for chainId ${chainId}, which this contest counts its buckets in ` +
+                `(\`criteria.bucketChainId\`). RPC endpoints are client settings, not part of the ` +
+                `criteria document: configure the \`chains\` factory (PubsubVoterOptions.chains) to ` +
+                `return a viem PublicClient for this chain, or recuse this contest.`
         );
         this.name = "MissingChainClientError";
     }
