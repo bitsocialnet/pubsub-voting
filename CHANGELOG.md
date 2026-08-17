@@ -1,5 +1,123 @@
 # Changelog
 
+## [0.5.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.4.1...v0.5.0) (2026-08-17)
+
+### ⚠ BREAKING CHANGES
+
+* **criteria:** `requires.chains` (a ticker -> chainId map) is replaced
+by a required top-level `bucketChainId`, rule refs lose their `chain`
+option, `ChainClientFactory` takes `{ chainId }` alone, and the bundle
+verdict no longer carries `ruleScore`. Every criteria document re-CIDs,
+so every contest re-topics — this lands with the `rule` -> `gate` rename
+as ONE cutover rather than paying for two. `GateChainMismatchError` is
+gone; there is nothing left for it to catch.
+
+The document said its chain twice: each rule named a ticker, and
+`requires.chains` bound that ticker to an id. Two spellings of one fact
+need a rule to keep them honest, so a validator compared every gate leaf
+against every other and refused a document that mixed them. An invariant
+you cannot express beats one you have to police: a contest now names one
+chain by the numeric id the EIP-712 ballot domain already signs over,
+every rule reads it, and "this leaf answered about someone else's
+history" stops being a thing that can be written down. The ticker was
+only ever a label local to a document — and two documents spelling one
+chain differently were two topics for one contest.
+
+What went with it: `src/chain/ticker.ts`, `ChainConfigSchema`,
+`ChainTickerSchema`, the per-contest `chainFor(ticker)` seam threaded
+through `resolveGate`, both verifiers and the tally, and the ticker ->
+client map in the voter. All of it collapses to one `chain: ChainClient`.
+
+Also here, because they are the same document and the same cutover:
+
+- Leaves that ask the SAME question are evaluated once, not once per
+  position. A rule may be named in two branches — that is how "any two
+  of these three" is written — and the two positions race, so both miss
+  the rule's own memo before either writes it. `dedupeLeaves` groups by
+  canonical ref: one batched call per distinct question in the
+  background verifier, one shared promise per wallet inline.
+- `EligibilityCheck.leaf` is the render key. `ruleId` is the hash of a
+  leaf's canonical ref, so it is NOT unique within a gate that names one
+  rule twice; it stays as the sharing identity (equal ids are one
+  question, one memo, one read across contests).
+- The gate tree's depth and leaf caps are checked on the RAW value
+  before the recursive schema descends. `z.lazy` overflows the stack on
+  a pathological document long before a post-parse cap can fire, and a
+  RangeError escaping `safeParse` breaks the one guarantee that call
+  makes.
+- `requires` and `voteSchema` are strict. A non-strict `requires`
+  silently STRIPPED a leftover `chains` key and derived a different
+  topic from the one the author's bytes implied — the exact silent fork
+  the strict top level exists to prevent.
+- `BundleVerdictValid.ruleScore` is dropped: nothing read it, and a
+  min-across-`all` fold over unrelated rules ("holds 5" and "not banned
+  = 1") is a number that means nothing. Per-rule scores live on
+  `checkEligibility().checks`, which has a consumer.
+* **criteria:** `criteria.rule` becomes `criteria.gate`, a boolean tree
+over rule references. This re-CIDs every criteria document and so
+re-topics every contest; the identity migration is
+`gate: { rule: <the old rule ref> }`. `Contest.checkEligibility` returns
+a new shape, and `BundleVerifier.checkGate` becomes `checkGates`.
+
+A client could not answer "which requirements is this wallet missing?"
+because a contest had exactly one gate rule, so listing failures was
+listing one thing. Expressing "the Pass, or a moderator, and not banned"
+needed a bespoke rule per combination — code every participant must
+implement to say what a document could say.
+
+The gate is now `{ rule } | { all: [...] } | { any: [...] }`. A rule
+still answers one question about one wallet and never sees the gate it
+sits in; `src/rules/gate.ts` folds the answers, reading the tree's
+structure and the results' discriminants but never which rule produced
+them. Canonicity constrains the shape, because the topic is the CID of
+these bytes and two spellings of one meaning is a silent topic fork: a
+branch takes >= 2 children, the leaf is wrapped (a rule ref is loose, so
+an option named `all`/`any` would make a bare leaf ambiguous), depth and
+leaf count are capped, and every leaf must read the contest's one clock
+chain (`GateChainMismatchError`).
+
+Three things fold, and only the first is obvious:
+
+- the score: min across an `all` (the binding constraint), max across a
+  satisfied `any` (the best qualification);
+- the blame set: the failures that EXPLAIN a refusal, which is NOT every
+  failed leaf. One inside a satisfied `any` cost the wallet nothing, and
+  telling it to acquire an asset it does not need is worse than silence;
+- `penalize`: an `all` is attributable if ANY failing child is (that
+  child alone closes the gate everywhere), an `any` only if EVERY child
+  is (one unprovable failure means a peer with a fresher view may see a
+  wallet this gate admits, and reject-scoring it punishes honest
+  relaying). The inline gate short-circuits and can only under-report
+  attributability, which is the fail-safe direction.
+
+`checkEligibility` now returns `{ eligible, score | error, checks,
+failures, gate }` — every rule in document order, the blame set, and the
+tree with per-node verdicts so a client renders the real requirement.
+Rows key by `ruleId` (the leaf's canonical hash, which is also its cache
+namespace), because one gate may name a rule twice on different options.
+
+The forward gate evaluates lazily; the background verifier scores every
+leaf because its batching axis is the rule — one `evaluateMany` per leaf
+per round — so collecting all is cheaper there and yields the complete
+blame set for free.
+
+Benchmark: re-run against the WAN host with a same-session control on
+master. `verify+merge` is flat (0.31/0.32/0.33/0.47/1.96 on master vs
+0.32/0.32/0.32/0.47/1.97 here) and gate-RPC counts are identical; the
+end-to-end spread between the two runs sits entirely in `connect` and
+`fetch`, which drifted on master too. RESULTS.md is left alone rather
+than re-baselined on today's link conditions.
+
+### Features
+
+* **criteria:** compose gate rules with all/any, and report every failure ([91376fe](https://github.com/bitsocialnet/pubsub-voting/commit/91376fe107d024c2f7781a2d6d47cbf8a37a36ea))
+* **criteria:** name the contest's chain once, as bucketChainId ([17e810c](https://github.com/bitsocialnet/pubsub-voting/commit/17e810c2d33f891748aeeaf079b56ac845648d41))
+
+### Bug Fixes
+
+* **criteria:** reject the redundant gate spellings that fork a topic ([4456304](https://github.com/bitsocialnet/pubsub-voting/commit/4456304d78cbf7bc91736849b76bdcbda7a2f48c))
+* **gate:** keep one unreadable rule from sinking checkEligibility ([19d09e8](https://github.com/bitsocialnet/pubsub-voting/commit/19d09e83deb18dcd6ce97c42ec6501371186a627))
+
 ## [0.4.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.4.0...v0.4.1) (2026-08-14)
 
 ## [0.4.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.3.0...v0.4.0) (2026-08-09)
