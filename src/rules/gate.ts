@@ -113,12 +113,34 @@ export async function evaluateGate(args: {
      * verifier); the inline gate leaves it off and pays for only what it needs.
      */
     collectAll?: boolean;
+    /**
+     * Treat a leaf whose evaluation THREW as unknown (`satisfied: undefined`) instead of letting
+     * it reject the whole fold. Off by default, and deliberately so: on a verification path an
+     * unreachable chain is an infra failure whose only safe handling is to retry the bundle, and
+     * silently folding "could not read" into the tree would let an outage decide a vote.
+     *
+     * `checkEligibility` turns it on because it answers a person, not the network: a wallet that
+     * qualifies through a branch that DID answer must not be told it is ineligible because some
+     * other rule's RPC timed out. When the tree cannot be decided without the failed leaf the root
+     * comes back unknown, and that caller re-throws the underlying error rather than inventing a
+     * verdict.
+     */
+    tolerateLeafErrors?: boolean;
+    /** Called for each leaf that threw under {@link tolerateLeafErrors}, in completion order. */
+    onLeafError?: (leaf: number, error: unknown) => void;
 }): Promise<GateResult> {
-    const { node, evaluate, collectAll = false } = args;
+    const { node, evaluate, collectAll = false, tolerateLeafErrors = false, onLeafError } = args;
 
     const run = async (indexed: IndexedGate): Promise<GateResult> => {
         if (indexed.kind === "leaf") {
-            const result = await evaluate(indexed.leaf);
+            let result: RuleResult;
+            try {
+                result = await evaluate(indexed.leaf);
+            } catch (error) {
+                if (!tolerateLeafErrors) throw error;
+                onLeafError?.(indexed.leaf, error);
+                return UNEVALUATED(indexed.leaf);
+            }
             const failed = gateFailure(result);
             return failed
                 ? { kind: "leaf", leaf: indexed.leaf, satisfied: false, score: 0n, error: failed.error, penalize: failed.penalize }
@@ -128,8 +150,7 @@ export async function evaluateGate(args: {
         const decidesAt = indexed.kind === "all" ? false : true;
         if (collectAll) {
             const children = await Promise.all(indexed.children.map(run));
-            const satisfied = indexed.kind === "all" ? children.every(isSatisfied) : children.some(isSatisfied);
-            return { kind: indexed.kind, satisfied, children };
+            return { kind: indexed.kind, satisfied: foldSatisfied(indexed.kind, children), children };
         }
         const children: GateResult[] = [];
         for (const [position, child] of indexed.children.entries()) {
@@ -142,7 +163,9 @@ export async function evaluateGate(args: {
                 return { kind: indexed.kind, satisfied: decidesAt, children };
             }
         }
-        return { kind: indexed.kind, satisfied: !decidesAt, children };
+        // No child decided it, so every one of them settled the other way — unless a read failed
+        // under `tolerateLeafErrors`, in which case the branch is honestly unknown.
+        return { kind: indexed.kind, satisfied: foldSatisfied(indexed.kind, children), children };
     };
 
     return run(indexGate(node));
@@ -155,6 +178,20 @@ function skipped(indexed: IndexedGate): GateResult[] {
 }
 
 const isSatisfied = (result: GateResult): boolean => result.satisfied === true;
+
+/**
+ * A branch's verdict from its children's, in three values rather than two — `undefined` is "not
+ * known", and only a KNOWN answer may decide. An `all` fails on any known failure and admits only
+ * once every child is known to admit; an `any` admits on any known success and refuses only once
+ * every alternative is known to have failed. Anything else is unknown, which is what keeps a leaf
+ * nobody could read (see `tolerateLeafErrors`) or one the evaluation skipped from being counted as
+ * a refusal the wallet is supposed to act on.
+ */
+function foldSatisfied(kind: "all" | "any", children: readonly GateResult[]): boolean | undefined {
+    const decidesAt = kind === "all" ? false : true;
+    if (children.some((child) => child.satisfied === decidesAt)) return decidesAt;
+    return children.every((child) => child.satisfied === !decidesAt) ? !decidesAt : undefined;
+}
 
 /**
  * The gate's score for a wallet it admitted: a leaf's own score, the MINIMUM across an `all` (the

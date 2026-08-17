@@ -104,8 +104,26 @@ export function makeBundleVerifier(deps: BundleVerifierDeps): BundleVerifier {
         // which is the entire value of exposing it: a caller asking "would this wallet's vote
         // count?" can never drift from what the gate actually does. Every leaf is scored here
         // (`collectAll`), because naming each failure is what this call is for.
-        checkGates: ({ address, sampleBlock }) =>
-            evaluateGate({ node: criteria.gate, evaluate: scoreLeaf({ address, sampleBlock }), collectAll: true }),
+        async checkGates({ address, sampleBlock }) {
+            // A leaf whose read FAILED is not a leaf that said no. Under an `any`, refusing the
+            // whole check because one rule's RPC timed out would tell a wallet that qualifies
+            // through another branch that it is ineligible — over an outage it cannot act on. So
+            // a failed read is folded as unknown, and only if the tree cannot be decided without
+            // it does the original error surface (never a verdict invented from a missing read).
+            let firstError: unknown;
+            let failed = false;
+            const gate = await evaluateGate({
+                node: criteria.gate,
+                evaluate: scoreLeaf({ address, sampleBlock }),
+                collectAll: true,
+                tolerateLeafErrors: true,
+                onLeafError: (_leaf, error) => {
+                    if (!failed) [failed, firstError] = [true, error];
+                }
+            });
+            if (gate.satisfied === undefined) throw firstError;
+            return gate;
+        },
         async verify(bundle: VotesBundle): Promise<BundleVerdict> {
             const offline = await verifyOffline(bundle);
             if (!offline.valid) return offline;

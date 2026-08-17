@@ -28,6 +28,27 @@ async function run(node: GateNode, answers: RuleResult[], collectAll = false) {
     return { result, asked };
 }
 
+/**
+ * A leaf whose chain read THREW rather than answering. The tree may still be decidable without
+ * it, which is the whole reason `tolerateLeafErrors` exists — see the fold's three-valued logic.
+ */
+const boom = (leaf: number): Error => new Error(`rpc failed for leaf ${leaf}`);
+async function runTolerant(node: GateNode, answers: (RuleResult | "throws")[]) {
+    const errors: unknown[] = [];
+    const result = await evaluateGate({
+        node,
+        collectAll: true,
+        tolerateLeafErrors: true,
+        onLeafError: (leaf, error) => errors.push({ leaf, error }),
+        evaluate: async (leaf) => {
+            const answer = answers[leaf]!;
+            if (answer === "throws") throw boom(leaf);
+            return answer;
+        }
+    });
+    return { result, errors };
+}
+
 describe("gate tree structure", () => {
     it("numbers leaves depth-first, left to right — the index every per-leaf array is keyed by", () => {
         const node: GateNode = { all: [ref("a"), { any: [ref("b"), ref("c")] }, ref("d")] };
@@ -179,3 +200,67 @@ describe("gatePenalize — may a refusal be blamed on the sender", () => {
         expect(gatePenalize((await run(ref("a"), [pass(1n)])).result)).toBe(false);
     });
 });
+
+/**
+ * A leaf that cannot answer at all. A chain read is infrastructure: it fails for reasons that say
+ * nothing about the wallet, so "unknown" must never be folded as "no" — that would refuse a voter
+ * over someone else's RPC outage, and (on a path that penalizes) blame the peer that relayed them.
+ */
+describe("a leaf whose read failed", () => {
+    it("propagates by default — an unanswered gate is not a refusal", async () => {
+        await expect(
+            evaluateGate({
+                node: { any: [ref("a"), ref("b")] },
+                collectAll: true,
+                evaluate: async (leaf) => {
+                    if (leaf === 0) throw boom(0);
+                    return pass(1n);
+                }
+            })
+        ).rejects.toThrow("rpc failed for leaf 0");
+    });
+
+    it("still admits when another branch of an `any` already decided it", async () => {
+        // The wallet qualifies through `b`. Failing the whole check because `a`'s read timed out
+        // would tell an eligible voter they are ineligible — over an outage they cannot act on.
+        const { result, errors } = await runTolerant({ any: [ref("a"), ref("b")] }, ["throws", pass(4n)]);
+        expect(result.satisfied).toBe(true);
+        expect(gateScore(result)).toBe(4n);
+        expect(errors).toHaveLength(1);
+        if (result.kind === "leaf") throw new Error("expected a branch");
+        // The unreadable leaf reports UNKNOWN, never `false`: nothing was learned about it.
+        expect(result.children[0]).toMatchObject({ leaf: 0, satisfied: undefined });
+    });
+
+    it("still refuses when a known failure decides an `all`, and never blames the unknown leaf", async () => {
+        const { result } = await runTolerant({ all: [ref("a"), ref("b")] }, ["throws", fail("this wallet is banned")]);
+        expect(result.satisfied).toBe(false);
+        // Only the rule that actually answered explains the refusal — a voter cannot act on "we
+        // could not reach the chain", and `a` may well have admitted them.
+        expect(gateBlame(result).map((leaf) => leaf.error)).toEqual(["this wallet is banned"]);
+        expect(gateReason(result)).toBe("this wallet is banned");
+    });
+
+    it("reports UNKNOWN, not a verdict, when the failed read is the one that decides", async () => {
+        // `all` needs both; one is unknown and the other passed, so the gate has no answer. The
+        // caller turns this back into the underlying infra error rather than inventing one.
+        const { result, errors } = await runTolerant({ all: [ref("a"), ref("b")] }, ["throws", pass(1n)]);
+        expect(result.satisfied).toBeUndefined();
+        expect(errors).toHaveLength(1);
+        // Same for an `any` where every alternative is unknown-or-failed but none passed.
+        const either = await runTolerant({ any: [ref("a"), ref("b")] }, ["throws", fail("holds none")]);
+        expect(either.result.satisfied).toBeUndefined();
+    });
+
+    it("never penalizes on an incomplete tree", async () => {
+        // `any` is attributable only if EVERY alternative failed attributably; one that never
+        // answered is not one of them, so nobody is reject-scored on a read that did not happen.
+        const { result } = await runTolerant({ any: [ref("a"), ref("b")] }, ["throws", fail("holds none")]);
+        expect(gatePenalize(result)).toBe(false);
+        // An `all` that a known attributable failure already closed is still attributable: that
+        // one rule shuts the gate identically on every verifier, whatever the unknown leaf says.
+        const closed = await runTolerant({ all: [ref("a"), ref("b")] }, ["throws", fail("holds none")]);
+        expect(gatePenalize(closed.result)).toBe(true);
+    });
+});
+

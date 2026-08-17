@@ -101,6 +101,10 @@ export interface BundleVerifier {
      * Unlike `verify`, this never short-circuits: a caller asking which rules a wallet fails needs
      * all of their answers, not just the first one that settled the outcome.
      *
+     * Also unlike `verify`, a leaf whose chain read THROWS does not fail the call outright — it is
+     * folded as unknown, so a wallet admitted by a branch that did answer still gets its answer.
+     * The error is re-thrown only when the tree cannot be decided without that leaf.
+     *
      * `sampleBlock` is the pinned block the prospective ballot would name (the caller's current
      * bucket). A head-scoring rule ignores it exactly as it does during verification.
      */

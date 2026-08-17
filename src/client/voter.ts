@@ -234,6 +234,9 @@ export interface Contest {
      *
      * Every leaf is evaluated, even once the outcome is settled, because naming each failure is
      * what this call is for (the forward gate, which only needs the verdict, stops early instead).
+     * A rule whose chain read fails comes back `satisfied: undefined` rather than sinking the
+     * whole answer — a wallet admitted by a branch that did answer is still told so. It throws
+     * only when the gate cannot be decided without the rule that failed.
      *
      * It is a courtesy check, not a promise. Eligibility is a fact about the chain and can change
      * between this call and the publish, and each peer verifies against its own view — so a
