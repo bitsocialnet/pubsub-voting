@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.6.0...v0.6.1) (2026-08-18)
+
+### Bug Fixes
+
+* **announce:** sign the provider record, or no router keeps it ([c43e16e](https://github.com/bitsocialnet/pubsub-voting/commit/c43e16e67d6842fd99b72939d0aa53a0a5f1262f)), closes [#38](https://github.com/bitsocialnet/pubsub-voting/issues/38)
+
 ## [0.6.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.5.0...v0.6.0) (2026-08-18)
 
 ### ⚠ BREAKING CHANGES
