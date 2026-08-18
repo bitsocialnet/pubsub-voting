@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { makeAnnouncer, announceableAddrs, sentinelAddrs } from "./node.js";
 import { makeAnnouncer as makeBrowserAnnouncer } from "./browser.js";
 import { requireAnnounceSigner, signedProvidersBody } from "./record.js";
-import { createTestPeer, rawPayload, verifyProvidersBody } from "./router-verifier.test-fixtures.js";
+import { createTestPeer, rawPayload, verifyProvidersBody, type VerifyResult } from "./router-verifier.test-fixtures.js";
 import { MissingPrivateKeyError } from "../../errors.js";
 import type { AnnouncerLibp2p, AnnouncerOptions } from "./types.js";
 
@@ -42,7 +42,7 @@ async function startMockRouter(opts: { status?: number; hang?: boolean } = {}): 
         let raw = "";
         req.on("data", (d) => (raw += d));
         req.on("end", () => {
-            const verification = raw ? verifyProvidersBody(raw) : { valid: false as const, reason: undefined };
+            const verification: VerifyResult = raw ? verifyProvidersBody(raw) : { valid: false, error: "empty body" };
             puts.push({
                 method: req.method ?? "",
                 url: req.url ?? "",
@@ -503,10 +503,13 @@ describe("signed provider records (IPIP-0526, as pkc-http-router verifies them)"
         // The running node's key lives on the component registry...
         expect(requireAnnounceSigner(base)).toBe(base.components!.privateKey);
         // ...and a host that surfaces it directly is honoured without reaching into internals.
-        expect(requireAnnounceSigner({ ...base, components: undefined, privateKey: signer })).toBe(signer);
+        // (Both keys are *omitted* rather than set to `undefined`: under
+        // `exactOptionalPropertyTypes` an explicit undefined is not the same as an absent
+        // property, and the announcer probes for absence.)
+        const { components: _components, privateKey: _privateKey, ...keyless } = base;
+        expect(requireAnnounceSigner({ ...keyless, privateKey: signer })).toBe(signer);
         // A node that can sign for nothing can only produce records every router rejects, so the
         // announcer refuses at construction instead of announcing hourly into a 403.
-        const keyless = { ...base, components: undefined, privateKey: undefined };
         expect(() => requireAnnounceSigner(keyless)).toThrow(MissingPrivateKeyError);
         expect(() => testAnnouncer({ routerUrls: ["https://router.invalid"], libp2p: keyless })).toThrow(
             MissingPrivateKeyError
