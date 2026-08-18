@@ -30,8 +30,7 @@ declare function seeditSigner(): VoteSigner;
 declare const criteria: Criteria;
 const voter = new PubsubVoter({
     helia: seeditHelia(),
-    chains: viemChains(),
-    signer: seeditSigner()
+    chains: viemChains()
 });
 
 const contest = await voter.createContest({ criteria });
@@ -41,7 +40,13 @@ console.log(`contest ${contest.criteria.contestId} on topic ${contest.topic}`);
 const tally = await contest.getTally();
 console.log("ranking:", tally.ranking);
 
-const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW...community" }, vote: 1 }] });
+// The signer is the BALLOT's, not the voter's: seedit hands the wallet that holds the Pass to
+// each publication, so one client on the shared node can vote for as many wallets as it holds.
+const vote = await voter.createContestVote({
+    criteria,
+    votes: [{ community: { publicKey: "12D3KooW...community" }, vote: 1 }],
+    signer: seeditSigner()
+});
 await vote.publish();
 // Keeping the vote alive is seedit's job: re-publish before it expires (see republishIntervalBuckets).
 

@@ -68,7 +68,6 @@ import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import {
     InvalidCommunityNameError,
     MissingChainClientError,
-    ReadOnlyError,
     UnknownRuleError,
     VoteEvictedError,
     VoterDestroyedError
@@ -345,6 +344,13 @@ export interface ContestVote {
     readonly topic: string;
     /** The votes this ballot will sign and broadcast (empty array = a withdrawal). */
     readonly votes: readonly Vote[];
+    /**
+     * The wallet that signs this ballot. Identity is per-ballot, not per-voter: one
+     * `PubsubVoter` on the host's shared node publishes for as many wallets as the host holds
+     * keys for, and the address recovered from the signature is the only voter identity there
+     * is (see DESIGN.md "Identity: the voting wallet, nothing else").
+     */
+    readonly signer: VoteSigner;
     /** Where in the publish lifecycle this ballot is. */
     readonly publishingState: PublishingState;
     /** The signed bundle, once `publish()` has produced it (`undefined` before then). */
@@ -363,11 +369,10 @@ export interface ContestVote {
      * the `VotesBundle` (whose `blockNumber` the client uses to schedule its own refresh — see
      * {@link republishIntervalBuckets}) plus `recipientCount`, the number of peers gossipsub sent
      * the vote directly to. Emits `publishingstatechange` as it goes; throws (and emits `error`) on
-     * failure: `ReadOnlyError` with no signer, and `InvalidCommunityNameError` when a vote's
-     * carried `community.name` definitively does not resolve to its claimed `publicKey` (checked
-     * BEFORE signing or joining — every verifier drops such a bundle silently, so it is refused
-     * here instead of published into a network-wide silent drop; a resolver outage does not block
-     * the publish). This library does not re-publish: to keep the vote alive, call `publish()`
+     * failure: `InvalidCommunityNameError` when a vote's carried `community.name` definitively does
+     * not resolve to its claimed `publicKey` (checked BEFORE signing or joining — every verifier
+     * drops such a bundle silently, so it is refused here instead of published into a network-wide
+     * silent drop; a resolver outage does not block the publish). This library does not re-publish: to keep the vote alive, call `publish()`
      * again before it expires.
      */
     publish(): Promise<PublishOutcome>;
@@ -386,8 +391,6 @@ export interface ContestVote {
 
 /** The factory: one set of injected dependencies, many contests. */
 export interface VoteClient {
-    /** True when constructed without a signer: every contest is read-only. */
-    readonly readOnly: boolean;
     /**
      * Create the reactive read view for one contest from its full criteria document. The document
      * is strictly validated (`CriteriaSchema` + the rule registry — an unimplemented rule throws
@@ -400,8 +403,13 @@ export interface VoteClient {
      * Create a publishable ballot for one contest, validated and addressed exactly like
      * `createContest`. Each call returns a fresh `ContestVote` over the shared per-topic engine;
      * pass `votes: []` to build a withdrawal.
+     *
+     * The `signer` is per-ballot, and required. Identity belongs to the vote rather than to the
+     * client, so one voter on the host's shared node can publish for several wallets; and a
+     * ballot that cannot be signed has nothing to show (every other field on it is
+     * publish-derived), so reading a contest is `createContest`'s job, not this one's.
      */
-    createContestVote(args: { criteria: Criteria; votes: Vote[] }): Promise<ContestVote>;
+    createContestVote(args: { criteria: Criteria; votes: Vote[]; signer: VoteSigner }): Promise<ContestVote>;
     /**
      * Leave every topic this client joined, resetting each read view so it can `update()` again.
      * The checkpoint fetch responder unregisters itself once the last topic is left (see
@@ -442,8 +450,6 @@ export interface PubsubVoterOptions {
      * See `ChainClientFactory` (src/chain/types.ts) for the full contract.
      */
     chains: ChainClientFactory;
-    /** Identity. Omit for a read-only voter (renders tallies, cannot publish). */
-    signer?: VoteSigner;
     /** Rule overrides that shadow built-ins by `type` (a flat `type -> rule` map). */
     rules?: RuleRegistry;
     /**
@@ -493,7 +499,6 @@ interface ResolvedDeps {
     /** The node's libp2p fetch service (root-record pull), validated once at construction. */
     fetch: FetchServiceLike;
     chains: ChainClientFactory;
-    signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
     registry: RuleRegistry;
     /** Community-name resolvers for verifying `community.name` claims at tally time. */
@@ -1058,7 +1063,6 @@ function hexToBytes(hex: string): Uint8Array {
 class ContestEngine {
     readonly criteria: Criteria;
     readonly topic: string;
-    readonly readOnly: boolean;
 
     readonly #deps: ResolvedDeps;
     readonly #criteriaCid: Uint8Array;
@@ -1130,7 +1134,6 @@ class ContestEngine {
     constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
         this.topic = topic;
-        this.readOnly = deps.signer === undefined;
         this.#deps = deps;
         this.#criteriaCid = criteriaCidBytes;
         // The contest's ONE chain (`bucketChainId`): it fixes the ballot's chainId, the blocks the
@@ -1288,6 +1291,15 @@ class ContestEngine {
      * from {@link #peerRoots}, itself capped at {@link PEER_ROOTS_MAX}.
      */
     readonly #ownCheckpointPeers = new Map<string, Set<string>>();
+    /**
+     * This voter's signing address, lowercased, resolved once at join. It is what makes a bundle
+     * recognisable as OURS on a path that did not sign it — a snapshot restore after a reload, or
+     * our own vote arriving back through gossip. Without it, `#ownCids` would only ever be filled
+     * by `signVote`, so a restored vote could never be attributed to any peer, however many
+     * checkpoints carried it. `undefined` on a read-only voter, which owns no bundles by
+     * definition.
+     */
+    #ownAddress: string | undefined;
 
     /** Does any vote in the bundle carry a `community.name` claim (needing resolution)? */
     #carriesName(bundle: VotesBundle): boolean {
@@ -1300,6 +1312,11 @@ class ContestEngine {
      * gate read only (`nameSettled`).
      */
     #recordChecks(cid: CID, bundle: VotesBundle, settled: boolean, nameSettled = settled): void {
+        // Every admit path lands here — gossip, chase, own publish, snapshot restore — so this is
+        // the one place that can recognise our own bundle no matter how it arrived.
+        if (this.#ownAddress !== undefined && bundle.address.toLowerCase() === this.#ownAddress) {
+            this.#ownCids.add(cid.toString());
+        }
         this.#checks.set(
             cid.toString(),
             this.#carriesName(bundle) ? { chainVerified: settled, nameResolved: nameSettled } : { chainVerified: settled }
@@ -1613,6 +1630,11 @@ class ContestEngine {
     async join(): Promise<void> {
         if (this.#destroyed) throw new VoterDestroyedError();
         if (this.#joined) return;
+        // Before any admit path can run (the snapshot restore below is one), so a restored own
+        // bundle is recognised as ours rather than as any other wallet's.
+        if (this.#ownAddress === undefined && this.#deps.signer !== undefined) {
+            this.#ownAddress = (await this.#deps.signer.address()).toLowerCase();
+        }
         const limit = pLimit(GATE_CONCURRENCY);
         const gate = makeGossipGate({
             decodeMessage: decodeVoteMessage,
@@ -1948,13 +1970,15 @@ class ContestEngine {
     /**
      * Sign the votes into a bundle for the current bucket boundary block (the block every verifier
      * reads at), add it to the CRDT, and return the bundle plus its encoded block bytes for
-     * broadcast. Throws `ReadOnlyError` with no signer. `namesSettled` carries the
-     * {@link preflightNames} outcome (default false: name checks still owed to the background
-     * verifier); `onEvicted` is told if a deferred check later evicts THIS bundle — registered
-     * here, before the background verifier can possibly settle, so the report cannot be missed.
+     * broadcast with the wallet the caller hands it (identity is the ballot's, see
+     * {@link VoteClient.createContestVote}). `namesSettled` carries the {@link preflightNames}
+     * outcome (default false: name checks still owed to the background verifier); `onEvicted` is
+     * told if a deferred check later evicts THIS bundle — registered here, before the background
+     * verifier can possibly settle, so the report cannot be missed.
      */
     async signVote(
         votes: Vote[],
+        signer: VoteSigner,
         opts: {
             namesSettled?: boolean;
             onEvicted?: (error: VoteEvictedError) => void;
@@ -1962,9 +1986,6 @@ class ContestEngine {
             onCheckpointedByPeer?: () => void;
         } = {}
     ): Promise<{ bundle: VotesBundle; encoded: Uint8Array; cid: CID }> {
-        const signer = this.#deps.signer;
-        if (signer === undefined) throw new ReadOnlyError();
-
         const head = await this.#ruleChain.getBlockNumber();
         const bucket = this.#bucketMath.bucketForBlock(Number(head));
         this.#currentBucketCache = bucket;
@@ -2217,6 +2238,12 @@ class ContestEngine {
         const own = await this.rootRecord();
         if (own.root.equals(record.root)) {
             this.#heardMatchingRoot = true;
+            // Their checkpoint is ours byte for byte, so it demonstrably contains every bundle
+            // ours does — including our own. Nothing is chased here (there is no divergence to
+            // chase), so without this the ONE case tier-3 attribution most wants to catch — a
+            // healthy topic where we and the seeder have converged — would be the one case it
+            // never saw.
+            this.#indexRootContents(record.root, this.#ownVerifiedCids());
             return;
         }
         this.#chaser?.chase(record.root, undefined, this.#sessionProvidersFor(record.root));
@@ -2255,6 +2282,24 @@ class ContestEngine {
             const key = cid.toString();
             if (this.#ownCids.has(key)) mine.add(key);
         }
+        this.#indexRootContents(root, mine);
+    }
+
+    /**
+     * Our own bundles that are in our OWN checkpoint right now — i.e. fully verified ones. A
+     * pending bundle is deliberately excluded: the encoder does not serve it, so a peer holding
+     * our root is not thereby holding it.
+     */
+    #ownVerifiedCids(): Set<string> {
+        const mine = new Set<string>();
+        for (const key of this.#ownCids) {
+            if (this.#isFullyVerified(CID.parse(key))) mine.add(key);
+        }
+        return mine;
+    }
+
+    /** Index `mine` under `root` (bounded, LRU) and credit every peer already at that root. */
+    #indexRootContents(root: CID, mine: Set<string>): void {
         if (mine.size === 0) return; // nothing of ours in it — not worth an index entry
         const rootKey = root.toString();
         if (this.#decodedRoots.has(rootKey)) this.#decodedRoots.delete(rootKey); // refresh LRU slot
@@ -2453,6 +2498,7 @@ class ContestView implements Contest {
 class ContestVotePublication implements ContestVote {
     readonly contestId: string;
     readonly votes: readonly Vote[];
+    readonly signer: VoteSigner;
     readonly #engine: ContestEngine;
     readonly #stateCbs: Array<(state: PublishingState) => void> = [];
     readonly #errorCbs: Array<(error: unknown) => void> = [];
@@ -2481,10 +2527,11 @@ class ContestVotePublication implements ContestVote {
         this.#setState(state);
     }
 
-    constructor(engine: ContestEngine, votes: Vote[]) {
+    constructor(engine: ContestEngine, votes: Vote[], signer: VoteSigner) {
         this.#engine = engine;
         this.contestId = engine.criteria.contestId;
         this.votes = votes;
+        this.signer = signer;
     }
 
     get topic(): string {
@@ -2511,12 +2558,6 @@ class ContestVotePublication implements ContestVote {
     }
 
     async publish(): Promise<PublishOutcome> {
-        // Fail before joining a read-only voter needlessly to the topic.
-        if (this.#engine.readOnly) {
-            const error = new ReadOnlyError();
-            this.#fail(error);
-            throw error;
-        }
         try {
             // Name preflight, also before joining: a vote whose carried community name
             // definitively fails to resolve to its claimed key would be silently dropped by
@@ -2527,7 +2568,7 @@ class ContestVotePublication implements ContestVote {
             await this.#engine.join();
             this.#evicted = false;
             this.#setState("signing");
-            const { bundle, encoded, cid } = await this.#engine.signVote([...this.votes], {
+            const { bundle, encoded, cid } = await this.#engine.signVote([...this.votes], this.signer, {
                 namesSettled,
                 // The positive counterparts of `onEvicted`: our own deferred checks settling
                 // clean, then a peer serving the bundle back to us in its checkpoint. Both
@@ -2622,7 +2663,6 @@ export class PubsubVoter implements VoteClient {
             // the background verifier) merge into shared multicall3 round trips under one
             // per-client in-flight budget — see src/chain/coalescer.ts.
             chains: coalescingChainFactory(options.chains),
-            signer: options.signer,
             registry: resolveRegistry(options.rules),
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
@@ -2704,10 +2744,6 @@ export class PubsubVoter implements VoteClient {
         return [...new Set(keys)];
     };
 
-    get readOnly(): boolean {
-        return this.#deps.signer === undefined;
-    }
-
     /** Guard the create paths after {@link destroy}: a destroyed voter is terminal. */
     #assertLive(): void {
         if (this.#destroyed) throw new VoterDestroyedError();
@@ -2723,10 +2759,10 @@ export class PubsubVoter implements VoteClient {
         return view;
     }
 
-    async createContestVote(args: { criteria: Criteria; votes: Vote[] }): Promise<ContestVote> {
+    async createContestVote(args: { criteria: Criteria; votes: Vote[]; signer: VoteSigner }): Promise<ContestVote> {
         this.#assertLive();
         const engine = await this.#engineFor(this.#validateCriteria(args.criteria));
-        return new ContestVotePublication(engine, args.votes);
+        return new ContestVotePublication(engine, args.votes, args.signer);
     }
 
     /**
