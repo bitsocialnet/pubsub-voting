@@ -20,6 +20,7 @@ import {
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
+import type { VoteSigner } from "../signer/types.js";
 import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import type { Criteria } from "../schema/criteria.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
@@ -29,13 +30,12 @@ import {
     MissingChainClientError,
     MissingFetchError,
     MissingPubsubError,
-    ReadOnlyError,
     UnknownRuleError,
     VoteEvictedError,
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
-import { blockForBytes } from "../checkpoint/codec.js";
+import { blockForBytes, encodeCheckpoint } from "../checkpoint/codec.js";
 import {
     bizCriteria,
     bizGateRef,
@@ -196,12 +196,7 @@ function subscribableHelia(): {
     };
 }
 
-describe("PubsubVoter construction + read-only", () => {
-    it("is read-only without a signer", () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
-        expect(voter.readOnly).toBe(true);
-    });
-
+describe("PubsubVoter construction", () => {
     it("throws MissingPubsubError when the node's libp2p has no gossipsub service", () => {
         expect(
             () => new PubsubVoter({ dataPath: false, helia: fakeHeliaWithoutPubsub(), chains: fakeChains() })
@@ -220,13 +215,11 @@ describe("PubsubVoter construction + read-only", () => {
         ).toThrow(MissingFetchError);
     });
 
-    it("is writable with a signer", () => {
-        const voter = new PubsubVoter({ dataPath: false,
-            helia: fakeHelia(),
-            chains: fakeChains(),
-            signer: fakeSigner()
-        });
-        expect(voter.readOnly).toBe(false);
+    it("holds no identity of its own: the signer is the ballot's, and the ballot exposes it", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
+        const signer = fakeSigner();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer });
+        expect(vote.signer).toBe(signer);
     });
 });
 
@@ -292,34 +285,38 @@ describe("PubsubVoter.createContest", () => {
 
 describe("createContestVote (publish path)", () => {
     it("rejects an invalid criteria document like createContest", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
         const missingFields = { contestId: "x", name: "/x/" } as unknown as ReturnType<typeof bizCriteria>;
-        await expect(voter.createContestVote({ criteria: missingFields, votes: [] })).rejects.toThrow();
+        await expect(voter.createContestVote({ criteria: missingFields, votes: [], signer: fakeSigner() })).rejects.toThrow();
     });
 
-    it("publish() throws ReadOnlyError (and emits error + failed state) without a signer", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
-        const states: PublishingState[] = [];
-        const errors: unknown[] = [];
-        vote.on("publishingstatechange", (s) => states.push(s));
-        vote.on("error", (e) => errors.push(e));
-        await expect(vote.publish()).rejects.toBeInstanceOf(ReadOnlyError);
-        expect(vote.publishingState).toBe("failed");
-        expect(states).toEqual(["failed"]);
-        expect(errors[0]).toBeInstanceOf(ReadOnlyError);
+    it("signs each ballot with ITS OWN signer, so one voter publishes for several wallets", async () => {
+        // Identity is per-ballot, not per-voter: a host holding two keys publishes both through the
+        // one voter on its shared node, and the CRDT keys them apart by the address each recovers to.
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
+        const alice = "0x00000000000000000000000000000000000000aa";
+        const bob = "0x00000000000000000000000000000000000000bb";
+        const first = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(alice) });
+        const second = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(bob) });
+
+        expect((await first.publish()).bundle.address).toBe(alice);
+        expect((await second.publish()).bundle.address).toBe(bob);
+
+        // Two wallets, two winner-set slots: one vote each on the same community.
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        expect((await contest.getTally()).ranking[0]?.weight).toBe(2n);
     });
 
     it("walks publishingState stopped -> signing -> publishing -> succeeded and resolves the bundle", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
         const states: PublishingState[] = [];
         vote.on("publishingstatechange", (s) => states.push(s));
         expect(vote.publishingState).toBe("stopped");
 
         const { bundle, recipientCount } = await vote.publish();
-        expect(states).toEqual(["signing", "publishing", "succeeded"]);
-        expect(vote.publishingState).toBe("succeeded");
+        expect(states).toEqual(["signing", "publishing", "published"]);
+        expect(vote.publishingState).toBe("published");
         expect(vote.bundle).toBe(bundle);
         expect(recipientCount).toBe(1); // gossipsub `recipients.length`, surfaced through the facade
         expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
@@ -330,8 +327,8 @@ describe("createContestVote (publish path)", () => {
 
     it("broadcasts the bundle once over the host node's gossipsub", async () => {
         const { helia, publish } = spyableHelia();
-        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains(), signer: fakeSigner() });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
         await vote.publish();
         // Exactly one bundle-kind message (the live delta). The heartbeat only fires 10 min out.
         const bundleBroadcasts = publish.mock.calls.filter((call) => {
@@ -359,8 +356,8 @@ describe("Contest read view + tally", () => {
     });
 
     it("reflects a published vote end-to-end (publish -> shared engine CRDT -> tally)", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
 
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const tally = await contest.getTally();
@@ -371,8 +368,8 @@ describe("Contest read view + tally", () => {
 
     it("admits an own vote provisionally: chainVerified flips once the background gate read lands", async () => {
         const { chains, release } = gatedChains();
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contest = await voter.createContest({ criteria: bizCriteria() });
 
         // The vote counts immediately (render fast), but its gate read has not landed yet.
@@ -404,8 +401,8 @@ describe("Contest read view + tally", () => {
 
         // Session 1: publish, let the background gate read settle (and persist), then destroy.
         const first = countingChains();
-        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: first.chains, signer: fakeSigner() });
-        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: first.chains });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contestA = await voterA.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
         expect(first.gateReads()).toBe(2); // the gate's ERC-5192 lock probe + the wallet's balanceOf
@@ -414,8 +411,8 @@ describe("Contest read view + tally", () => {
         // Session 2 (a restart): same wallet, same bucket, same criteria — the gate score is a
         // pure function of pinned historical state, so it comes from the store, not the chain.
         const second = countingChains();
-        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: second.chains, signer: fakeSigner() });
-        await (await voterB.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: second.chains });
+        await (await voterB.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contestB = await voterB.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contestB.getTally()).ranking[0]?.chainVerified).toBe(true));
         expect(second.gateReads()).toBe(0);
@@ -435,8 +432,8 @@ describe("Contest read view + tally", () => {
         const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
 
         let block = 43200n * 40n; // divisible by the rule's 30-block epoch, so the epoch is this
-        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: advancingChains(() => block), signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: advancingChains(() => block) });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contest = await voter.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
 
@@ -446,14 +443,14 @@ describe("Contest read view + tally", () => {
 
         // The head moves past the window, and the next gate read purges what it left behind.
         block += 300n;
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(async () => expect(firstEpochKey(await reader.keys())).toBeUndefined());
         await voter.destroy();
     });
 
     it("emits an update event when a row's chainVerified flips after the background gate read lands", async () => {
         const { chains, release } = gatedChains();
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         // Record the row's flag at every update emit: the flip must arrive AS AN EVENT, not
         // only via a forced getTally().
@@ -461,7 +458,7 @@ describe("Contest read view + tally", () => {
         contest.on("update", () => flags.push(contest.tally?.ranking[0]?.chainVerified));
         await contest.update();
 
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(() => expect(flags).toContain(false)); // the provisional render emitted
 
         release(); // the gate read lands in the background
@@ -475,7 +472,6 @@ describe("Contest read view + tally", () => {
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
             chains: stubChains(), // instant gate — isolates the name check as the pending stage
-            signer: fakeSigner(),
             nameResolvers: [resolver]
         });
         const contest = await voter.createContest({ criteria: bizCriteria() });
@@ -485,7 +481,7 @@ describe("Contest read view + tally", () => {
 
         // The preflight's resolve throws (gatedResolver call 1): a registry outage never blocks
         // the publish — the name check stays deferred to the background verifier.
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(() => expect(flags).toContain(false)); // name still pending at render
 
         release(); // the resolution lands in the background
@@ -504,8 +500,8 @@ describe("Contest read view + tally", () => {
         // still converges to the network's view of an ineligible wallet.
         vi.useFakeTimers();
         try {
-            const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
-            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+            const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }) });
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
             const contest = await voter.createContest({ criteria: bizCriteria() });
             expect((await contest.getTally()).ranking).toHaveLength(1); // still pending, not evicted
             await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
@@ -520,10 +516,9 @@ describe("Contest read view + tally", () => {
         const voter = new PubsubVoter({ dataPath: false,
             helia,
             chains: stubChains(),
-            signer: fakeSigner(),
             nameResolvers: [instantResolver(OTHER_KEY)] // the registry says the name is someone else's
         });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE, signer: fakeSigner() });
         const states: PublishingState[] = [];
         const errors: unknown[] = [];
         vote.on("publishingstatechange", (s) => states.push(s));
@@ -545,17 +540,20 @@ describe("Contest read view + tally", () => {
         const noRecord = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
             chains: stubChains(),
-            signer: fakeSigner(),
             nameResolvers: [instantResolver(undefined)]
         });
-        await expect((await noRecord.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish()).rejects.toThrow(
-            /does not resolve/
-        );
+        await expect((await noRecord.createContestVote({
+            criteria: bizCriteria(),
+            votes: NAMED_VOTE,
+            signer: fakeSigner()
+        })).publish()).rejects.toThrow(/does not resolve/);
 
-        const noResolver = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
-        await expect((await noResolver.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish()).rejects.toThrow(
-            /no resolver handles/
-        );
+        const noResolver = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
+        await expect((await noResolver.createContestVote({
+            criteria: bizCriteria(),
+            votes: NAMED_VOTE,
+            signer: fakeSigner()
+        })).publish()).rejects.toThrow(/no resolver handles/);
     });
 
     it("records a preflight-resolved name as settled: no pending nameResolved flash on the own row", async () => {
@@ -563,11 +561,10 @@ describe("Contest read view + tally", () => {
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
             chains,
-            signer: fakeSigner(),
             nameResolvers: [instantResolver(VALID_KEY)]
         });
         const contest = await voter.createContest({ criteria: bizCriteria() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE, signer: fakeSigner() })).publish();
 
         // The preflight resolved the name before signing, so the very first rendered row is
         // already nameResolved — only the deferred gate read is still owed.
@@ -580,13 +577,13 @@ describe("Contest read view + tally", () => {
 
     it("surfaces VoteEvictedError on the vote AND the contest when the gate evicts an own publish", async () => {
         vi.useFakeTimers();
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }) });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const contestErrors: unknown[] = [];
         contest.on("error", (e) => contestErrors.push(e));
         await contest.update();
 
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
         const voteErrors: unknown[] = [];
         vote.on("error", (e) => voteErrors.push(e));
         await vote.publish(); // resolves on the offline checks; the gate read lands in the background
@@ -625,10 +622,9 @@ describe("Contest read view + tally", () => {
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
             chains: stubChains(),
-            signer: fakeSigner(),
             nameResolvers: [resolver]
         });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE, signer: fakeSigner() });
         const voteErrors: unknown[] = [];
         vote.on("error", (e) => voteErrors.push(e));
         await vote.publish(); // the outage fails open — publishing is never blocked on the registry
@@ -641,8 +637,8 @@ describe("Contest read view + tally", () => {
 
     it("serves only verified bundles in its checkpoint (a pending own vote is withheld)", async () => {
         const { chains, release } = gatedChains();
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contest = (await voter.createContest({ criteria: bizCriteria() })) as unknown as {
             rootRecord(): Promise<{ count: number }>;
         };
@@ -662,15 +658,14 @@ describe("Contest read view + tally", () => {
         };
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
-            chains: () => client as unknown as ChainClient,
-            signer: fakeSigner()
+            chains: () => client as unknown as ChainClient
         });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const errors: unknown[] = [];
         contest.on("error", (e) => errors.push(e));
         await contest.update();
 
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
         // Infra is nobody's verdict: not evicted, still counted, flagged unverified.
         const tally = await contest.getTally();
@@ -680,7 +675,7 @@ describe("Contest read view + tally", () => {
     });
 
     it("update() emits an initial update and a fresh tally when a later vote is published", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         let updates = 0;
         contest.on("update", () => {
@@ -690,7 +685,7 @@ describe("Contest read view + tally", () => {
         expect(updates).toBe(1); // initial update fires with the current (empty) state
         expect(contest.tally).toEqual({ contestId: "biz", ranking: [] });
 
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(() => expect(contest.tally?.ranking).toHaveLength(1));
         expect(updates).toBeGreaterThanOrEqual(2); // the publish triggered a recompute + emit
         expect(contest.tally?.ranking[0].community.publicKey).toBe(VALID_KEY);
@@ -703,10 +698,9 @@ describe("Contest read view + tally", () => {
         let block = 43200n; // bucket 1
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
-            chains: advancingChains(() => block),
-            signer: fakeSigner()
+            chains: advancingChains(() => block)
         });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contest = await voter.createContest({ criteria: bizCriteria() });
 
         // Still live at bucket 1: the vote counts.
@@ -813,8 +807,8 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         // Session 1: publish, let the background gate read settle, then destroy — the leave()
         // flush persists the snapshot (the debounced timer has not fired yet).
         const first = countingChains();
-        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: first.chains, signer });
-        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: first.chains });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: signer })).publish();
         const contestA = await voterA.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
         await voterA.destroy();
@@ -822,7 +816,7 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         // Session 2 (the incident's restart): a FRESH Helia node — empty blockstore, zero topic
         // subscribers, no providers — so only the persisted snapshot can populate the tally.
         const second = countingChains();
-        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: second.chains, signer });
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: second.chains });
         const contestB = await voterB.createContest({ criteria: bizCriteria() });
         await contestB.update();
         // The restored state is already in the initial tally (provisional, then re-verified in
@@ -856,8 +850,8 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         const dataPath = await tempDataPath();
         const topic = await topicFor(bizCriteria());
         const { chains, release } = gatedChains(); // the gate read never lands until release()
-        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains, signer: realSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: realSigner() })).publish();
 
         // Leave with the gate read still pending: the flush must SKIP — the encoder would
         // serve none of the pending bundles, persisting an empty checkpoint.
@@ -871,8 +865,8 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
     });
 
     it("runs the flush safely on the in-memory backend (`dataPath: false` — nothing to persist, nothing thrown)", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await expect(voter.stop()).resolves.toBeUndefined(); // leave() flush against the memory store
         await expect(voter.destroy()).resolves.toBeUndefined();
     });
@@ -919,22 +913,24 @@ describe("PubsubVoter lifecycle", () => {
     it("destroy() is terminal: create paths reject afterward", async () => {
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
-            chains: fakeChains(),
-            signer: fakeSigner()
+            chains: fakeChains()
         });
         await voter.destroy();
         await expect(voter.createContest({ criteria: bizCriteria() })).rejects.toThrow(VoterDestroyedError);
-        await expect(voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).rejects.toThrow(VoterDestroyedError);
+        await expect(voter.createContestVote({
+            criteria: bizCriteria(),
+            votes: VOTE,
+            signer: fakeSigner()
+        })).rejects.toThrow(VoterDestroyedError);
     });
 
     it("destroy() stops pre-existing contests and forbids re-update / re-publish", async () => {
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
-            chains: fakeChains(),
-            signer: fakeSigner()
+            chains: fakeChains()
         });
         const contest = await voter.createContest({ criteria: bizCriteria() });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
         await contest.update(); // live before teardown
         await voter.destroy();
 
@@ -968,8 +964,7 @@ describe("checkpoint root record (on-demand encode + cache)", () => {
         };
         const voter = new PubsubVoter({ dataPath: false,
             helia,
-            chains: advancingChains(() => block),
-            signer: fakeSigner()
+            chains: advancingChains(() => block)
         });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         // `rootRecord`/`latestCheckpointRoot` are internal hooks on the view (see voter.ts), not part
@@ -980,7 +975,11 @@ describe("checkpoint root record (on-demand encode + cache)", () => {
         };
         expect(ck.latestCheckpointRoot()).toBeUndefined(); // nothing encoded yet
 
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish(); // state at bucket 1
+        await (await voter.createContestVote({
+            criteria: bizCriteria(),
+            votes: VOTE,
+            signer: fakeSigner()
+        })).publish(); // state at bucket 1
         // The checkpoint serves only settled bundles; the own vote's deferred checks land in the
         // background, so wait for the settlement before asserting the encoded count.
         await vi.waitFor(async () => expect((await ck.rootRecord()).count).toBe(1));
@@ -996,7 +995,7 @@ describe("checkpoint root record (on-demand encode + cache)", () => {
         // cache. Until the new bundle's deferred checks settle, the checkpoint keeps serving the
         // superseded VERIFIED bundle (the provisional-winner fallback), so wait for settlement.
         block = bucketBlock(20);
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(async () => expect((await ck.rootRecord()).root.equals(record.root)).toBe(false));
         await voter.stop();
     });
@@ -1192,10 +1191,10 @@ describe("root-record fetch protocol", () => {
         const joined = await voter.createContest({ criteria: bizCriteria() });
         await joined.update(); // registers the responder
 
-        // A ballot for a second contest builds its engine, but publish() never runs — so this
-        // node never joins that topic and holds no view of that contest.
+        // A second contest gets its engine built, but update() never runs — so this node never
+        // joins that topic and holds no view of that contest.
         const bystander = { ...bizCriteria(), contestId: "pol" };
-        await voter.createContestVote({ criteria: bystander, votes: [] });
+        await voter.createContest({ criteria: bystander });
 
         const asKey = (s: string): Uint8Array => new TextEncoder().encode(s);
         const lookup = h.lookups.get(TOPIC_PREFIX);
@@ -1745,7 +1744,7 @@ describe("root-record fetch protocol", () => {
             );
             await Promise.all(joined.map((contest) => contest.update()));
             const bystander = { ...bizCriteria(), contestId: "pol" };
-            await voter.createContestVote({ criteria: bystander, votes: [] }); // builds an engine, never joins
+            await voter.createContest({ criteria: bystander }); // builds an engine, never joins
 
             const lookup = h.lookups.get(TOPIC_PREFIX);
             const answer = await lookup!(new TextEncoder().encode(BULK_ROOTS_FETCH_KEY));
@@ -1795,9 +1794,9 @@ describe("root-record fetch protocol", () => {
 
         it("publishing a ballot also joins, so a write-only client serves root records too", async () => {
             const h = fetchSpyHelia(new Map());
-            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: stubChains(), signer: fakeSigner() });
+            const voter = new PubsubVoter({ dataPath: false, helia: h.helia, chains: stubChains() });
             expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
-            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
             expect(h.lookups.has(TOPIC_PREFIX)).toBe(true);
             await voter.stop();
             expect(h.lookups.has(TOPIC_PREFIX)).toBe(false);
@@ -1890,7 +1889,6 @@ describe("provider-record announcer (httpRouterUrls)", () => {
             dataPath: false,
             helia: h.helia,
             chains: stubChains(),
-            signer: fakeSigner(),
             httpRouterUrls: ["http://router.example"]
         });
         const contest = await voter.createContest({ criteria: bizCriteria() });
@@ -1898,7 +1896,7 @@ describe("provider-record announcer (httpRouterUrls)", () => {
         await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
         expect(h.fetchSpy).toHaveBeenCalledTimes(1);
 
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
         // The publish (and its background settlement) re-announced at least once more.
         expect(h.fetchSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -2200,10 +2198,9 @@ describe("tally tie-break through the engine (bucket-boundary block hash seed)",
         };
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
-            chains: () => client as unknown as ChainClient,
-            signer: fakeSigner()
+            chains: () => client as unknown as ChainClient
         });
-        await (await voter.createContestVote({ criteria: tieCriteria(), votes: TWO_VOTES })).publish();
+        await (await voter.createContestVote({ criteria: tieCriteria(), votes: TWO_VOTES, signer: fakeSigner() })).publish();
         const contest = await voter.createContest({ criteria: tieCriteria() });
         const tally = await contest.getTally();
         expect(tally.ranking.map((r) => r.weight)).toEqual([1n, 1n]); // a genuine tie
@@ -2238,14 +2235,13 @@ describe("tally tie-break through the engine (bucket-boundary block hash seed)",
         };
         const voter = new PubsubVoter({ dataPath: false,
             helia: fakeHelia(),
-            chains: () => client as unknown as ChainClient,
-            signer: fakeSigner()
+            chains: () => client as unknown as ChainClient
         });
         const contest = await voter.createContest({ criteria: tieCriteria() });
         const errors: unknown[] = [];
         contest.on("error", (e) => errors.push(e));
         await contest.update();
-        await (await voter.createContestVote({ criteria: tieCriteria(), votes: TWO_VOTES })).publish();
+        await (await voter.createContestVote({ criteria: tieCriteria(), votes: TWO_VOTES, signer: fakeSigner() })).publish();
         await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
         expect(String(errors[0])).toContain("has no hash");
         await voter.stop();
@@ -2361,8 +2357,8 @@ describe("facade odds and ends", () => {
     });
 
     it("a ContestVote exposes its contest's topic", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains(), signer: fakeSigner() });
-        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: fakeChains() });
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
         expect(vote.topic).toBe(await topicFor(bizCriteria()));
         await voter.destroy();
     });
@@ -2372,7 +2368,7 @@ describe("Contest.checkEligibility", () => {
     const WALLET = "0x000000000000000000000000000000000000aaaa";
 
     it("reports the gate score for a wallet the REAL rule admits", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 3n }), signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 3n }) });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const result = await contest.checkEligibility({ address: WALLET });
         expect(result).toMatchObject({ eligible: true, score: 3n });
@@ -2384,7 +2380,7 @@ describe("Contest.checkEligibility", () => {
     });
 
     it("returns the RULE's own reason when it refuses — no block or bucket wording", async () => {
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }) });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const result = await contest.checkEligibility({ address: WALLET });
 
@@ -2413,7 +2409,7 @@ describe("Contest.checkEligibility", () => {
                 }
             }) as unknown as ChainClient;
 
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         expect(await contest.checkEligibility({ address: WALLET })).toMatchObject({ eligible: true });
         expect(balanceReads).toBe(1);
@@ -2672,7 +2668,7 @@ describe("Contest.checkEligibility", () => {
                 }
             }) as unknown as ChainClient;
 
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         expect(await contest.checkEligibility({ address: WALLET })).toMatchObject({ eligible: true, score: 1n });
         await voter.destroy();
@@ -2729,14 +2725,13 @@ describe("weight-rule cache namespacing", () => {
             dataPath: false,
             helia: fakeHelia(),
             chains: chainsByWeight({ 1: 5n, 137: 9n }),
-            signer: fakeSigner(),
             rules: { "chain-weight": chainWeight }
         });
 
         const onEth = criteriaWeighedOn(1);
         const onPolygon = criteriaWeighedOn(137);
-        await (await voter.createContestVote({ criteria: onEth, votes: VOTE })).publish();
-        await (await voter.createContestVote({ criteria: onPolygon, votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: onEth, votes: VOTE, signer: fakeSigner() })).publish();
+        await (await voter.createContestVote({ criteria: onPolygon, votes: VOTE, signer: fakeSigner() })).publish();
 
         // Same wallet, same weight ref, one shared gateStore — and still each contest's own chain.
         // (The gate reads `readContract`, which every stub answers `1n`; only the weight differs.)
@@ -2767,8 +2762,8 @@ describe("checkpoint snapshot restore admissibility", () => {
         const signer = realSigner();
 
         // Session 1 persists a vote sampled at bucket 40.
-        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: chainsAt(40n * 43200n), signer });
-        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: chainsAt(40n * 43200n) });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: signer })).publish();
         const contestA = await voterA.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
         await voterA.destroy();
@@ -2776,7 +2771,7 @@ describe("checkpoint snapshot restore admissibility", () => {
         // Session 2's chain head is far BEHIND the snapshot (a lagging or wrong RPC): the bundle's
         // sample bucket is not yet reachable, so the restore must skip it rather than admit a
         // bundle no verifier could evaluate.
-        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: chainsAt(43200n), signer });
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: chainsAt(43200n) });
         const contestB = await voterB.createContest({ criteria: bizCriteria() });
         await contestB.update();
         expect(contestB.tally?.ranking).toEqual([]);
@@ -2788,13 +2783,13 @@ describe("checkpoint snapshot restore admissibility", () => {
         const signer = realSigner();
         const chains = chainsAt(40n * 43200n);
 
-        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains, signer });
-        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains });
+        await (await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: signer })).publish();
         const contestA = await voterA.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
         await voterA.destroy();
 
-        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains, signer });
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains });
         const contestB = await voterB.createContest({ criteria: bizCriteria() });
         await contestB.update();
         expect(contestB.tally?.ranking).toHaveLength(1);
@@ -2920,8 +2915,8 @@ describe("makeHeadReader (voter-wide gating-chain head coalescer)", () => {
             getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
             readContract: async () => 1n
         };
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient, signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contest = await voter.createContest({ criteria: bizCriteria() });
         // Let the background gate read settle first, so no in-flight settlement recompute races the
         // measurement below.
@@ -2950,9 +2945,9 @@ describe("makeHeadReader (voter-wide gating-chain head coalescer)", () => {
         // shared head read, not one per contest.
         const criteriaA = bizCriteria();
         const criteriaB = { ...bizCriteria(), contestId: "biz2", name: "/biz2/" };
-        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient, signer: fakeSigner() });
-        await (await voter.createContestVote({ criteria: criteriaA, votes: VOTE })).publish();
-        await (await voter.createContestVote({ criteria: criteriaB, votes: VOTE })).publish();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient });
+        await (await voter.createContestVote({ criteria: criteriaA, votes: VOTE, signer: fakeSigner() })).publish();
+        await (await voter.createContestVote({ criteria: criteriaB, votes: VOTE, signer: fakeSigner() })).publish();
         const contestA = await voter.createContest({ criteria: criteriaA });
         const contestB = await voter.createContest({ criteria: criteriaB });
         await vi.waitFor(async () => {
@@ -2966,5 +2961,304 @@ describe("makeHeadReader (voter-wide gating-chain head coalescer)", () => {
         await Promise.all([contestA.getTally(), contestB.getTally()]);
         expect(heads - before).toBe(1);
         await voter.destroy();
+    });
+});
+
+
+/** The gossip forward-gate the pubsub service registers per topic (a test drives it directly). */
+type TopicValidator = (peer: PeerId, message: { topic: string; data: Uint8Array }) => Promise<unknown>;
+
+describe("publisher verification states", () => {
+    /** A Helia whose blockstore is a real map, so a peer's checkpoint blocks can be made readable. */
+    function checkpointHelia(): { helia: HeliaInstance; blocks: Map<string, Uint8Array>; validators: Map<string, TopicValidator> } {
+        const blocks = new Map<string, Uint8Array>();
+        const topicValidators = new Map<string, TopicValidator>();
+        const pubsub = {
+            publish: async () => ({ recipients: [] as PeerId[] }),
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [],
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators
+        } as unknown as PubsubService;
+        const blockstore = {
+            get: async (cid: CID) => {
+                const bytes = blocks.get(cid.toString());
+                if (bytes === undefined) throw new Error(`no block ${cid.toString()}`);
+                return bytes;
+            },
+            put: async (cid: CID, bytes: Uint8Array) => {
+                blocks.set(cid.toString(), bytes);
+                return cid;
+            },
+            has: async (cid: CID) => blocks.has(cid.toString())
+        };
+        const helia = { libp2p: { services: { pubsub, fetch: fakeFetchService() } }, blockstore } as unknown as HeliaInstance;
+        return { helia, blocks, validators: topicValidators };
+    }
+
+    /**
+     * A chain with a caller-moved head (so two attempts on one ballot land in different buckets
+     * and sign different bytes) whose `balanceOf` answer is looked up per block — an empty map
+     * means ineligible everywhere. `supportsInterface` always declares.
+     */
+    function blockKeyedChains(head: () => bigint, balances: Map<bigint, bigint>): ChainClientFactory {
+        const client = {
+            getBlockNumber: async () => head(),
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async ({ functionName, blockNumber }: { functionName?: string; blockNumber?: bigint } = {}) =>
+                functionName === "supportsInterface" ? true : (balances.get(blockNumber ?? 0n) ?? 0n)
+        };
+        return () => client as unknown as ChainClient;
+    }
+
+    /** Like {@link gatedChains}, but with a caller-moved head so two attempts can sign different bytes. */
+    function gatedChainsAt(head: () => bigint): { chains: ChainClientFactory; release: () => void } {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const client = {
+            getBlockNumber: async () => head(),
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async ({ functionName }: { functionName?: string } = {}) => {
+                if (functionName === "supportsInterface") return true;
+                await gate;
+                return 1n;
+            }
+        };
+        return { chains: () => client as unknown as ChainClient, release };
+    }
+
+    /** A signer that holds its SECOND `signBallot` open, parking a re-publish inside `signVote`. */
+    function signerHeldOnSecondBallot(): { signer: VoteSigner; releaseSign: () => void } {
+        const inner = fakeSigner();
+        let releaseSign!: () => void;
+        const gate = new Promise<void>((resolve) => (releaseSign = resolve));
+        let calls = 0;
+        return {
+            signer: {
+                address: () => inner.address(),
+                signBallot: async (typedData) => {
+                    calls += 1;
+                    if (calls === 2) await gate;
+                    return inner.signBallot(typedData);
+                }
+            },
+            releaseSign
+        };
+    }
+
+    /** A second, foreign bundle — only there to make a peer's checkpoint differ from our own. */
+    function foreignBundle() {
+        return {
+            address: `0x${"ab".repeat(20)}`,
+            votes: [{ community: { publicKey: OTHER_KEY }, vote: 1 }],
+            blockNumber: 43200,
+            signature: { signature: `0x${"11".repeat(65)}`, type: "eip712" as const }
+        };
+    }
+
+    it("walks published → verified-locally once the deferred gate read settles clean", async () => {
+        const { chains, release } = gatedChains();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const states: PublishingState[] = [];
+        vote.on("publishingstatechange", (state) => states.push(state));
+
+        const { cid } = await vote.publish();
+        // publish() resolves on the OFFLINE checks — the gate read is still held open here, and
+        // "published" says exactly that much: broadcast, nothing more.
+        expect(vote.publishingState).toBe("published");
+        expect(contest.checksFor(cid)).toEqual({ chainVerified: false });
+
+        release();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        expect(states).toEqual(["signing", "publishing", "published", "verified-locally"]);
+        expect(contest.checksFor(cid)).toEqual({ chainVerified: true });
+        expect(vote.checks).toEqual({ chainVerified: true });
+        // Nobody else has served it back to us, so tier 3 stays empty.
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+        await contest.stop();
+    });
+
+    it("reports no checks at all for an evicted bundle (never a pending-looking `false`)", async () => {
+        vi.useFakeTimers();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const { cid } = await vote.publish();
+        expect(contest.checksFor(cid)).toEqual({ chainVerified: false });
+
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
+        await vi.waitFor(() => expect(vote.publishingState).toBe("failed"));
+        // Gone from the working set: `undefined` means "not held", which a caller must not
+        // confuse with `{ chainVerified: false }` — that one means "not read YET".
+        expect(contest.checksFor(cid)).toBeUndefined();
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("reaches verified-by-peer, naming the peer whose checkpoint carried our own vote", async () => {
+        vi.useFakeTimers();
+        const { helia, blocks, validators } = checkpointHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains({ balance: 1n }) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const { bundle, cid } = await vote.publish();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+
+        // A peer advertises a checkpoint holding OUR bundle (plus a foreign one, so its root
+        // differs from ours and the hint is actually chased rather than suppressed as a match).
+        const { root, blocks: cpBlocks } = await encodeCheckpoint([bundle, foreignBundle()]);
+        for (const block of cpBlocks) blocks.set(block.cid.toString(), block.bytes);
+        const record: RootRecord = { version: ROOT_RECORD_VERSION, root, count: 2, sizeBytes: 0 };
+        const validator = validators.get(contest.topic)!;
+        await validator({ toString: () => "peerA" } as unknown as PeerId, {
+            topic: contest.topic,
+            data: encodeRootMessage(record)
+        } as never);
+        await vi.advanceTimersByTimeAsync(1);
+
+        // Our own bundle is already held, so the chase never ADMITS it — attribution can only
+        // come from what the checkpoint contained.
+        await vi.waitFor(() => expect(contest.checkpointPeersFor(cid)).toEqual(["peerA"]));
+        expect(vote.publishingState).toBe("verified-by-peer");
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("attributes a peer whose advertised root IS ours — the converged case, which is never chased", async () => {
+        vi.useFakeTimers();
+        const { helia, validators } = checkpointHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains({ balance: 1n }) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const { cid } = await vote.publish();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+
+        // A peer advertises OUR OWN root back at us — the steady state once a topic has
+        // converged. `#handleRootRecord` suppresses the heartbeat and chases nothing, so if
+        // attribution only rode the chase path this case would never be credited at all.
+        const ownRecord = await (contest as unknown as { rootRecord(): Promise<RootRecord> }).rootRecord();
+        const validator = validators.get(contest.topic)!;
+        await validator({ toString: () => "peerB" } as unknown as PeerId, {
+            topic: contest.topic,
+            data: encodeRootMessage(ownRecord)
+        } as never);
+        await vi.advanceTimersByTimeAsync(1);
+
+        await vi.waitFor(() => expect(contest.checkpointPeersFor(cid)).toEqual(["peerB"]));
+        expect(vote.publishingState).toBe("verified-by-peer");
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("does not fail a re-publish when the attempt it superseded is evicted", async () => {
+        vi.useFakeTimers();
+        let head = 43200n;
+        // Ineligible at every block, so BOTH attempts walk the grace window — but they enter it
+        // 90 s apart, which is the whole point: the first is evicted while the second is still
+        // provisional, so the CRDT is still holding the first as its fallback winner and the
+        // background verifier still owns its eviction callback.
+        const chains = blockKeyedChains(() => head, new Map());
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const errors: unknown[] = [];
+        vote.on("error", (error) => errors.push(error));
+
+        const first = await vote.publish();
+        expect(vote.publishingState).toBe("published");
+
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS * 0.75); // still inside the first's grace
+        head = 86401n; // the next bucket, a block past its boundary
+        const second = await vote.publish();
+        expect(second.cid.equals(first.cid)).toBe(false);
+        expect(vote.publishingState).toBe("published");
+
+        // The first attempt's grace window closes; the second's has 90 s left to run.
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS * 0.25 + GATE_RETRY_MS * 2);
+        await vi.waitFor(() => expect(contest.checksFor(first.cid)).toBeUndefined());
+        expect(contest.checksFor(second.cid)).toEqual({ chainVerified: false });
+
+        // That eviction belongs to an attempt this object no longer owns. Reporting it would tell
+        // the publisher that its LIVE vote was rejected, which is the opposite of what happened.
+        expect(vote.publishingState).toBe("published");
+        expect(errors).toEqual([]);
+
+        // The attempt that DOES own the object is still evictable on its own schedule — scoping
+        // the callback must not swallow the report the publisher is actually owed.
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
+        await vi.waitFor(() => expect(vote.publishingState).toBe("failed"));
+        expect(errors).toHaveLength(1);
+        expect((errors[0] as VoteEvictedError).bundle.blockNumber).toBe(86400);
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("ignores the superseded attempt's clean verdict landing while the next attempt is still signing", async () => {
+        let head = 43200n;
+        const { chains, release } = gatedChainsAt(() => head);
+        const { signer, releaseSign } = signerHeldOnSecondBallot();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer });
+        const states: PublishingState[] = [];
+        vote.on("publishingstatechange", (state) => states.push(state));
+
+        const first = await vote.publish(); // gate read still held open: "published", nothing more
+
+        head = 86401n;
+        const republish = vote.publish();
+        // Parked inside `signVote`: the attempt has advanced, but `#cid` still holds the PREVIOUS
+        // attempt's value — the window where a CID check cannot tell the two attempts apart.
+        await vi.waitFor(() => expect(vote.publishingState).toBe("signing"));
+
+        release(); // the FIRST attempt's deferred checks come back clean
+        await vi.waitFor(() => expect(contest.checksFor(first.cid)).toEqual({ chainVerified: true }));
+        expect(vote.publishingState).toBe("signing");
+
+        releaseSign();
+        const second = await republish;
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        expect(contest.checksFor(second.cid)).toEqual({ chainVerified: true });
+        // No stray "verified-locally" between the second attempt's "signing" and "publishing":
+        // the old bundle's verdict is the old attempt's, and it says nothing about these bytes.
+        expect(states).toEqual(["signing", "publishing", "published", "signing", "publishing", "published", "verified-locally"]);
+        await contest.stop();
+    });
+
+    it("trackOwnBundle is idempotent and attributes nothing for a bundle this contest does not hold", async () => {
+        vi.useFakeTimers();
+        const { helia } = checkpointHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains({ balance: 1n }) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const { cid } = await vote.publish();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+
+        // Registering our own publish again changes nothing (a restored client cannot know
+        // whether this session already signed the bundle, so calling is always safe).
+        contest.trackOwnBundle(cid);
+        contest.trackOwnBundle(cid);
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+
+        // A CID this contest never admitted is registrable but attributes nothing — attribution
+        // is driven by what a decoded checkpoint actually contained, not by the claim.
+        const stranger = (await blockForBytes(new TextEncoder().encode("not a bundle we hold"))).cid;
+        contest.trackOwnBundle(stranger);
+        expect(contest.checkpointPeersFor(stranger)).toEqual([]);
+        await contest.stop();
+        vi.useRealTimers();
     });
 });

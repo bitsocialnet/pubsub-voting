@@ -58,7 +58,7 @@ async function pkcHostedVoter(key: string, options: { signed?: boolean } = {}) {
         dataPath: false,
         helia,
         chains: stubChains(),
-        ...(options.signed ? { signer: realSigner() } : {})
+        ...(options.signed ? { } : {})
     });
     cleanups.push(() => voter.destroy());
     const contest: Contest = await voter.createContest({ criteria: bizCriteria() });
@@ -94,7 +94,8 @@ describe("pkc-js-hosted voters (real PKC shared nodes)", () => {
             // the stub chain) before admitting, so B's row lands already chain-verified.
             const vote = await a.voter.createContestVote({
                 criteria: bizCriteria(),
-                votes: [{ community: { publicKey: KEY_A }, vote: 1 }]
+                votes: [{ community: { publicKey: KEY_A }, vote: 1 }],
+                signer: realSigner()
             });
             const { recipientCount } = await vote.publish();
             expect(recipientCount).toBeGreaterThanOrEqual(1); // gossipsub reached B directly

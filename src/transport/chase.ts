@@ -123,6 +123,14 @@ export interface RootChaserDeps {
     deferVerify: (entries: PendingBundle[]) => void;
     /** Called once per chase that admitted at least one bundle (drives tally updates). */
     onMerged?: () => void;
+    /**
+     * Called once per successfully decoded checkpoint with EVERY bundle CID it referenced —
+     * including the ones this chase skipped because we already hold them. That inclusion is the
+     * point: a publisher's own bundle is by definition already held, so it never reaches
+     * {@link admit}, and "which peers are serving my vote back to me" would be unanswerable from
+     * the admit path alone. Reports what the checkpoint CONTAINED, not what was new.
+     */
+    onCheckpointContents?: (root: CID, cids: CID[]) => void;
     /** Concurrency limiter shared across chases (a root spray queues, never floods). */
     limit: <T>(fn: () => Promise<T>) => Promise<T>;
     /** Per-root deadline (ms); on expiry the abort signal fires and the chase yields nothing. */
@@ -164,7 +172,20 @@ interface Flight {
 }
 
 export function makeRootChaser(deps: RootChaserDeps): RootChaser {
-    const { getBlock, openSession, verifyOffline, cache, isEvaluableNow, hasBundle, admit, deferVerify, onMerged, limit, timeoutMs } = deps;
+    const {
+        getBlock,
+        openSession,
+        verifyOffline,
+        cache,
+        isEvaluableNow,
+        hasBundle,
+        admit,
+        deferVerify,
+        onMerged,
+        onCheckpointContents,
+        limit,
+        timeoutMs
+    } = deps;
     const inFlight = new Map<string, Flight>();
 
     function addProviders(flight: Flight, providers: readonly PeerId[]): void {
@@ -228,12 +249,14 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
 
             let merged = false;
             const pending: PendingBundle[] = [];
+            const contained: CID[] = [];
             for (const bundle of winners) {
                 if (controller.signal.aborted) break;
                 // Re-encoding the decoded bundle reproduces the exact block bytes (the codec is
                 // canonical), so the CID matches the advertiser's block and dedups everywhere.
                 const bytes = encodeBundle(bundle);
                 const cid = await bundleCidForBytes(bytes);
+                contained.push(cid); // recorded BEFORE the skip below — see onCheckpointContents
                 if (await hasBundle(cid)) continue; // already held — nothing to verify
                 const cached = cache.get(cid);
                 if (cached) {
@@ -258,6 +281,7 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
             // One batch per chased root: the background verifier groups these by sample block
             // and batches the gate reads (see verify/background.ts).
             if (pending.length > 0) deferVerify(pending);
+            if (contained.length > 0) onCheckpointContents?.(root, contained);
             if (merged) onMerged?.();
         } finally {
             clearTimeout(timer);

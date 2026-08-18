@@ -52,7 +52,7 @@ describe("pkc-js host contract (offline)", () => {
     it("the shared Helia node passes PubsubVoter's construction guards and drives the facade", async () => {
         // Would throw MissingPubsubError / MissingBlockstoreError / MissingFetchError on a node
         // missing any of the three surfaces the transport drives.
-        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains(), signer: realSigner() });
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains() });
         voters.push(voter);
 
         const contest = await voter.createContest({ criteria: bizCriteria() });

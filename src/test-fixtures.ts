@@ -189,10 +189,14 @@ export function fakeChains(): ChainClientFactory {
     return () => client;
 }
 
-/** A minimal signer for write-path tests (65-byte placeholder — the binary codec checks size). */
-export function fakeSigner(): VoteSigner {
+/**
+ * A minimal signer for write-path tests (65-byte placeholder — the binary codec checks size).
+ * The address is a parameter because identity is per-ballot: a test that publishes for two
+ * wallets through one voter needs two of these, and the CRDT keys by address.
+ */
+export function fakeSigner(address = "0x0000000000000000000000000000000000000001"): VoteSigner {
     return {
-        address: () => "0x0000000000000000000000000000000000000001",
+        address: () => address,
         signBallot: () => ({ signature: `0x${"de".repeat(65)}`, type: EIP712_SIGNATURE_TYPE })
     };
 }

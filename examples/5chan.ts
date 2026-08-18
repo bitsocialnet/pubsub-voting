@@ -60,16 +60,15 @@ const allCriteria: Criteria[] = deriveDirectoryCriteria(manifest);
 // whose name→publicKey claim the tally verifies before counting.
 declare function pkcHelia(): HeliaInstance; // pkc.clients.libp2pJsClients[key].heliaNode
 declare function viemChains(): ChainClientFactory;
-declare const signer: VoteSigner;
+declare const signer: VoteSigner | undefined; // undefined until the user connects a wallet
 declare const bsoResolver: NameResolver; // e.g. new BsoResolver({ key: "bso-viem", provider: "viem" })
 
 // One voter for the whole app: the seams are injected once, and every contest shares them.
-// There is no library-side persistence: 5chan keeps track of its own votes and republishes
-// them itself.
+// Identity is NOT one of them — a signer belongs to each ballot below. There is no
+// library-side persistence either: 5chan keeps track of its own votes and republishes them.
 const voter = new PubsubVoter({
     helia: pkcHelia(),
     chains: viemChains(),
-    signer,
     nameResolvers: [bsoResolver]
 });
 
@@ -90,14 +89,16 @@ for (const contest of contests) {
     await contest.update(); // start syncing + fire the initial update
 }
 
-// Publish a vote in one slot. With a signer this is a write; v1 is one upvote per topic.
+// Publish a vote in one slot; v1 is one upvote per topic. The ballot carries the wallet that
+// signs it, so a 5chan user who has connected no wallet simply never reaches this branch.
 const biz = allCriteria.find((criteria) => criteria.contestId === "biz")!;
-if (!voter.readOnly) {
+if (signer !== undefined) {
     // `name` must be the community's resolvable domain (unique per community); the tally
     // drops any vote whose name does not resolve to the claimed publicKey.
     const vote = await voter.createContestVote({
         criteria: biz,
-        votes: [{ community: { name: "bizfinance.bso", publicKey: "12D3KooW...someCommunityKey" }, vote: 1 }]
+        votes: [{ community: { name: "bizfinance.bso", publicKey: "12D3KooW...someCommunityKey" }, vote: 1 }],
+        signer
     });
     vote.on("publishingstatechange", (state) => console.log(`biz vote: ${state}`));
     const { bundle, recipientCount } = await vote.publish();
@@ -109,7 +110,7 @@ if (!voter.readOnly) {
     console.log(`refresh /biz/ every ~${republishIntervalBuckets(biz)} buckets; last vote at block ${bundle.blockNumber}`);
 
     // Withdraw (active): publish an empty ballot that supersedes the prior vote under LWW.
-    await (await voter.createContestVote({ criteria: biz, votes: [] })).publish();
+    await (await voter.createContestVote({ criteria: biz, votes: [], signer })).publish();
 }
 
 // On shutdown: terminal teardown — leave all topics, unregister the fetch responder, and forbid

@@ -68,7 +68,6 @@ import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import {
     InvalidCommunityNameError,
     MissingChainClientError,
-    ReadOnlyError,
     UnknownRuleError,
     VoteEvictedError,
     VoterDestroyedError
@@ -86,7 +85,7 @@ import {
  * `blockNumber` on a published `VotesBundle`, and `criteria.voteExpiryBuckets` /
  * `criteria.blocksPerBucket` are what a client uses to schedule its own refreshes: a vote sampled
  * at bucket `b` expires once the current bucket exceeds `b + voteExpiryBuckets`; refresh by
- * calling `createContestVote({ criteria, votes }).publish()` again before then.
+ * calling `createContestVote({ criteria, votes, signer }).publish()` again before then.
  */
 export function republishIntervalBuckets(criteria: Criteria): number {
     return Math.ceil(criteria.voteExpiryBuckets / 2);
@@ -115,19 +114,49 @@ export function republishIntervalBuckets(criteria: Criteria): number {
  */
 
 /**
- * A vote publication's lifecycle, walked by {@link ContestVote.publish}. `"succeeded"` means
- * signed, admitted locally, and broadcast — NOT accepted by the network (gossipsub gives a
- * publisher no acceptance/rejection feedback). It can therefore still flip to `"failed"`
- * afterwards: if this node's own deferred checks — the same checks every peer runs — evict the
- * bundle, the vote emits a `VoteEvictedError` and fails post hoc (see DESIGN.md "Background
- * chain verification", publisher feedback).
+ * A vote publication's lifecycle, walked by {@link ContestVote.publish}, then continued by the
+ * deferred checks that settle after it resolves. Three states describe a bundle that is on the
+ * wire, and they are deliberately not synonyms:
+ *
+ *   - `"published"` — signed, admitted to our OWN local set, and broadcast. It says what we did,
+ *     and nothing about anyone else: gossipsub gives a publisher no acceptance feedback, so an
+ *     ineligible wallet reaches this state exactly like an eligible one. (This state was called
+ *     `"succeeded"` before 0.6.0, a name borrowed from pkc-js — where a publish really is
+ *     acknowledged, by the challenge exchange. Nothing acknowledges a vote here.)
+ *   - `"verified-locally"` — OUR deferred checks came back clean for this bundle: the gate rule
+ *     scored the wallet `> 0n` at its bucket block, and every carried `community.name` resolved
+ *     to the key it claimed. Still our own verdict — but every honest peer runs byte-identical
+ *     checks, so it is the strongest inference a publisher can draw without hearing from anyone.
+ *   - `"verified-by-peer"` — a peer advertised a checkpoint that contained this bundle. Since a
+ *     node serves only fully verified bundles in its own checkpoint, an honest peer including it
+ *     implies that peer verified it too; what we OBSERVE is that somebody other than us kept the
+ *     vote. See {@link Contest.checkpointPeersFor} for who, and its caveats.
+ *
+ * `"failed"` is the counterpart of `"verified-locally"`: if the deferred checks EVICT the bundle
+ * the vote emits a `VoteEvictedError` and fails post hoc (see DESIGN.md "Background chain
+ * verification", publisher feedback). The two verified states are reached in order and neither is
+ * reached after `"failed"` — an evicted bundle is gone from the set that checkpoints are cut from.
  */
-export type PublishingState = "stopped" | "signing" | "publishing" | "succeeded" | "failed";
+export type PublishingState =
+    | "stopped"
+    | "signing"
+    | "publishing"
+    | "published"
+    | "verified-locally"
+    | "verified-by-peer"
+    | "failed";
 
 /** What {@link ContestVote.publish} resolves: the signed bundle plus a peer-reach hint. */
 export interface PublishOutcome {
     /** The signed bundle; its `blockNumber` drives the client's own refresh schedule. */
     readonly bundle: VotesBundle;
+    /**
+     * The bundle's CID — the key its deferred-check state and peer attribution are tracked
+     * under. Worth persisting alongside a stored vote: after a reload the `ContestVote` that
+     * published it is gone, and this is what {@link Contest.checksFor} /
+     * {@link Contest.checkpointPeersFor} are asked with.
+     */
+    readonly cid: CID;
     /**
      * How many peers gossipsub sent this vote *directly* to — first-hop fan-out, not total network
      * reach and not an acceptance confirmation (each recipient still runs the forward-gate before
@@ -261,6 +290,50 @@ export interface Contest {
     checkEligibility(args: { address: string }): Promise<EligibilityResult>;
 
     /**
+     * The deferred-check state of one bundle by CID, or `undefined` if this contest is not
+     * holding that bundle (never admitted, evicted, or expired — the three are not
+     * distinguishable here, and none of them means "counted").
+     *
+     * The publisher's question after a reload. A `ContestVote` reports its own bundle's progress
+     * through `publishingstatechange`, but that object dies with the page, while a vote lives for
+     * `voteExpiryBuckets` — so a tab that restored a vote from its own storage asks here instead,
+     * with the CID from {@link PublishOutcome.cid}.
+     *
+     * `{ chainVerified: true, nameResolved: true | undefined }` is the fully settled state (the
+     * same condition that drives `"verified-locally"`). `chainVerified: false` means NOT YET
+     * READ, never "failed" — a failed gate evicts the bundle, and this returns `undefined`.
+     */
+    checksFor(cid: CID): BundleChecks | undefined;
+
+    /**
+     * The peers seen advertising a checkpoint that contained `cid` — for THIS wallet's own
+     * published bundles only (see DESIGN.md "Checkpoints"). Empty for anything else, including
+     * other wallets' bundles, which this node deliberately does not index.
+     *
+     * What it proves, exactly: a node serves only fully verified bundles in its own checkpoint,
+     * so an honest peer including ours implies that peer verified it too — but honesty is not
+     * provable, and a peer may serve whatever it likes. So read this as evidence of RETENTION
+     * and propagation ("somebody other than us is keeping this vote"), and only inferentially of
+     * verification. It is also a lower bound in a second way: it counts peers whose checkpoints
+     * we happened to chase, not every peer holding the vote.
+     */
+    checkpointPeersFor(cid: CID): string[];
+
+    /**
+     * Declare that `cid` is one of THIS client's own published bundles, so peer-checkpoint
+     * attribution starts tracking it. Only needed after a restart: within one session
+     * `publish()` registers its own bundle, but the engine cannot recognise a bundle it did not
+     * sign — the signer belongs to the publication, not to the contest, and a restored bundle
+     * arrives through the snapshot like any other wallet's.
+     *
+     * So a client that persisted {@link PublishOutcome.cid} calls this after `update()` to
+     * re-arm {@link checkpointPeersFor}. Attribution runs from the call forward, not backwards:
+     * the first peer credited is the next one seen advertising a checkpoint that holds the
+     * bundle — at most one heartbeat interval away on a live topic. Idempotent.
+     */
+    trackOwnBundle(cid: CID): void;
+
+    /**
      * Fired when incoming votes change the state; `tally` carries the freshly recomputed
      * ranking. Background check settlements fire it too: a cold join emits a first tally with
      * `chainVerified: false` rows immediately, then re-emits as the batched gate reads and name
@@ -285,10 +358,24 @@ export interface ContestVote {
     readonly topic: string;
     /** The votes this ballot will sign and broadcast (empty array = a withdrawal). */
     readonly votes: readonly Vote[];
+    /**
+     * The wallet that signs this ballot. Identity is per-ballot, not per-voter: one
+     * `PubsubVoter` on the host's shared node publishes for as many wallets as the host holds
+     * keys for, and the address recovered from the signature is the only voter identity there
+     * is (see DESIGN.md "Identity: the voting wallet, nothing else").
+     */
+    readonly signer: VoteSigner;
     /** Where in the publish lifecycle this ballot is. */
     readonly publishingState: PublishingState;
     /** The signed bundle, once `publish()` has produced it (`undefined` before then). */
     readonly bundle: VotesBundle | undefined;
+    /**
+     * This ballot's deferred-check state — which of the two network checks have settled — or
+     * `undefined` before it is signed, and once the bundle has left the working set (evicted or
+     * expired). The detail behind `"verified-locally"`, for a UI that wants to say WHICH check is
+     * still outstanding rather than just "pending".
+     */
+    readonly checks: BundleChecks | undefined;
 
     /**
      * Sign the votes into a bundle for the current bucket, add it to the local CRDT, and broadcast
@@ -296,11 +383,10 @@ export interface ContestVote {
      * the `VotesBundle` (whose `blockNumber` the client uses to schedule its own refresh — see
      * {@link republishIntervalBuckets}) plus `recipientCount`, the number of peers gossipsub sent
      * the vote directly to. Emits `publishingstatechange` as it goes; throws (and emits `error`) on
-     * failure: `ReadOnlyError` with no signer, and `InvalidCommunityNameError` when a vote's
-     * carried `community.name` definitively does not resolve to its claimed `publicKey` (checked
-     * BEFORE signing or joining — every verifier drops such a bundle silently, so it is refused
-     * here instead of published into a network-wide silent drop; a resolver outage does not block
-     * the publish). This library does not re-publish: to keep the vote alive, call `publish()`
+     * failure: `InvalidCommunityNameError` when a vote's carried `community.name` definitively does
+     * not resolve to its claimed `publicKey` (checked BEFORE signing or joining — every verifier
+     * drops such a bundle silently, so it is refused here instead of published into a network-wide
+     * silent drop; a resolver outage does not block the publish). This library does not re-publish: to keep the vote alive, call `publish()`
      * again before it expires.
      */
     publish(): Promise<PublishOutcome>;
@@ -319,8 +405,6 @@ export interface ContestVote {
 
 /** The factory: one set of injected dependencies, many contests. */
 export interface VoteClient {
-    /** True when constructed without a signer: every contest is read-only. */
-    readonly readOnly: boolean;
     /**
      * Create the reactive read view for one contest from its full criteria document. The document
      * is strictly validated (`CriteriaSchema` + the rule registry — an unimplemented rule throws
@@ -333,8 +417,13 @@ export interface VoteClient {
      * Create a publishable ballot for one contest, validated and addressed exactly like
      * `createContest`. Each call returns a fresh `ContestVote` over the shared per-topic engine;
      * pass `votes: []` to build a withdrawal.
+     *
+     * The `signer` is per-ballot, and required. Identity belongs to the vote rather than to the
+     * client, so one voter on the host's shared node can publish for several wallets; and a
+     * ballot that cannot be signed has nothing to show (every other field on it is
+     * publish-derived), so reading a contest is `createContest`'s job, not this one's.
      */
-    createContestVote(args: { criteria: Criteria; votes: Vote[] }): Promise<ContestVote>;
+    createContestVote(args: { criteria: Criteria; votes: Vote[]; signer: VoteSigner }): Promise<ContestVote>;
     /**
      * Leave every topic this client joined, resetting each read view so it can `update()` again.
      * The checkpoint fetch responder unregisters itself once the last topic is left (see
@@ -375,8 +464,6 @@ export interface PubsubVoterOptions {
      * See `ChainClientFactory` (src/chain/types.ts) for the full contract.
      */
     chains: ChainClientFactory;
-    /** Identity. Omit for a read-only voter (renders tallies, cannot publish). */
-    signer?: VoteSigner;
     /** Rule overrides that shadow built-ins by `type` (a flat `type -> rule` map). */
     rules?: RuleRegistry;
     /**
@@ -426,7 +513,6 @@ interface ResolvedDeps {
     /** The node's libp2p fetch service (root-record pull), validated once at construction. */
     fetch: FetchServiceLike;
     chains: ChainClientFactory;
-    signer: VoteSigner | undefined;
     /** Built-ins with any host overrides merged in (overrides shadow by `type`). */
     registry: RuleRegistry;
     /** Community-name resolvers for verifying `community.name` claims at tally time. */
@@ -603,6 +689,14 @@ const CHASE_SESSION_PROVIDER_HEADROOM = 1;
  * cannot grow memory.
  */
 const PEER_ROOTS_MAX = 256;
+/**
+ * How many distinct chased roots we remember the contents of, for peer-checkpoint attribution
+ * ({@link ContestEngine.checkpointPeersFor}). Bounded for the same reason as {@link PEER_ROOTS_MAX}:
+ * a busy topic mints a new root on every admitted vote, so an unbounded index would grow with
+ * traffic forever. Forgetting a root only costs attribution for peers still advertising it — the
+ * next chase of a newer root re-establishes it.
+ */
+const DECODED_ROOTS_MAX = 64;
 /**
  * How long a gating-chain head read stays fresh (ms) for the gate's freshness guard. Steady-
  * state votes cost no read (they resolve against the cached bucket); only a look-ahead bundle
@@ -983,7 +1077,6 @@ function hexToBytes(hex: string): Uint8Array {
 class ContestEngine {
     readonly criteria: Criteria;
     readonly topic: string;
-    readonly readOnly: boolean;
 
     readonly #deps: ResolvedDeps;
     readonly #criteriaCid: Uint8Array;
@@ -1055,7 +1148,6 @@ class ContestEngine {
     constructor(criteria: Criteria, topic: string, criteriaCidBytes: Uint8Array, deps: ResolvedDeps) {
         this.criteria = criteria;
         this.topic = topic;
-        this.readOnly = deps.signer === undefined;
         this.#deps = deps;
         this.#criteriaCid = criteriaCidBytes;
         // The contest's ONE chain (`bucketChainId`): it fixes the ballot's chainId, the blocks the
@@ -1181,6 +1273,45 @@ class ContestEngine {
     readonly #ownPublishes = new Map<string, VotesBundle>();
     /** Per-own-CID eviction callbacks: the publishing `ContestVote` registers one at sign time. */
     readonly #ownEvictionCbs = new Map<string, (error: VoteEvictedError) => void>();
+    /**
+     * Per-own-CID verification callbacks — the positive counterpart of {@link #ownEvictionCbs},
+     * registered by the publishing `ContestVote` at sign time and fired once every deferred check
+     * on that bundle has settled clean.
+     */
+    readonly #ownVerifiedCbs = new Map<string, (cid: CID) => void>();
+    /**
+     * Per-own-CID first-peer-checkpoint callbacks. Fires once — the state it drives has no
+     * degrees, and a second peer holding the vote is not a new fact about the publish.
+     */
+    readonly #ownCheckpointCbs = new Map<string, (cid: CID) => void>();
+    /**
+     * Every bundle CID this wallet published that is still in the working set. Unlike
+     * {@link #ownPublishes} — which exists only to report an eviction and is dropped the moment
+     * the checks settle — this outlives verification, because peer-checkpoint attribution keeps
+     * mattering afterwards: a bundle stays live for `voteExpiryBuckets` and peers go on
+     * re-serving it, so "who else kept my vote" is a longer-lived question than "is it valid".
+     * Dropped on eviction and on expiry prune.
+     */
+    readonly #ownCids = new Set<string>();
+    /**
+     * Roots we decoded → which of OUR CIDs that checkpoint contained. Kept so a peer that
+     * advertises an ALREADY-decoded root is attributed without re-chasing it (the common case:
+     * many peers converge on one root). Bounded by {@link DECODED_ROOTS_MAX}, oldest evicted first.
+     */
+    readonly #decodedRoots = new Map<string, Set<string>>();
+    /**
+     * Own CID → the peers seen advertising a checkpoint that contained it. Bounded twice over:
+     * one entry per own bundle (one per wallet per contest), and the peers can only ever come
+     * from {@link #peerRoots}, itself capped at {@link PEER_ROOTS_MAX}.
+     */
+    readonly #ownCheckpointPeers = new Map<string, Set<string>>();
+    /**
+     * Cap on {@link #ownCids}. A wallet holds one live bundle per contest and a re-publish
+     * supersedes it, so real use sits far below this; the cap exists because
+     * {@link ContestEngine.trackOwnBundle} lets a caller add CIDs, and no public entry point
+     * should be able to grow a map without bound.
+     */
+    static readonly #OWN_CIDS_MAX = 64;
 
     /** Does any vote in the bundle carry a `community.name` claim (needing resolution)? */
     #carriesName(bundle: VotesBundle): boolean {
@@ -1225,8 +1356,13 @@ class ContestEngine {
         if (!checks) return; // evicted or pruned while its check was in flight
         checks[key] = true;
         // A fully settled own publish can no longer be evicted — its verdict is terminal — so
-        // its eviction-reporting entries are done (see #ownPublishes).
-        if (this.#isFullyVerified(cid)) this.#dropOwnTracking(cid.toString());
+        // its eviction-reporting entries are done (see #ownPublishes). Tell the publishing
+        // ContestVote first: this is the positive verdict it has no other way to hear.
+        if (this.#isFullyVerified(cid)) {
+            const key = cid.toString();
+            this.#ownVerifiedCbs.get(key)?.(cid);
+            this.#dropOwnTracking(key);
+        }
         this.#onStateChanged();
     }
 
@@ -1241,11 +1377,13 @@ class ContestEngine {
         this.#crdt.remove(cid);
         const key = cid.toString();
         this.#checks.delete(key);
+        this.#ownCids.delete(key);
+        this.#ownCheckpointPeers.delete(key);
         const own = this.#ownPublishes.get(key);
         if (own) {
             const error = new VoteEvictedError(own, verdict);
             const notifyVote = this.#ownEvictionCbs.get(key);
-            this.#dropOwnTracking(key);
+            this.#forgetOwnBundle(key);
             notifyVote?.(error);
             this.#emitError(error);
         }
@@ -1256,6 +1394,20 @@ class ContestEngine {
     #dropOwnTracking(key: string): void {
         this.#ownPublishes.delete(key);
         this.#ownEvictionCbs.delete(key);
+        this.#ownVerifiedCbs.delete(key);
+    }
+
+    /**
+     * Forget an own bundle entirely — its verdict-reporting entries AND its peer-checkpoint
+     * attribution. Only for a bundle that has LEFT the working set (evicted or expired):
+     * settlement alone must not reach this, because attribution goes on accruing for a bundle
+     * that is verified and live (see {@link #ownCids}).
+     */
+    #forgetOwnBundle(key: string): void {
+        this.#dropOwnTracking(key);
+        this.#ownCheckpointCbs.delete(key);
+        this.#ownCids.delete(key);
+        this.#ownCheckpointPeers.delete(key);
     }
 
     #emitError(error: unknown): void {
@@ -1423,7 +1575,7 @@ class ContestEngine {
             for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
                 const key = removed.toString();
                 this.#checks.delete(key);
-                this.#dropOwnTracking(key); // expiry is decay, not an eviction — no error
+                this.#forgetOwnBundle(key); // expiry is decay, not an eviction — no error
             }
         }
         return this.#tally.compute();
@@ -1558,6 +1710,9 @@ class ContestEngine {
                 this.#markStateChanged();
             },
             deferVerify: (entries) => this.#background.enqueue(entries),
+            // Every CID the checkpoint referenced, admitted or skipped — the skipped ones are
+            // what tier-3 attribution is made of (see #noteCheckpointContents).
+            onCheckpointContents: (root, cids) => this.#noteCheckpointContents(root, cids),
             onMerged: () => this.#onStateChanged(),
             limit: (fn) => chaseLimit(fn),
             timeoutMs: CHASE_TIMEOUT_MS
@@ -1817,18 +1972,22 @@ class ContestEngine {
     /**
      * Sign the votes into a bundle for the current bucket boundary block (the block every verifier
      * reads at), add it to the CRDT, and return the bundle plus its encoded block bytes for
-     * broadcast. Throws `ReadOnlyError` with no signer. `namesSettled` carries the
-     * {@link preflightNames} outcome (default false: name checks still owed to the background
-     * verifier); `onEvicted` is told if a deferred check later evicts THIS bundle — registered
-     * here, before the background verifier can possibly settle, so the report cannot be missed.
+     * broadcast with the wallet the caller hands it (identity is the ballot's, see
+     * {@link VoteClient.createContestVote}). `namesSettled` carries the {@link preflightNames}
+     * outcome (default false: name checks still owed to the background verifier); `onEvicted` is
+     * told if a deferred check later evicts THIS bundle — registered here, before the background
+     * verifier can possibly settle, so the report cannot be missed.
      */
     async signVote(
         votes: Vote[],
-        opts: { namesSettled?: boolean; onEvicted?: (error: VoteEvictedError) => void } = {}
-    ): Promise<{ bundle: VotesBundle; encoded: Uint8Array }> {
-        const signer = this.#deps.signer;
-        if (signer === undefined) throw new ReadOnlyError();
-
+        signer: VoteSigner,
+        opts: {
+            namesSettled?: boolean;
+            onEvicted?: (error: VoteEvictedError) => void;
+            onVerified?: (cid: CID) => void;
+            onCheckpointedByPeer?: (cid: CID) => void;
+        } = {}
+    ): Promise<{ bundle: VotesBundle; encoded: Uint8Array; cid: CID }> {
         const head = await this.#ruleChain.getBlockNumber();
         const bucket = this.#bucketMath.bucketForBlock(Number(head));
         this.#currentBucketCache = bucket;
@@ -1846,10 +2005,13 @@ class ContestEngine {
         // preflight already resolved is recorded settled, so it renders verified immediately.
         this.#recordChecks(cid, bundle, false, opts.namesSettled ?? false);
         this.#ownPublishes.set(cid.toString(), bundle);
+        this.#ownCids.add(cid.toString());
         if (opts.onEvicted) this.#ownEvictionCbs.set(cid.toString(), opts.onEvicted);
+        if (opts.onVerified) this.#ownVerifiedCbs.set(cid.toString(), opts.onVerified);
+        if (opts.onCheckpointedByPeer) this.#ownCheckpointCbs.set(cid.toString(), opts.onCheckpointedByPeer);
         this.#background.enqueue([{ cid, bundle }]);
         this.#onStateChanged();
-        return { bundle, encoded: encodeBundle(bundle) };
+        return { bundle, encoded: encodeBundle(bundle), cid };
     }
 
     /**
@@ -2078,6 +2240,12 @@ class ContestEngine {
         const own = await this.rootRecord();
         if (own.root.equals(record.root)) {
             this.#heardMatchingRoot = true;
+            // Their checkpoint is ours byte for byte, so it demonstrably contains every bundle
+            // ours does — including our own. Nothing is chased here (there is no divergence to
+            // chase), so without this the ONE case tier-3 attribution most wants to catch — a
+            // healthy topic where we and the seeder have converged — would be the one case it
+            // never saw.
+            this.#indexRootContents(record.root, this.#ownVerifiedCids());
             return;
         }
         this.#chaser?.chase(record.root, undefined, this.#sessionProvidersFor(record.root));
@@ -2095,7 +2263,109 @@ class ContestEngine {
             const oldest = this.#peerRoots.keys().next().value;
             if (oldest !== undefined) this.#peerRoots.delete(oldest);
         }
-        this.#peerRoots.set(peerId, root.toString());
+        const key = root.toString();
+        this.#peerRoots.set(peerId, key);
+        // Many peers converge on one root, and most of them advertise it AFTER we chased it —
+        // so attribution cannot wait for a decode that already happened. #decodedRoots is what
+        // makes that retroactive.
+        this.#attributeRoot(peerId, key);
+    }
+
+    /**
+     * Record which of OUR bundles a decoded checkpoint contained, and credit every peer already
+     * known to advertise that root. Called once per successful chase decode, with every bundle
+     * CID the checkpoint referenced — INCLUDING ones we already hold, which is the whole point:
+     * our own bundle is always already held, so the chase skips admitting it and would otherwise
+     * never mention it.
+     */
+    #noteCheckpointContents(root: CID, cids: readonly CID[]): void {
+        const mine = new Set<string>();
+        for (const cid of cids) {
+            const key = cid.toString();
+            if (this.#ownCids.has(key)) mine.add(key);
+        }
+        this.#indexRootContents(root, mine);
+    }
+
+    /**
+     * Our own bundles that are in our OWN checkpoint right now — i.e. fully verified ones. A
+     * pending bundle is deliberately excluded: the encoder does not serve it, so a peer holding
+     * our root is not thereby holding it.
+     */
+    #ownVerifiedCids(): Set<string> {
+        const mine = new Set<string>();
+        for (const key of this.#ownCids) {
+            if (this.#isFullyVerified(CID.parse(key))) mine.add(key);
+        }
+        return mine;
+    }
+
+    /** Index `mine` under `root` (bounded, LRU) and credit every peer already at that root. */
+    #indexRootContents(root: CID, mine: Set<string>): void {
+        if (mine.size === 0) return; // nothing of ours in it — not worth an index entry
+        const rootKey = root.toString();
+        if (this.#decodedRoots.has(rootKey)) this.#decodedRoots.delete(rootKey); // refresh LRU slot
+        else if (this.#decodedRoots.size >= DECODED_ROOTS_MAX) {
+            const oldest = this.#decodedRoots.keys().next().value;
+            if (oldest !== undefined) this.#decodedRoots.delete(oldest);
+        }
+        this.#decodedRoots.set(rootKey, mine);
+        let credited = false;
+        for (const [peerId, peerRoot] of this.#peerRoots) {
+            if (peerRoot === rootKey) credited = this.#creditPeer(peerId, mine) || credited;
+        }
+        if (credited) this.#onStateChanged();
+    }
+
+    /** Credit `peerId` with every own CID in a root it advertises, if we decoded that root. */
+    #attributeRoot(peerId: string, rootKey: string): void {
+        const mine = this.#decodedRoots.get(rootKey);
+        if (mine !== undefined && this.#creditPeer(peerId, mine)) this.#onStateChanged();
+    }
+
+    /** Add `peerId` to each own CID's attribution set; true if anything was new. */
+    #creditPeer(peerId: string, ownCids: ReadonlySet<string>): boolean {
+        let added = false;
+        for (const key of ownCids) {
+            if (!this.#ownCids.has(key)) continue; // evicted or expired since the decode
+            let peers = this.#ownCheckpointPeers.get(key);
+            if (peers === undefined) {
+                peers = new Set<string>();
+                this.#ownCheckpointPeers.set(key, peers);
+            }
+            if (!peers.has(peerId)) {
+                const first = peers.size === 0;
+                peers.add(peerId);
+                added = true;
+                if (first) {
+                    this.#ownCheckpointCbs.get(key)?.(CID.parse(key));
+                    this.#ownCheckpointCbs.delete(key);
+                }
+            }
+        }
+        return added;
+    }
+
+    /** {@link Contest.trackOwnBundle}. */
+    trackOwnBundle(cid: CID): void {
+        const key = cid.toString();
+        if (this.#ownCids.has(key)) return;
+        if (this.#ownCids.size >= ContestEngine.#OWN_CIDS_MAX) {
+            const oldest = this.#ownCids.values().next().value;
+            if (oldest !== undefined) this.#forgetOwnBundle(oldest);
+        }
+        this.#ownCids.add(key);
+    }
+
+    /** {@link Contest.checksFor}. */
+    checksFor(cid: CID): BundleChecks | undefined {
+        const checks = this.#checks.get(cid.toString());
+        return checks === undefined ? undefined : { ...checks };
+    }
+
+    /** {@link Contest.checkpointPeersFor}. */
+    checkpointPeersFor(cid: CID): string[] {
+        return [...(this.#ownCheckpointPeers.get(cid.toString()) ?? [])];
     }
 
     /**
@@ -2182,6 +2452,16 @@ class ContestView implements Contest {
         return this.#engine.cachedTally;
     }
 
+    checksFor(cid: CID): BundleChecks | undefined {
+        return this.#engine.checksFor(cid);
+    }
+    checkpointPeersFor(cid: CID): string[] {
+        return this.#engine.checkpointPeersFor(cid);
+    }
+    trackOwnBundle(cid: CID): void {
+        this.#engine.trackOwnBundle(cid);
+    }
+
     async update(): Promise<void> {
         if (this.#subscribed) return;
         await this.#engine.join();
@@ -2234,23 +2514,62 @@ class ContestView implements Contest {
 class ContestVotePublication implements ContestVote {
     readonly contestId: string;
     readonly votes: readonly Vote[];
+    readonly signer: VoteSigner;
     readonly #engine: ContestEngine;
     readonly #stateCbs: Array<(state: PublishingState) => void> = [];
     readonly #errorCbs: Array<(error: unknown) => void> = [];
     #state: PublishingState = "stopped";
     #bundle: VotesBundle | undefined;
+    #cid: CID | undefined;
+    /**
+     * Which `publish()` call owns the state machine. Incremented synchronously at the top of
+     * `publish()`, BEFORE any await, and captured by every callback that attempt registers.
+     *
+     * A re-publish in a later window signs new bytes, so the previous attempt's bundle keeps its
+     * own CID, stays live in the CRDT (a superseded bundle outlives its superseder's deferred
+     * checks) and can still be verified, served by a peer, or evicted — long after a newer
+     * attempt owns this object. Matching on the CID cannot separate the two: `#cid` still holds
+     * the PREVIOUS attempt's value until the new `signVote()` resolves, so an old verdict landing
+     * in that window passes a CID check and moves the wrong attempt. The token is established
+     * before that window opens, so it does not. It also decouples the check from `#cid` entirely,
+     * which is what lets a verdict that settles BEFORE `#cid` is assigned still be delivered
+     * (the engine delivers each callback once and then drops it — a settlement ignored here is
+     * lost for good).
+     */
+    #attempt = 0;
     /**
      * True once the background verifier evicted the current publish's bundle. The eviction can
      * land WHILE `publish()` is still broadcasting (the deferred checks run concurrently), and
      * its `"failed"` is terminal for this attempt — the in-flight publish must not stomp it
-     * with `"publishing"`/`"succeeded"`. Reset by the next `publish()` call.
+     * with `"publishing"`/`"published"`. Reset by the next `publish()` call.
      */
     #evicted = false;
 
-    constructor(engine: ContestEngine, votes: Vote[]) {
+    /** Is this callback's attempt still the one that owns the object? (see {@link #attempt}) */
+    #isCurrent(attempt: number): boolean {
+        return attempt === this.#attempt;
+    }
+
+    /**
+     * Advance to a settled state, unless this attempt is already finished or further along.
+     * Two orderings have to be tolerated, not just one: the deferred checks race the broadcast,
+     * so a verdict can land before `publish()` resolves, and a peer can serve our bundle back to
+     * us before our OWN gate read returns — peer evidence is strictly stronger (a peer
+     * checkpoints only fully verified bundles), so it must never be overwritten by the weaker
+     * local one arriving late.
+     */
+    #settle(attempt: number, state: "verified-locally" | "verified-by-peer"): void {
+        if (!this.#isCurrent(attempt)) return;
+        if (this.#evicted || this.#state === "failed" || this.#state === "verified-by-peer") return;
+        if (state === "verified-locally" && this.#state === "verified-locally") return;
+        this.#setState(state);
+    }
+
+    constructor(engine: ContestEngine, votes: Vote[], signer: VoteSigner) {
         this.#engine = engine;
         this.contestId = engine.criteria.contestId;
         this.votes = votes;
+        this.signer = signer;
     }
 
     get topic(): string {
@@ -2261,6 +2580,9 @@ class ContestVotePublication implements ContestVote {
     }
     get bundle(): VotesBundle | undefined {
         return this.#bundle;
+    }
+    get checks(): BundleChecks | undefined {
+        return this.#cid === undefined ? undefined : this.#engine.checksFor(this.#cid);
     }
 
     #setState(state: PublishingState): void {
@@ -2274,12 +2596,11 @@ class ContestVotePublication implements ContestVote {
     }
 
     async publish(): Promise<PublishOutcome> {
-        // Fail before joining a read-only voter needlessly to the topic.
-        if (this.#engine.readOnly) {
-            const error = new ReadOnlyError();
-            this.#fail(error);
-            throw error;
-        }
+        // Before the first await: every callback below is bound to THIS attempt, and the
+        // previous attempt's callbacks stop being able to move this object the moment the
+        // counter ticks — even though its bundle is still live and still verifiable.
+        const attempt = ++this.#attempt;
+        this.#evicted = false;
         try {
             // Name preflight, also before joining: a vote whose carried community name
             // definitively fails to resolve to its claimed key would be silently dropped by
@@ -2288,27 +2609,43 @@ class ContestVotePublication implements ContestVote {
             // the background verifier owns the deferred check).
             const namesSettled = await this.#engine.preflightNames(this.votes);
             await this.#engine.join();
-            this.#evicted = false;
             this.#setState("signing");
-            const { bundle, encoded } = await this.#engine.signVote([...this.votes], {
+            const { bundle, encoded, cid } = await this.#engine.signVote([...this.votes], this.signer, {
                 namesSettled,
+                // The positive counterparts of `onEvicted`: our own deferred checks settling
+                // clean, then a peer serving the bundle back to us in its checkpoint. Both
+                // normally land after publish() has resolved.
+                onVerified: () => this.#settle(attempt, "verified-locally"),
+                onCheckpointedByPeer: () => this.#settle(attempt, "verified-by-peer"),
                 // The one rejection a publisher can hear about (peers drop silently): our own
                 // node's deferred checks evicting this bundle. Usually post hoc — publish() has
                 // already resolved — so it surfaces as `error` + `publishingState: "failed"`.
                 onEvicted: (error) => {
+                    // Attempt-scoped like the positive verdicts: a superseded bundle is kept
+                    // alive while its superseder's checks are pending, so an eviction of the
+                    // PREVIOUS attempt's bytes must not fail the attempt that replaced it.
+                    if (!this.#isCurrent(attempt)) return;
                     this.#evicted = true;
                     this.#fail(error);
                 }
             });
             this.#bundle = bundle;
-            if (!this.#evicted) this.#setState("publishing");
+            this.#cid = cid;
+            // Only from "signing": a deferred check can settle before this line runs (a cached
+            // verdict needs no round trip), and "publishing" would walk that verdict backwards.
+            if (this.#state === "signing") this.#setState("publishing");
             const { recipientCount } = await this.#engine.broadcastBundle(encoded);
             // An eviction that landed mid-broadcast already failed this attempt; the outcome
-            // still resolves (the bundle DID hit the wire) but the state stays "failed".
-            if (!this.#evicted) this.#setState("succeeded");
-            return { bundle, recipientCount };
+            // still resolves (the bundle DID hit the wire) but the state stays "failed". A
+            // check that SETTLED mid-broadcast is not stomped either: "published" describes
+            // the broadcast, and a verdict already in hand is further along than that.
+            if (!this.#evicted && this.#state === "publishing") this.#setState("published");
+            return { bundle, recipientCount, cid };
         } catch (error) {
-            this.#fail(error);
+            // Same scoping: two overlapping `publish()` calls are a misuse, but the loser's
+            // rejection belongs to ITS caller (it is rethrown), not to the state machine a
+            // later attempt now owns.
+            if (this.#isCurrent(attempt)) this.#fail(error);
             throw error;
         }
     }
@@ -2377,7 +2714,6 @@ export class PubsubVoter implements VoteClient {
             // the background verifier) merge into shared multicall3 round trips under one
             // per-client in-flight budget — see src/chain/coalescer.ts.
             chains: coalescingChainFactory(options.chains),
-            signer: options.signer,
             registry: resolveRegistry(options.rules),
             nameResolvers: options.nameResolvers ?? [],
             onTopicJoined: this.#onTopicJoined,
@@ -2459,10 +2795,6 @@ export class PubsubVoter implements VoteClient {
         return [...new Set(keys)];
     };
 
-    get readOnly(): boolean {
-        return this.#deps.signer === undefined;
-    }
-
     /** Guard the create paths after {@link destroy}: a destroyed voter is terminal. */
     #assertLive(): void {
         if (this.#destroyed) throw new VoterDestroyedError();
@@ -2478,10 +2810,10 @@ export class PubsubVoter implements VoteClient {
         return view;
     }
 
-    async createContestVote(args: { criteria: Criteria; votes: Vote[] }): Promise<ContestVote> {
+    async createContestVote(args: { criteria: Criteria; votes: Vote[]; signer: VoteSigner }): Promise<ContestVote> {
         this.#assertLive();
         const engine = await this.#engineFor(this.#validateCriteria(args.criteria));
-        return new ContestVotePublication(engine, args.votes);
+        return new ContestVotePublication(engine, args.votes, args.signer);
     }
 
     /**
