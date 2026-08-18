@@ -17,6 +17,10 @@ import { encodeBundle, decodeBundle, bundleCid, bundleCidForBytes } from "../crd
 import type { BundleVerifier } from "../verify/types.js";
 import type { VotesBundle } from "../schema/votes.js";
 
+/** What these consumers actually take: the `verify` half of a `BundleVerifier` (see verify/cache.ts). */
+type VerifyOnly = Pick<BundleVerifier, "verify">;
+
+
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 
 // The binary codec requires well-formed field sizes (20-byte address, 65-byte signature), so
@@ -43,8 +47,8 @@ async function makeRootRecord(): Promise<RootRecord> {
     return { version: ROOT_RECORD_VERSION, root: await bundleCid(bundle("0xcc")), count: 3, sizeBytes: 700 };
 }
 
-const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, resolvedNames: {} }) };
-const badVerifier: BundleVerifier = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
+const okVerifier: VerifyOnly = { verify: async () => ({ valid: true, resolvedNames: {} }) };
+const badVerifier: VerifyOnly = { verify: async () => ({ valid: false, disposition: "reject", reason: "invalid" }) };
 
 function gate(over: Partial<GossipGateDeps> = {}) {
     return makeGossipGate({
@@ -79,8 +83,8 @@ describe("makeGossipGate — bundle deltas", () => {
         expect(admitted?.cid.equals(cid)).toBe(true);
         // Byte-identity: the stored block is the sender's exact bytes, so its hash IS the CID.
         expect((await bundleCidForBytes(admitted!.bytes)).equals(cid)).toBe(true);
-        expect(accepted[0][0].equals(cid)).toBe(true);
-        expect(accepted[0][1]).toBe("peer1");
+        expect(accepted[0]![0]!.equals(cid)).toBe(true);
+        expect(accepted[0]![1]!).toBe("peer1");
     });
 
     it("rejects malformed bytes (layer-1)", async () => {
@@ -317,8 +321,8 @@ describe("makeGossipGate — root records", () => {
         const g = gate({ onRootRecord: (r, from) => heard.push([r, from]) });
         expect(await g.validate(encodeRootMessage(record), "peer1")).toBe("accept");
         expect(heard).toHaveLength(1);
-        expect(heard[0][0].root.equals(record.root)).toBe(true);
-        expect(heard[0][1]).toBe("peer1");
+        expect(heard[0]![0]!.root.equals(record.root)).toBe(true);
+        expect(heard[0]![1]!).toBe("peer1");
     });
 
     it("never verifies or admits on a root record (it is only a hint)", async () => {

@@ -120,7 +120,7 @@ export function rootFetchService(options: {
     /** Called for every request, before the answer is computed. */
     onFetch?: (peerId: string, key: string) => void;
 } = {}): FetchServiceLike {
-    const { records = () => ({}), speaksBulk = true, onFetch } = options;
+    const { records = (): Record<string, BulkFetchRootRecord> => ({}), speaksBulk = true, onFetch } = options;
     const bulkMode = (): boolean | "error" => (typeof speaksBulk === "function" ? speaksBulk() : speaksBulk);
     return {
         fetch: async (peer: PeerId, key: string | Uint8Array) => {

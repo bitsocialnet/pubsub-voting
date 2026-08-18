@@ -84,9 +84,10 @@ describe("EIP-712 ballot v1 frozen vector", () => {
     const PRIVATE_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
     const SIGNER_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
     const EXPECTED_HASH = "0x1b0c3e29a0bffb1305d7dc278707165ea5bbf8004b65b24738256a5544facc7a";
-    const EXPECTED_SIGNATURE =
-        "0x67813a39ba6e600b0370934a6cc8958c5d54b2f1bdbaa5c64457262133d41e16" +
-        "3d045c635cc1ce1648421452b7a6075c4c3329205b79988c472a2e28a0bc7b5b1c";
+    const EXPECTED_SIGNATURE: `0x${string}` = `0x${
+        "67813a39ba6e600b0370934a6cc8958c5d54b2f1bdbaa5c64457262133d41e16" +
+        "3d045c635cc1ce1648421452b7a6075c4c3329205b79988c472a2e28a0bc7b5b1c"
+    }`;
 
     const vector = ballotTypedData({
         criteriaCid: CRITERIA_CID,

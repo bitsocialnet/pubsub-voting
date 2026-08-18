@@ -219,8 +219,8 @@ describe("coalescingChainFactory", () => {
     it("memoizes on the underlying client so parallel contests share ONE coalescer", async () => {
         const { client, seenCalls } = stubClient(() => 2n);
         const factory = coalescingChainFactory(() => client, { windowMs: 5 });
-        const a = factory({ chain: "base", chainId: 8453 });
-        const b = factory({ chain: "base", chainId: 8453 });
+        const a = factory({ chainId: 8453 });
+        const b = factory({ chainId: 8453 });
         expect(a).toBe(b);
         // Reads from two "contests" (two factory calls) land in one aggregate3.
         await Promise.all([readBalance(a!, wallet(0)), readBalance(b!, wallet(1))]);
@@ -230,6 +230,6 @@ describe("coalescingChainFactory", () => {
 
     it("passes through an unresolved chain (factory returned undefined) without wrapping", () => {
         const factory = coalescingChainFactory(() => undefined);
-        expect(factory({ chain: "base", chainId: 8453 })).toBeUndefined();
+        expect(factory({ chainId: 8453 })).toBeUndefined();
     });
 });

@@ -5,6 +5,7 @@ import { makeMemoryRuleCache } from "../rules/cache.js";
 import { makeVerdictCache } from "./cache.js";
 import { Erc5192MinBalanceOptionsSchema } from "../rules/erc5192-min-balance.js";
 import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
+import type { VerifyFail } from "./types.js";
 import { makeBucketMath } from "../chain/bucket.js";
 import { bundleCid } from "../crdt/codec.js";
 import { bizCriteria } from "../test-fixtures.js";
@@ -468,9 +469,10 @@ describe("composite gates", () => {
         expect(h.evicted).toEqual([{ cid: entry.cid.toString(), disposition: "reject" }]);
         const verdict = h.cache.get(entry.cid);
         expect(verdict).toMatchObject({ valid: false, disposition: "reject" });
-        expect((verdict as { reason: string }).reason).toContain("banned from the board");
+        const failed = verdict as VerifyFail;
+        expect(failed.reason).toContain("banned from the board");
         // The satisfied leaf is not in the blame set — the wallet is not missing the Pass.
-        expect((verdict as { failures: { type: string }[] }).failures.map((f) => f.type)).toEqual(["not-banned"]);
+        expect(failed.failures?.map((f) => f.type)).toEqual(["not-banned"]);
     });
 
     it("holds an `any` whose alternatives failed for reasons NOBODY is blamed for", async () => {

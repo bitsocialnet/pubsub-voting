@@ -40,6 +40,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run typecheck:examples
+      - run: npm run typecheck:tests
       - run: npm run build
       # Unit suite with V8 coverage; the thresholds in vitest.config.ts fail the run if
       # coverage regresses below the pinned baseline.

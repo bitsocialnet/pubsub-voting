@@ -20,7 +20,7 @@ describe("deriveDirectoryCriteria", () => {
             ])
         );
         expect(a).toEqual({ ...bizCriteria(), contestId: "a", name: "/a/ - Anime" });
-        expect(b.contestId).toBe("b");
+        expect(b!.contestId).toBe("b");
     });
 
     it("replaces a whole top-level field on override — shallow merge, no deep merge", () => {
@@ -37,9 +37,9 @@ describe("deriveDirectoryCriteria", () => {
                 }
             ])
         );
-        expect(criteria.gate).toEqual({ rule: { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 } });
+        expect(criteria!.gate).toEqual({ rule: { type: "erc5192-min-balance", chain: "base", contract: `0x${"ab".repeat(20)}`, min: 2 } });
         // Untouched fields still inherit.
-        expect(criteria.weight).toEqual(bizCriteria().weight);
+        expect(criteria!.weight).toEqual(bizCriteria().weight);
     });
 
     it("works without defaults when entries are self-contained documents", () => {
@@ -71,7 +71,7 @@ describe("deriveDirectoryCriteria", () => {
         const source = manifest([{ contestId: "a", name: "/a/ - Anime" }]);
         const [first] = deriveDirectoryCriteria(source);
         const [second] = deriveDirectoryCriteria(source);
-        expect(encodeCriteria(second)).toEqual(encodeCriteria(first));
+        expect(encodeCriteria(second!)).toEqual(encodeCriteria(first!));
     });
 });
 
@@ -110,7 +110,7 @@ describe("deriveDirectoryCriteria over a whole directory", () => {
         expect(overridden?.gate).toEqual(strictGate);
         for (const criteria of allCriteria) {
             if (criteria.contestId === OVERRIDDEN_SLOT) continue;
-            expect(criteria.gate).toEqual(bizCriteria().gate);
+            expect(criteria!.gate).toEqual(bizCriteria().gate);
         }
     });
 });

@@ -322,7 +322,7 @@ describe("createContestVote (publish path)", () => {
         expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
         // blockNumber is the bucket boundary: bucketForBlock(43200)=1, sampleBlockForBucket(1)=43200.
         expect(bundle.blockNumber).toBe(43200);
-        expect(bundle.votes[0].community.publicKey).toBe(VALID_KEY);
+        expect(bundle.votes[0]!.community.publicKey).toBe(VALID_KEY);
     });
 
     it("broadcasts the bundle once over the host node's gossipsub", async () => {
@@ -362,8 +362,8 @@ describe("Contest read view + tally", () => {
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const tally = await contest.getTally();
         expect(tally.ranking).toHaveLength(1);
-        expect(tally.ranking[0].community.publicKey).toBe(VALID_KEY);
-        expect(tally.ranking[0].weight).toBe(1n); // constant weight, 1 pass = 1 vote
+        expect(tally.ranking[0]!.community.publicKey).toBe(VALID_KEY);
+        expect(tally.ranking[0]!.weight).toBe(1n); // constant weight, 1 pass = 1 vote
     });
 
     it("admits an own vote provisionally: chainVerified flips once the background gate read lands", async () => {
@@ -375,7 +375,7 @@ describe("Contest read view + tally", () => {
         // The vote counts immediately (render fast), but its gate read has not landed yet.
         const before = await contest.getTally();
         expect(before.ranking).toHaveLength(1);
-        expect(before.ranking[0].chainVerified).toBe(false);
+        expect(before.ranking[0]!.chainVerified).toBe(false);
 
         release(); // the RPC answers — the background verifier settles the gate check
         await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
@@ -670,7 +670,7 @@ describe("Contest read view + tally", () => {
         // Infra is nobody's verdict: not evicted, still counted, flagged unverified.
         const tally = await contest.getTally();
         expect(tally.ranking).toHaveLength(1);
-        expect(tally.ranking[0].chainVerified).toBe(false);
+        expect(tally.ranking[0]!.chainVerified).toBe(false);
         await voter.stop(); // clears the background retry timer with the topic leave
     });
 
@@ -688,7 +688,7 @@ describe("Contest read view + tally", () => {
         await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(() => expect(contest.tally?.ranking).toHaveLength(1));
         expect(updates).toBeGreaterThanOrEqual(2); // the publish triggered a recompute + emit
-        expect(contest.tally?.ranking[0].community.publicKey).toBe(VALID_KEY);
+        expect(contest.tally?.ranking[0]!.community.publicKey).toBe(VALID_KEY);
         await contest.stop();
     });
 
@@ -1138,7 +1138,7 @@ describe("root-record fetch protocol", () => {
         const chased: string[] = []; // root CIDs the chase pulled blocks for
         const puts: string[] = []; // CIDs stored (the bulk answer's verified inline chunk blocks land here)
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => subscribers as unknown as ReturnType<PubsubService["getSubscribers"]>,
@@ -1266,7 +1266,7 @@ describe("root-record fetch protocol", () => {
             unregisterLookupFunction: () => {}
         };
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => [{ toString: () => "peerA" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
@@ -1328,7 +1328,7 @@ describe("root-record fetch protocol", () => {
             unregisterLookupFunction: () => {}
         };
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => [{ toString: () => "seeder" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
@@ -1432,7 +1432,7 @@ describe("root-record fetch protocol", () => {
             onFetch: (peer, key) => fetchCalls.push({ peer, key })
         });
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => [], // NO subscribers — only the router can supply the provider
@@ -1984,7 +1984,7 @@ describe("cold-start fetch backoff bounds", () => {
             unregisterLookupFunction: () => {}
         };
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => [{ toString: () => "peerA" }] as unknown as ReturnType<PubsubService["getSubscribers"]>,
@@ -2036,7 +2036,7 @@ describe("cold-start provider discovery bounds", () => {
         // providers taken — which is what these bounds are about, not protocol generation.
         const fetchService = rootFetchService({ onFetch: (peer) => fetchedPeers.push(peer) });
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => [], // router-only discovery
@@ -2278,7 +2278,7 @@ describe("peer-root map (advertiser LRU + chase session providers)", () => {
             }
         };
         const pubsub: PubsubService = {
-            publish: async () => undefined,
+            publish: async () => ({}),
             subscribe: () => {},
             unsubscribe: () => {},
             getSubscribers: () => [],

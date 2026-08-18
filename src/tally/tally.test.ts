@@ -60,8 +60,8 @@ describe("makeTally", () => {
 
         expect(tally.contestId).toBe("biz");
         expect(tally.ranking).toHaveLength(1);
-        expect(tally.ranking[0].community.publicKey).toBe(KEY_A);
-        expect(tally.ranking[0].weight).toBe(2n);
+        expect(tally.ranking[0]!.community.publicKey).toBe(KEY_A);
+        expect(tally.ranking[0]!.weight).toBe(2n);
     });
 
     it("ranks communities by weight, highest first", async () => {
@@ -116,8 +116,8 @@ describe("makeTally", () => {
     it("flags a row's name unresolved while its only carried name is still pending", async () => {
         const entries = [entry("0xaaa", [{ community: { name: "memes.bso", publicKey: KEY_A }, vote: 1 }], { nameResolved: false })];
         const tally = await makeTally(makeDeps(entries)).compute();
-        expect(tally.ranking[0].community.name).toBe("memes.bso");
-        expect(tally.ranking[0].nameResolved).toBe(false);
+        expect(tally.ranking[0]!.community.name).toBe("memes.bso");
+        expect(tally.ranking[0]!.nameResolved).toBe(false);
     });
 
     it("does zero chain reads for constant weight, and reads no block hash absent a tie", async () => {
@@ -141,7 +141,7 @@ describe("makeTally", () => {
         ];
         const tally = await makeTally(makeDeps(entries)).compute();
         expect(tally.ranking).toHaveLength(1);
-        expect(tally.ranking[0].weight).toBe(1n);
+        expect(tally.ranking[0]!.weight).toBe(1n);
     });
 
     it("breaks a weight tie via the rolling block-hash seed, deterministically", async () => {

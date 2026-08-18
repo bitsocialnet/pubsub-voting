@@ -35,7 +35,7 @@ describe("checkpoint codec", () => {
             "0x0000000000000000000000000000000000000001",
             "0x0000000000000000000000000000000000000002"
         ]);
-        expect(decoded[0].votes[0].community.publicKey).toBe(KEY_A);
+        expect(decoded[0]!.votes[0]!.community.publicKey).toBe(KEY_A);
     });
 
     it("is order-independent: shuffled input yields the same root CID", async () => {

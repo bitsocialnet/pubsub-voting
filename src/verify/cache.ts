@@ -68,8 +68,11 @@ export interface CachingBundleVerifier {
  * valid bundle or a provable `reject` is remembered (a known-bad bundle is not re-fetched or
  * re-checked), while a transient `ignore` is re-evaluated next time so a stale head/record
  * cannot pin it.
+ *
+ * Takes the `verify` half of a {@link BundleVerifier}: the cache memoizes whole-pipeline verdicts
+ * by CID and has nothing to say about the offline stage or a gate check, so it asks for neither.
  */
-export function makeCachingVerifier(verifier: BundleVerifier, cache: VerdictCache): CachingBundleVerifier {
+export function makeCachingVerifier(verifier: Pick<BundleVerifier, "verify">, cache: VerdictCache): CachingBundleVerifier {
     return {
         async verify(cid: CID, bundle: VotesBundle): Promise<BundleVerdict> {
             const cached = cache.get(cid);
