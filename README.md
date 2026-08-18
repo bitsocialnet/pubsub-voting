@@ -184,7 +184,7 @@ const vote = await voter.createContestVote({
   votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }],
   signer: mySigner                                                // VoteSigner: address() + signBallot()
 });
-vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → published → verified-locally → verified-by-peer (or failed)
+vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → published, then verified-locally and/or verified-by-peer (or failed)
 const { bundle, cid, recipientCount } = await vote.publish();     // the signed VotesBundle, its CID, and how many peers gossipsub sent it directly to
 vote.signer === mySigner;                                         // the ballot carries the wallet it was minted with
 
@@ -209,6 +209,8 @@ The positive verdicts are states too, so a client never has to infer "it counted
 
 - `"verified-locally"` — our own deferred checks came back clean for this bundle. Still our verdict, but every honest peer runs byte-identical checks, so it is the strongest inference available without hearing from anyone.
 - `"verified-by-peer"` — a peer advertised a checkpoint containing this bundle. A node serves only fully verified bundles in its own checkpoint, so an honest peer including it implies that peer verified it too; what is *observed* is that somebody other than us is keeping the vote.
+
+The two are independent outcomes of two asynchronous races, not a sequence: a peer can serve our bundle back before our own gate read returns, in which case `"verified-by-peer"` is reached directly and `"verified-locally"` is never emitted. Peer evidence is the stronger of the two, so it is never walked back to the local verdict arriving late. Treat both as terminal-positive; do not wait for `"verified-locally"` before `"verified-by-peer"`.
 
 Both are readable from the contest by bundle CID, which is how a restored vote asks after a reload — the publishing `ContestVote` is long gone by then, but the vote lives for `voteExpiryBuckets`. Persist `PublishOutcome.cid` and ask with it:
 

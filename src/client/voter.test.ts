@@ -20,6 +20,7 @@ import {
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
+import type { VoteSigner } from "../signer/types.js";
 import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import type { Criteria } from "../schema/criteria.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
@@ -2997,6 +2998,56 @@ describe("publisher verification states", () => {
         return { helia, blocks, validators: topicValidators };
     }
 
+    /**
+     * A chain with a caller-moved head (so two attempts on one ballot land in different buckets
+     * and sign different bytes) whose `balanceOf` answer is looked up per block — an empty map
+     * means ineligible everywhere. `supportsInterface` always declares.
+     */
+    function blockKeyedChains(head: () => bigint, balances: Map<bigint, bigint>): ChainClientFactory {
+        const client = {
+            getBlockNumber: async () => head(),
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async ({ functionName, blockNumber }: { functionName?: string; blockNumber?: bigint } = {}) =>
+                functionName === "supportsInterface" ? true : (balances.get(blockNumber ?? 0n) ?? 0n)
+        };
+        return () => client as unknown as ChainClient;
+    }
+
+    /** Like {@link gatedChains}, but with a caller-moved head so two attempts can sign different bytes. */
+    function gatedChainsAt(head: () => bigint): { chains: ChainClientFactory; release: () => void } {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        const client = {
+            getBlockNumber: async () => head(),
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async ({ functionName }: { functionName?: string } = {}) => {
+                if (functionName === "supportsInterface") return true;
+                await gate;
+                return 1n;
+            }
+        };
+        return { chains: () => client as unknown as ChainClient, release };
+    }
+
+    /** A signer that holds its SECOND `signBallot` open, parking a re-publish inside `signVote`. */
+    function signerHeldOnSecondBallot(): { signer: VoteSigner; releaseSign: () => void } {
+        const inner = fakeSigner();
+        let releaseSign!: () => void;
+        const gate = new Promise<void>((resolve) => (releaseSign = resolve));
+        let calls = 0;
+        return {
+            signer: {
+                address: () => inner.address(),
+                signBallot: async (typedData) => {
+                    calls += 1;
+                    if (calls === 2) await gate;
+                    return inner.signBallot(typedData);
+                }
+            },
+            releaseSign
+        };
+    }
+
     /** A second, foreign bundle — only there to make a peer's checkpoint differ from our own. */
     function foreignBundle() {
         return {
@@ -3107,6 +3158,83 @@ describe("publisher verification states", () => {
         expect(vote.publishingState).toBe("verified-by-peer");
         await contest.stop();
         vi.useRealTimers();
+    });
+
+    it("does not fail a re-publish when the attempt it superseded is evicted", async () => {
+        vi.useFakeTimers();
+        let head = 43200n;
+        // Ineligible at every block, so BOTH attempts walk the grace window — but they enter it
+        // 90 s apart, which is the whole point: the first is evicted while the second is still
+        // provisional, so the CRDT is still holding the first as its fallback winner and the
+        // background verifier still owns its eviction callback.
+        const chains = blockKeyedChains(() => head, new Map());
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const errors: unknown[] = [];
+        vote.on("error", (error) => errors.push(error));
+
+        const first = await vote.publish();
+        expect(vote.publishingState).toBe("published");
+
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS * 0.75); // still inside the first's grace
+        head = 86401n; // the next bucket, a block past its boundary
+        const second = await vote.publish();
+        expect(second.cid.equals(first.cid)).toBe(false);
+        expect(vote.publishingState).toBe("published");
+
+        // The first attempt's grace window closes; the second's has 90 s left to run.
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS * 0.25 + GATE_RETRY_MS * 2);
+        await vi.waitFor(() => expect(contest.checksFor(first.cid)).toBeUndefined());
+        expect(contest.checksFor(second.cid)).toEqual({ chainVerified: false });
+
+        // That eviction belongs to an attempt this object no longer owns. Reporting it would tell
+        // the publisher that its LIVE vote was rejected, which is the opposite of what happened.
+        expect(vote.publishingState).toBe("published");
+        expect(errors).toEqual([]);
+
+        // The attempt that DOES own the object is still evictable on its own schedule — scoping
+        // the callback must not swallow the report the publisher is actually owed.
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
+        await vi.waitFor(() => expect(vote.publishingState).toBe("failed"));
+        expect(errors).toHaveLength(1);
+        expect((errors[0] as VoteEvictedError).bundle.blockNumber).toBe(86400);
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("ignores the superseded attempt's clean verdict landing while the next attempt is still signing", async () => {
+        let head = 43200n;
+        const { chains, release } = gatedChainsAt(() => head);
+        const { signer, releaseSign } = signerHeldOnSecondBallot();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer });
+        const states: PublishingState[] = [];
+        vote.on("publishingstatechange", (state) => states.push(state));
+
+        const first = await vote.publish(); // gate read still held open: "published", nothing more
+
+        head = 86401n;
+        const republish = vote.publish();
+        // Parked inside `signVote`: the attempt has advanced, but `#cid` still holds the PREVIOUS
+        // attempt's value — the window where a CID check cannot tell the two attempts apart.
+        await vi.waitFor(() => expect(vote.publishingState).toBe("signing"));
+
+        release(); // the FIRST attempt's deferred checks come back clean
+        await vi.waitFor(() => expect(contest.checksFor(first.cid)).toEqual({ chainVerified: true }));
+        expect(vote.publishingState).toBe("signing");
+
+        releaseSign();
+        const second = await republish;
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        expect(contest.checksFor(second.cid)).toEqual({ chainVerified: true });
+        // No stray "verified-locally" between the second attempt's "signing" and "publishing":
+        // the old bundle's verdict is the old attempt's, and it says nothing about these bytes.
+        expect(states).toEqual(["signing", "publishing", "published", "signing", "publishing", "published", "verified-locally"]);
+        await contest.stop();
     });
 
     it("trackOwnBundle is idempotent and attributes nothing for a bundle this contest does not hold", async () => {

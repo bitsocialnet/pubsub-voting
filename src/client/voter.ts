@@ -85,7 +85,7 @@ import {
  * `blockNumber` on a published `VotesBundle`, and `criteria.voteExpiryBuckets` /
  * `criteria.blocksPerBucket` are what a client uses to schedule its own refreshes: a vote sampled
  * at bucket `b` expires once the current bucket exceeds `b + voteExpiryBuckets`; refresh by
- * calling `createContestVote({ criteria, votes }).publish()` again before then.
+ * calling `createContestVote({ criteria, votes, signer }).publish()` again before then.
  */
 export function republishIntervalBuckets(criteria: Criteria): number {
     return Math.ceil(criteria.voteExpiryBuckets / 2);
@@ -2522,12 +2522,33 @@ class ContestVotePublication implements ContestVote {
     #bundle: VotesBundle | undefined;
     #cid: CID | undefined;
     /**
+     * Which `publish()` call owns the state machine. Incremented synchronously at the top of
+     * `publish()`, BEFORE any await, and captured by every callback that attempt registers.
+     *
+     * A re-publish in a later window signs new bytes, so the previous attempt's bundle keeps its
+     * own CID, stays live in the CRDT (a superseded bundle outlives its superseder's deferred
+     * checks) and can still be verified, served by a peer, or evicted — long after a newer
+     * attempt owns this object. Matching on the CID cannot separate the two: `#cid` still holds
+     * the PREVIOUS attempt's value until the new `signVote()` resolves, so an old verdict landing
+     * in that window passes a CID check and moves the wrong attempt. The token is established
+     * before that window opens, so it does not. It also decouples the check from `#cid` entirely,
+     * which is what lets a verdict that settles BEFORE `#cid` is assigned still be delivered
+     * (the engine delivers each callback once and then drops it — a settlement ignored here is
+     * lost for good).
+     */
+    #attempt = 0;
+    /**
      * True once the background verifier evicted the current publish's bundle. The eviction can
      * land WHILE `publish()` is still broadcasting (the deferred checks run concurrently), and
      * its `"failed"` is terminal for this attempt — the in-flight publish must not stomp it
      * with `"publishing"`/`"published"`. Reset by the next `publish()` call.
      */
     #evicted = false;
+
+    /** Is this callback's attempt still the one that owns the object? (see {@link #attempt}) */
+    #isCurrent(attempt: number): boolean {
+        return attempt === this.#attempt;
+    }
 
     /**
      * Advance to a settled state, unless this attempt is already finished or further along.
@@ -2537,11 +2558,8 @@ class ContestVotePublication implements ContestVote {
      * checkpoints only fully verified bundles), so it must never be overwritten by the weaker
      * local one arriving late.
      */
-    #settle(state: "verified-locally" | "verified-by-peer", cid: CID): void {
-        // A re-publish in a LATER window signs new bytes, so the previous attempt's bundle keeps
-        // its own CID, stays live, and can still be verified or served by a peer. Its callbacks
-        // must not move the state of the attempt that replaced it.
-        if (this.#cid === undefined || !this.#cid.equals(cid)) return;
+    #settle(attempt: number, state: "verified-locally" | "verified-by-peer"): void {
+        if (!this.#isCurrent(attempt)) return;
         if (this.#evicted || this.#state === "failed" || this.#state === "verified-by-peer") return;
         if (state === "verified-locally" && this.#state === "verified-locally") return;
         this.#setState(state);
@@ -2578,6 +2596,11 @@ class ContestVotePublication implements ContestVote {
     }
 
     async publish(): Promise<PublishOutcome> {
+        // Before the first await: every callback below is bound to THIS attempt, and the
+        // previous attempt's callbacks stop being able to move this object the moment the
+        // counter ticks — even though its bundle is still live and still verifiable.
+        const attempt = ++this.#attempt;
+        this.#evicted = false;
         try {
             // Name preflight, also before joining: a vote whose carried community name
             // definitively fails to resolve to its claimed key would be silently dropped by
@@ -2586,19 +2609,22 @@ class ContestVotePublication implements ContestVote {
             // the background verifier owns the deferred check).
             const namesSettled = await this.#engine.preflightNames(this.votes);
             await this.#engine.join();
-            this.#evicted = false;
             this.#setState("signing");
             const { bundle, encoded, cid } = await this.#engine.signVote([...this.votes], this.signer, {
                 namesSettled,
                 // The positive counterparts of `onEvicted`: our own deferred checks settling
                 // clean, then a peer serving the bundle back to us in its checkpoint. Both
                 // normally land after publish() has resolved.
-                onVerified: (verified) => this.#settle("verified-locally", verified),
-                onCheckpointedByPeer: (served) => this.#settle("verified-by-peer", served),
+                onVerified: () => this.#settle(attempt, "verified-locally"),
+                onCheckpointedByPeer: () => this.#settle(attempt, "verified-by-peer"),
                 // The one rejection a publisher can hear about (peers drop silently): our own
                 // node's deferred checks evicting this bundle. Usually post hoc — publish() has
                 // already resolved — so it surfaces as `error` + `publishingState: "failed"`.
                 onEvicted: (error) => {
+                    // Attempt-scoped like the positive verdicts: a superseded bundle is kept
+                    // alive while its superseder's checks are pending, so an eviction of the
+                    // PREVIOUS attempt's bytes must not fail the attempt that replaced it.
+                    if (!this.#isCurrent(attempt)) return;
                     this.#evicted = true;
                     this.#fail(error);
                 }
@@ -2616,7 +2642,10 @@ class ContestVotePublication implements ContestVote {
             if (!this.#evicted && this.#state === "publishing") this.#setState("published");
             return { bundle, recipientCount, cid };
         } catch (error) {
-            this.#fail(error);
+            // Same scoping: two overlapping `publish()` calls are a misuse, but the loser's
+            // rejection belongs to ITS caller (it is rethrown), not to the state machine a
+            // later attempt now owns.
+            if (this.#isCurrent(attempt)) this.#fail(error);
             throw error;
         }
     }
