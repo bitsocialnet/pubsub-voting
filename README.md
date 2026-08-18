@@ -182,8 +182,8 @@ Repeated `createContest` calls with byte-identical criteria return the same `Con
 
 ```ts
 const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
-vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → succeeded (or failed)
-const { bundle, recipientCount } = await vote.publish();          // the signed VotesBundle + how many peers gossipsub sent it directly to
+vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → published → verified-locally → verified-by-peer (or failed)
+const { bundle, cid, recipientCount } = await vote.publish();     // the signed VotesBundle, its CID, and how many peers gossipsub sent it directly to
 
 // Withdraw (active): publish an empty ballot; it supersedes the prior vote under LWW.
 await (await voter.createContestVote({ criteria, votes: [] })).publish();
@@ -200,7 +200,19 @@ A community's identity is its `publicKey`. The optional `name` is the community'
 Gossipsub gives a publisher **no acceptance or rejection feedback** — a peer that drops a bundle does so silently. Since every honest peer runs the same checks this node runs, the library turns its own local verdict into the feedback the protocol can't provide, in two places:
 
 - **At `publish()`**: each vote's `community.name` is preflighted through the shared resolution cache first — a name that definitively fails (no resolver for its TLD, no record, or it resolves to a **different** `publicKey` than the vote claims) throws `InvalidCommunityNameError` before signing or joining the topic, since every verifier would silently drop that bundle anyway. A resolver that merely *throws* (registry outage) never blocks the publish — the check stays deferred to the background verifier.
-- **After `publish()` resolved**: `"succeeded"` means signed and broadcast, **not** accepted by the network. The deferred checks (the on-chain gate read, and any name resolution a preflight outage skipped) run in the background; if one evicts the bundle, the vote emits a `VoteEvictedError` on its `error` event — carrying the evicted `bundle` and the exact `verdict` any verifier would produce — and its `publishingState` flips to `"failed"` post hoc. The same error fires on the contest's `error` event, for long-lived views.
+- **After `publish()` resolved**: `"published"` means signed and broadcast, **not** accepted by the network. The deferred checks (the on-chain gate read, and any name resolution a preflight outage skipped) run in the background; if one evicts the bundle, the vote emits a `VoteEvictedError` on its `error` event — carrying the evicted `bundle` and the exact `verdict` any verifier would produce — and its `publishingState` flips to `"failed"` post hoc. The same error fires on the contest's `error` event, for long-lived views.
+
+The positive verdicts are states too, so a client never has to infer "it counted" from the absence of an error:
+
+- `"verified-locally"` — our own deferred checks came back clean for this bundle. Still our verdict, but every honest peer runs byte-identical checks, so it is the strongest inference available without hearing from anyone.
+- `"verified-by-peer"` — a peer advertised a checkpoint containing this bundle. A node serves only fully verified bundles in its own checkpoint, so an honest peer including it implies that peer verified it too; what is *observed* is that somebody other than us is keeping the vote.
+
+Both survive a page reload through the contest, which is where a restored vote asks about a CID it persisted from `PublishOutcome.cid` — the publishing `ContestVote` is long gone by then, but a vote lives for `voteExpiryBuckets`:
+
+```ts
+contest.checksFor(cid);          // { chainVerified, nameResolved? } — or undefined if not held (never admitted, evicted, expired)
+contest.checkpointPeersFor(cid); // peer ids seen serving OUR bundle back in their checkpoint (own bundles only; a lower bound)
+```
 
 ```ts
 vote.on("error", (err) => {

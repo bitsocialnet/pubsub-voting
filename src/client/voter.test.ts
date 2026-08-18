@@ -35,7 +35,7 @@ import {
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
-import { blockForBytes } from "../checkpoint/codec.js";
+import { blockForBytes, encodeCheckpoint } from "../checkpoint/codec.js";
 import {
     bizCriteria,
     bizGateRef,
@@ -318,8 +318,8 @@ describe("createContestVote (publish path)", () => {
         expect(vote.publishingState).toBe("stopped");
 
         const { bundle, recipientCount } = await vote.publish();
-        expect(states).toEqual(["signing", "publishing", "succeeded"]);
-        expect(vote.publishingState).toBe("succeeded");
+        expect(states).toEqual(["signing", "publishing", "published"]);
+        expect(vote.publishingState).toBe("published");
         expect(vote.bundle).toBe(bundle);
         expect(recipientCount).toBe(1); // gossipsub `recipients.length`, surfaced through the facade
         expect(bundle.address).toBe("0x0000000000000000000000000000000000000001");
@@ -2966,5 +2966,125 @@ describe("makeHeadReader (voter-wide gating-chain head coalescer)", () => {
         await Promise.all([contestA.getTally(), contestB.getTally()]);
         expect(heads - before).toBe(1);
         await voter.destroy();
+    });
+});
+
+
+/** The gossip forward-gate the pubsub service registers per topic (a test drives it directly). */
+type TopicValidator = (peer: PeerId, message: { topic: string; data: Uint8Array }) => Promise<unknown>;
+
+describe("publisher verification states", () => {
+    /** A Helia whose blockstore is a real map, so a peer's checkpoint blocks can be made readable. */
+    function checkpointHelia(): { helia: HeliaInstance; blocks: Map<string, Uint8Array>; validators: Map<string, TopicValidator> } {
+        const blocks = new Map<string, Uint8Array>();
+        const topicValidators = new Map<string, TopicValidator>();
+        const pubsub = {
+            publish: async () => ({ recipients: [] as PeerId[] }),
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [],
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators
+        } as unknown as PubsubService;
+        const blockstore = {
+            get: async (cid: CID) => {
+                const bytes = blocks.get(cid.toString());
+                if (bytes === undefined) throw new Error(`no block ${cid.toString()}`);
+                return bytes;
+            },
+            put: async (cid: CID, bytes: Uint8Array) => {
+                blocks.set(cid.toString(), bytes);
+                return cid;
+            },
+            has: async (cid: CID) => blocks.has(cid.toString())
+        };
+        const helia = { libp2p: { services: { pubsub, fetch: fakeFetchService() } }, blockstore } as unknown as HeliaInstance;
+        return { helia, blocks, validators: topicValidators };
+    }
+
+    /** A second, foreign bundle — only there to make a peer's checkpoint differ from our own. */
+    function foreignBundle() {
+        return {
+            address: `0x${"ab".repeat(20)}`,
+            votes: [{ community: { publicKey: OTHER_KEY }, vote: 1 }],
+            blockNumber: 43200,
+            signature: { signature: `0x${"11".repeat(65)}`, type: "eip712" as const }
+        };
+    }
+
+    it("walks published → verified-locally once the deferred gate read settles clean", async () => {
+        const { chains, release } = gatedChains();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains, signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const states: PublishingState[] = [];
+        vote.on("publishingstatechange", (state) => states.push(state));
+
+        const { cid } = await vote.publish();
+        // publish() resolves on the OFFLINE checks — the gate read is still held open here, and
+        // "published" says exactly that much: broadcast, nothing more.
+        expect(vote.publishingState).toBe("published");
+        expect(contest.checksFor(cid)).toEqual({ chainVerified: false });
+
+        release();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        expect(states).toEqual(["signing", "publishing", "published", "verified-locally"]);
+        expect(contest.checksFor(cid)).toEqual({ chainVerified: true });
+        expect(vote.checks).toEqual({ chainVerified: true });
+        // Nobody else has served it back to us, so tier 3 stays empty.
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+        await contest.stop();
+    });
+
+    it("reports no checks at all for an evicted bundle (never a pending-looking `false`)", async () => {
+        vi.useFakeTimers();
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains({ balance: 0n }), signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const { cid } = await vote.publish();
+        expect(contest.checksFor(cid)).toEqual({ chainVerified: false });
+
+        await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS * 2);
+        await vi.waitFor(() => expect(vote.publishingState).toBe("failed"));
+        // Gone from the working set: `undefined` means "not held", which a caller must not
+        // confuse with `{ chainVerified: false }` — that one means "not read YET".
+        expect(contest.checksFor(cid)).toBeUndefined();
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("reaches verified-by-peer, naming the peer whose checkpoint carried our own vote", async () => {
+        vi.useFakeTimers();
+        const { helia, blocks, validators } = checkpointHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains({ balance: 1n }), signer: fakeSigner() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE });
+        const { bundle, cid } = await vote.publish();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+
+        // A peer advertises a checkpoint holding OUR bundle (plus a foreign one, so its root
+        // differs from ours and the hint is actually chased rather than suppressed as a match).
+        const { root, blocks: cpBlocks } = await encodeCheckpoint([bundle, foreignBundle()]);
+        for (const block of cpBlocks) blocks.set(block.cid.toString(), block.bytes);
+        const record: RootRecord = { version: ROOT_RECORD_VERSION, root, count: 2, sizeBytes: 0 };
+        const validator = validators.get(contest.topic)!;
+        await validator({ toString: () => "peerA" } as unknown as PeerId, {
+            topic: contest.topic,
+            data: encodeRootMessage(record)
+        } as never);
+        await vi.advanceTimersByTimeAsync(1);
+
+        // Our own bundle is already held, so the chase never ADMITS it — attribution can only
+        // come from what the checkpoint contained.
+        await vi.waitFor(() => expect(contest.checkpointPeersFor(cid)).toEqual(["peerA"]));
+        expect(vote.publishingState).toBe("verified-by-peer");
+        await contest.stop();
+        vi.useRealTimers();
     });
 });

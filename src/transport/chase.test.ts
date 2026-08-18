@@ -66,6 +66,7 @@ function fakeSession(map: Map<string, Uint8Array>) {
 function harness(over: Partial<RootChaserDeps> & Pick<RootChaserDeps, "getBlock">) {
     const admitted: Array<{ cid: CID; verified: boolean }> = [];
     const deferred: PendingBundle[][] = [];
+    const contents: Array<{ root: CID; cids: CID[] }> = [];
     const runs: Promise<unknown>[] = [];
     let mergedCalls = 0;
     const chaser = makeRootChaser({
@@ -81,6 +82,9 @@ function harness(over: Partial<RootChaserDeps> & Pick<RootChaserDeps, "getBlock"
         onMerged: () => {
             mergedCalls++;
         },
+        onCheckpointContents: (root, cids) => {
+            contents.push({ root, cids });
+        },
         limit: (fn) => {
             const run = fn();
             runs.push(run);
@@ -93,7 +97,7 @@ function harness(over: Partial<RootChaserDeps> & Pick<RootChaserDeps, "getBlock"
         // A run may queue further work; settle every captured promise (they never reject upward).
         await Promise.allSettled(runs);
     };
-    return { chaser, admitted, deferred, settle, merged: () => mergedCalls };
+    return { chaser, admitted, deferred, contents, settle, merged: () => mergedCalls };
 }
 
 describe("makeRootChaser", () => {
@@ -111,6 +115,32 @@ describe("makeRootChaser", () => {
         expect(h.deferred[0]).toHaveLength(2);
         expect(h.merged()).toBe(1);
         expect(h.chaser.inFlight()).toBe(0);
+    });
+
+    it("reports every CID a checkpoint contained — including bundles already held, which never reach admit", async () => {
+        const winners = [bundle("0x1"), bundle("0x2")];
+        const { root, getBlock } = await checkpointOf(winners);
+        // Everything in this checkpoint is already in our store: the publisher's own bundle is
+        // always in exactly this position, so if `onCheckpointContents` fired from the admit path
+        // it would never mention the one CID a publisher actually wants to hear about.
+        const h = harness({ getBlock, hasBundle: async () => true });
+        h.chaser.chase(root);
+        await h.settle();
+        expect(h.admitted).toHaveLength(0);
+        expect(h.deferred).toHaveLength(0);
+        expect(h.merged()).toBe(0);
+        expect(h.contents).toHaveLength(1);
+        expect(h.contents[0]?.root.toString()).toBe(root.toString());
+        expect(h.contents[0]?.cids).toHaveLength(2);
+    });
+
+    it("does not report contents for a chase that decoded nothing", async () => {
+        // Unfetchable blocks: the decode yields no winners, so there is nothing to attribute.
+        const { root } = await checkpointOf([bundle("0x1")]);
+        const h = harness({ getBlock: async () => undefined });
+        h.chaser.chase(root);
+        await h.settle();
+        expect(h.contents).toHaveLength(0);
     });
 
     it("skips the root-manifest fetch when handed a verified chunk index (piggyback fast-path)", async () => {
