@@ -122,6 +122,13 @@ network on the day: `connect` fell ~0.13s at every N (1.68s → 1.56s at N=1) an
 1.85s → 1.14s (write→read 1.48s → 0.84s), which is also what pulls `START→VERIFIED` at N=1000 down
 (6.35s → 6.16s) despite the extra round trip.*
 
+*Re-measured 2026-08-18 (median of 3) with **signed provider records** (the announcer now PUTs an
+IPIP-0526 `Signature` + `Payload.Timestamp`; the bench router refuses a record without them). The
+announce is seeder-side and out-of-band of the measured join path, and every column matched the table
+within jitter: `START→TALLY` 2.46s / 2.48s / 2.48s / 2.66s / 4.80s and `START→VERIFIED` 3.07s / 3.09s /
+3.09s / 3.27s / 6.08s for N=1…1000, with `router` 1.00s, `connect` 1.58–1.59s, `fetch` 0.51–1.09s and
+`gate-RPC` 3 / 3 / 3 / 3 / 9 unchanged. The table above is left at the 2026-08-09 numbers.*
+
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
 gateway and background chain verification existed, hence no gate-RPC/VERIFIED values) — a realistic
