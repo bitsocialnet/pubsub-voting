@@ -4,16 +4,34 @@ import net from "node:net";
 import type { AddressInfo } from "node:net";
 import { makeAnnouncer, announceableAddrs, sentinelAddrs } from "./node.js";
 import { makeAnnouncer as makeBrowserAnnouncer } from "./browser.js";
+import { requireAnnounceSigner, signedProvidersBody } from "./record.js";
+import { createTestPeer, rawPayload, verifyProvidersBody } from "./router-verifier.test-fixtures.js";
+import { MissingPrivateKeyError } from "../../errors.js";
 import type { AnnouncerLibp2p, AnnouncerOptions } from "./types.js";
 
 /** One received announce, as the mock router recorded it. */
 interface ReceivedPut {
     method: string;
     url: string;
-    body: { Providers: Array<{ Schema: string; Payload: { ID: string; Addrs: string[]; Keys: string[] } }> };
+    /** The body EXACTLY as it arrived — what the signature covers (see router-verifier fixture). */
+    raw: string;
+    body: {
+        Providers: Array<{
+            Schema: string;
+            Signature?: string;
+            Payload: { ID: string; Addrs: string[]; Keys: string[]; Timestamp?: number };
+        }>;
+    };
+    /** The production router's verdict on this record, mirrored by the fixture verifier. */
+    verification: ReturnType<typeof verifyProvidersBody>;
 }
 
-/** A local mock Delegated Routing V1 router: records every PUT, answers per `status`. */
+/**
+ * A local mock Delegated Routing V1 router: records every PUT, verifies its record the way the
+ * production router does — signature verification is not optional there and there is no mode
+ * here that skips it — and answers 403 on a record it refuses (the exact answer issue #38's
+ * seeder was getting), or per `status` otherwise.
+ */
 async function startMockRouter(opts: { status?: number; hang?: boolean } = {}): Promise<{
     url: string;
     puts: ReceivedPut[];
@@ -24,8 +42,20 @@ async function startMockRouter(opts: { status?: number; hang?: boolean } = {}): 
         let raw = "";
         req.on("data", (d) => (raw += d));
         req.on("end", () => {
-            puts.push({ method: req.method ?? "", url: req.url ?? "", body: raw ? JSON.parse(raw) : undefined });
+            const verification = raw ? verifyProvidersBody(raw) : { valid: false as const, reason: undefined };
+            puts.push({
+                method: req.method ?? "",
+                url: req.url ?? "",
+                raw,
+                body: raw ? JSON.parse(raw) : undefined,
+                verification
+            });
             if (opts.hang) return; // never answer — the client's per-router timeout must fire
+            if (!verification.valid) {
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ Error: `record verification failed: ${verification.error}` }));
+                return;
+            }
             res.writeHead(opts.status ?? 200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ProvideResults: [] }));
         });
@@ -55,14 +85,27 @@ async function waitUntil(cond: () => boolean, timeoutMs = 2_000): Promise<void> 
 const PUBLIC_ADDR = "/ip4/203.0.113.5/tcp/4001";
 const DNS_ADDR = "/dns4/example.libp2p.direct/tcp/443/tls/ws";
 
-/** A fake libp2p carrying a peer id + address set, capturing the `self:peer:update` listener. */
+/**
+ * The announcing node's identity, shared by every test in this file: a REAL ed25519 key whose peer
+ * id embeds its public key, because a router recovers the verifying key from `Payload.ID` alone —
+ * a made-up peer id string can no longer stand in.
+ */
+const PEER = createTestPeer();
+
+/**
+ * A fake libp2p carrying a peer id + address set, capturing the `self:peer:update` listener. The
+ * signing key sits on `components.privateKey`, where a running libp2p node actually keeps it (the
+ * public `Libp2p` interface exposes only the derived peer id), and signs like libp2p's
+ * `Ed25519PrivateKey`: raw ed25519 over whatever bytes it is handed.
+ */
 function fakeLibp2p(addrs: string[] = [PUBLIC_ADDR, "/ip4/127.0.0.1/tcp/4001"]): AnnouncerLibp2p & {
     fireAddressChange: () => void;
     listenerCount: () => number;
 } {
     const listeners = new Set<() => void>();
     return {
-        peerId: { toString: () => "12D3KooWAnnouncerPeer" },
+        peerId: { toString: () => PEER.peerId },
+        components: { privateKey: { sign: (data: Uint8Array) => PEER.sign(data) } },
         getMultiaddrs: () => addrs.map((a) => ({ toString: () => a })),
         addEventListener: (_type, listener) => listeners.add(listener),
         removeEventListener: (_type, listener) => listeners.delete(listener),
@@ -137,16 +180,16 @@ describe("sentinelAddrs", () => {
     it("derives deduped wildcard sentinels from non-loopback interface addrs, keeping port/transport/p2p suffix", () => {
         expect(
             sentinelAddrs([
-                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer",
-                "/ip4/192.168.1.7/tcp/4001/p2p/12D3KooWAnnouncerPeer",
-                "/ip4/172.31.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer", // same port as above — dedupes
-                "/ip4/192.168.1.7/tcp/4002/ws/p2p/12D3KooWAnnouncerPeer",
-                "/ip6/fd00::1/tcp/4001/p2p/12D3KooWAnnouncerPeer"
+                `/ip4/127.0.0.1/tcp/4001/p2p/${PEER.peerId}`,
+                `/ip4/192.168.1.7/tcp/4001/p2p/${PEER.peerId}`,
+                `/ip4/172.31.0.1/tcp/4001/p2p/${PEER.peerId}`, // same port as above — dedupes
+                `/ip4/192.168.1.7/tcp/4002/ws/p2p/${PEER.peerId}`,
+                `/ip6/fd00::1/tcp/4001/p2p/${PEER.peerId}`
             ])
         ).toEqual([
-            "/ip4/0.0.0.0/tcp/4001/p2p/12D3KooWAnnouncerPeer",
-            "/ip4/0.0.0.0/tcp/4002/ws/p2p/12D3KooWAnnouncerPeer",
-            "/ip6/::/tcp/4001/p2p/12D3KooWAnnouncerPeer"
+            `/ip4/0.0.0.0/tcp/4001/p2p/${PEER.peerId}`,
+            `/ip4/0.0.0.0/tcp/4002/ws/p2p/${PEER.peerId}`,
+            `/ip6/::/tcp/4001/p2p/${PEER.peerId}`
         ]);
     });
 
@@ -185,7 +228,7 @@ describe("makeAnnouncer (node)", () => {
                 expect(put.body.Providers).toHaveLength(1);
                 const { Schema, Payload } = put.body.Providers[0]!;
                 expect(Schema).toBe("peer");
-                expect(Payload.ID).toBe("12D3KooWAnnouncerPeer");
+                expect(Payload.ID).toBe(PEER.peerId);
                 expect(Payload.Keys).toEqual(["bafyCriteria1", "bafyRoot1", "bafyCriteria2", "bafyRoot2"]);
                 expect(Payload.Addrs).toEqual([PUBLIC_ADDR]); // loopback filtered client-side
             }
@@ -339,6 +382,139 @@ describe("makeAnnouncer (node)", () => {
 });
 
 /**
+ * ROOT CAUSE (issue #38): the announcer PUT its provider record UNSIGNED, on the premise that the
+ * production router — pkc-http-router, the implementation every configured router is assumed to
+ * run — read only `Payload.{ID, Addrs, Keys, AdvisoryTTL}`. That premise went stale when the
+ * router added IPIP-0526 verification, on by default: four of a production seeder's six routers
+ * answered 403 to every announce, so the seeder was absent from them and a browser querying only
+ * those could not find it.
+ * FIX: sign the record, and stamp the `Payload.Timestamp` the verifier also requires. These tests
+ * check both against a faithful mirror of the router's verifier — including the trap the fix has
+ * to avoid, that the signature covers the Payload bytes as they appear IN THE REQUEST BODY, not a
+ * re-serialization of them.
+ */
+describe("signed provider records (IPIP-0526, as pkc-http-router verifies them)", () => {
+    it("PUTs a record the router accepts, signed over the exact Payload bytes on the wire", async () => {
+        const router = await startMockRouter();
+        try {
+            const onError = vi.fn();
+            const announcer = testAnnouncer({ routerUrls: [router.url], onError });
+            announcer.start();
+            announcer.notifyChange();
+            await waitUntil(() => router.puts.length >= 1);
+            announcer.stop();
+
+            const put = router.puts[0]!;
+            // The router's own verdict — signature over sha256 of the raw payload bytes, key
+            // recovered from Payload.ID, timestamp inside the replay bounds.
+            expect(put.verification).toEqual({ valid: true });
+            const provider = put.body.Providers[0]!;
+            expect(provider.Signature).toMatch(/^m/); // multibase base64, the reference encoding
+            expect(provider.Payload.ID).toBe(PEER.peerId);
+            // What was signed is the byte range the router locates in the body, not a re-encode.
+            expect(rawPayload(put.raw)).toBe(JSON.stringify(provider.Payload));
+            // A 403 would have reached onError; an accepted record reaches nobody.
+            expect(onError).not.toHaveBeenCalled();
+        } finally {
+            await router.stop();
+        }
+    });
+
+    it("would fail verification if the payload were re-serialized — the bytes signed are the bytes sent", async () => {
+        const router = await startMockRouter();
+        try {
+            const announcer = testAnnouncer({ routerUrls: [router.url] });
+            announcer.start();
+            announcer.notifyChange();
+            await waitUntil(() => router.puts.length >= 1);
+            announcer.stop();
+
+            const put = router.puts[0]!;
+            // Same record, same key order, only re-serialized with different spacing — which is
+            // what an announcer that stringifies the enclosing object a second time would send.
+            // The verifier must call that `invalid_signature`, or the test above proves nothing.
+            const reserialized = JSON.stringify(JSON.parse(put.raw), null, 1);
+            expect(verifyProvidersBody(reserialized).reason).toBe("invalid_signature");
+            // And the body as actually sent still verifies, byte for byte.
+            expect(verifyProvidersBody(put.raw).valid).toBe(true);
+        } finally {
+            await router.stop();
+        }
+    });
+
+    it("stamps a fresh Timestamp on every announce (the router bounds staleness and skew)", async () => {
+        const router = await startMockRouter();
+        try {
+            const announcer = testAnnouncer({ routerUrls: [router.url] });
+            announcer.start();
+            announcer.notifyChange();
+            await waitUntil(() => router.puts.length >= 1);
+            announcer.notifyChange();
+            await waitUntil(() => router.puts.length >= 2);
+            announcer.stop();
+
+            const stamps = router.puts.map((put) => put.body.Providers[0]!.Payload.Timestamp!);
+            for (const stamp of stamps) expect(Math.abs(Date.now() - stamp)).toBeLessThan(60_000);
+            // Read per announce, not captured once: the debounce alone puts the ticks ms apart.
+            expect(stamps[1]!).toBeGreaterThan(stamps[0]!);
+            for (const put of router.puts) expect(put.verification.valid).toBe(true);
+        } finally {
+            await router.stop();
+        }
+    });
+
+    it("an unsigned record is refused with 403 — the exact regression, against the same router", async () => {
+        const router = await startMockRouter();
+        try {
+            // The body the announcer used to send, replayed verbatim.
+            const unsigned = JSON.stringify({
+                Providers: [{ Schema: "peer", Payload: { ID: PEER.peerId, Addrs: [PUBLIC_ADDR], Keys: ["bafyCriteria"] } }]
+            });
+            const res = await fetch(`${router.url.replace(/\/+$/, "")}/routing/v1/providers`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: unsigned
+            });
+            expect(res.status).toBe(403);
+            expect(router.puts[0]!.verification.reason).toBe("missing_signature");
+            // A signed record missing only the timestamp is refused too — hence the stamp above.
+            const noTimestamp = await signedProvidersBody(
+                { peerId: PEER.peerId, addrs: [PUBLIC_ADDR], keys: ["bafyCriteria"], timestamp: Number.NaN },
+                PEER
+            );
+            expect(verifyProvidersBody(noTimestamp).reason).toBe("missing_timestamp");
+        } finally {
+            await router.stop();
+        }
+    });
+
+    it("a record signed by another key is refused: the verifying key comes from Payload.ID", async () => {
+        const impostor = createTestPeer();
+        const body = await signedProvidersBody(
+            { peerId: PEER.peerId, addrs: [PUBLIC_ADDR], keys: ["bafyCriteria"], timestamp: Date.now() },
+            impostor
+        );
+        expect(verifyProvidersBody(body).reason).toBe("invalid_signature");
+    });
+
+    it("finds the signing key where libp2p keeps it, and refuses to announce without one", () => {
+        const signer = { sign: (data: Uint8Array) => PEER.sign(data) };
+        const base = fakeLibp2p();
+        // The running node's key lives on the component registry...
+        expect(requireAnnounceSigner(base)).toBe(base.components!.privateKey);
+        // ...and a host that surfaces it directly is honoured without reaching into internals.
+        expect(requireAnnounceSigner({ ...base, components: undefined, privateKey: signer })).toBe(signer);
+        // A node that can sign for nothing can only produce records every router rejects, so the
+        // announcer refuses at construction instead of announcing hourly into a 403.
+        const keyless = { ...base, components: undefined, privateKey: undefined };
+        expect(() => requireAnnounceSigner(keyless)).toThrow(MissingPrivateKeyError);
+        expect(() => testAnnouncer({ routerUrls: ["https://router.invalid"], libp2p: keyless })).toThrow(
+            MissingPrivateKeyError
+        );
+    });
+});
+
+/**
  * The production router's `cleanAddrs` (pkc-http-router lib/utils.ts), mirrored faithfully:
  * strip the nodejs `::ffff:` prefix from the source IP; rewrite ONLY the exactly-unspecified
  * leading component of the matching family to the source IP and drop the other family's
@@ -408,9 +584,9 @@ describe("end-to-end against the production router's cleanAddrs semantics", () =
             const announcer = testAnnouncer({
                 routerUrls: [router.url],
                 libp2p: fakeLibp2p([
-                    "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer",
-                    "/ip4/172.31.0.1/tcp/4001/p2p/12D3KooWAnnouncerPeer",
-                    "/ip6/fd00::1/tcp/4001/p2p/12D3KooWAnnouncerPeer"
+                    `/ip4/127.0.0.1/tcp/4001/p2p/${PEER.peerId}`,
+                    `/ip4/172.31.0.1/tcp/4001/p2p/${PEER.peerId}`,
+                    `/ip6/fd00::1/tcp/4001/p2p/${PEER.peerId}`
                 ]),
                 keys: async () => ["bafyCriteria", "bafyRoot"]
             });
@@ -422,12 +598,12 @@ describe("end-to-end against the production router's cleanAddrs semantics", () =
             const record = router.records[0]!;
             // The stored record carries the request's ACTUAL source IP where the sentinel stood...
             expect(record.sourceIp).not.toBe("");
-            expect(record.addrs).toEqual([`/ip4/${record.sourceIp}/tcp/4001/p2p/12D3KooWAnnouncerPeer`]);
+            expect(record.addrs).toEqual([`/ip4/${record.sourceIp}/tcp/4001/p2p/${PEER.peerId}`]);
             // ...the cross-family /ip6/:: sentinel was dropped by the router (the PUT came over v4)...
             expect(record.addrs.join()).not.toContain("::");
             // ...and nothing unspecified leaked into what the router stores.
             expect(record.addrs.some((a) => a.includes("0.0.0.0"))).toBe(false);
-            expect(record.id).toBe("12D3KooWAnnouncerPeer");
+            expect(record.id).toBe(PEER.peerId);
             expect(record.keys).toEqual(["bafyCriteria", "bafyRoot"]);
         } finally {
             await router.stop();
@@ -441,7 +617,7 @@ describe("end-to-end against the production router's cleanAddrs semantics", () =
             // wildcard verbatim — the pass-through path, no synthesis involved.
             const announcer = testAnnouncer({
                 routerUrls: [router.url],
-                libp2p: fakeLibp2p(["/ip4/0.0.0.0/tcp/4001/p2p/12D3KooWAnnouncerPeer"])
+                libp2p: fakeLibp2p([`/ip4/0.0.0.0/tcp/4001/p2p/${PEER.peerId}`])
             });
             announcer.start();
             announcer.notifyChange();
@@ -449,7 +625,7 @@ describe("end-to-end against the production router's cleanAddrs semantics", () =
             announcer.stop();
 
             const record = router.records[0]!;
-            expect(record.addrs).toEqual([`/ip4/${record.sourceIp}/tcp/4001/p2p/12D3KooWAnnouncerPeer`]);
+            expect(record.addrs).toEqual([`/ip4/${record.sourceIp}/tcp/4001/p2p/${PEER.peerId}`]);
             expect(record.addrs.some((a) => a.includes("0.0.0.0"))).toBe(false);
         } finally {
             await router.stop();

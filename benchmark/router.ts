@@ -8,10 +8,15 @@ import { CID } from "multiformats/cid";
  *
  *   - `GET /routing/v1/providers/{cid}` answers with the known provider records for that CID,
  *     after an artificial latency that models a real over-the-internet router lookup;
- *   - `PUT /routing/v1/providers` accepts kubo-shape unsigned announces
- *     (`{ Providers: [{ Payload: { ID, Addrs, Keys } }] }`) — this is what the seeder's
- *     `httpRouterUrls` announcer writes, so the cold-join bench exercises the announce path
- *     end-to-end instead of a hardcoded record.
+ *   - `PUT /routing/v1/providers` accepts kubo-shape announces
+ *     (`{ Providers: [{ Signature, Payload: { ID, Addrs, Keys, Timestamp } }] }`) — this is what
+ *     the seeder's `httpRouterUrls` announcer writes, so the cold-join bench exercises the
+ *     announce path end-to-end instead of a hardcoded record. Production verifies the IPIP-0526
+ *     signature and answers 403 without one; the bench does not carry the crypto, but it does
+ *     refuse a record with no `Signature`/`Timestamp` — enough that an announcer regressing to
+ *     the unsigned record of issue #38 fails the bench instead of silently passing it. The
+ *     signature's own correctness is pinned by the unit test's mirror of the real verifier
+ *     (src/transport/announce).
  *
  * Keys are normalized by multihash exactly like the production router (`normalizeCid`:
  * `CID.create(1, dag-pb, cid.multihash)` on both announce and lookup), so dag-cbor criteria /
@@ -123,9 +128,14 @@ export async function startRouter(options: RouterOptions = {}): Promise<RunningR
                 return;
             }
 
-            // --- the announce path: unsigned kubo-shape PUT, one record per (key, peer) ---
+            // --- the announce path: signed kubo-shape PUT, one record per (key, peer) ---
             if (req.url === "/routing/v1/providers" && req.method === "PUT") {
-                let body: { Providers?: Array<{ Payload?: { ID?: string; Addrs?: string[]; Keys?: string[] } }> };
+                let body: {
+                    Providers?: Array<{
+                        Signature?: string;
+                        Payload?: { ID?: string; Addrs?: string[]; Keys?: string[]; Timestamp?: number };
+                    }>;
+                };
                 try {
                     body = JSON.parse(await readBody(req));
                 } catch {
@@ -135,6 +145,21 @@ export async function startRouter(options: RouterOptions = {}): Promise<RunningR
                 if (!Array.isArray(body?.Providers)) {
                     res.writeHead(400).end(JSON.stringify({ Error: 'invalid body, expected {"Providers": [...]}' }));
                     return;
+                }
+                // Production rejects the WHOLE request on the first unverifiable record; mirror that
+                // shape with the presence checks this stand-in can make (see the header comment).
+                for (const provider of body.Providers) {
+                    const missing =
+                        typeof provider.Signature !== "string" || !provider.Signature
+                            ? "record has no Signature"
+                            : typeof provider.Payload?.Timestamp !== "number"
+                              ? "record has no Payload.Timestamp"
+                              : undefined;
+                    if (missing !== undefined) {
+                        res.writeHead(403, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ Error: `record verification failed: ${missing}` }));
+                        return;
+                    }
                 }
                 try {
                     for (const provider of body.Providers) {

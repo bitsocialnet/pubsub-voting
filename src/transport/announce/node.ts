@@ -1,14 +1,17 @@
+import { requireAnnounceSigner, signedProvidersBody } from "./record.js";
 import type { Announcer, AnnouncerOptions } from "./types.js";
 
 /**
  * The Node provider-record announcer (see types.ts for the seam rationale, and DESIGN.md
- * "Deferred pkc-js work", provider-record announces): one unsigned `PUT /routing/v1/providers`
+ * "Deferred pkc-js work", provider-record announces): one **signed** `PUT /routing/v1/providers`
  * per configured router per tick, kubo's body shape —
- * `{ Providers: [{ Schema: "peer", Payload: { ID, Addrs, Keys } }] }` — with `Keys` batched
- * across ALL joined contests. Unsigned is correct against the production router
- * (pkc-http-router reads only `Payload.{ID, Addrs, Keys, AdvisoryTTL}`; no signature field
- * exists), and its anti-spoofing keeps `/ip4`/`/ip6` addrs only when the IP matches the PUT's
- * source IP — which a seeder announcing its own addresses passes naturally.
+ * `{ Providers: [{ Schema: "peer", Signature, Payload: { ID, Addrs, Keys, Timestamp } }] }` —
+ * with `Keys` batched across ALL joined contests. The signature is IPIP-0526, built by
+ * {@link signedProvidersBody} over the exact payload bytes put on the wire; the production router
+ * verifies by default and answers 403 for the whole request otherwise, so an unsigned record made
+ * the announcing node absent from every verifying router (issue #38). Its address anti-spoofing
+ * keeps `/ip4`/`/ip6` addrs only when the IP matches the PUT's source IP — which a seeder
+ * announcing its own addresses passes naturally.
  *
  * Addresses: the announceable set is `getMultiaddrs()` filtered to public/DNS addrs plus
  * exactly-unspecified addrs (`0.0.0.0`/`::`), which the production router rewrites to the PUT's
@@ -116,7 +119,7 @@ export function sentinelAddrs(addrs: readonly string[]): string[] {
     return [...sentinels];
 }
 
-/** One unsigned kubo-shape provider PUT; throws on timeout or a non-2xx answer. */
+/** One signed kubo-shape provider PUT; throws on timeout or a non-2xx answer. */
 async function putProviders(baseUrl: string, body: string, timeoutMs: number): Promise<void> {
     const endpoint = `${baseUrl.replace(/\/+$/, "")}/routing/v1/providers`;
     const res = await fetch(endpoint, {
@@ -135,6 +138,10 @@ export function makeAnnouncer(options: AnnouncerOptions): Announcer {
     const intervalMs = options.intervalMs ?? ANNOUNCE_INTERVAL_MS;
     const debounceMs = options.debounceMs ?? ANNOUNCE_DEBOUNCE_MS;
     const timeoutMs = options.timeoutMs ?? ANNOUNCE_ROUTER_TIMEOUT_MS;
+    // Resolved once, at construction: a node that cannot sign for its own peer id can only
+    // produce records the routers reject, so that is a config error to raise now, not an
+    // announce to make hourly and have refused (see MissingPrivateKeyError).
+    const signer = requireAnnounceSigner(options.libp2p);
 
     let started = false;
     let intervalTimer: ReturnType<typeof setInterval> | undefined;
@@ -162,9 +169,20 @@ export function makeAnnouncer(options: AnnouncerOptions): Announcer {
                 // Nothing joined, or loopback-only (not listening on any rewritable interface):
                 // announce nothing — the production router drops addr-less providers anyway.
                 if (keys.length === 0 || addrs.length === 0) continue;
-                const body = JSON.stringify({
-                    Providers: [{ Schema: "peer", Payload: { ID: options.libp2p.peerId.toString(), Addrs: addrs, Keys: keys } }]
-                });
+                let body: string;
+                try {
+                    // Fresh clock reading per tick: the router bounds a record's staleness and
+                    // skew, so a cached timestamp ages into a rejection (see record.ts).
+                    body = await signedProvidersBody(
+                        { peerId: options.libp2p.peerId.toString(), addrs, keys, timestamp: Date.now() },
+                        signer
+                    );
+                } catch (error) {
+                    // A key that cannot sign fails every router identically; report it on each
+                    // (the announcer never throws into the voter) and let the next tick retry.
+                    for (const url of options.routerUrls) options.onError?.(url, error);
+                    continue;
+                }
                 await Promise.all(
                     options.routerUrls.map(async (url) => {
                         try {

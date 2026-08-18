@@ -23,8 +23,26 @@
 export interface AnnouncerLibp2p {
     peerId: { toString(): string };
     getMultiaddrs(): Array<{ toString(): string }>;
+    /**
+     * The node's own signing key, if it is surfaced directly. libp2p's public `Libp2p` interface
+     * exposes only the derived `peerId`, so this is normally absent and the key is read from
+     * {@link AnnouncerLibp2p.components} instead — both are optional because the announcer probes
+     * the injected node structurally (see `requireAnnounceSigner`).
+     */
+    privateKey?: unknown;
+    /** libp2p's component registry on the running node — where `privateKey` actually lives. */
+    components?: { privateKey?: unknown };
     addEventListener(type: "self:peer:update", listener: () => void): void;
     removeEventListener(type: "self:peer:update", listener: () => void): void;
+}
+
+/**
+ * The signing surface a provider record needs: libp2p's `PrivateKey.sign`, narrowed to the one
+ * call the announcer makes. The announcer hands it the sha256 digest of the payload bytes and
+ * multibase-encodes what comes back — see `record.ts` for why that is what the router verifies.
+ */
+export interface AnnounceSigner {
+    sign(data: Uint8Array): Uint8Array | Promise<Uint8Array>;
 }
 
 export interface AnnouncerOptions {

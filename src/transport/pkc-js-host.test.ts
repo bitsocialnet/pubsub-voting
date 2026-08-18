@@ -6,6 +6,8 @@ import PKC from "@pkcprotocol/pkc-js";
 import { PubsubVoter } from "../client/voter.js";
 import { topicFor } from "../topic.js";
 import { adaptBlockstore } from "./helia.js";
+import { requireAnnounceSigner, signedProvidersBody } from "./announce/record.js";
+import { verifyProvidersBody } from "./announce/router-verifier.test-fixtures.js";
 import { bizCriteria, realSigner, stubChains } from "../test-fixtures.js";
 
 /**
@@ -59,6 +61,27 @@ describe("pkc-js host contract (offline)", () => {
         expect(contest.topic).toBe(await topicFor(bizCriteria()));
         // A fresh contest tallies empty without joining the topic — fully offline.
         expect(await contest.getTally()).toEqual({ contestId: "biz", ranking: [] });
+    });
+
+    it("the node's own key signs a provider record the HTTP routers accept", async () => {
+        // The announce path's other half of the host contract (issue #38): pkc-http-router — the
+        // implementation every configured router is assumed to run — verifies the IPIP-0526
+        // signature and 403s the whole PUT without it. Pin it against the REAL node: the key must
+        // be reachable where libp2p keeps it, and libp2p's `PrivateKey.sign` over the payload
+        // digest must be what the router's verifier accepts for THIS node's peer id. A fake signer
+        // could only prove the fixture agrees with itself.
+        const signer = requireAnnounceSigner(helia.libp2p);
+        const body = await signedProvidersBody(
+            {
+                peerId: helia.libp2p.peerId.toString(),
+                addrs: ["/ip4/203.0.113.5/tcp/4001"],
+                keys: ["bafyreihjvjzva7reg5ot6e6ahu74z2nppohcvkmk4rrykg2voike3vfjcu"],
+                timestamp: Date.now()
+            },
+            signer
+        );
+
+        expect(verifyProvidersBody(body)).toEqual({ valid: true });
     });
 
     it("the node's blockstore round-trips a block through adaptBlockstore", async () => {

@@ -12,7 +12,7 @@ export default defineConfig({
             include: ["src/**"],
             // Test infrastructure, not shipped code: the shared fixtures and the integration
             // harness (the latter is only exercised by the integration suite anyway).
-            exclude: ["src/**/*.test.ts", "src/test-fixtures.ts", "src/transport/integration/**"],
+            exclude: ["src/**/*.test.ts", "src/test-fixtures.ts", "src/**/*.test-fixtures.ts", "src/transport/integration/**"],
             // Hold the line at the measured baseline (see `npm run test:coverage`), with a small
             // margin so unrelated changes don't flake the gate. A drop below these means new
             // code landed untested — add tests, don't lower the numbers.

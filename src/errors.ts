@@ -121,6 +121,28 @@ export class MissingFetchError extends Error {
 }
 
 /**
+ * Thrown at construction when `PubsubVoterOptions.httpRouterUrls` is set but the injected Helia
+ * node's libp2p exposes no signing key (neither `libp2p.privateKey` nor `libp2p.components.privateKey`).
+ * Delegated-routing providers are announced as IPIP-0526 **signed** records — the production router
+ * verifies by default and rejects the whole PUT otherwise — so a node that cannot sign cannot
+ * announce, and announcing unsigned would silently leave the seeder undiscoverable on every
+ * verifying router. See DESIGN.md "Provider-record announces".
+ */
+export class MissingPrivateKeyError extends Error {
+    constructor() {
+        super(
+            "The injected Helia node's libp2p exposes no private key (`libp2p.privateKey` / " +
+                "`libp2p.components.privateKey`), so provider records cannot be signed. Delegated " +
+                "Routing V1 routers verify the IPIP-0526 signature and reject unsigned records, so " +
+                "`httpRouterUrls` needs a node that can sign for its own peer id. Pass a real libp2p " +
+                "node, or drop `httpRouterUrls` to stop announcing. See DESIGN.md " +
+                "\"Provider-record announces\"."
+        );
+        this.name = "MissingPrivateKeyError";
+    }
+}
+
+/**
  * Thrown once a voter has been `destroy()`ed and something tries to keep using it. Unlike `stop()`
  * (which leaves every topic but keeps the client reusable), `destroy()` is terminal: every contest
  * is stopped and can no longer update or publish. Surfaced by `createContest` / `createContestVote`,

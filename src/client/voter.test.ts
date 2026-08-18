@@ -19,6 +19,7 @@ import {
     type FetchRootRecord
 } from "../transport/messages.js";
 import { TOPIC_PREFIX } from "../topic.js";
+import { createTestPeer, verifyProvidersBody } from "../transport/announce/router-verifier.test-fixtures.js";
 import type { ChainClient, ChainClientFactory, NameResolver } from "../chain/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
@@ -1813,6 +1814,12 @@ describe("provider-record announcer (httpRouterUrls)", () => {
     /** The announcer's change-coalescing window (ANNOUNCE_DEBOUNCE_MS in transport/announce/node.ts). */
     const DEBOUNCE_MS = 10_000;
     const PUBLIC_ADDR = "/ip4/203.0.113.5/tcp/4001";
+    /**
+     * The seeder's identity: a real ed25519 key, because the record is signed with it and the
+     * routers recover the verifying key from the announced peer id (see
+     * `transport/announce/record.ts`). A made-up peer id string cannot stand in.
+     */
+    const SEEDER = createTestPeer();
 
     /**
      * A fake Helia whose libp2p also carries the announcer's surface (peer id, addresses,
@@ -1836,18 +1843,26 @@ describe("provider-record announcer (httpRouterUrls)", () => {
         const helia = {
             libp2p: {
                 services: { pubsub, fetch: fakeFetchService() },
-                peerId: { toString: () => "12D3KooWSeeder" },
+                peerId: { toString: () => SEEDER.peerId },
+                // Where a running libp2p node keeps its signing key (the public interface exposes
+                // only the derived peer id) — the announcer signs every record with it.
+                components: { privateKey: { sign: (data: Uint8Array) => SEEDER.sign(data) } },
                 getMultiaddrs: () => [PUBLIC_ADDR, "/ip4/127.0.0.1/tcp/4001"].map((a) => ({ toString: () => a })),
                 addEventListener: () => {},
                 removeEventListener: () => {}
             },
             blockstore
         } as unknown as HeliaInstance;
-        /** The JSON bodies fetch received, parsed. */
+        /** The bodies fetch received: parsed, plus the raw string the signature covers. */
         const bodies = () =>
             fetchSpy.mock.calls.map((call) => {
                 const [url, init] = call as unknown as [string, { method: string; body: string }];
-                return { url, method: init.method, body: JSON.parse(init.body) as { Providers: Array<{ Payload: { ID: string; Addrs: string[]; Keys: string[] } }> } };
+                return {
+                    url,
+                    method: init.method,
+                    raw: init.body,
+                    body: JSON.parse(init.body) as { Providers: Array<{ Payload: { ID: string; Addrs: string[]; Keys: string[] } }> }
+                };
             });
         return { helia, fetchSpy, bodies };
     }
@@ -1873,8 +1888,11 @@ describe("provider-record announcer (httpRouterUrls)", () => {
         for (const put of h.bodies()) {
             expect(put.url).toMatch(/^http:\/\/router-[ab]\.example\/routing\/v1\/providers$/);
             expect(put.method).toBe("PUT");
+            // Signed, and signed over the bytes actually sent: an unsigned record is a 403 from
+            // every router running pkc-http-router (issue #38), i.e. an undiscoverable seeder.
+            expect(verifyProvidersBody(put.raw)).toEqual({ valid: true });
             const { ID, Addrs, Keys } = put.body.Providers[0]!.Payload;
-            expect(ID).toBe("12D3KooWSeeder");
+            expect(ID).toBe(SEEDER.peerId);
             expect(Addrs).toEqual([PUBLIC_ADDR]); // loopback filtered client-side
             // Both criteria CIDs plus the (shared, deduped) empty-checkpoint root.
             expect(Keys).toEqual(expect.arrayContaining([criteriaCidOf(a.topic), criteriaCidOf(b.topic), rootA]));
