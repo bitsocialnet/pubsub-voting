@@ -34,13 +34,12 @@ See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists 
 
 ## Usage
 
-The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects its seams into a single `PubsubVoter`:
+The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects its seams into a single `PubsubVoter`. **Identity is not one of the seams**: the voting wallet (`VoteSigner`) belongs to each ballot, passed to `createContestVote`, so one voter on the host's shared node publishes for as many wallets as the host holds keys for — and a client that only renders tallies never touches key material.
 
 | Seam | Type | Required | Purpose |
 |---|---|---|---|
 | `helia` | `HeliaInstance` | yes | the host's running Helia node; must carry a gossipsub service at `libp2p.services.pubsub` (else `MissingPubsubError`), a `blockstore` (else `MissingBlockstoreError`), and a libp2p fetch service at `libp2p.services.fetch` (else `MissingFetchError`) |
 | `chains` | `ChainClientFactory` | yes | resolves the chain a contest counts in (`{ chainId }`, from `criteria.bucketChainId`) to a viem `PublicClient`; every gate rule and the weight rule read through it. **RPC endpoints are this client's own settings, never part of the criteria document** — return one shared (memoized) client per chain, pointed at a gateway that carries a multicall3 deployment in its viem `chain` config and serves **historical state at least `voteExpiryBuckets × blocksPerBucket` blocks behind head** (the v1 gate reads the head first, but falls back to the block a ballot names — see [Custom rules](#custom-rules)); return `undefined` for a chain with no RPC configured, and `createContest`/`createContestVote` throws `MissingChainClientError` (recuse, don't miscount) |
-| `signer` | `VoteSigner` | no | the voting wallet's address + EIP-712 ballot signing; omit for a read-only voter |
 | `nameResolvers` | `NameResolver[]` | no | community-name resolvers (same interface and instances as pkc-js's `nameResolvers`, e.g. `@bitsocial/bso-resolver` for `name.bso`); each vote's `community.name` claim is verified through them — inline at the forward-gate for live votes, in the background verifier for cold-join admits — and a bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted |
 | `dataPath` | `string \| false` | no | directory for the voter's persistent state (gate-result + name-resolution caches, and each joined contest's **checkpoint snapshot** — its last fully-verified winner-set, reloaded at join so a restart with no other peer online keeps the tally), the pkc-js `dataPath` equivalent. Node default: `{cwd}/.bitsocial-pubsub-voting` (better-sqlite3 under `{dataPath}/lru-storage/` + `{dataPath}/checkpoints.db`); in the browser the path is ignored and everything lives in IndexedDB. Pass `false` for in-memory-only (the pkc-js `noData` equivalent). A restart re-serves settled gate reads and fresh name resolutions from the store instead of the RPC, and restores each contest's checkpoint before the cold-start pull. A seeder should always set a stable path |
 | `httpRouterUrls` | `string[]` | no | Delegated Routing V1 router base URLs to **announce provider records to** (one unsigned `PUT /routing/v1/providers` per router; `Keys` batches every joined contest's criteria CID + current checkpoint root + chunk CIDs — hourly, debounced on root changes, and on address changes). **Seeders only**: absent/empty means never announce (the default — plain clients are not dialable), and the browser build never announces regardless. The node must be publicly **reachable** (its listening port open/forwarded/published), but it does not need to know its own public IP: private, loopback, and link-local addrs are filtered client-side, and when nothing survives — the normal zero-config case behind NAT or a Docker bridge, and even on public-IP hosts, since libp2p withholds unconfirmed public addrs pending AutoNAT — the announcer sends the wildcard sentinels (`/ip4/0.0.0.0/...`, `/ip6/::/...`) that the router rewrites to the PUT's observed source IP, exactly as kubo announces work. Configured `addresses.announce` values (concrete public addrs, DNS/AutoTLS, or a kubo-style wildcard) are used as-is. Only a loopback-only node announces nothing. *Querying* needs no URLs here — cold-join discovery uses the injected node's `libp2p.contentRouting`, which the host wires its routers into |
@@ -78,7 +77,6 @@ const viemChainFactory = (): ChainClientFactory => {
 const voter = new PubsubVoter({
   helia,                        // the host's Helia node; needs a gossipsub service at libp2p.services.pubsub + a blockstore
   chains: viemChainFactory(),   // ({ chainId }) => viem PublicClient | undefined
-  signer: mySigner,             // optional; omit → read-only voter
   nameResolvers: [bsoResolver], // optional; verifies community-name claims (e.g. @bitsocial/bso-resolver)
   dataPath: "/path/to/data",    // optional; persistent state: caches + checkpoint snapshots (default {cwd}/.bitsocial-pubsub-voting; false → in-memory)
   httpRouterUrls: [             // optional, SEEDERS ONLY (publicly reachable node): announce provider
@@ -89,7 +87,7 @@ const voter = new PubsubVoter({
 
 Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingFetchError` if the node lacks a usable pubsub service, blockstore, or libp2p fetch service — the library fails fast rather than letting a later `publish`/`subscribe`/`fetch` fail obscurely. ("Bitswap" is not a separately checkable property — it is a block broker wired beneath `blockstore` — so the validated guarantee is a well-formed blockstore, the surface bitswap retrieves through. The fetch service carries the checkpoint root-record pull; the library registers its own responder on it.)
 
-### Read a tally reactively (no signer needed)
+### Read a tally reactively
 
 `createContest` mints a per-contest read object; `update()` starts syncing and it emits `update` (carrying a fresh `tally`) and `error`, just like a pkc-js `community`:
 
@@ -176,24 +174,29 @@ A cold join **renders fast and refines**: checkpoint bundles are admitted after 
 
 Repeated `createContest` calls with byte-identical criteria return the same `Contest` (engines are keyed by topic, the criteria CID).
 
-### Publish or withdraw a vote (needs a signer)
+### Publish or withdraw a vote
 
-`createContestVote` mints a publishable ballot; `publish()` signs and broadcasts it once and emits `publishingstatechange`, like a pkc-js publication:
+`createContestVote` mints a publishable ballot; `publish()` signs and broadcasts it once and emits `publishingstatechange`, like a pkc-js publication. The `signer` is the ballot's — the wallet that holds the Pass and whose recovered address *is* the voter:
 
 ```ts
-const vote = await voter.createContestVote({ criteria, votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }] });
+const vote = await voter.createContestVote({
+  criteria,
+  votes: [{ community: { publicKey: "12D3KooW..." }, vote: 1 }],
+  signer: mySigner                                                // VoteSigner: address() + signBallot()
+});
 vote.on("publishingstatechange", (state) => console.log(state)); // stopped → signing → publishing → published → verified-locally → verified-by-peer (or failed)
 const { bundle, cid, recipientCount } = await vote.publish();     // the signed VotesBundle, its CID, and how many peers gossipsub sent it directly to
+vote.signer === mySigner;                                         // the ballot carries the wallet it was minted with
 
 // Withdraw (active): publish an empty ballot; it supersedes the prior vote under LWW.
-await (await voter.createContestVote({ criteria, votes: [] })).publish();
+await (await voter.createContestVote({ criteria, votes: [], signer: mySigner })).publish();
 ```
+
+A ballot is required to name its wallet, so a client that holds no key simply never mints one — there is no read-only mode to check, and nothing on an unpublished ballot to render. Two wallets on one voter are two `createContestVote` calls with two signers; the CRDT keys them apart by recovered address, so both land in the tally.
 
 A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, the name is resolved through the injected `nameResolvers` (inline at the forward-gate for live votes, in the background verifier for cold-join admits), and any bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
 
 `recipientCount` is the peer-reach hint gossipsub reports: how many peers it sent the vote *directly* to at publish time (first-hop fan-out, filtered for send failures) — **not** total network reach, and **not** an acceptance confirmation, since each recipient still runs the forward-gate before re-forwarding. Treat it as a coarse "did this reach anyone?" signal. Note that gossipsub *rejects* the publish with `NoPeersSubscribedToTopic` when it would reach zero peers (common right after joining, before the mesh grafts), unless the host enables `allowPublishToZeroTopicPeers` — so a resolved `recipientCount === 0` only occurs under that host setting; otherwise a no-reach publish surfaces as a thrown error (and a `failed` state).
-
-`publish()` on a voter built without a `signer` throws `ReadOnlyError` (and emits an `error`).
 
 #### Rejection feedback
 
@@ -207,11 +210,17 @@ The positive verdicts are states too, so a client never has to infer "it counted
 - `"verified-locally"` — our own deferred checks came back clean for this bundle. Still our verdict, but every honest peer runs byte-identical checks, so it is the strongest inference available without hearing from anyone.
 - `"verified-by-peer"` — a peer advertised a checkpoint containing this bundle. A node serves only fully verified bundles in its own checkpoint, so an honest peer including it implies that peer verified it too; what is *observed* is that somebody other than us is keeping the vote.
 
-Both survive a page reload through the contest, which is where a restored vote asks about a CID it persisted from `PublishOutcome.cid` — the publishing `ContestVote` is long gone by then, but a vote lives for `voteExpiryBuckets`:
+Both are readable from the contest by bundle CID, which is how a restored vote asks after a reload — the publishing `ContestVote` is long gone by then, but the vote lives for `voteExpiryBuckets`. Persist `PublishOutcome.cid` and ask with it:
 
 ```ts
 contest.checksFor(cid);          // { chainVerified, nameResolved? } — or undefined if not held (never admitted, evicted, expired)
 contest.checkpointPeersFor(cid); // peer ids seen serving OUR bundle back in their checkpoint (own bundles only; a lower bound)
+```
+
+`checksFor` needs nothing extra: the checks are recorded on every admit path, including the snapshot restore. **`checkpointPeersFor` does**, because the engine cannot recognise a bundle it did not sign — the signer belongs to the publication, not the contest, so a restored bundle looks like any other wallet's. A client that persisted the CID re-arms attribution once, after `update()`:
+
+```ts
+contest.trackOwnBundle(cid); // idempotent; attribution runs from here forward, not backwards
 ```
 
 ```ts
@@ -223,7 +232,7 @@ await vote.publish(); // throws InvalidCommunityNameError if a carried name can'
 
 ### Republishing is the client's job
 
-A vote is not permanent: a bundle is valid only for `voteExpiryBuckets` after its `blockNumber`, so a live vote must be re-published before it decays. **This library does not do that automatically** — it publishes each vote once and the consuming client decides when (or whether) to refresh. To refresh, just `createContestVote(...).publish()` again; a new bundle at the current bucket supersedes the old one. To stop, simply stop refreshing and let the vote lapse. The library gives you what you need to schedule it — all pure, no chain reads:
+A vote is not permanent: a bundle is valid only for `voteExpiryBuckets` after its `blockNumber`, so a live vote must be re-published before it decays. **This library does not do that automatically** — it publishes each vote once and the consuming client decides when (or whether) to refresh. To refresh, just `createContestVote(...).publish()` again (with the same signer); a new bundle at the current bucket supersedes the old one. To stop, simply stop refreshing and let the vote lapse. The library gives you what you need to schedule it — all pure, no chain reads:
 
 ```ts
 import { republishIntervalBuckets } from "@bitsocial/pubsub-voting";
@@ -257,7 +266,7 @@ There is no separate seeder API: a node that joins a topic (via `update()` or `p
 `stop()` leaves every joined topic but keeps the voter **reusable** — each `Contest` can `update()` again and you can `createContest` afterward. `destroy()` is **terminal** (like pkc-js): it leaves every topic, unregisters the fetch responder, and marks the voter and its contests dead — any later `createContest`/`createContestVote`, or a pre-existing `Contest.update()`/`ContestVote.publish()`, throws `VoterDestroyedError`. Construct a new `PubsubVoter` to participate again. (There is no store to dispose — republishing is the client's concern.)
 
 ```ts
-const voter = new PubsubVoter({ helia, chains, signer });
+const voter = new PubsubVoter({ helia, chains });
 // … create + update contests, app runs …
 await voter.destroy();   // terminal: leave all topics, unregister the responder, forbid reuse
 ```

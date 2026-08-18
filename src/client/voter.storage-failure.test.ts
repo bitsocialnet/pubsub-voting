@@ -49,11 +49,11 @@ describe("snapshot store failure (best-effort persistence)", () => {
     });
 
     it("an unwritable snapshot store never fails the leave flush (the write is best-effort)", async () => {
-        const voter = new PubsubVoter({ dataPath: "mocked-away", helia: fakeHelia(), chains: stubChains(), signer: fakeSigner() });
+        const voter = new PubsubVoter({ dataPath: "mocked-away", helia: fakeHelia(), chains: stubChains() });
         const contest = await voter.createContest({ criteria: bizCriteria() });
         const errors: unknown[] = [];
         contest.on("error", (e) => errors.push(e));
-        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE })).publish();
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         // Wait for the deferred gate read to settle, so the leave flush really attempts the
         // snapshot write (a pending check would skip it before reaching the store).
         await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));

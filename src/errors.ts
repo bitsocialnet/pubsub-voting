@@ -154,17 +154,6 @@ export class DuplicateContestIdError extends Error {
     }
 }
 
-/** Thrown when a publish (vote/withdraw) is attempted on a voter constructed without a signer. */
-export class ReadOnlyError extends Error {
-    constructor() {
-        super(
-            "This voter is read-only: it was constructed without a `signer`. " +
-                "Provide a VoteSigner to publish or withdraw votes; reading tallies needs no signer."
-        );
-        this.name = "ReadOnlyError";
-    }
-}
-
 /**
  * Thrown by `ContestVote.publish()` when a vote carries a `community.name` that definitively
  * fails the publish-time preflight (see verify/name-preflight.ts): no configured resolver
