@@ -3081,4 +3081,56 @@ describe("publisher verification states", () => {
         await contest.stop();
         vi.useRealTimers();
     });
+
+    it("attributes a peer whose advertised root IS ours — the converged case, which is never chased", async () => {
+        vi.useFakeTimers();
+        const { helia, validators } = checkpointHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains({ balance: 1n }) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const { cid } = await vote.publish();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+
+        // A peer advertises OUR OWN root back at us — the steady state once a topic has
+        // converged. `#handleRootRecord` suppresses the heartbeat and chases nothing, so if
+        // attribution only rode the chase path this case would never be credited at all.
+        const ownRecord = await (contest as unknown as { rootRecord(): Promise<RootRecord> }).rootRecord();
+        const validator = validators.get(contest.topic)!;
+        await validator({ toString: () => "peerB" } as unknown as PeerId, {
+            topic: contest.topic,
+            data: encodeRootMessage(ownRecord)
+        } as never);
+        await vi.advanceTimersByTimeAsync(1);
+
+        await vi.waitFor(() => expect(contest.checkpointPeersFor(cid)).toEqual(["peerB"]));
+        expect(vote.publishingState).toBe("verified-by-peer");
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
+    it("trackOwnBundle is idempotent and attributes nothing for a bundle this contest does not hold", async () => {
+        vi.useFakeTimers();
+        const { helia } = checkpointHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains({ balance: 1n }) });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const { cid } = await vote.publish();
+        await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+
+        // Registering our own publish again changes nothing (a restored client cannot know
+        // whether this session already signed the bundle, so calling is always safe).
+        contest.trackOwnBundle(cid);
+        contest.trackOwnBundle(cid);
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+
+        // A CID this contest never admitted is registrable but attributes nothing — attribution
+        // is driven by what a decoded checkpoint actually contained, not by the claim.
+        const stranger = (await blockForBytes(new TextEncoder().encode("not a bundle we hold"))).cid;
+        contest.trackOwnBundle(stranger);
+        expect(contest.checkpointPeersFor(stranger)).toEqual([]);
+        await contest.stop();
+        vi.useRealTimers();
+    });
 });

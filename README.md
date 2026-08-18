@@ -210,11 +210,17 @@ The positive verdicts are states too, so a client never has to infer "it counted
 - `"verified-locally"` — our own deferred checks came back clean for this bundle. Still our verdict, but every honest peer runs byte-identical checks, so it is the strongest inference available without hearing from anyone.
 - `"verified-by-peer"` — a peer advertised a checkpoint containing this bundle. A node serves only fully verified bundles in its own checkpoint, so an honest peer including it implies that peer verified it too; what is *observed* is that somebody other than us is keeping the vote.
 
-Both survive a page reload through the contest, which is where a restored vote asks about a CID it persisted from `PublishOutcome.cid` — the publishing `ContestVote` is long gone by then, but a vote lives for `voteExpiryBuckets`:
+Both are readable from the contest by bundle CID, which is how a restored vote asks after a reload — the publishing `ContestVote` is long gone by then, but the vote lives for `voteExpiryBuckets`. Persist `PublishOutcome.cid` and ask with it:
 
 ```ts
 contest.checksFor(cid);          // { chainVerified, nameResolved? } — or undefined if not held (never admitted, evicted, expired)
 contest.checkpointPeersFor(cid); // peer ids seen serving OUR bundle back in their checkpoint (own bundles only; a lower bound)
+```
+
+`checksFor` needs nothing extra: the checks are recorded on every admit path, including the snapshot restore. **`checkpointPeersFor` does**, because the engine cannot recognise a bundle it did not sign — the signer belongs to the publication, not the contest, so a restored bundle looks like any other wallet's. A client that persisted the CID re-arms attribution once, after `update()`:
+
+```ts
+contest.trackOwnBundle(cid); // idempotent; attribution runs from here forward, not backwards
 ```
 
 ```ts
