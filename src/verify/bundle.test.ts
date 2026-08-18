@@ -63,7 +63,10 @@ function resolver(map: Record<string, string>): NameResolver {
         key: "test",
         provider: "test",
         canResolve: ({ name }) => name.endsWith(".bso"),
-        resolve: async ({ name }) => (name in map ? { publicKey: map[name] } : undefined)
+        resolve: async ({ name }) => {
+            const publicKey = map[name];
+            return publicKey === undefined ? undefined : { publicKey };
+        }
     };
 }
 
@@ -76,7 +79,9 @@ function verifier(over: { balance?: bigint; onRead?: () => void; names?: Record<
         chain: fakeChain(over.balance ?? 1n, over.onRead),
         bucketMath: makeBucketMath(bizCriteria().blocksPerBucket),
         nameResolvers: [resolver(over.names ?? {})],
-        ruleCaches: over.ruleCaches
+        // Omitted rather than passed as undefined: `ruleCaches` is optional and the deps type is
+        // exact, so an explicit undefined is not the same as "the caller said nothing".
+        ...(over.ruleCaches === undefined ? {} : { ruleCaches: over.ruleCaches })
     });
 }
 

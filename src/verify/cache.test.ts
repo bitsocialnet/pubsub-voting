@@ -6,6 +6,10 @@ import { makeVerdictCache, makeCachingVerifier } from "./cache.js";
 import type { BundleVerifier } from "./types.js";
 import type { VotesBundle } from "../schema/votes.js";
 
+/** What these consumers actually take: the `verify` half of a `BundleVerifier` (see verify/cache.ts). */
+type VerifyOnly = Pick<BundleVerifier, "verify">;
+
+
 async function cidOf(seed: string): Promise<CID> {
     const digest = await sha256.digest(new TextEncoder().encode(seed));
     return CID.createV1(raw.code, digest);
@@ -19,7 +23,7 @@ const dummyBundle: VotesBundle = {
 };
 
 /** A verifier that counts how many times it actually runs the pipeline. */
-function countingVerifier(): { verifier: BundleVerifier; calls: () => number } {
+function countingVerifier(): { verifier: VerifyOnly; calls: () => number } {
     let calls = 0;
     return {
         verifier: {
@@ -57,7 +61,7 @@ describe("verdict cache", () => {
 
     it("caches a provable reject too (a known-bad CID is not re-checked)", async () => {
         let calls = 0;
-        const verifier: BundleVerifier = {
+        const verifier: VerifyOnly = {
             verify: async () => {
                 calls++;
                 return { valid: false, disposition: "reject", reason: "nope" };
@@ -92,7 +96,7 @@ describe("verdict cache", () => {
 
     it("does NOT cache a transient ignore verdict (it is re-checked as heads/records converge)", async () => {
         let calls = 0;
-        const verifier: BundleVerifier = {
+        const verifier: VerifyOnly = {
             verify: async () => {
                 calls++;
                 return { valid: false, disposition: "ignore", reason: "name at head" };

@@ -30,7 +30,7 @@ describe("bundle codec (binary block layout)", () => {
         const wire = toWireBundle(VECTOR);
         expect(wire.address.length).toBe(20);
         expect(wire.signature.signature.length).toBe(65);
-        expect(wire.votes[0].community.publicKey).toBeInstanceOf(Uint8Array);
+        expect(wire.votes[0]!.community.publicKey).toBeInstanceOf(Uint8Array);
     });
 
     it("round-trips, including an omitted name", () => {
@@ -41,7 +41,7 @@ describe("bundle codec (binary block layout)", () => {
         };
         const decoded = decodeBundle(encodeBundle(nameless));
         expect(decoded).toEqual(nameless);
-        expect("name" in decoded.votes[0].community).toBe(false);
+        expect("name" in decoded.votes[0]!.community).toBe(false);
     });
 
     it("normalizes a checksummed address to lowercase (casing is presentation, not identity)", () => {
@@ -73,7 +73,7 @@ describe("bundle codec (binary block layout)", () => {
         expect(() => decodeBundle(dagCbor.encode({ nonsense: true }))).toThrow();
         // publicKey bytes that do not decode to a multihash fail the schema's B58 IPNS check
         const wire = toWireBundle(VECTOR);
-        wire.votes[0].community.publicKey = new Uint8Array([1, 2, 3]);
+        wire.votes[0]!.community.publicKey = new Uint8Array([1, 2, 3]);
         expect(() => decodeBundle(dagCbor.encode(wire))).toThrow();
     });
 });

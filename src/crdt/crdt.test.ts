@@ -34,8 +34,8 @@ describe("makeVoteCrdt — LWW reduction", () => {
 
         const current = c.current(LIVE);
         expect(current).toHaveLength(1);
-        expect(current[0].blockNumber).toBe(200);
-        expect(current[0].votes[0].community.publicKey).toBe(KEY_B);
+        expect(current[0]!.blockNumber).toBe(200);
+        expect(current[0]!.votes[0]!.community.publicKey).toBe(KEY_B);
     });
 
     it("collapses same-wallet equivocation (same blockNumber) to one, tie-broken by lowest CID", async () => {
@@ -55,7 +55,7 @@ describe("makeVoteCrdt — LWW reduction", () => {
         // The winner is the one whose bundle CID the resolver picks as lowest.
         const winnerCid = lwwResolve({ bundle: bundleA, cid: cidA }, { bundle: bundleB, cid: cidB });
         const winnerKey = winnerCid.equals(cidA) ? KEY_A : KEY_B;
-        expect(current[0].votes[0].community.publicKey).toBe(winnerKey);
+        expect(current[0]!.votes[0]!.community.publicKey).toBe(winnerKey);
     });
 
     it("supersedes an earlier vote with an empty withdrawal bundle", async () => {
@@ -65,7 +65,7 @@ describe("makeVoteCrdt — LWW reduction", () => {
 
         const current = c.current(LIVE);
         expect(current).toHaveLength(1);
-        expect(current[0].votes).toHaveLength(0); // resolves to the withdrawal
+        expect(current[0]!.votes).toHaveLength(0); // resolves to the withdrawal
     });
 });
 
@@ -78,7 +78,7 @@ describe("makeVoteCrdt — LWW winners and monotonic union", () => {
         // One wallet -> one winner (the higher-blockNumber bundle), not both bundles.
         const winners = c.current(LIVE);
         expect(winners).toHaveLength(1);
-        expect(winners[0].votes[0].community.publicKey).toBe(KEY_B);
+        expect(winners[0]!.votes[0]!.community.publicKey).toBe(KEY_B);
     });
 
     it("unions two peers' state without subtracting, and merge is idempotent", async () => {
@@ -110,7 +110,7 @@ describe("makeVoteCrdt — read-time expiry filter", () => {
         // At bucket 4: WALLET (bucket 0) is expired (4 > 0 + 2), OTHER (bucket 3) is live (4 <= 3 + 2).
         const current = c.current(4);
         expect(current).toHaveLength(1);
-        expect(current[0].address).toBe(OTHER);
+        expect(current[0]!.address).toBe(OTHER);
     });
 
     it("filters an expired bundle out of a merged set, keeping the live one", async () => {
@@ -129,7 +129,7 @@ describe("makeVoteCrdt — read-time expiry filter", () => {
         // At bucket 4: A (bucket 0) is expired, B (bucket 3) is live. A must not pollute the view.
         const current = c.current(4);
         expect(current).toHaveLength(1);
-        expect(current[0].address).toBe(OTHER);
+        expect(current[0]!.address).toBe(OTHER);
         expect((await store.get(bCid))?.address).toBe(OTHER); // the live winner's block is intact
     });
 
@@ -161,7 +161,7 @@ describe("makeVoteCrdt — prune bounds the working set", () => {
         // The read-time view at a live bucket is unaffected by prune — prune is memory-only.
         const current = c.current(1);
         expect(current).toHaveLength(1);
-        expect(current[0].blockNumber).toBe(BLOCKS_PER_BUCKET);
+        expect(current[0]!.blockNumber).toBe(BLOCKS_PER_BUCKET);
     });
 
     it("keeps a still-live winner and drops the superseded older one", async () => {
@@ -173,7 +173,7 @@ describe("makeVoteCrdt — prune bounds the working set", () => {
         expect(c.nodeCount()).toBe(1);
         const current = c.current(1);
         expect(current).toHaveLength(1);
-        expect(current[0].blockNumber).toBe(BLOCKS_PER_BUCKET);
+        expect(current[0]!.blockNumber).toBe(BLOCKS_PER_BUCKET);
     });
 });
 
@@ -195,25 +195,25 @@ describe("makeVoteCrdt — provisional admits (deferred verification)", () => {
         // Unfiltered (the tally view): the newest bundle wins regardless of verification state.
         const all = c.currentEntries(1);
         expect(all).toHaveLength(1);
-        expect(all[0].cid.equals(pendingCid)).toBe(true);
+        expect(all[0]!.cid.equals(pendingCid)).toBe(true);
 
         // Filtered (the checkpoint view): with the pending winner ineligible, the wallet's newest
         // VERIFIED bundle is served instead of the wallet vanishing from the checkpoint.
         const verifiedOnly = c.currentEntries(1, (cid) => cid.equals(verifiedCid));
         expect(verifiedOnly).toHaveLength(1);
-        expect(verifiedOnly[0].cid.equals(verifiedCid)).toBe(true);
+        expect(verifiedOnly[0]!.cid.equals(verifiedCid)).toBe(true);
     });
 
     it("remove() evicts a failed provisional bundle and its verified predecessor wins again", async () => {
         const c = crdt();
         const oldCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_A }, vote: 1 }], 0));
         const newCid = await c.add(bundle(WALLET, [{ community: { publicKey: KEY_B }, vote: 1 }], BLOCKS_PER_BUCKET));
-        expect(c.currentEntries(1)[0].cid.equals(newCid)).toBe(true);
+        expect(c.currentEntries(1)[0]!.cid.equals(newCid)).toBe(true);
 
         c.remove(newCid); // the deferred gate read failed — evict
         const current = c.currentEntries(1);
         expect(current).toHaveLength(1);
-        expect(current[0].cid.equals(oldCid)).toBe(true);
+        expect(current[0]!.cid.equals(oldCid)).toBe(true);
     });
 
     it("prune keeps a superseded bundle while its superseder is provisional, drops it once settled", async () => {
@@ -233,7 +233,7 @@ describe("makeVoteCrdt — provisional admits (deferred verification)", () => {
         const removed = await c.prune(1);
         expect(removed).toHaveLength(1);
         expect(c.nodeCount()).toBe(1);
-        expect(c.currentEntries(1)[0].cid.equals(pendingCid)).toBe(true);
+        expect(c.currentEntries(1)[0]!.cid.equals(pendingCid)).toBe(true);
     });
 
     it("prune still drops an EXPIRED superseded bundle even under a provisional winner", async () => {

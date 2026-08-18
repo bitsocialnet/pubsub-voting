@@ -45,9 +45,9 @@ describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () =
     /** A client answering `supportsInterface` from `declares` and `balanceOf` from `balance`, recording every read. */
     function probeChain(over: { declares?: boolean | (() => boolean | never); balance?: bigint; multicall?: boolean } = {}): {
         chain: ChainClient;
-        reads: Array<{ functionName: string; args: readonly unknown[]; block?: bigint }>;
+        reads: Array<{ functionName: string; args: readonly unknown[]; block: bigint | undefined }>;
     } {
-        const reads: Array<{ functionName: string; args: readonly unknown[]; block?: bigint }> = [];
+        const reads: Array<{ functionName: string; args: readonly unknown[]; block: bigint | undefined }> = [];
         const chain: ChainClient = createPublicClient({ transport: http("http://localhost") });
         if (over.multicall) {
             (chain as { chain?: unknown }).chain = { contracts: { multicall3: { address: "0xca11bde05977b3631167028862be2a173976ca11" } } };
@@ -301,7 +301,7 @@ describe("erc721-min-balance (unregistered: a bare, transferable gate)", () => {
 
 describe("constant", () => {
     it("returns its fixed value with no chain read", async () => {
-        const score = scoreOrZero(await constant.evaluate({ options: { type: "constant", value: 3 }, walletAddress: "0x000000000000000000000000000000000000aaaa", ctx: ctxWith({}) }));
+        const score = scoreOrZero(await constant.evaluate({ options: { type: "constant", value: 3 }, wallet: at("0x000000000000000000000000000000000000aaaa"), ctx: ctxWith({}) }));
         expect(score).toBe(3n);
     });
 });

@@ -1,0 +1,13 @@
+{
+  // Typecheck the tests and their fixtures, which `tsconfig.json` excludes because it is also the
+  // BUILD config — test code must not reach `dist`. Same compiler options, so the suites are held
+  // to the repo's real strictness (`exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`): a
+  // fake shaped like a host object, or a mock missing half an interface, is a wrong test long
+  // before it is a failing one, and nothing else in the repo would notice. Emits nothing.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src"],
+  "exclude": []
+}

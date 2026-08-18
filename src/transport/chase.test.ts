@@ -204,7 +204,7 @@ describe("makeRootChaser", () => {
         h.chaser.chase(root);
         await h.settle();
         expect(h.admitted).toHaveLength(1);
-        expect(h.admitted[0].cid.equals(goodCid)).toBe(true);
+        expect(h.admitted[0]!.cid.equals(goodCid)).toBe(true);
         // A provable offline reject is terminal — cached so a re-served copy short-circuits.
         expect(cache.get(forgedCid)).toMatchObject({ valid: false, disposition: "reject" });
     });
@@ -244,9 +244,9 @@ describe("makeRootChaser", () => {
         await h.settle();
         expect(verifies).toBe(0);
         expect(h.admitted).toHaveLength(1);
-        expect(h.admitted[0].cid.equals(await bundleCid(known))).toBe(true);
+        expect(h.admitted[0]!.cid.equals(await bundleCid(known))).toBe(true);
         // The cached terminal verdict covers the FULL pipeline — no deferred work remains.
-        expect(h.admitted[0].verified).toBe(true);
+        expect(h.admitted[0]!.verified).toBe(true);
         expect(h.deferred).toHaveLength(0);
     });
 

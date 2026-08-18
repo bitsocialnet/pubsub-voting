@@ -47,8 +47,13 @@ export interface GossipGateDeps {
      * key). Throws on malformed block bytes — provable layer-1 badness.
      */
     parseBundle: (blockBytes: Uint8Array) => Promise<{ cid: CID; bundle: VotesBundle }>;
-    /** The full validity pipeline for one bundle (see verify/bundle.ts). */
-    verifier: BundleVerifier;
+    /**
+     * The full validity pipeline for one bundle (see verify/bundle.ts). Declared as the `verify`
+     * half of {@link BundleVerifier}: the gate never runs a stage on its own (no `verifyOffline`,
+     * no `checkGates` — those belong to the cold-join chase and `Contest.checkEligibility`), and
+     * asking only for what it calls keeps that true.
+     */
+    verifier: Pick<BundleVerifier, "verify">;
     /**
      * Clock-aware freshness guard, kept OUT of the pure (cacheable) verifier: is this bundle's
      * bucket sample block already reachable from our chain head? A bundle dated to a future

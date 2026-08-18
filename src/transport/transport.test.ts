@@ -18,9 +18,13 @@ import { encodeBundle, decodeBundle, bundleCid, bundleCidForBytes } from "../crd
 import type { BundleVerifier } from "../verify/types.js";
 import type { VotesBundle } from "../schema/votes.js";
 
+/** What these consumers actually take: the `verify` half of a `BundleVerifier` (see verify/cache.ts). */
+type VerifyOnly = Pick<BundleVerifier, "verify">;
+
+
 const KEY_A = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const TOPIC = "bitsocial-votes/test";
-const okVerifier: BundleVerifier = { verify: async () => ({ valid: true, resolvedNames: {} }) };
+const okVerifier: VerifyOnly = { verify: async () => ({ valid: true, resolvedNames: {} }) };
 
 function fakePeer(id: string): PeerId {
     return { toString: () => id } as unknown as PeerId;
@@ -114,8 +118,8 @@ describe("makeVoteTransport", () => {
         const { recipientCount } = await h.transport.publishBundle(encodeBundle(h.bundle));
         expect(recipientCount).toBe(2); // gossipsub's `recipients.length` surfaced to the caller
         expect(h.published).toHaveLength(1);
-        expect(h.published[0].topic).toBe(TOPIC);
-        const message = decodeVoteMessage(h.published[0].data);
+        expect(h.published[0]!.topic).toBe(TOPIC);
+        const message = decodeVoteMessage(h.published[0]!.data);
         expect(message.kind).toBe("bundle");
         if (message.kind === "bundle") expect(decodeBundle(message.bundle)).toEqual(h.bundle);
     });
@@ -127,16 +131,16 @@ describe("makeVoteTransport", () => {
 
         await h.transport.publishRootRecord(record);
         expect(h.published).toHaveLength(1);
-        const message = decodeVoteMessage(h.published[0].data);
+        const message = decodeVoteMessage(h.published[0]!.data);
         expect(message.kind).toBe("root");
         if (message.kind === "root") expect(message.record.root.equals(record.root)).toBe(true);
 
         // Loop the published heartbeat back through the installed validator: forwarded + surfaced.
         const validator = h.topicValidators.get(TOPIC)!;
-        const verdict = await validator(fakePeer("peer2"), { topic: TOPIC, data: h.published[0].data, from: fakePeer("peer2") });
+        const verdict = await validator(fakePeer("peer2"), { topic: TOPIC, data: h.published[0]!.data, from: fakePeer("peer2") });
         expect(verdict).toBe("accept");
         expect(h.rootRecords).toHaveLength(1);
-        expect(h.rootRecords[0][1]).toBe("peer2");
+        expect(h.rootRecords[0]![1]!).toBe("peer2");
     });
 
     it("removes the validator and unsubscribes on stop", async () => {
