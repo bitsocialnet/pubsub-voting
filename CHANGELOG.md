@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.6.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.5.0...v0.6.0) (2026-08-18)
+
+### ⚠ BREAKING CHANGES
+
+* **client:** `PubsubVoterOptions.signer` is gone; pass `signer` to
+`createContestVote({ criteria, votes, signer })` instead, where it is required
+and exposed as `ContestVote.signer`. `VoteClient.readOnly` and `ReadOnlyError`
+are removed with it — there is no publish path left that can fail for want of a
+signer, and a caller that has no wallet does not construct a ballot.
+
+  - const voter = new PubsubVoter({ helia, chains, signer });
+  - const vote = await voter.createContestVote({ criteria, votes });
+  + const voter = new PubsubVoter({ helia, chains });
+  + const vote = await voter.createContestVote({ criteria, votes, signer });
+
+Two tests replace the ones that pinned the read-only mode: a ballot exposes the
+signer it was minted with, and one voter publishing two ballots with two
+signers lands two winner-set rows. `fakeSigner(address?)` takes an address so a
+test can hold two wallets. The two "created but never joined" tests built their
+engine through `createContestVote` with no publish; they now use `createContest`,
+which is the honest way to say that and no longer needs a signer to do it.
+* **client:** `PublishingState`'s `"succeeded"` is now `"published"`.
+
+### Features
+
+* **client:** give a publisher the verdicts, not just the broadcast ([a3aa3a5](https://github.com/bitsocialnet/pubsub-voting/commit/a3aa3a55c7f710b9f30996da938dd95e772ebfd5))
+* **client:** the signer belongs to the ballot, not the voter ([05871fb](https://github.com/bitsocialnet/pubsub-voting/commit/05871fbd86d5d15e559a16cdc3c39c675eebcf79))
+
+### Bug Fixes
+
+* **client:** a publish attempt owns its own verdicts ([01cb2b3](https://github.com/bitsocialnet/pubsub-voting/commit/01cb2b31403f260ef04d3fa82a4d1fee69512815))
+* **client:** attribute the converged case, and the reload the docs promised ([ee50546](https://github.com/bitsocialnet/pubsub-voting/commit/ee505463ee0192109d3ee62642e00c64f61eea24))
+* stop tracking a node_modules symlink that pointed at itself ([5b2617c](https://github.com/bitsocialnet/pubsub-voting/commit/5b2617caf0efa3f04ebb93b776496b5f797f0a1d))
+
 ## [0.5.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.4.1...v0.5.0) (2026-08-17)
 
 ### ⚠ BREAKING CHANGES
