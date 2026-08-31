@@ -1,12 +1,14 @@
 import pLimit from "p-limit";
-import { createLibp2p, type Libp2p } from "libp2p";
+import type { Libp2p } from "libp2p";
 import { tcp } from "@libp2p/tcp";
 import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import { identify } from "@libp2p/identify";
 import { gossipsub } from "@libp2p/gossipsub";
 import { fetch as fetchService } from "@libp2p/fetch";
-import { createHelia, type Helia } from "helia";
+import { createHeliaLight, type Helia } from "helia";
+import { withLibp2pLight } from "@helia/libp2p";
+import { withBitswap } from "@helia/bitswap";
 import type { CID } from "multiformats/cid";
 import type { VotesBundle } from "../../schema/votes.js";
 import type { BundleVerdict, BundleVerifier } from "../../verify/types.js";
@@ -111,7 +113,12 @@ export interface VoteNode {
  * REAL `PubsubVoter` as the injected host node (the `PubsubVoterOptions.helia` seam).
  */
 export async function makeBareNode(topic: string) {
-    const libp2p = await createLibp2p({
+    // Helia 7 no longer takes a pre-built libp2p instance — it constructs libp2p itself
+    // inside `start()` from the options passed to `withLibp2p(Light)`. Compose the node the
+    // way the pkc-js host does (`withBitswap(withLibp2p*(createHeliaLight(...)))`), using
+    // the Light variants so no default service (DHT, relay, bootstrap, public HTTP brokers)
+    // leaks into the hermetic loopback tests.
+    const helia = withBitswap(withLibp2pLight(createHeliaLight(), {
         addresses: { listen: ["/ip4/127.0.0.1/tcp/0"] },
         transports: [tcp()],
         connectionEncrypters: [noise()],
@@ -155,9 +162,11 @@ export async function makeBareNode(topic: string) {
                 }
             })
         }
-    });
-    const helia = await createHelia({ libp2p });
-    return { libp2p, helia };
+    }));
+    // Helia 7 creates libp2p lazily inside `start()` — the `helia.libp2p` getter throws
+    // NotStartedError until then — so start before handing the node out.
+    await helia.start();
+    return { libp2p: helia.libp2p, helia };
 }
 
 /** Build one real node with the full forward-gate wired to real gossipsub. */

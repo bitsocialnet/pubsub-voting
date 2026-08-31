@@ -1,12 +1,14 @@
-import { createLibp2p, type Libp2p } from "libp2p";
+import type { Libp2p } from "libp2p";
 import { tcp } from "@libp2p/tcp";
 import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import { identify } from "@libp2p/identify";
 import { gossipsub } from "@libp2p/gossipsub";
 import { fetch as fetchService } from "@libp2p/fetch";
-import { delegatedRoutingV1HttpApiClient } from "@helia/delegated-routing-v1-http-api-client";
-import { createHelia, type Helia } from "helia";
+import { delegatedRoutingV1HttpApiClientContentRouting } from "@helia/delegated-routing-v1-http-api-client";
+import { createHeliaLight, type Helia } from "helia";
+import { withLibp2pLight } from "@helia/libp2p";
+import { withBitswap } from "@helia/bitswap";
 import type { PubsubService } from "../dist/transport/types.js";
 
 /**
@@ -35,7 +37,7 @@ interface GossipView {
 
 export interface HostNode {
     libp2p: Libp2p;
-    helia: Helia;
+    helia: Helia & { libp2p: Libp2p };
     /** The gossipsub service, structurally typed to the subset the library drives. */
     pubsub: PubsubService;
     peerId: string;
@@ -86,10 +88,18 @@ export interface HostNodeOptions {
 export async function makeHostNode(options: HostNodeOptions = {}): Promise<HostNode> {
     const host = options.host ?? "0.0.0.0";
     const port = options.port ?? 0;
+    // v9 of the client split the libp2p capability wrappers out: the bare
+    // `delegatedRoutingV1HttpApiClient` service no longer carries `contentRoutingSymbol` (so
+    // libp2p would see "no content routers"); the ContentRouting variant is what wires
+    // `libp2p.contentRouting.findProviders` to the router.
     const routers = Object.fromEntries(
-        (options.routerUrls ?? []).map((url, i) => [`delegatedRouting${i}`, delegatedRoutingV1HttpApiClient({ url })])
+        (options.routerUrls ?? []).map((url, i) => [`delegatedRouting${i}`, delegatedRoutingV1HttpApiClientContentRouting({ url })])
     );
-    const libp2p = await createLibp2p({
+    // Helia 7 no longer takes a pre-built libp2p instance — it constructs libp2p itself inside
+    // `start()` from the options passed to `withLibp2p(Light)`. Compose the node the way the
+    // pkc-js host does (`withBitswap(withLibp2p*(createHeliaLight(...)))`), Light variants so no
+    // default service (DHT, relay, bootstrap, public HTTP brokers) skews the measurements.
+    const helia = withBitswap(withLibp2pLight(createHeliaLight(), {
         addresses: {
             listen: [`/ip4/${host}/tcp/${port}`],
             ...(options.announce !== undefined ? { announce: options.announce } : {})
@@ -113,8 +123,11 @@ export async function makeHostNode(options: HostNodeOptions = {}): Promise<HostN
                 scoreParams: { IPColocationFactorWeight: 0 }
             })
         }
-    });
-    const helia = await createHelia({ libp2p });
+    }));
+    // Helia 7 creates libp2p lazily inside `start()` — the `helia.libp2p` getter throws
+    // NotStartedError until then — so start before reading it.
+    await helia.start();
+    const libp2p = helia.libp2p;
     const gossip = libp2p.services.pubsub as unknown as GossipView;
     const pubsub = libp2p.services.pubsub as unknown as PubsubService;
     return {
