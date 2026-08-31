@@ -108,6 +108,18 @@ the pipeline owns"). The attributable cost is **one extra RPC round trip, entire
 doubles from **+0.30s to +0.60s** at N ≤ 100 (exactly two 270 ms charges instead of one). Inner `reads`
 is unchanged at **N+1** (2 / 6 / 11 / 101 / 1001), so this is a round trip, not extra reads.
 
+*Re-measured 2026-08-31 (median of 3) on the **helia 7 host stack** (pkc-js `0.0.89`'s pins: `helia
+7.1.10`, `@libp2p/gossipsub 17.0.1`, `libp2p 3.3.9`; the bench nodes now compose
+`withBitswap(withLibp2pLight(createHeliaLight(), …))`, and the joiner registers the router through
+v9's `delegatedRoutingV1HttpApiClientContentRouting` — in client v9 the bare service factory no
+longer carries the libp2p content-routing capability): every column matched a back-to-back
+**master control** on the same link window within jitter — `START→TALLY` 3.19s / 3.26s / 3.16s /
+3.30s / 6.15s for N=1…1000 vs control 3.45s (N=1) and 5.81s (N=1000); `START→VERIFIED` 3.80s vs
+4.05s at N=1, 7.44s vs 7.13s at N=1000; `connect` 1.95s vs 1.93s and `fetch` 0.88s vs 1.16s at
+N=1. Both runs sat ~0.4s above the table's `connect` 1.56s — the control pins that on the link
+window, not the upgrade. `gate-RPC` (3 / 9), inner `reads` (N+1), `bitswap` (0.00–0.02s) and
+`verify+merge` (0.30–1.99s) are unchanged.*
+
 The extra trip is **not** the head read (`head` stays 1 at N ≤ 100, 3 at N=1000): it is `multicall`
 going 1 → 2, because the ERC-5192 lock probe is no longer folded into the same `aggregate3` as the
 balances. `scoreAt` awaits the probe before issuing the balance batch — its answer decides whether the

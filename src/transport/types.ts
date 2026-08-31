@@ -1,5 +1,5 @@
 import type { CID } from "multiformats/cid";
-import type { PeerId } from "@libp2p/interface";
+import type { Libp2p, PeerId, ServiceMap } from "@libp2p/interface";
 import type { Helia } from "helia";
 import type { RootRecord } from "./messages.js";
 
@@ -164,12 +164,14 @@ export interface BlockSessionLike {
 }
 
 /**
- * The host's running Helia node, as injected into {@link PubsubVoter}. Typed with the
- * default libp2p `ServiceMap`, so `libp2p.services.pubsub` is `unknown` and cannot be
- * trusted at compile time (a plain Helia node has no pubsub) — `requireHeliaServices`
- * validates the gossipsub service and the blockstore at construction and narrows them.
+ * The host's running Helia node, as injected into {@link PubsubVoter}. Helia 7 made the
+ * base `Helia` network-agnostic (`libp2p` moved to `@helia/libp2p`'s `HeliaWithLibp2p`),
+ * so the libp2p handle is required structurally here, typed with the loose `ServiceMap` —
+ * `libp2p.services.pubsub` is `unknown` and cannot be trusted at compile time (a plain
+ * Helia node has no pubsub) — `requireHeliaServices` validates the gossipsub service and
+ * the blockstore at construction and narrows them.
  */
-export type HeliaInstance = Helia;
+export type HeliaInstance = Helia & { libp2p: Libp2p<ServiceMap> };
 
 /** Live-delta propagation over pubsub (one inline bundle per message + root heartbeats). */
 export interface VoteTransport {
