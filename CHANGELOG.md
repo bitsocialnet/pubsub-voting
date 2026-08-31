@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.6.2...v0.7.0) (2026-08-31)
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** the injected host node must now be a helia 7 node exposing
+`libp2p` (helia 7's HeliaWithLibp2p shape — pkc-js >= 0.0.89's heliaNode). A
+host still passing a pre-built libp2p instance through helia 6's
+createHelia({ libp2p }) must recompose via @helia/libp2p's withLibp2p.
+
+Claude-Session: https://claude.ai/code/session_01PhtYuQpvDt1Xr8Cv9reoVq
+
+### Bug Fixes
+
+* **deps:** upgrade to the helia 7 / gossipsub 17 host stack (pkc-js 0.0.89) ([e47fff8](https://github.com/bitsocialnet/pubsub-voting/commit/e47fff85c2326986acf70fffa189164569bdcb5c))
+
 ## [0.6.2](https://github.com/bitsocialnet/pubsub-voting/compare/v0.6.1...v0.6.2) (2026-08-26)
 
 ## [0.6.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.6.0...v0.6.1) (2026-08-18)
