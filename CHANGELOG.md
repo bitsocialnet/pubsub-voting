@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.0...v0.7.1) (2026-09-01)
+
+### Bug Fixes
+
+* **deps:** regenerate lockfile with npm 10 so npm ci passes on CI ([5b1728b](https://github.com/bitsocialnet/pubsub-voting/commit/5b1728baf2ffd7f1c1f361d6d34bbca607fb86ca))
+
 ## [0.7.0](https://github.com/bitsocialnet/pubsub-voting/compare/v0.6.2...v0.7.0) (2026-08-31)
 
 ### ⚠ BREAKING CHANGES
