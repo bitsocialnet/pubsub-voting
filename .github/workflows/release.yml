@@ -23,6 +23,12 @@ jobs:
           node-version: 22
           cache: "npm"
 
+      # release-it's version bump rewrites package-lock.json with whatever npm this job
+      # has (see the before:git:release hook in config/.release-it.json), so it must match
+      # the npm CI uses or every release desyncs the lockfile and breaks `npm ci` on
+      # master. Keep in sync with ci.yml.
+      - run: npm i -g npm@11.13.0
+
       - run: npm ci
       - run: npm run build
 

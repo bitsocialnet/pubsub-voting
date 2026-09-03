@@ -4,6 +4,10 @@
   "description": "Trustless pubsub voting over a shared libp2p/Helia node.",
   "type": "module",
   "license": "GPL-3.0-or-later",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "npm": ">=11"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bitsocialnet/pubsub-voting.git"
