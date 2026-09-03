@@ -176,6 +176,28 @@ const COUNT_IN_PAGE = () => {
     };
 };
 
+/** libp2p-fetch counters, read from the page's own accounting (main.ts `window.__fetchStats`).
+ * Taken at the cold/steady boundary and again at the end, so the reported numbers are what the
+ * tab spends while it is just sitting there — the steady-state cost the CPU columns measure,
+ * in calls rather than seconds. Summed here rather than in the report so the multi-minute peer
+ * array never crosses CDP. */
+const FETCH_IN_PAGE = () => {
+    const stats = window.__fetchStats?.();
+    if (!stats) return { unavailable: true, total: 0, ok: 0, aborted: 0, failed: 0, peers: 0, bySource: {} };
+    const sum = (key) => stats.peers.reduce((acc, peer) => acc + peer[key], 0);
+    return {
+        total: stats.total,
+        bySource: { ...stats.bySource },
+        ok: sum("ok"),
+        aborted: sum("aborted"),
+        failed: sum("failed"),
+        peers: stats.peers.length,
+        updateIntervalMs: stats.updateIntervalMs,
+        // The busiest peer is the whole story when one node serves every community record.
+        topPeer: stats.peers.slice().sort((a, b) => b.calls - a.calls)[0]?.calls ?? 0
+    };
+};
+
 async function metrics(session) {
     const { metrics: ms } = await session.send("Performance.getMetrics");
     const get = (name) => ms.find((m) => m.name === name)?.value ?? 0;
@@ -217,11 +239,13 @@ async function round(n) {
     await sampleUntil(t0 + SETTLE_MS, "cold");
     const afterCold = treeStats(rootPid);
     const coldMetrics = await metrics(session);
+    const fetchCold = await page.evaluate(FETCH_IN_PAGE).catch(() => undefined);
 
     await sampleUntil(t0 + SETTLE_MS + WINDOW_MS, "steady");
     const afterSteady = treeStats(rootPid);
     const steadyMetrics = await metrics(session);
     const steadyCounts = await evalSafe();          // rate + histogram only
+    const fetchEnd = await page.evaluate(FETCH_IN_PAGE).catch(() => undefined);
 
     await context.close();
     try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch {}
@@ -229,6 +253,22 @@ async function round(n) {
     const coldCpu = afterCold.cpuSec - base.cpuSec;
     const steadyCpu = afterSteady.cpuSec - afterCold.cpuSec;
     const firstSteady = samples.find((s) => s.tag === "steady");
+    // Fetch calls made DURING the steady window only: the cold burst (63 joins, the root
+    // pull, the first resolve of every community) is a one-off and would swamp the number
+    // that matters, which is what the tab keeps spending forever.
+    const deltaSources = {};
+    for (const source of new Set([...Object.keys(fetchCold?.bySource ?? {}), ...Object.keys(fetchEnd?.bySource ?? {})]))
+        deltaSources[source] = (fetchEnd?.bySource?.[source] ?? 0) - (fetchCold?.bySource?.[source] ?? 0);
+    const steadyFetch = {
+        calls: (fetchEnd?.total ?? 0) - (fetchCold?.total ?? 0),
+        ok: (fetchEnd?.ok ?? 0) - (fetchCold?.ok ?? 0),
+        aborted: (fetchEnd?.aborted ?? 0) - (fetchCold?.aborted ?? 0),
+        failed: (fetchEnd?.failed ?? 0) - (fetchCold?.failed ?? 0),
+        bySource: deltaSources,
+        peers: fetchEnd?.peers ?? 0,
+        topPeerCalls: fetchEnd?.topPeer ?? 0,
+        updateIntervalMs: fetchEnd?.updateIntervalMs
+    };
     return {
         label: LABEL, round: n, query: QUERY, coldMs: SETTLE_MS, windowMs: WINDOW_MS,
         coldCpuSec: +coldCpu.toFixed(2),
@@ -243,6 +283,10 @@ async function round(n) {
         rendererTaskSecCold: +coldMetrics.taskSec.toFixed(2),
         rendererTaskSecSteady: +(steadyMetrics.taskSec - coldMetrics.taskSec).toFixed(2),
         rendererScriptSecSteady: +(steadyMetrics.scriptSec - coldMetrics.scriptSec).toFixed(2),
+        /** libp2p-fetch calls made during the steady window, and the rate that implies. */
+        steadyFetchCalls: steadyFetch.calls,
+        steadyFetchPerMin: +((steadyFetch.calls / (WINDOW_MS / 1000)) * 60).toFixed(1),
+        steadyFetch, fetchCold, fetchEnd,
         healthCounts, steadyCounts, procs: afterSteady.procs, pageErrors: pageErrors.slice(0, 5), samples
     };
 }
@@ -258,6 +302,7 @@ for (let i = 1; i <= ROUNDS; i++) {
    renderer main thread (steady): task ${r.rendererTaskSecSteady}s, script ${r.rendererScriptSecSteady}s
    memory: peak RSS ${r.peakRssMiB} MiB · end RSS ${r.endRssMiB} MiB · JS heap ${r.jsHeapMiB} MiB (grew ${r.jsHeapGrowthMiB} MiB over the window)
    cold-start health @${(HEALTH_AT_MS / 1000).toFixed(0)}s: ${r.healthCounts.communitiesLoaded} communities · ${r.healthCounts.joinsDone} joins ok / ${r.healthCounts.joinsFailed} failed · ${r.healthCounts.tallies} first-tallies
+   libp2p-fetch (steady): ${r.steadyFetchCalls} calls → ${r.steadyFetchPerMin}/min · ${r.steadyFetch.ok} ok, ${r.steadyFetch.aborted} aborted, ${r.steadyFetch.failed} failed · by caller ${Object.entries(r.steadyFetch.bySource).filter(([, c]) => c > 0).map(([k, c]) => `${c} ${k}`).join(", ") || "none"} · ${r.steadyFetch.peers} peers
    steady churn: ${r.steadyCounts.eventsPerSec} instrumentation events/s over the last ${(r.steadyCounts.windowSpanMs / 1000).toFixed(0)}s · chrome procs ${r.procs}
    steady event kinds: ${(r.steadyCounts.byKind ?? []).map(([k, c]) => `${k}=${c}`).join(" ")}${r.pageErrors.length ? `\n   pageerrors: ${r.pageErrors.join(" | ")}` : ""}`);
 }
@@ -268,7 +313,8 @@ if (ROUNDS > 1) {
 ══ ${LABEL} — ${ROUNDS} rounds
    steady CPU  mean ${mean(results.map((r) => r.steadyCpuPct)).toFixed(1)}% of one core  (${results.map((r) => r.steadyCpuPct).join(", ")})
    cold CPU    mean ${mean(results.map((r) => r.coldCpuSec)).toFixed(2)} CPU-s
-   peak RSS    mean ${mean(results.map((r) => r.peakRssMiB)).toFixed(0)} MiB`);
+   peak RSS    mean ${mean(results.map((r) => r.peakRssMiB)).toFixed(0)} MiB
+   fetch/min   mean ${mean(results.map((r) => r.steadyFetchPerMin)).toFixed(1)}  (${results.map((r) => r.steadyFetchPerMin).join(", ")})`);
 }
 
 if (OUT) {
