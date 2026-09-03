@@ -74,11 +74,11 @@
     "@libp2p/identify": "4.1.13",
     "@libp2p/tcp": "11.0.27",
     "@multiformats/multiaddr": "13.0.3",
-    "@pkcprotocol/pkc-js": "0.0.95",
+    "@pkcprotocol/pkc-js": "0.0.96",
     "@release-it/conventional-changelog": "10.0.6",
     "@types/better-sqlite3": "7.6.13",
     "@vitest/coverage-v8": "4.1.11",
-    "commitizen": "4.3.1",
+    "commitizen": "4.3.2",
     "cz-conventional-changelog": "3.3.0",
     "husky": "9.1.7",
     "libp2p": "3.3.9",
@@ -86,5 +86,16 @@
     "strip-json-comments": "5.0.3",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
+  },
+  "overrides": {
+    "@pkcprotocol/pkc-js": {
+      "undici": "7.29.0",
+      "uuid": "13.0.1",
+      "ws": "8.21.3"
+    },
+    "protobufjs": "7.6.6",
+    "release-it": {
+      "undici": "6.28.0"
+    }
   }
 }
