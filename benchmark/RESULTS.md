@@ -572,6 +572,40 @@ sections measure.
 - Cold-start health is asserted every round (64 communities, 64/64 joins, 64 first-tallies) so a
   configuration that is cheap because it is *broken* cannot pass as a win.
 
+## The pkc-js IPNS fetch finding (measured 2026-09-03)
+
+Same harness and same reference consumer, 60 s cold start + a steady window; the only variable is
+the pkc-js version. The site counts every call on the shared `/libp2p/fetch/0.0.1` service per
+peer and per caller, and this harness now reads those counters at the cold/steady boundary and
+again at the end, so the fetch column is steady-state only — the cold burst is excluded.
+
+| pkc-js | fetch calls/min (steady) | aborted share | steady CPU | peak RSS | end RSS |
+|---|---|---|---|---|---|
+| 0.0.94 | **117.3** (118, 116.7) | ~45% | 8.6% of a core (8.6, 8.6) | 1243 MiB | 1095-1101 MiB |
+| **0.0.95** | **0** | **0%** | **5.9%** of a core (5.8, 5.7, 4.7, 7.2) | 1248 MiB | 1040-1097 MiB |
+
+n=2 at a 180 s window per version, plus n=2 more at 300 s on 0.0.95.
+
+**This library's own share of that traffic: 5 calls, ever.** Across a whole session the voter
+fetched one bulk root record per peer at join and never again — cold-join pull, then gossip
+heartbeat and bitswap. 98-100% of the tab's fetch traffic was pkc-js resolving the 64 leader
+communities' IPNS records.
+
+**The cause of the pkc-js share:** one network revalidation per updating community per
+`updateInterval` (60 s, floored at 30 s), each fanning out to every topic subscriber and every
+discovered provider at once and aborting the losers on the first valid record — hence the ~45%
+abort share, which is the race working rather than failures. pkc-js 0.0.95
+(`perf(helia): serve subscribed IPNS names from cache while the push channel is healthy`,
+pkcprotocol/pkc-js#331, issue #330) adds a push-channel watchdog: a name whose topic has
+subscribers and has delivered a signature-valid record inside the watchdog window is served from
+cache past its ttl, and the update loop stops forcing `nocache: true` while healthy. Three of the
+four 0.0.95 rounds made no fetch calls at all in the steady window; the fourth made 64/min (one
+per community per minute, zero aborts) with the watchdog not yet warm. Both 300 s rounds were
+zero, so zero is the steady state and 64/min is the warm-up.
+
+Memory does not move (peak RSS within noise, JS heap 62-84 MiB either way) and cold start is
+unchanged: 64 communities loaded, 64/64 joins, 64 first-tallies in every round.
+
 To A/B a change to **this** library rather than a dependency, `npm pack` it and install the
 tarball into `SITE_ROOT` between runs — the site consumes it as a normal dependency, so nothing
 needs linking.
