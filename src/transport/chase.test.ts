@@ -72,7 +72,7 @@ function harness(over: Partial<RootChaserDeps> & Pick<RootChaserDeps, "getBlock"
     const chaser = makeRootChaser({
         verifyOffline: async () => ({ valid: true }),
         cache: makeVerdictCache(),
-        hasBundle: async () => false,
+        isAdmitted: async () => false,
         admit: async ({ cid, verified }) => {
             admitted.push({ cid, verified });
         },
@@ -117,13 +117,13 @@ describe("makeRootChaser", () => {
         expect(h.chaser.inFlight()).toBe(0);
     });
 
-    it("reports every CID a checkpoint contained — including bundles already held, which never reach admit", async () => {
+    it("reports every CID a checkpoint contained — including bundles already admitted, which never reach admit", async () => {
         const winners = [bundle("0x1"), bundle("0x2")];
         const { root, getBlock } = await checkpointOf(winners);
-        // Everything in this checkpoint is already in our store: the publisher's own bundle is
+        // Everything in this checkpoint is already in our winner-set: the publisher's own bundle is
         // always in exactly this position, so if `onCheckpointContents` fired from the admit path
         // it would never mention the one CID a publisher actually wants to hear about.
-        const h = harness({ getBlock, hasBundle: async () => true });
+        const h = harness({ getBlock, isAdmitted: async () => true });
         h.chaser.chase(root);
         await h.settle();
         expect(h.admitted).toHaveLength(0);
@@ -168,13 +168,13 @@ describe("makeRootChaser", () => {
         expect(fetched).toContain(root.toString());
     });
 
-    it("skips bundles we already hold without re-verifying", async () => {
+    it("skips bundles we already admitted without re-verifying", async () => {
         const winners = [bundle("0x1")];
         const { root, getBlock } = await checkpointOf(winners);
         let verifies = 0;
         const h = harness({
             getBlock,
-            hasBundle: async () => true,
+            isAdmitted: async () => true,
             verifyOffline: async () => {
                 verifies++;
                 return { valid: true };
@@ -186,6 +186,22 @@ describe("makeRootChaser", () => {
         expect(h.deferred).toHaveLength(0);
         expect(verifies).toBe(0);
         expect(h.merged()).toBe(0);
+    });
+
+    it("admits a bundle whose blocks are already local but which was never admitted (issue #44's wedge)", async () => {
+        // The skip predicate is ADMISSION, not block presence. A node holding every block of a
+        // checkpoint locally — a persistent blockstore that outlived the state keyed on it — used
+        // to skip every bundle of every chase and could never converge again, silently, while
+        // peers served the votes. Here `getBlock` answers entirely from the local block map (no
+        // want leaves the node) and nothing is admitted yet: the chase must verify and admit.
+        const winners = [bundle("0x1"), bundle("0x2")];
+        const { root, map } = await checkpointOf(winners);
+        const localOnly: RootChaserDeps["getBlock"] = async (cid) => map.get(cid.toString());
+        const h = harness({ getBlock: localOnly, isAdmitted: async () => false });
+        h.chaser.chase(root);
+        await h.settle();
+        expect(h.admitted).toHaveLength(2);
+        expect(h.merged()).toBe(1);
     });
 
     it("drops a liar's offline-invalid bundle before admit but keeps the honest one (per-bundle trust)", async () => {

@@ -94,7 +94,7 @@ Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingF
 ```ts
 const contest = await voter.createContest({ criteria });  // criteria: the contest's full document (strictly validated here)
 contest.on("update", () => render(contest.tally));        // tally rides the object; recomputed before each emit
-contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed, the background verifier's RPC/resolver is down (retrying), or a deferred check evicted THIS wallet's own vote (VoteEvictedError)
+contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed, the background verifier's RPC/resolver is down (retrying), a deferred check evicted THIS wallet's own vote (VoteEvictedError), or this node's persisted checkpoint could not be kept (SnapshotError)
 await contest.update();                                   // join the topic, cold-start, begin emitting
 // const fresh = await contest.getTally();                // or force a fresh read, bypassing the cache
 // await contest.stop();                                  // leave the topic

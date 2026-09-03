@@ -141,6 +141,18 @@ within jitter: `START→TALLY` 2.46s / 2.48s / 2.48s / 2.66s / 4.80s and `START�
 3.09s / 3.27s / 6.08s for N=1…1000, with `router` 1.00s, `connect` 1.58–1.59s, `fetch` 0.51–1.09s and
 `gate-RPC` 3 / 3 / 3 / 3 / 9 unchanged. The table above is left at the 2026-08-09 numbers.*
 
+*Re-measured 2026-09-03 (median of 3) with the **admission-keyed chase skip and the split snapshot
+restore** (the chaser's skip predicate moved from blockstore membership to the engine's admission map;
+the snapshot restore's decode and per-bundle admission got separate failure handling, with a retry
+backlog). Neither touches the measured path here (the joiner starts empty, so nothing is skipped and
+there is no snapshot to restore): `START→TALLY` 3.18s / 3.12s / 3.13s / 3.28s / 5.82s and
+`START→VERIFIED` 3.79s / 3.73s / 3.74s / 3.89s / 7.09s for N=1…1000, against a back-to-back **master
+control** on the same link window of 3.14s / 3.12s / 3.13s / 3.37s / 5.61s and 3.74s / 3.73s / 3.74s /
+3.98s / 6.88s — every column within jitter (`connect` 1.91–1.97s vs 1.91–1.93s, `fetch` 0.84–1.79s vs
+0.84–1.44s, `verify+merge` 0.31–1.98s vs 0.31–2.05s, `gate-RPC` 3 / 9 and inner `reads` N+1 in both).
+Both runs again sit ~0.35s above the table's `connect` 1.56s, as the 2026-08-31 control did — the link
+window, not the change. The table above is left at the 2026-08-09 numbers.*
+
 *†The `N=10000` row (median of 3, one rep timed out on WAN jitter) is a separate single-contest run from
 the **previous baseline** (2026-07-08: instant fake chain, inline verification — before the mock ETH
 gateway and background chain verification existed, hence no gate-RPC/VERIFIED values) — a realistic

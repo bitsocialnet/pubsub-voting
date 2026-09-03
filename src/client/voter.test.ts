@@ -31,12 +31,14 @@ import {
     MissingChainClientError,
     MissingFetchError,
     MissingPubsubError,
+    SnapshotError,
     UnknownRuleError,
     VoteEvictedError,
     VoterDestroyedError
 } from "../errors.js";
 import { topicFor } from "../topic.js";
 import { blockForBytes, encodeCheckpoint } from "../checkpoint/codec.js";
+import { bundleCidForBytes, encodeBundle } from "../crdt/codec.js";
 import {
     bizCriteria,
     bizGateRef,
@@ -49,7 +51,8 @@ import {
     fakeChains,
     stubChains,
     fakeSigner,
-    realSigner
+    realSigner,
+    SECOND_TEST_PRIVATE_KEY
 } from "../test-fixtures.js";
 
 /** A valid base58btc IPNS community key (VotesBundleSchema rejects non-keys, so a real one is needed). */
@@ -58,6 +61,8 @@ const VALID_KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const OTHER_KEY = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust";
 /** A one-community upvote used across the publish tests. */
 const VOTE = [{ community: { publicKey: VALID_KEY }, vote: 1 }];
+/** A second community's upvote, for tests that need two distinguishable ballots. */
+const OTHER_VOTE = [{ community: { publicKey: OTHER_KEY }, vote: 1 }];
 /** The same upvote carrying a resolvable community name (exercises the name pipeline). */
 const NAMED_VOTE = [{ community: { name: "memes.bso", publicKey: VALID_KEY }, vote: 1 }];
 
@@ -79,11 +84,11 @@ function advancingChains(currentBlock: () => bigint): ChainClientFactory {
  * test can observe the provisional (chainVerified: false) window deterministically before the
  * background verifier settles it.
  */
-function gatedChains(): { chains: ChainClientFactory; release: () => void } {
+function gatedChains(head = 43200n): { chains: ChainClientFactory; release: () => void } {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const client = {
-        getBlockNumber: async () => 43200n,
+        getBlockNumber: async () => head,
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
         readContract: async () => {
             await gate;
@@ -865,11 +870,225 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         await voter.destroy();
     });
 
+    /**
+     * A chain client whose head read fails on demand — the production shape of issue #45's
+     * incident: a seeder boots, restores ~64 topics at once, and one rate-limit window makes the
+     * head read behind the restore's admissibility check throw. `readContract` (the gate read)
+     * keeps working, so only the restore path is disturbed.
+     */
+    const flakyHeadChains = (): { chains: ChainClientFactory; fail: (on: boolean) => void } => {
+        let failing = true;
+        const client = {
+            getBlockNumber: async () => {
+                if (failing) throw new Error("429 Too Many Requests");
+                return 43200n;
+            },
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        return { chains: () => client as unknown as ChainClient, fail: (on) => (failing = on) };
+    };
+
+    /** Session 1 of a restart test: publish one verified vote and persist it on `leave()`. */
+    const persistOneVote = async (dataPath: string, signer = realSigner()): Promise<void> => {
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: countingChains().chains });
+        await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer })).publish();
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voter.destroy();
+    };
+
+    it("keeps the snapshot when a transient RPC failure interrupts the restore (issue #45)", async () => {
+        const dataPath = await tempDataPath();
+        const topic = await topicFor(bizCriteria());
+        await persistOneVote(dataPath);
+
+        // Session 2 restores into an RPC outage: the head read the admissibility check makes
+        // throws for every bundle. The blob is NOT corrupt — nothing about it failed — so
+        // deleting it (as one try/catch around the whole restore used to) permanently discards
+        // votes the node verified itself and no peer may be online to re-serve.
+        const flaky = flakyHeadChains();
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: flaky.chains });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        const errors: unknown[] = [];
+        contestB.on("error", (e) => errors.push(e));
+        await contestB.update();
+        expect(contestB.tally?.ranking).toEqual([]); // nothing admitted this session...
+        // ...and the incompleteness is reported, not silent (the whole loss was invisible).
+        expect(errors.filter((e) => e instanceof SnapshotError && e.failure === "restore-incomplete")).toHaveLength(1);
+        await voterB.destroy();
+
+        // The blob survived — session 3, with a healthy RPC, restores the vote it holds.
+        const reader = (await import("../storage/node.js")).makeStorage({ dataPath });
+        expect(await reader.openSnapshots().get(topic)).toBeDefined();
+        await reader.destroy();
+
+        const voterC = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: countingChains().chains });
+        const contestC = await voterC.createContest({ criteria: bizCriteria() });
+        await contestC.update();
+        expect(contestC.tally?.ranking[0]?.community.publicKey).toBe(VALID_KEY);
+        await voterC.destroy();
+    });
+
+    it("suppresses the snapshot write while a restore is incomplete (a partial view must not overwrite the blob)", async () => {
+        const dataPath = await tempDataPath();
+        const topic = await topicFor(bizCriteria());
+        await persistOneVote(dataPath); // wallet #1's vote, on the blob
+
+        // Session 2's restore is interrupted, then the RPC recovers and a SECOND wallet votes
+        // here. That publish changes the winner set and arms the snapshot write — which must
+        // skip, because our view is knowably missing the votes the backlog still holds. Writing
+        // it would replace a blob holding wallet #1's vote with one that never mentions it.
+        const flaky = flakyHeadChains();
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: flaky.chains });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        await contestB.update();
+        flaky.fail(false);
+        const second = realSigner(SECOND_TEST_PRIVATE_KEY);
+        await (await voterB.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: second })).publish();
+        await vi.waitFor(async () => expect((await contestB.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voterB.destroy(); // the leave() flush must skip too
+
+        // Session 3 still finds wallet #1's vote: the blob was never overwritten.
+        const voterC = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: countingChains().chains });
+        const contestC = await voterC.createContest({ criteria: bizCriteria() });
+        await contestC.update();
+        expect(contestC.tally?.ranking.map((row) => row.community.publicKey)).toEqual([VALID_KEY]);
+        await voterC.destroy();
+        expect(topic).toBe(await topicFor(bizCriteria()));
+    });
+
+    it("retries the interrupted restore and admits its bundles once the RPC recovers", async () => {
+        const dataPath = await tempDataPath();
+        await persistOneVote(dataPath);
+
+        const flaky = flakyHeadChains();
+        vi.useFakeTimers();
+        try {
+            const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: flaky.chains });
+            const contestB = await voterB.createContest({ criteria: bizCriteria() });
+            await contestB.update();
+            expect(contestB.tally?.ranking).toEqual([]);
+
+            // The RPC comes back. Nothing else happens on this topic — no peer, no publish — so
+            // only the restore's own retry can recover the vote (RESTORE_RETRY_MS, the first
+            // backoff step). Before it existed, the session simply ran on without those ballots.
+            flaky.fail(false);
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect((await contestB.getTally()).ranking[0]?.community.publicKey).toBe(VALID_KEY);
+            await voterB.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("drops the check state of bundles the join-time prune removes (no orphan left to block writes)", async () => {
+        // A snapshot older than the expiry window: `verifyOffline` is deliberately expiry-blind
+        // (verify/bundle.ts), so the restore admits its bundles and the join-time prune drops them
+        // again moments later. Their per-bundle check state must go with them — an orphan reads as
+        // "an admitted bundle whose deferred checks are pending", which suppresses every snapshot
+        // write for this contest, and as "already admitted" to the chase, for a bundle that is no
+        // longer in the winner-set. This join runs off `publish()`, with no update listener
+        // registered, so nothing kicks the tally refresh whose own prune would otherwise clean up
+        // first: the join-time prune is the only one that runs.
+        const dataPath = await tempDataPath();
+        const signer = realSigner();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: countingChains().chains });
+        const ballotA = await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer });
+        const { cid: decayed } = await ballotA.publish(); // sampled at bucket 1 (head 43200)
+        const contestA = await voterA.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voterA.destroy();
+
+        // Session 2 comes up 40 buckets later — past `voteExpiryBuckets: 30`. The gate reads never
+        // settle here, so nothing can quietly clean the orphan up after the fact.
+        const { chains, release } = gatedChains(43200n * 40n);
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        const second = realSigner(SECOND_TEST_PRIVATE_KEY);
+        await (await voterB.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: second })).publish();
+        expect(contestB.checksFor(decayed)).toBeUndefined();
+        await voterB.destroy();
+        release();
+    });
+
     it("runs the flush safely on the in-memory backend (`dataPath: false` — nothing to persist, nothing thrown)", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
         await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await expect(voter.stop()).resolves.toBeUndefined(); // leave() flush against the memory store
         await expect(voter.destroy()).resolves.toBeUndefined();
+    });
+});
+
+/**
+ * The chase's skip predicate is ADMISSION, not block presence (issue #44). The two disagree
+ * exactly on the node that needs the chase most: one whose persistent blockstore outlived the
+ * state keyed on it. Keyed on the blockstore, such a node decoded every peer's checkpoint
+ * successfully (all blocks resolve locally!), skipped every bundle in it, admitted nothing, and
+ * stayed silently wedged — for 13 days on the production seeder, while four peers served the
+ * ballots it was missing.
+ */
+describe("chase convergence with a warm blockstore (issue #44)", () => {
+    it("admits a served checkpoint's bundles whose blocks we already hold but never admitted", async () => {
+        // One real, signature-verifiable bundle, encoded into a real checkpoint.
+        const publisher = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains() });
+        const ballot = await publisher.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: realSigner() });
+        const { bundle } = await ballot.publish();
+        await publisher.destroy();
+        const { root, chunks, blocks } = await encodeCheckpoint([bundle]);
+
+        // The wedged node: every block of that checkpoint is in its blockstore — the chunk blocks
+        // AND the bundle's own block, which is what the production seeder really had on disk (it
+        // received the vote live, verified it and stored it) — while nothing is admitted, because
+        // the state keyed on those blocks was lost with its snapshot on an earlier restart.
+        const held = new Map(blocks.map((block) => [block.cid.toString(), block.bytes]));
+        const bundleBytes = encodeBundle(bundle);
+        held.set((await bundleCidForBytes(bundleBytes)).toString(), bundleBytes);
+        const blockstore = {
+            get: async (cid: CID) => {
+                const bytes = held.get(cid.toString());
+                if (bytes === undefined) throw new Error("no block");
+                return bytes;
+            },
+            put: async (cid: CID, bytes: Uint8Array) => {
+                held.set(cid.toString(), bytes);
+                return cid;
+            },
+            has: async (cid: CID) => held.has(cid.toString())
+        };
+
+        // One peer serving exactly the root the wedged node's blocks belong to.
+        let topic = "";
+        const record: FetchRootRecord = {
+            version: ROOT_RECORD_VERSION,
+            root,
+            chunks,
+            count: 1,
+            sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
+        };
+        const subscriber = { toString: () => "peerA" };
+        const pubsub: PubsubService = {
+            publish: async () => ({}) as never,
+            subscribe: () => {},
+            unsubscribe: () => {},
+            getSubscribers: () => [subscriber] as unknown as ReturnType<PubsubService["getSubscribers"]>,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            topicValidators: new Map()
+        };
+        const helia = {
+            libp2p: { services: { pubsub, fetch: rootFetchService({ records: () => ({ [topic]: record }) }) } },
+            blockstore
+        } as unknown as HeliaInstance;
+
+        const voter = new PubsubVoter({ dataPath: false, helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        topic = contest.topic;
+        await contest.update();
+        // The cold-start pull hears the divergent root and chases it; the bundle must be verified
+        // and ADMITTED, not skipped because its block happens to be on disk.
+        await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.community.publicKey).toBe(VALID_KEY));
+        await voter.destroy();
     });
 });
 

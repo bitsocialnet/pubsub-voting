@@ -110,8 +110,18 @@ export interface RootChaserDeps {
     cache: VerdictCache;
     /** The gate's freshness guard (see gossip-validator.ts); omitted ⇒ no check. */
     isEvaluableNow?: (bundle: VotesBundle) => Promise<boolean>;
-    /** Skip bundles we already hold (their CID is in the store) without re-verifying. */
-    hasBundle: (cid: CID) => Promise<boolean>;
+    /**
+     * Have we already ADMITTED this bundle (is it in the CRDT / winner-set)? Admitted bundles are
+     * skipped without re-verifying.
+     *
+     * Admission, never block presence: this was wired to the blockstore once, and the two disagree
+     * exactly when it matters (issue #44). A node whose persistent blockstore holds a bundle's
+     * block but whose admission state was lost — a restart that dropped the snapshot, an eviction,
+     * a prune — skipped that bundle on EVERY chase and could never converge again, silently, while
+     * every peer served it. Re-verifying a locally-held block costs no network (the bytes are the
+     * ones we just decoded), so the safe side of the disagreement is cheap.
+     */
+    isAdmitted: (cid: CID) => Promise<boolean>;
     /**
      * Store an offline-valid bundle's block bytes and admit its CID into the CRDT (idempotent).
      * `verified: true` means a cached terminal verdict already covers the FULL pipeline (the
@@ -178,7 +188,7 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
         verifyOffline,
         cache,
         isEvaluableNow,
-        hasBundle,
+        isAdmitted,
         admit,
         deferVerify,
         onMerged,
@@ -257,7 +267,7 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
                 const bytes = encodeBundle(bundle);
                 const cid = await bundleCidForBytes(bytes);
                 contained.push(cid); // recorded BEFORE the skip below — see onCheckpointContents
-                if (await hasBundle(cid)) continue; // already held — nothing to verify
+                if (await isAdmitted(cid)) continue; // already in the winner-set — nothing to verify
                 const cached = cache.get(cid);
                 if (cached) {
                     if (!cached.valid) continue; // known bad — skip
