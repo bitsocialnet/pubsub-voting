@@ -201,14 +201,21 @@ export function fakeSigner(address = "0x0000000000000000000000000000000000000001
     };
 }
 
+/** Anvil/hardhat test account #2 — a SECOND wallet for {@link realSigner}. */
+export const SECOND_TEST_PRIVATE_KEY = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a" as const;
+
 /**
  * A REAL signer over the anvil/hardhat test account #1 (as in verify/bundle.test.ts and the
  * two-node integration test), for tests whose bundles must survive the verifier's signature
  * recovery — e.g. the checkpoint-snapshot restore, which re-runs `verifyOffline` on reload.
  * `fakeSigner`'s placeholder fails recovery by design.
+ *
+ * `privateKey` selects a different wallet ({@link SECOND_TEST_PRIVATE_KEY} is anvil account #2) —
+ * the LWW winner-set is keyed by wallet, so a test that needs two coexisting bundles needs two of
+ * these, not one signing twice.
  */
-export function realSigner(): VoteSigner {
-    const account = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+export function realSigner(privateKey: `0x${string}` = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"): VoteSigner {
+    const account = privateKeyToAccount(privateKey);
     return {
         address: () => account.address,
         signBallot: async (typedData) => ({ signature: await account.signTypedData(typedData), type: EIP712_SIGNATURE_TYPE })

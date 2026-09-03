@@ -68,6 +68,7 @@ import { criteriaCid, TOPIC_PREFIX } from "../topic.js";
 import {
     InvalidCommunityNameError,
     MissingChainClientError,
+    SnapshotError,
     UnknownRuleError,
     VoteEvictedError,
     VoterDestroyedError
@@ -671,6 +672,22 @@ const COLD_START_REPULL_WINDOW_MS = HEARTBEAT_INTERVAL_MS;
  * `leave()` flushes whatever is still pending so a clean shutdown never loses the tail.
  */
 const SNAPSHOT_DEBOUNCE_MS = 10_000;
+/**
+ * How long to wait before re-attempting the bundles a snapshot restore could not admit for a
+ * TRANSIENT reason — an RPC outage during a seeder's boot burst, or a gating-chain head that has
+ * not yet reached a bundle's sample bucket (see {@link ContestEngine.#restoreSnapshot}). Backs off
+ * exponentially to {@link RESTORE_RETRY_CAP_MS} and keeps retrying while joined: giving up would
+ * mean either abandoning those votes or suppressing this topic's snapshot writes forever, and a
+ * retry costs one head read against a memoized bucket, so the patient option is also the cheap one.
+ */
+const RESTORE_RETRY_MS = 30_000;
+const RESTORE_RETRY_CAP_MS = 600_000;
+/**
+ * Snapshot write attempts (one per debounce window) before leaving it to the next winner-set
+ * change. A store that fails every write must not spin, but a topic quiet enough to never change
+ * again must not keep a stale snapshot forever because ONE write failed (issue #45).
+ */
+const SNAPSHOT_WRITE_ATTEMPTS = 3;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
@@ -1135,6 +1152,19 @@ class ContestEngine {
     #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
     /** The armed (debounced) snapshot-write timer; flushed by `leave()`. See {@link #writeSnapshot}. */
     #snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+    /** Consecutive failed snapshot writes in the current run (see {@link SNAPSHOT_WRITE_ATTEMPTS}). */
+    #snapshotWriteFailures = 0;
+    /**
+     * Bundles a restore decoded but could not admit for a TRANSIENT reason, awaiting
+     * {@link #restoreTimer}. Non-empty means the restore is INCOMPLETE, which suppresses the
+     * snapshot write: our view is missing votes the blob holds, and persisting it would overwrite
+     * the good blob with the partial one — the loss the retry exists to prevent (issue #45).
+     */
+    #restoreBacklog: readonly VotesBundle[] = [];
+    /** The armed restore-retry timer; cleared by `leave()`. */
+    #restoreTimer: ReturnType<typeof setTimeout> | undefined;
+    /** Consecutive restore retries, driving the backoff (reset by a complete restore). */
+    #restoreAttempts = 0;
     /**
      * Tears down the per-join `subscription-change` re-pull (listener + window timer); set by
      * {@link #armSubscriptionRepull}, cleared by `leave()` or by the window expiring.
@@ -1205,9 +1235,8 @@ class ContestEngine {
             nameResolutionCache: deps.nameResolutionCache,
             readHead: ({ chain }) => this.#readHead({ chain })
         });
-        // The gate/transport are (re)built on join(); the store, crdt, caches, verifier, and
-        // background verifier are stable per contest, so they survive re-joins of the topic.
-        this.#store = store;
+        // The gate/transport are (re)built on join(); the crdt, caches, verifier, and background
+        // verifier are stable per contest, so they survive re-joins of the topic.
         this.#cache = makeVerdictCache();
         this.#acceptedDedup = makeAcceptedDedup(this.#bucketMath);
         this.#verifier = verifier;
@@ -1243,7 +1272,6 @@ class ContestEngine {
         });
     }
 
-    readonly #store: ReturnType<typeof makeBlockstoreBundleStore>;
     /** Per gate leaf: hash of its canonical rule ref + chainId — its keyspace in the shared gate store. */
     readonly #ruleIds: string[];
     /** The gate's leaf refs in document order, aligned with {@link #ruleIds}. */
@@ -1699,7 +1727,12 @@ class ContestEngine {
             verifyOffline: (bundle) => this.#verifier.verifyOffline(bundle),
             cache: this.#cache,
             isEvaluableNow: (bundle) => this.#isEvaluableNow(bundle),
-            hasBundle: (cid) => this.#store.has(cid),
+            // ADMISSION, not block presence (issue #44): our blockstore may hold a bundle's block
+            // while the winner-set does not know it — after a restart that lost the snapshot, an
+            // eviction, or a prune. Keyed on the blockstore, such a node skipped that bundle on
+            // every chase and never converged; `#checks` is the same admission map
+            // `#restoreSnapshot` consults, and it is dropped in lockstep with the CRDT's membership.
+            isAdmitted: async (cid) => this.#checks.has(cid.toString()),
             // `verified: false` is a provisional admit (offline checks only) whose deferred gate
             // read + name resolution ride `deferVerify`; `true` means a cached terminal verdict
             // already covers the full pipeline.
@@ -1927,12 +1960,21 @@ class ContestEngine {
         if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
         this.#heartbeatTimer = undefined;
         // Flush the debounced snapshot write so a clean shutdown persists the latest state
-        // (still skipped if checks are pending — the stale-but-good snapshot stays put).
+        // (still skipped if checks are pending, or a restore backlog is outstanding — the
+        // stale-but-good snapshot stays put). `retry: false`: a failed flush must not arm a
+        // timer that outlives the join.
         if (this.#snapshotTimer !== undefined) {
             clearTimeout(this.#snapshotTimer);
             this.#snapshotTimer = undefined;
-            await this.#writeSnapshot();
+            await this.#writeSnapshot({ retry: false });
         }
+        // Drop the restore backlog with its timer: a re-join re-reads the blob (still on disk,
+        // since the backlog suppressed every write that could have thinned it) and starts over.
+        if (this.#restoreTimer !== undefined) clearTimeout(this.#restoreTimer);
+        this.#restoreTimer = undefined;
+        this.#restoreBacklog = [];
+        this.#restoreAttempts = 0;
+        this.#snapshotWriteFailures = 0;
         // Pause the background verifier's retry timer; pending state survives for a re-join.
         this.#background.stop();
         this.#disarmSubscriptionRepull();
@@ -2062,17 +2104,25 @@ class ContestEngine {
      * wire bytes plus the blocks it references (just re-put by the encode, read back from the
      * blockstore so no second copy is held in memory). Best-effort like every persistent-cache
      * write — a broken store degrades to the pre-persistence behavior (the cold-start pull),
-     * never an error.
+     * never an error — but not silent: a write that keeps failing surfaces as a `SnapshotError`
+     * on the contest's `error` event, because the state it fails to keep is invisible otherwise.
      *
-     * Skipped while ANY admitted bundle has a deferred check pending: the encoder serves only
-     * fully verified bundles, so writing mid-settlement would persist a snapshot that OMITS the
-     * pending ones — right after a restore (where every reloaded bundle is provisional) that
-     * would clobber a good snapshot with a near-empty one, and a crash in that window would lose
-     * the very votes persistence exists to keep. Every settlement and eviction re-marks the
-     * state changed, so the write that was skipped here is re-armed by the last one to land.
+     * Skipped while our view is knowably INCOMPLETE, in either of the two ways it can be, because
+     * a write in that window overwrites a good blob with a lossy one:
+     *
+     *   - ANY admitted bundle has a deferred check pending — the encoder serves only fully
+     *     verified bundles, so writing mid-settlement persists a snapshot that OMITS the pending
+     *     ones (right after a restore, where every reloaded bundle is provisional, that is a
+     *     near-empty snapshot). Every settlement and eviction re-marks the state changed, so the
+     *     skipped write is re-armed by the last one to land.
+     *   - a restore is still carrying a backlog ({@link #restoreBacklog}) — the blob holds votes
+     *     a transient failure kept us from admitting, and the retry owns them until it lands.
+     *
+     * `retry` is false on the `leave()` flush: a failed write there must not arm a timer that
+     * outlives the join.
      */
-    async #writeSnapshot(): Promise<void> {
-        if (this.#hasUnsettledChecks()) return;
+    async #writeSnapshot({ retry = true }: { retry?: boolean } = {}): Promise<void> {
+        if (this.#hasUnsettledChecks() || this.#restoreBacklog.length > 0) return;
         try {
             await this.rootRecord(); // (re-)encode so the cache reflects the current winner-set
             // Read record + blocks from the cache as one unit: a state change racing the encode
@@ -2083,9 +2133,18 @@ class ContestEngine {
                 this.topic,
                 encodeSnapshot({ record: encodeRootRecord(cached.record), blocks: cached.blocks.map((block) => block.bytes) })
             );
-        } catch {
-            // Best-effort: a failed write leaves the previous snapshot in place; the next
-            // state change re-arms the debounce and retries.
+            this.#snapshotWriteFailures = 0;
+        } catch (error) {
+            // The previous snapshot stays in place (a restart restores older state, never none).
+            // Retry on the debounce a couple of times rather than waiting for a winner-set change
+            // that a quiet topic may never see — then report and stop, so a dead store cannot spin.
+            this.#snapshotWriteFailures += 1;
+            if (retry && this.#snapshotWriteFailures < SNAPSHOT_WRITE_ATTEMPTS) {
+                this.#scheduleSnapshotWrite();
+                return;
+            }
+            this.#snapshotWriteFailures = 0;
+            this.#emitError(new SnapshotError("write-failed", this.topic, error));
         }
     }
 
@@ -2097,9 +2156,18 @@ class ContestEngine {
      * bundle re-passes the offline signature/constraint checks, and the deferred gate read +
      * name resolution ride the background verifier (mostly persisted-gate-cache hits on a
      * restart) — so the trust model is unchanged: this is the node's own previously-validated
-     * state, re-validated on load. A corrupt or version-mismatched blob is removed and the join
-     * proceeds empty, exactly as before persistence; the cold-start pull then still runs, so a
-     * stale snapshot self-heals by union with the live topic.
+     * state, re-validated on load. The cold-start pull still runs afterwards, so a stale snapshot
+     * self-heals by union with the live topic.
+     *
+     * **Only a provably bad blob is discarded** (issue #45). The decode is the whole of the
+     * corruption test, so it is the whole of what this catch covers: a truncated, mangled or
+     * version-mismatched blob is removed and the join proceeds empty, exactly as before
+     * persistence. Everything after it — the per-bundle admission, which reads the gating chain —
+     * runs under {@link #admitRestored}, where a transient failure yields a RETRY and never a
+     * delete. The distinction is the incident: the two catches used to be one, so a momentary RPC
+     * failure during a seeder's boot burst (64 topics restoring at once, one rate-limit window)
+     * permanently discarded a topic's persisted votes and the node came up empty on a topic every
+     * other peer still served.
      */
     async #restoreSnapshot(): Promise<void> {
         let blob: Uint8Array | undefined;
@@ -2109,39 +2177,101 @@ class ContestEngine {
             return; // unreadable store — degrade to a plain cold join
         }
         if (blob === undefined) return;
+        let winners: VotesBundle[];
         try {
             const snapshot = decodeSnapshot(blob);
             const record = decodeRootRecord(snapshot.record);
             const byCid = new Map<string, Uint8Array>();
             for (const bytes of snapshot.blocks) byCid.set((await blockForBytes(bytes)).cid.toString(), bytes);
-            const winners = await decodeCheckpoint(record.root, async (cid) => byCid.get(cid.toString()), record.chunks);
-
-            const pending: PendingBundle[] = [];
-            for (const bundle of winners) {
-                // Same two-stage admit as the chase (see transport/chase.ts): offline checks
-                // synchronously before admit, chain/name checks deferred and batched. Admission
-                // goes through `crdt.add` (which stores the block AND registers the bundle) — a
-                // merge-by-CID would re-read through the blockstore, which the restore must not
-                // depend on: it may be fresh (the incident's in-memory case) or hold the block
-                // already (a persistent one), neither of which says the CRDT knows the bundle.
-                const cid = await bundleCidForBytes(encodeBundle(bundle));
-                if (this.#checks.has(cid.toString())) continue; // already admitted (a re-join)
-                if (!(await this.#isEvaluableNow(bundle))) continue;
-                const offline = await this.#verifier.verifyOffline(bundle);
-                if (!offline.valid) continue;
-                await this.#crdt.add(bundle);
-                this.#recordChecks(cid, bundle, false);
-                pending.push({ cid, bundle });
-            }
-            if (pending.length > 0) {
-                this.#background.enqueue(pending);
-                this.#onStateChanged();
-            }
-        } catch {
+            winners = await decodeCheckpoint(record.root, async (cid) => byCid.get(cid.toString()), record.chunks);
+        } catch (error) {
             // Corrupt, truncated, or version-mismatched blob: discard it and join empty — the
             // pre-persistence behavior. Never let a bad snapshot block the join.
             void this.#deps.snapshots.remove(this.topic).catch(() => {});
+            this.#emitError(new SnapshotError("discarded", this.topic, error));
+            return;
         }
+        this.#restoreAttempts = 0;
+        await this.#admitRestored(winners);
+    }
+
+    /**
+     * Admit a decoded snapshot's bundles, one independently of the next. Three outcomes per
+     * bundle, and the whole point of the method is that they stay distinct:
+     *
+     *   - **admitted** — the same two-stage admit as the chase (transport/chase.ts): offline
+     *     checks synchronously before admit, chain/name checks deferred and batched. Admission
+     *     goes through `crdt.add` (which stores the block AND registers the bundle) — a
+     *     merge-by-CID would re-read through the blockstore, which the restore must not depend
+     *     on: it may be fresh (the incident's in-memory case) or hold the block already (a
+     *     persistent one), neither of which says the CRDT knows the bundle.
+     *   - **dropped** — the offline checks REFUSED it. That is a verdict on the bundle, not on
+     *     the environment, and no retry changes it.
+     *   - **backlogged** — a transient failure: the read that decides evaluability threw (an RPC
+     *     outage), or our gating-chain head has not yet reached the bundle's sample bucket. Those
+     *     go to {@link #restoreBacklog}, which suppresses the snapshot write and arms a retry;
+     *     dropping them silently is how a restart's ballots disappeared with the blob intact.
+     */
+    async #admitRestored(winners: readonly VotesBundle[]): Promise<void> {
+        const pending: PendingBundle[] = [];
+        const backlog: VotesBundle[] = [];
+        for (const bundle of winners) {
+            try {
+                const cid = await bundleCidForBytes(encodeBundle(bundle));
+                if (this.#checks.has(cid.toString())) continue; // already admitted (a re-join)
+                if (!(await this.#isEvaluableNow(bundle))) {
+                    backlog.push(bundle); // our head is behind the ballot: retry, do not forget it
+                    continue;
+                }
+                const offline = await this.#verifier.verifyOffline(bundle);
+                if (!offline.valid) continue; // the bundle's own fault — a sibling's admit stands
+                await this.#crdt.add(bundle);
+                this.#recordChecks(cid, bundle, false);
+                pending.push({ cid, bundle });
+            } catch {
+                // Infrastructure, not the bundle (a chain read, a blockstore write): keep it.
+                backlog.push(bundle);
+            }
+        }
+        const wasIncomplete = this.#restoreBacklog.length > 0;
+        this.#restoreBacklog = backlog;
+        if (pending.length > 0) {
+            this.#background.enqueue(pending);
+            this.#onStateChanged();
+        }
+        if (backlog.length === 0) {
+            // The backlog just drained: re-arm the write it was suppressing, so the now-complete
+            // view reaches disk even if the retry admitted nothing new (a re-join that raced us).
+            if (wasIncomplete) this.#scheduleSnapshotWrite();
+            return;
+        }
+        // Report the incompleteness once per restore (not once per retry): an operator needs to
+        // know this topic's tally is missing persisted votes, not a line every backoff window.
+        if (!wasIncomplete) this.#emitError(new SnapshotError("restore-incomplete", this.topic));
+        this.#armRestoreRetry();
+    }
+
+    /**
+     * Arm the next backlog retry (exponential backoff, capped). Kept armed for as long as the
+     * backlog is non-empty and we stay joined: the alternative — giving up — means either
+     * discarding the votes or suppressing this topic's snapshot writes forever.
+     */
+    #armRestoreRetry(): void {
+        if (this.#restoreTimer !== undefined || !this.#joined) return;
+        const delay = Math.min(RESTORE_RETRY_MS * 2 ** this.#restoreAttempts, RESTORE_RETRY_CAP_MS);
+        this.#restoreAttempts += 1;
+        const timer = setTimeout(() => {
+            this.#restoreTimer = undefined;
+            const backlog = this.#restoreBacklog;
+            if (backlog.length === 0 || !this.#joined) return;
+            void this.#admitRestored(backlog).catch(() => {
+                // #admitRestored never throws; re-arm defensively so a backlog cannot strand.
+                this.#armRestoreRetry();
+            });
+        }, delay);
+        // Don't hold a Node process open; no-op in the browser.
+        (timer as { unref?: () => void }).unref?.();
+        this.#restoreTimer = timer;
     }
 
     /**
@@ -2464,10 +2594,22 @@ class ContestView implements Contest {
 
     async update(): Promise<void> {
         if (this.#subscribed) return;
-        await this.#engine.join();
+        // Registered BEFORE the join, not after: the join restores this contest's persisted
+        // snapshot, and every way that can go wrong (a blob discarded as corrupt, a restore an
+        // RPC outage left incomplete — `SnapshotError`) is reported on the `error` event from
+        // inside `join()`. Attaching afterwards made exactly those reports unobservable.
         this.#engine.addUpdateListener(this.#onEngineUpdate);
         this.#engine.addErrorListener(this.#onEngineError);
         this.#subscribed = true;
+        try {
+            await this.#engine.join();
+        } catch (error) {
+            // A failed join leaves no subscription behind (a retry must be able to re-arm).
+            this.#engine.removeUpdateListener(this.#onEngineUpdate);
+            this.#engine.removeErrorListener(this.#onEngineError);
+            this.#subscribed = false;
+            throw error;
+        }
         // Populate `tally` and fire an initial `update` for the current state.
         await this.#engine.refreshTallyNow();
     }

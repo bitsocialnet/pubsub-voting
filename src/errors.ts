@@ -235,3 +235,43 @@ export class VoteEvictedError extends Error {
         this.name = "VoteEvictedError";
     }
 }
+
+/**
+ * Emitted (never thrown) on a contest's `error` event when this node's OWN persisted checkpoint
+ * snapshot could not be kept ({@link SnapshotFailure} says which way): a blob discarded as
+ * unreadable, a restore left incomplete by a transient failure, or a write that kept failing.
+ *
+ * Persistence is best-effort by design — every one of these degrades to the pre-persistence
+ * behaviour (the cold-start pull), never to a broken join — but "best-effort" used to mean
+ * "silent", and silent state loss is exactly how a seeder served a divergent tally for 13 days
+ * without anyone noticing (issue #45). Operators get a fact and a topic instead of an unexplained
+ * gap; there is nothing for a client to do about it beyond logging or alerting.
+ */
+export class SnapshotError extends Error {
+    constructor(
+        /** Which snapshot operation failed. */
+        readonly failure: SnapshotFailure,
+        /** The topic whose snapshot is affected. */
+        readonly topic: string,
+        /** The underlying throw, when there was one (a `restore-incomplete` may have none). */
+        readonly cause?: unknown
+    ) {
+        super(`Checkpoint snapshot ${failure} for topic ${topic}${cause === undefined ? "" : `: ${String(cause)}`}`);
+        this.name = "SnapshotError";
+    }
+}
+
+/**
+ * What went wrong with a persisted checkpoint snapshot:
+ *
+ * - `discarded` — the blob did not decode (corrupt, truncated, version-mismatched) and was
+ *   removed. The votes it held are gone from disk; the topic joins empty and re-converges from
+ *   peers.
+ * - `restore-incomplete` — the blob decoded, but a transient failure (an RPC outage during the
+ *   boot burst, a head that has not reached a bundle's sample bucket) left some of its bundles
+ *   un-admitted. The blob is KEPT and the restore retries; snapshot writes are suppressed for
+ *   this topic meanwhile, so a partial view can never overwrite the good blob.
+ * - `write-failed` — the store rejected the snapshot write repeatedly. The previous snapshot
+ *   stays in place, so a restart restores an older state rather than none.
+ */
+export type SnapshotFailure = "discarded" | "restore-incomplete" | "write-failed";

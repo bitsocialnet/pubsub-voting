@@ -200,9 +200,13 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         checkGates: async () => ({ kind: "leaf", leaf: 0, satisfied: true, score: 1n, penalize: false })
     };
 
+    // Mirrors the voter's admission map (`#checks`): what the CRDT knows, NOT what the blockstore
+    // holds — the chase's skip predicate must be admission (voter.ts `isAdmitted`, issue #44).
+    const admitted = new Set<string>();
     const admit = async ({ cid, bytes }: { cid: CID; bytes: Uint8Array; bundle: VotesBundle }): Promise<void> => {
         await blockstore.put(cid, bytes);
         await crdt.merge([cid]);
+        admitted.add(cid.toString());
     };
 
     const acceptedBundles: Uint8Array[] = [];
@@ -255,7 +259,7 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
         },
         verifyOffline: (bundle) => verifier.verifyOffline(bundle),
         cache,
-        hasBundle: (cid) => store.has(cid),
+        isAdmitted: async (cid) => admitted.has(cid.toString()),
         admit,
         // The harness runs the whole swapped pipeline in `verifyOffline` above, so nothing is
         // left deferred; the background verifier has its own unit tests.
@@ -346,6 +350,7 @@ export async function makeVoteNode(topic: string, options: VoteNodeOptions = {})
             const cid = await bundleCidForBytes(bytes);
             await blockstore.put(cid, bytes);
             await crdt.merge([cid]);
+            admitted.add(cid.toString());
         },
         stop: async () => {
             await transport.stop();
