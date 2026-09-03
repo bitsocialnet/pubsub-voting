@@ -1592,6 +1592,24 @@ class ContestEngine {
         if (i >= 0) this.#errorListeners.splice(i, 1);
     }
 
+    /**
+     * Drop decayed and superseded bundles from the CRDT **and** the per-bundle state keyed by
+     * their CIDs — one method because the two must not drift. `#checks` is not bookkeeping: it is
+     * what {@link #hasUnsettledChecks} reads (a leaked pending entry suppresses this contest's
+     * snapshot writes for a bundle that is no longer in the winner-set) and what the chase's
+     * `isAdmitted` reads (a leaked entry makes it skip a bundle we no longer hold). The join-time
+     * prune used to discard the removed CIDs — reachable in one restart: `verifyOffline` is
+     * deliberately expiry-blind (verify/bundle.ts), so a snapshot older than the expiry window
+     * restores its bundles and this prune removes them again moments later.
+     */
+    async #pruneDecayed(): Promise<void> {
+        for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
+            const key = removed.toString();
+            this.#checks.delete(key);
+            this.#forgetOwnBundle(key); // expiry is decay, not an eviction — no error
+        }
+    }
+
     /** Compute the current ranking fresh (refreshing the bucket + pruning when state is present). */
     async computeTally(): Promise<ContestTally> {
         // With state present, refresh the bucket so the tally's `current()` filters expiry against
@@ -1600,11 +1618,7 @@ class ContestEngine {
         // chain reads" property).
         if (this.#crdt.nodeCount() > 0) {
             await this.#refreshBucket();
-            for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
-                const key = removed.toString();
-                this.#checks.delete(key);
-                this.#forgetOwnBundle(key); // expiry is decay, not an eviction — no error
-            }
+            await this.#pruneDecayed();
         }
         return this.#tally.compute();
     }
@@ -1781,7 +1795,7 @@ class ContestEngine {
         // constant-weight tally" property.
         if (this.#crdt.nodeCount() > 0) {
             await this.#refreshBucket();
-            await this.#crdt.prune(this.#currentBucketCache);
+            await this.#pruneDecayed();
         }
     }
 

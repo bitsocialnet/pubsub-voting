@@ -84,11 +84,11 @@ function advancingChains(currentBlock: () => bigint): ChainClientFactory {
  * test can observe the provisional (chainVerified: false) window deterministically before the
  * background verifier settles it.
  */
-function gatedChains(): { chains: ChainClientFactory; release: () => void } {
+function gatedChains(head = 43200n): { chains: ChainClientFactory; release: () => void } {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const client = {
-        getBlockNumber: async () => 43200n,
+        getBlockNumber: async () => head,
         getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
         readContract: async () => {
             await gate;
@@ -980,6 +980,36 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it("drops the check state of bundles the join-time prune removes (no orphan left to block writes)", async () => {
+        // A snapshot older than the expiry window: `verifyOffline` is deliberately expiry-blind
+        // (verify/bundle.ts), so the restore admits its bundles and the join-time prune drops them
+        // again moments later. Their per-bundle check state must go with them — an orphan reads as
+        // "an admitted bundle whose deferred checks are pending", which suppresses every snapshot
+        // write for this contest, and as "already admitted" to the chase, for a bundle that is no
+        // longer in the winner-set. This join runs off `publish()`, with no update listener
+        // registered, so nothing kicks the tally refresh whose own prune would otherwise clean up
+        // first: the join-time prune is the only one that runs.
+        const dataPath = await tempDataPath();
+        const signer = realSigner();
+        const voterA = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: countingChains().chains });
+        const ballotA = await voterA.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer });
+        const { cid: decayed } = await ballotA.publish(); // sampled at bucket 1 (head 43200)
+        const contestA = await voterA.createContest({ criteria: bizCriteria() });
+        await vi.waitFor(async () => expect((await contestA.getTally()).ranking[0]?.chainVerified).toBe(true));
+        await voterA.destroy();
+
+        // Session 2 comes up 40 buckets later — past `voteExpiryBuckets: 30`. The gate reads never
+        // settle here, so nothing can quietly clean the orphan up after the fact.
+        const { chains, release } = gatedChains(43200n * 40n);
+        const voterB = new PubsubVoter({ dataPath, helia: fakeHelia(), chains });
+        const contestB = await voterB.createContest({ criteria: bizCriteria() });
+        const second = realSigner(SECOND_TEST_PRIVATE_KEY);
+        await (await voterB.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: second })).publish();
+        expect(contestB.checksFor(decayed)).toBeUndefined();
+        await voterB.destroy();
+        release();
     });
 
     it("runs the flush safely on the in-memory backend (`dataPath: false` — nothing to persist, nothing thrown)", async () => {
