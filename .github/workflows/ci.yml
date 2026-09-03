@@ -37,6 +37,11 @@ jobs:
         with:
           node-version: 22
           cache: "npm"
+      # Node 22 bundles npm 10.9.x, which writes and requires a different lockfile shape
+      # than the npm 11 used locally (packageManager pins it) — npm 10 demands entries npm
+      # 11 prunes, so a lockfile regenerated on a dev machine failed `npm ci` here. Pin the
+      # same npm the repo declares, so CI and local agree. Keep in sync with release.yml.
+      - run: npm i -g npm@11.13.0
       - run: npm ci
       - run: npm run typecheck
       - run: npm run typecheck:examples
