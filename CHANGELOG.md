@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.3...v0.7.4) (2026-09-03)
+
+### Bug Fixes
+
+* **client:** chase on admission, never delete a snapshot over an RPC blip ([c781045](https://github.com/bitsocialnet/pubsub-voting/commit/c781045f7b8b01b8755bf287f42a4eea5336cbbf))
+* **client:** drop per-bundle check state at the join-time prune too ([ab52bde](https://github.com/bitsocialnet/pubsub-voting/commit/ab52bde4659a1efa8f2562390945fcc3ea46b207))
+
 ## [0.7.3](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.2...v0.7.3) (2026-09-03)
 
 ## [0.7.2](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.1...v0.7.2) (2026-09-03)
