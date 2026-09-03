@@ -493,3 +493,73 @@ not a transport or read-policy change).*
   `evaluateMany` still went to the wire separately — M=10 paid **38–74 round trips** (10 separate
   small multicalls + head reads, then 20–42 429'd retries) for all-verified **11.9–30.5 s**. With
   pinned multicalls decomposed into the shared pool: **2 round trips, 0 errors, 3.69 s**.
+
+---
+
+# Browser steady-state CPU — what an idle subscribed tab costs
+
+**What this measures:** every benchmark above measures an *operation* — cold join, directory
+load, warm restart. None of them measure what a browser tab running this library **costs once
+all of that has finished** and the page is just sitting there subscribed. That is the cost a
+user actually lives with, and it surfaces as a spinning laptop fan rather than as a slow number,
+so nothing latency-shaped catches it.
+
+Run it yourself: `SITE_ROOT=<site checkout> npm run bench:site-cpu` (see
+[site-cpu.mjs](./site-cpu.mjs)).
+
+**Why an external site, not a synthetic host:** the thing being measured is per-subscribed-contest
+overhead, which only appears at real fan-out. The reference consumer is
+[pubsub-voting-testing-on-real-website](https://github.com/Rinse12/pubsub-voting-website) — 63
+contests, 64 leader communities, one shared Helia node, the live production seeder and the six
+production HTTP routers. CPU is `utime+stime` of the **whole Chromium process tree** from `/proc`
+(renderer, network service, GPU, workers), with CDP `Performance.getMetrics` alongside it to
+separate renderer main-thread work from the rest. Fresh browser profile per round, so IndexedDB
+is empty and the snapshot-restore path is never taken.
+
+## The pkc-js 1s-poll finding (measured 2026-09-03)
+
+60 s cold start + a 300 s steady window; site at `82c44d1`, pubsub-voting 0.7.1 throughout — the
+only variable is the pkc-js version underneath.
+
+| pkc-js | steady CPU | renderer task / 5 min | peak RSS | end RSS | instrumentation churn |
+|---|---|---|---|---|---|
+| 0.0.92 | 24.1% of a core | 43.6 s | 1383 MiB | 1325 MiB | 131 events/s |
+| 0.0.93 | ~22% of a core | same rate | 1290 MiB | — | 128 events/s |
+| **0.0.94** | **8.5% of a core** | **10.3 s** | **1249 MiB** | **1079 MiB** | **7.6 events/s** |
+
+Three shorter rounds (60 s cold + 120 s steady) agree: 0.0.92 averaged **23.7%** of a core
+(22.1, 20.7, 28.3), 0.0.94 averaged **10.4%** (9.6, 8.4, 13.2).
+
+**The cause:** `updatingstatechange` churn and essentially nothing else. Each of the 63 subscribed
+communities emitted **exactly 2 transitions per second** (`waiting-retry` ↔ `fetching-ipns`),
+forever, because pkc-js's community update loop polled on a 1 s timer rather than waiting for a
+record. 63 × 2 ≈ the 130 events/s measured. It does not decay and it scales with the number of
+subscribed contests, so the more directories a deployment carries the worse it gets.
+
+pkc-js 0.0.94 (`perf(community): drive kubo/helia updates from gossip pushes instead of a 1s
+poll`, pkcprotocol/pkc-js#311, issues #308/#307) parks the loop on a pushed IPNS record arrival
+plus a jittered safety-net timeout. 0.0.93 is within noise of 0.0.92 — its only change is an
+unrelated RPC fix — so the whole effect is that one commit.
+
+Cold start improves too, by **−46%** (20.5 → 11.2 CPU-s over 60 s): the poll began as soon as the
+first community subscribed, so it was already burning during the join fan-out this file's other
+sections measure.
+
+### Reading the numbers
+
+- **Steady CPU %** is of *one* core, averaged over the window. 24% is a quarter of a core
+  continuously — enough to spin a laptop fan up and keep it there.
+- **Renderer task time** is main thread only. It fell 76% against 65% for total CPU, which is the
+  expected shape: the poll was main-thread JS, while the remaining cost is spread across network
+  and worker threads.
+- **RSS is the whole 8-process Chromium tree**, not the page — treat the delta as the signal, not
+  the absolute. JS heap sits at ~65–90 MiB either way and is not where the win is.
+- **Run-to-run variance is real** (the 0.0.92 rounds spanned 20.7–28.3%) because the live seeder
+  and routers are in the loop. Use `ROUNDS=3` and compare means; trust a single round only when
+  the effect is as large as this one.
+- Cold-start health is asserted every round (64 communities, 64/64 joins, 64 first-tallies) so a
+  configuration that is cheap because it is *broken* cannot pass as a win.
+
+To A/B a change to **this** library rather than a dependency, `npm pack` it and install the
+tarball into `SITE_ROOT` between runs — the site consumes it as a normal dependency, so nothing
+needs linking.
