@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.6...v0.7.7) (2026-09-22)
+
+### Bug Fixes
+
+* expose live block retention for safe seeder cleanup ([1cd8f61](https://github.com/bitsocialnet/pubsub-voting/commit/1cd8f617ce25eb3a7c59cda76337b31f485060c6))
+
 ## [0.7.6](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.5...v0.7.6) (2026-09-03)
 
 ## [0.7.5](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.4...v0.7.5) (2026-09-03)
