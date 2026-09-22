@@ -50,7 +50,7 @@ import { makeStorage } from "../storage/node.js";
 import type { LruStorage, SnapshotStorage } from "../storage/types.js";
 import { makeAnnouncer } from "../transport/announce/node.js";
 import type { Announcer } from "../transport/announce/types.js";
-import { encode as encodeDagCbor } from "@ipld/dag-cbor";
+import { encode as encodeDagCbor, code as dagCborCode } from "@ipld/dag-cbor";
 import { sha256 } from "viem";
 import { makeBackgroundVerifier, type BackgroundChainVerifier, type PendingBundle } from "../verify/background.js";
 import type { BundleChecks, VerifyFail } from "../verify/types.js";
@@ -432,6 +432,15 @@ export interface VoteClient {
      * `createContest` / `update()` after.
      */
     stop(): Promise<void>;
+    /**
+     * Synchronous GC retention check for joined contests: admitted bundles (including
+     * pending verification and fallback winners) and the last encoded checkpoint.
+     * Compares multihashes, since filesystem stores may enumerate another CID codec.
+     * Recheck immediately before deletion under the host's blockstore lock; protect
+     * in-flight reads/writes, other users of a shared store, and a grace period for
+     * superseded checkpoints. No I/O and no permission to delete a shared store's data.
+     */
+    retainsBlock(cid: CID): boolean;
     /**
      * Terminal teardown (mirrors pkc-js `destroy`): leave every topic, unregister the fetch
      * responder, and mark the voter and all its contests destroyed. Unlike `stop`, this is NOT
@@ -1679,6 +1688,10 @@ class ContestEngine {
     async join(): Promise<void> {
         if (this.#destroyed) throw new VoterDestroyedError();
         if (this.#joined) return;
+        // A host may have collected this stopped contest's old checkpoint blocks.
+        // Re-encode/re-store them before serving the cached root on a re-join.
+        this.#checkpointDirty = true;
+        this.#rootRecordCache = undefined;
         const limit = pLimit(GATE_CONCURRENCY);
         const gate = makeGossipGate({
             decodeMessage: decodeVoteMessage,
@@ -2333,6 +2346,14 @@ class ContestEngine {
     latestCheckpointRoot(): CID | undefined {
         return this.#rootRecordCache?.record.root;
     }
+
+    /** Keep all admitted bundles, including pending checks and verified fallback winners. */
+    retainsBlock(cid: CID): boolean {
+        if (!this.#joined) return false;
+        const key = CID.createV1(dagCborCode, cid.multihash).toString();
+        return this.#checks.has(key) || (this.#rootRecordCache?.blocks.some((block) => block.cid.toString() === key) ?? false);
+    }
+
 
     /**
      * The current root record plus its checkpoint chunk blocks, for the bulk responder's inline
@@ -3094,6 +3115,13 @@ export class PubsubVoter implements VoteClient {
             this.#unregisterResponder();
         }
     };
+
+    retainsBlock(cid: CID): boolean {
+        for (const engine of this.#engines.values()) {
+            if (engine.retainsBlock(cid)) return true;
+        }
+        return false;
+    }
 
     async stop(): Promise<void> {
         // Reset each read view (detach its engine listeners, clear `#subscribed`) so it can

@@ -34,6 +34,18 @@ See [DESIGN.md](./DESIGN.md) for the full rationale, including how this resists 
 
 ## Usage
 
+Hosts with a dedicated votes blockstore can use `voter.retainsBlock(cid)` during garbage
+collection. This synchronous, network-free check protects every joined contest's admitted
+bundles (including provisional votes and verified fallback winners) and its last encoded
+checkpoint root/chunks. It compares multihashes, so filesystem stores that enumerate CIDs
+with another codec work too. Recheck immediately before deletion under your blockstore's
+operation lock; also protect concurrent reads/writes and retain superseded blocks for a
+grace period so peers can finish pulling older checkpoints. For a shared store, retain
+other applications' blocks too. The method does not run GC, refresh checkpoints, or impose
+a storage quota. Persisted checkpoint snapshots are self-contained and must be retained
+independently of the blockstore.
+
+
 The library never starts a node and never takes a host SDK (there is no `pkc` argument). A host passes its own running Helia node in directly and injects its seams into a single `PubsubVoter`. **Identity is not one of the seams**: the voting wallet (`VoteSigner`) belongs to each ballot, passed to `createContestVote`, so one voter on the host's shared node publishes for as many wallets as the host holds keys for — and a client that only renders tallies never touches key material.
 
 | Seam | Type | Required | Purpose |
