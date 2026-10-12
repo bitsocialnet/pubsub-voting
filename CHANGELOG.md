@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.9](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.8...v0.7.9) (2026-10-12)
+
+### Dependencies
+
+* **deps:** bump pkc-js to 0.0.104, TypeScript 7, vitest 5, release-it 21 ([929a382](https://github.com/bitsocialnet/pubsub-voting/commit/929a3821693c1066bb11b5dc4bb92fd8fbcbd971)), references [libp2p/js-libp2p#3641](https://github.com/libp2p/js-libp2p/issues/3641)
+* **deps:** override shell-quote to 1.12.0 (critical audit finding under react-native-webrtc) ([c6f92a5](https://github.com/bitsocialnet/pubsub-voting/commit/c6f92a54a529d4783d30830744ef4355696537f1))
+
 ## [0.7.8](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.7...v0.7.8) (2026-09-29)
 
 ## [0.7.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.6...v0.7.7) (2026-09-22)
