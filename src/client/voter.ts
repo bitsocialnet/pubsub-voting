@@ -1611,12 +1611,14 @@ class ContestEngine {
      * deliberately expiry-blind (verify/bundle.ts), so a snapshot older than the expiry window
      * restores its bundles and this prune removes them again moments later.
      */
-    async #pruneDecayed(): Promise<void> {
-        for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
-            const key = removed.toString();
+    async #pruneDecayed(): Promise<number> {
+        const removed = await this.#crdt.prune(this.#currentBucketCache);
+        for (const cid of removed) {
+            const key = cid.toString();
             this.#checks.delete(key);
             this.#forgetOwnBundle(key); // expiry is decay, not an eviction — no error
         }
+        return removed.length;
     }
 
     /** Compute the current ranking fresh (refreshing the bucket + pruning when state is present). */
@@ -2310,7 +2312,12 @@ class ContestEngine {
      * "Checkpoints", "On-demand encode").
      */
     async rootRecord(): Promise<FetchRootRecord> {
-        const bucket = this.#currentBucketCache;
+        // Read the bucket fresh (memoized for HEAD_BUCKET_TTL_MS, coalesced per chain) rather than
+        // from whatever the last join / recompute / signing left behind: on a quiet node nothing
+        // else advances the cache, and a served record filtered by a weeks-old bucket kept
+        // advertising bundles every reader would prune at join (issue #52). Gated on state being
+        // present so an empty contest still serves with zero chain reads.
+        const bucket = this.#crdt.nodeCount() > 0 ? await this.#nowBucket() : this.#currentBucketCache;
         const cached = this.#rootRecordCache;
         if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
         // Serve only fully verified bundles: a provisional admit must not propagate through our
@@ -2580,7 +2587,25 @@ class ContestEngine {
     }
 
     async #heartbeatTick(): Promise<void> {
-        const suppressed = this.#heardMatchingRoot || this.#publishedRootThisInterval;
+        // Age the state out on the heartbeat cadence, not only on reads: a bundle can decay with
+        // no message arriving, and until now nothing on a quiet node refreshed the bucket or ran
+        // the prune, so decayed bundles stayed in memory, in the snapshot and in the served
+        // checkpoint for as long as the node ran (issue #52). One coalesced head read per chain
+        // per interval across the directory; an empty contest still reads nothing.
+        let pruned = 0;
+        if (this.#crdt.nodeCount() > 0) {
+            try {
+                await this.#refreshBucket();
+                pruned = await this.#pruneDecayed();
+            } catch {
+                // A head-read outage must not stop the heartbeat; the next tick retries, and
+                // rootRecord() below serves whatever bucket it can read.
+            }
+            if (pruned > 0) this.#onStateChanged(); // re-encode, re-snapshot, re-announce, retally
+        }
+        // A root heard (or published) this interval matched the OLD winner-set; a prune that
+        // changed it is a change the topic has not carried yet, so it is not suppressible.
+        const suppressed = pruned === 0 && (this.#heardMatchingRoot || this.#publishedRootThisInterval);
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         if (suppressed) return;
