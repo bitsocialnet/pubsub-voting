@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.7.8](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.7...v0.7.8) (2026-09-29)
+
 ## [0.7.7](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.6...v0.7.7) (2026-09-22)
 
 ### Bug Fixes
