@@ -565,7 +565,7 @@ interface ResolvedDeps {
      * {@link ContestEngine#refreshBucket}) — shares one head read per chain instead of each firing
      * its own, without ever serving a stale head to a later read. See {@link makeHeadReader}.
      */
-    readHead: (chain: ChainClient) => Promise<bigint>;
+    readHead: HeadReader;
     /**
      * The voter's persisted gate results, shared across ALL contests (keys carry each
      * contest's rule hash, so two contests over one gate — a 5chan-style directory — share
@@ -780,9 +780,18 @@ function makePerPeerBudget(limitPerPeer: number): <T>(peerId: string, task: () =
  * REJECTED read clears its slot too, so a transient RPC failure is retried on the next call rather than
  * shared by latecomers to the same failed read.
  */
-export function makeHeadReader(): (chain: ChainClient) => Promise<bigint> {
+export function makeHeadReader(): HeadReader {
     const inFlight = new WeakMap<ChainClient, Promise<bigint>>();
-    return (chain) => {
+    const lastSettled = new WeakMap<ChainClient, { head: bigint; at: number }>();
+    return (chain, opts) => {
+        // A caller that can tolerate a bounded-age head (housekeeping: the heartbeat's expiry
+        // prune, issue #52) shares the last SETTLED sample across every contest on the chain, so a
+        // directory's independently jittered ticks cost one read per chain per window rather than
+        // one per contest. Callers that pass no bound never see a stale head (the verify path).
+        if (opts?.maxAgeMs !== undefined) {
+            const sample = lastSettled.get(chain);
+            if (sample !== undefined && Date.now() - sample.at <= opts.maxAgeMs) return Promise.resolve(sample.head);
+        }
         const existing = inFlight.get(chain);
         if (existing !== undefined) return existing; // a read is already in flight — share it
         const head = chain.getBlockNumber();
@@ -792,10 +801,19 @@ export function makeHeadReader(): (chain: ChainClient) => Promise<bigint> {
         const clear = (): void => {
             if (inFlight.get(chain) === head) inFlight.delete(chain);
         };
-        head.then(clear, clear);
+        head.then((value) => {
+            lastSettled.set(chain, { head: value, at: Date.now() });
+            clear();
+        }, clear);
         return head;
     };
 }
+
+/**
+ * The voter-wide head reader: coalesces concurrent reads per chain, and — only when a caller
+ * passes `maxAgeMs` — serves the last settled sample while it is no older than that.
+ */
+export type HeadReader = (chain: ChainClient, opts?: { maxAgeMs?: number }) => Promise<bigint>;
 
 /**
  * How long the root-record batcher holds a peer's first request open, waiting for its siblings.
@@ -1471,10 +1489,11 @@ class ContestEngine {
      * Measured on the production 5chan cold start: 252 head-read requests → 66 actual `getBlockNumber`
      * (−74%). This is an RPC-load / churn reduction, not a first-tally latency win (see the commit).
      */
-    async #refreshBucket(): Promise<number> {
-        const head = await this.#deps.readHead(this.#ruleChain);
+    async #refreshBucket(opts?: { maxAgeMs?: number }): Promise<number> {
+        const head = await this.#deps.readHead(this.#ruleChain, opts);
         this.#currentBucketCache = this.#bucketMath.bucketForBlock(Number(head));
-        this.#headReadMs = Date.now();
+        // A bounded-age sample may be minutes old; only a genuine read renews the 1 s memo.
+        if (opts?.maxAgeMs === undefined) this.#headReadMs = Date.now();
         return this.#currentBucketCache;
     }
 
@@ -1611,12 +1630,14 @@ class ContestEngine {
      * deliberately expiry-blind (verify/bundle.ts), so a snapshot older than the expiry window
      * restores its bundles and this prune removes them again moments later.
      */
-    async #pruneDecayed(): Promise<void> {
-        for (const removed of await this.#crdt.prune(this.#currentBucketCache)) {
-            const key = removed.toString();
+    async #pruneDecayed(): Promise<number> {
+        const removed = await this.#crdt.prune(this.#currentBucketCache);
+        for (const cid of removed) {
+            const key = cid.toString();
             this.#checks.delete(key);
             this.#forgetOwnBundle(key); // expiry is decay, not an eviction — no error
         }
+        return removed.length;
     }
 
     /** Compute the current ranking fresh (refreshing the bucket + pruning when state is present). */
@@ -2310,7 +2331,13 @@ class ContestEngine {
      * "Checkpoints", "On-demand encode").
      */
     async rootRecord(): Promise<FetchRootRecord> {
-        const bucket = this.#currentBucketCache;
+        // Filter by the voter-wide head sample (shared across contests, at most one heartbeat
+        // interval old) rather than by whatever this engine's last join / recompute / signing
+        // left behind: on a quiet node nothing else advanced that cache, and a record filtered by
+        // a weeks-old bucket kept advertising bundles every reader pruned at join (issue #52).
+        // In steady state this costs no chain read — the heartbeat keeps the sample fresh — and
+        // an empty contest never reads at all.
+        const bucket = this.#crdt.nodeCount() > 0 ? await this.#refreshBucket({ maxAgeMs: HEARTBEAT_INTERVAL_MS }) : this.#currentBucketCache;
         const cached = this.#rootRecordCache;
         if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
         // Serve only fully verified bundles: a provisional admit must not propagate through our
@@ -2580,7 +2607,28 @@ class ContestEngine {
     }
 
     async #heartbeatTick(): Promise<void> {
-        const suppressed = this.#heardMatchingRoot || this.#publishedRootThisInterval;
+        // Age the state out on the heartbeat cadence, not only on reads: a bundle can decay with
+        // no message arriving, and until now nothing on a quiet node refreshed the bucket or ran
+        // the prune, so decayed bundles stayed in memory, in the snapshot and in the served
+        // checkpoint for as long as the node ran (issue #52). The head sample is shared across
+        // every contest on the chain for one interval (`maxAgeMs`), so a directory's jittered
+        // ticks cost one read per chain per interval, not one per contest — a bundle's expiry
+        // window is days, so a head up to one interval old decides it just as well; an empty
+        // contest still reads nothing.
+        let pruned = 0;
+        if (this.#crdt.nodeCount() > 0) {
+            try {
+                await this.#refreshBucket({ maxAgeMs: HEARTBEAT_INTERVAL_MS });
+                pruned = await this.#pruneDecayed();
+            } catch {
+                // A head-read outage must not stop the heartbeat; the next tick retries, and
+                // rootRecord() below serves whatever bucket it can read.
+            }
+            if (pruned > 0) this.#onStateChanged(); // re-encode, re-snapshot, re-announce, retally
+        }
+        // A root heard (or published) this interval matched the OLD winner-set; a prune that
+        // changed it is a change the topic has not carried yet, so it is not suppressible.
+        const suppressed = pruned === 0 && (this.#heardMatchingRoot || this.#publishedRootThisInterval);
         this.#heardMatchingRoot = false;
         this.#publishedRootThisInterval = false;
         if (suppressed) return;
