@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.10](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.9...v0.7.10) (2026-10-12)
+
+### Bug Fixes
+
+* **client:** age decayed bundles out of the served checkpoint on a quiet node ([4a82e6a](https://github.com/bitsocialnet/pubsub-voting/commit/4a82e6ab37669531a77dbdecf9894070f3772f21)), closes [#52](https://github.com/bitsocialnet/pubsub-voting/issues/52), references [#52](https://github.com/bitsocialnet/pubsub-voting/issues/52)
+* **client:** share one bounded-age head sample per chain for the expiry housekeeping ([8fbdf12](https://github.com/bitsocialnet/pubsub-voting/commit/8fbdf12210cbd8cd4b7f724658131f8229132587))
+
 ## [0.7.9](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.8...v0.7.9) (2026-10-12)
 
 ### Dependencies
