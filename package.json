@@ -96,6 +96,7 @@
     "protobufjs": "7.6.6",
     "release-it": {
       "undici": "6.28.1"
-    }
+    },
+    "shell-quote": "1.12.0"
   }
 }
