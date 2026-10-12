@@ -3531,14 +3531,15 @@ describe("served checkpoint expiry (issue #52)", () => {
         return { voter, contest, setBlock: (b: bigint) => (block = b) };
     }
 
-    it("rootRecord() stops serving a decayed bundle even when nothing else refreshed the head", async () => {
+    it("rootRecord() stops serving a decayed bundle within one heartbeat interval, with no reads in between", async () => {
         vi.useFakeTimers();
+        vi.spyOn(Math, "random").mockReturnValue(0.5);
         const n = await quietNode();
         // bizCriteria: voteExpiryBuckets 30 — a bucket-1 vote is dead once the bucket exceeds 31.
         n.setBlock(bucketBlock(32));
-        // A cold joiner's fetch arriving later (past the 1 s head memo), with no gossip, tally read
-        // or publish in between — short of the heartbeat, which is the second test's job.
-        await vi.advanceTimersByTimeAsync(5_000);
+        // Within the interval the served record may still carry the bundle (the staleness bound);
+        // a cold joiner's fetch after it must not — with no gossip, tally read or publish between.
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS * 1.5);
         expect((await ownRecord(n.contest)).count).toBe(0);
         await n.voter.stop();
     });
@@ -3558,13 +3559,48 @@ describe("served checkpoint expiry (issue #52)", () => {
                     }
                 })
                 .filter((m): m is { kind: "root"; record: RootRecord } => m?.kind === "root");
+        // Observe the prune through the tally the heartbeat's own state change emits — not through
+        // getTally(), which refreshes and prunes on its own and would mask a heartbeat that did not.
+        const emitted: number[] = [];
+        n.contest.on("update", () => emitted.push(n.contest.tally?.ranking.length ?? -1));
         n.setBlock(bucketBlock(32));
         // The publish suppressed one interval; the tick after that must heartbeat the EMPTY root.
         await vi.advanceTimersByTimeAsync(INTERVAL_MS * 2);
         const last = roots().at(-1);
         expect(last?.record.count).toBe(0);
         // ...and the node's own view agrees: the decayed bundle is pruned, not merely filtered.
-        expect((await n.contest.getTally()).ranking).toEqual([]);
+        expect(emitted.at(-1)).toBe(0);
         await n.voter.stop();
+    });
+
+    it("shares one head sample per chain per interval across contests (read budget)", async () => {
+        vi.useFakeTimers();
+        // Alternate jitter so the two contests' ticks land at different times (525 s and 675 s):
+        // without a shared sample each tick would be its own head read.
+        let flip = false;
+        vi.spyOn(Math, "random").mockImplementation(() => ((flip = !flip) ? 0.25 : 0.75));
+        let reads = 0;
+        const block = bucketBlock(1);
+        const client = {
+            getBlockNumber: async () => {
+                reads += 1;
+                return block;
+            },
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => 1n
+        };
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: () => client as unknown as ChainClient });
+        for (const criteria of [bizCriteria(), { ...bizCriteria(), contestId: "other" }]) {
+            const contest = await voter.createContest({ criteria });
+            await contest.update();
+            const vote = await voter.createContestVote({ criteria, votes: VOTE, signer: fakeSigner() });
+            await vote.publish();
+            await vi.waitFor(() => expect(vote.publishingState).toBe("verified-locally"));
+        }
+        reads = 0;
+        // Both contests tick (at different times) within one interval of each other.
+        await vi.advanceTimersByTimeAsync(INTERVAL_MS * 1.2);
+        expect(reads).toBe(1);
+        await voter.stop();
     });
 });
