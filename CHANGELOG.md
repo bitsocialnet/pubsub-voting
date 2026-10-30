@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.11](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.10...v0.7.11) (2026-10-30)
+
+### Dependencies
+
+* **deps:** bump pkc-js to 0.0.131, zod to 4.6.7 ([fd0bed8](https://github.com/bitsocialnet/pubsub-voting/commit/fd0bed8cff74e88faf6f73fff79db2ce2122ba50)), references [pkc-js#452](https://github.com/pkc-js/issues/452)
+* **deps:** patch vulnerable dependencies [skip ci] [skip github-alerts] ([1780e49](https://github.com/bitsocialnet/pubsub-voting/commit/1780e49e3c707b095e965e07095675a4a2c5ea16))
+* **deps:** patch vulnerable dependencies [skip ci] [skip github-alerts] ([54c7fd3](https://github.com/bitsocialnet/pubsub-voting/commit/54c7fd33646488197f32b324f88efc6c349c3a22))
+
 ## [0.7.10](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.9...v0.7.10) (2026-10-12)
 
 ### Bug Fixes
