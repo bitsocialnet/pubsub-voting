@@ -59,7 +59,7 @@
     "multiformats": "14.0.5",
     "p-limit": "7.3.3",
     "viem": "2.57.4",
-    "zod": "4.3.6"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@chainsafe/libp2p-noise": "17.0.0",
@@ -74,7 +74,7 @@
     "@libp2p/identify": "4.1.13",
     "@libp2p/tcp": "11.0.27",
     "@multiformats/multiaddr": "13.0.3",
-    "@pkcprotocol/pkc-js": "0.0.104",
+    "@pkcprotocol/pkc-js": "0.0.131",
     "@release-it/conventional-changelog": "12.0.0",
     "@types/better-sqlite3": "7.6.13",
     "@vitest/coverage-v8": "5.0.3",
@@ -89,9 +89,9 @@
   },
   "overrides": {
     "@pkcprotocol/pkc-js": {
-      "undici": "7.29.1",
+      "undici": "7.30.1",
       "uuid": "13.0.1",
-      "ws": "8.21.3",
+      "ws": "8.22.0",
       "probe-image-size": "7.4.0"
     },
     "get-uri": {
