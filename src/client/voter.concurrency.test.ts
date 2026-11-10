@@ -390,3 +390,23 @@ describe("tally recompute recovery and ordering", () => {
         }
     });
 });
+
+describe("destroy() racing a create", () => {
+    it("a createContest in flight when destroy() runs rejects instead of yielding a live contest", async () => {
+        const node = recordingHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const creating = voter.createContest({ criteria: bizCriteria() }); // suspended on the criteria CID
+        const destroying = voter.destroy();
+        await expect(creating).rejects.toThrow(VoterDestroyedError);
+        await destroying;
+        expect(node.topicValidators.size).toBe(0);
+    });
+
+    it("a createContestVote in flight when destroy() runs rejects too", async () => {
+        const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: stubChains() });
+        const creating = voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const destroying = voter.destroy();
+        await expect(creating).rejects.toThrow(VoterDestroyedError);
+        await destroying;
+    });
+});

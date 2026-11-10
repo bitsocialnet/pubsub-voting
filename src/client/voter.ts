@@ -3185,6 +3185,9 @@ export class PubsubVoter implements VoteClient {
     /** Build (or return the cached) engine for one already-validated criteria, keyed by topic. */
     async #engineFor(criteria: Criteria): Promise<ContestEngine> {
         const cid = await criteriaCid(criteria);
+        // Again after the await: a destroy() that ran meanwhile marked only the engines that existed
+        // then, so one built now would join, subscribe and serve on a voter whose storage is closed.
+        this.#assertLive();
         const topic = TOPIC_PREFIX + cid.toString();
         const existing = this.#engines.get(topic);
         if (existing) return existing;
