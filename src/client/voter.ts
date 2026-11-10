@@ -1136,6 +1136,14 @@ class ContestEngine {
     /** True between `join()` and `leave()`; makes both idempotent so views and ballots compose. */
     #joined = false;
     /**
+     * The tail of the join/leave queue: each transition starts only once the previous one settled.
+     * Both bodies read {@link #joined} at entry and change shared state across awaits, so two of
+     * them interleaving produced states no call order can: a leave resuming after a re-join wiped
+     * the new transport (joined, nothing to publish through), or a join finding `#joined` still
+     * true mid-leave returned early and the leave then unsubscribed the view that just joined.
+     */
+    #transition: Promise<void> = Promise.resolve();
+    /**
      * True once the owning voter was `destroy()`ed. Terminal: {@link join} then throws, so no view
      * or publication over this engine can go live again (see DESIGN.md / `VoterDestroyedError`).
      */
@@ -1706,7 +1714,22 @@ class ContestEngine {
         this.#destroyed = true;
     }
 
-    async join(): Promise<void> {
+    /** Run one join/leave after every transition queued before it (see {@link #transition}). */
+    #serialize(step: () => Promise<void>): Promise<void> {
+        const run = this.#transition.then(step);
+        this.#transition = run.catch(() => {}); // a failed join must not wedge the next transition
+        return run;
+    }
+
+    join(): Promise<void> {
+        return this.#serialize(() => this.#join());
+    }
+
+    leave(): Promise<void> {
+        return this.#serialize(() => this.#leave());
+    }
+
+    async #join(): Promise<void> {
         if (this.#destroyed) throw new VoterDestroyedError();
         if (this.#joined) return;
         // A host may have collected this stopped contest's old checkpoint blocks.
@@ -2004,7 +2027,7 @@ class ContestEngine {
         }
     }
 
-    async leave(): Promise<void> {
+    async #leave(): Promise<void> {
         if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
         this.#heartbeatTimer = undefined;
         // Flush the debounced snapshot write so a clean shutdown persists the latest state
