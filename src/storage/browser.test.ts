@@ -94,6 +94,18 @@ describe("LocalForageLruStorage (browser round-robin LRU)", () => {
         expect(await store.getItem("e")).toBe(5);
         expect(await store.getItem("f")).toBe(6);
     });
+
+    it("rotates once when concurrent writes fill the active half (never clears both halves)", async () => {
+        // RuleCache.memoMany persists a batch of fresh keys without awaiting each write, so
+        // several grow() calls can reach the threshold together. Each used to reconcile against
+        // the half it saw before its await and swap on its own: the second swap flipped the roles
+        // back and cleared the half the first swap had just retired.
+        const store = openLru(3);
+        await store.setItem("a", 1);
+        await store.setItem("b", 2);
+        await Promise.all([store.setItem("c", 3), store.setItem("d", 4)]);
+        expect((await store.keys()).sort()).toEqual(["a", "b", "c", "d"]);
+    });
 });
 
 describe("LocalForageSnapshotStorage (browser checkpoint snapshots)", () => {

@@ -58,7 +58,13 @@ class LocalForageLruStorage implements LruStorage {
                         // removeItem/clear never decrement the counter, so it only ever
                         // over-counts — reconcile at the threshold so a purge-heavy session
                         // cannot swap (and clear) before the active half is actually full.
-                        activeSize = await active.length();
+                        const half = active;
+                        const size = await half.length();
+                        // A concurrent grow() swapped while this one was counting: that half is
+                        // retired and the counter now belongs to the new one. Swapping again
+                        // would flip back and clear the half just retired.
+                        if (active !== half) return;
+                        activeSize = size;
                         if (activeSize >= this.#maxItems) await swap();
                     }
                 },
