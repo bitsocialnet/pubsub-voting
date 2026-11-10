@@ -550,6 +550,59 @@ describe("makeBackgroundVerifier", () => {
         });
     });
 
+    describe("a CID re-enqueued after its gate passed (the host re-recorded its checks as pending)", () => {
+        it("reports the gate pass again when the item is still waiting on a name retry", async () => {
+            // An own vote re-signed in the same bucket is the same CID, and the voter resets its
+            // checks when it records it again. The verifier keeps one item per CID, so it must
+            // say "gate verified" again or the bundle ends name-resolved but never chain-verified.
+            let registryDown = true;
+            const flaky: NameResolver = {
+                key: "flaky",
+                provider: "test",
+                canResolve: ({ name }) => name.endsWith(".bso"),
+                resolve: async () => {
+                    if (registryDown) throw new Error("resolver down");
+                    return { publicKey: KEY_A };
+                }
+            };
+            const h = harness({ nameResolvers: [flaky] });
+            const entry = await pending(bundle("0x1", { name: "memes.bso" }));
+            h.verifier.enqueue([entry]);
+            await vi.waitFor(() => expect(h.errors.length).toBeGreaterThan(0));
+            expect(h.gateVerified).toEqual([entry.cid.toString()]);
+
+            h.verifier.enqueue([entry]); // the re-publish
+            registryDown = false;
+            await h.verifier.idle();
+            expect(h.gateVerified).toEqual([entry.cid.toString(), entry.cid.toString()]);
+            expect(h.nameResolved).toEqual([entry.cid.toString()]);
+        });
+
+        it("reports the gate pass again when the re-enqueue lands while the name stage is awaited", async () => {
+            let release!: () => void;
+            const answered = new Promise<void>((resolve) => (release = resolve));
+            const slow: NameResolver = {
+                key: "slow",
+                provider: "test",
+                canResolve: ({ name }) => name.endsWith(".bso"),
+                resolve: async () => {
+                    await answered;
+                    return { publicKey: KEY_A };
+                }
+            };
+            const h = harness({ nameResolvers: [slow] });
+            const entry = await pending(bundle("0x1", { name: "memes.bso" }));
+            h.verifier.enqueue([entry]);
+            await vi.waitFor(() => expect(h.gateVerified).toEqual([entry.cid.toString()]));
+
+            h.verifier.enqueue([entry]); // the re-publish, mid name stage
+            release();
+            await h.verifier.idle();
+            expect(h.gateVerified).toEqual([entry.cid.toString(), entry.cid.toString()]);
+            expect(h.verifier.pendingCount()).toBe(0);
+        });
+    });
+
     it("finishes the round when a host callback throws, and reports the throw", async () => {
         // The voter's callbacks run host listeners synchronously (`publishingstatechange`,
         // `error`). One that throws must not unwind the round: the bundles after it were already

@@ -153,7 +153,10 @@ type Answer = { result: RuleResult } | { error: unknown; alone: boolean };
 /** Internal queue item: `gateDone`/`gate` survive an infra retry so no stage re-runs. */
 interface QueueItem extends PendingBundle {
     gateDone: boolean;
-    /** True once `onGateVerified` fired, so a name-stage retry does not re-notify. */
+    /**
+     * True once `onGateVerified` fired, so a name-stage retry does not re-notify. Cleared when the
+     * same CID is enqueued again while this item is in flight (see `enqueue`).
+     */
     gateNotified: boolean;
     /**
      * This item's place in line for the re-asks of a failed batch (see `ask`): a number drawn
@@ -517,6 +520,12 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 requeue.push(item); // gateDone survives — the retry only re-runs names
                 continue;
             }
+            // The CID was enqueued again while the names were awaited, so the host has recorded
+            // its checks afresh: report the gate pass again (from the result already held).
+            if (!item.gateNotified) {
+                item.gateNotified = true;
+                notify(() => deps.onGateVerified(item.cid));
+            }
             if (item.bundle.votes.some((v) => v.community.name)) notify(() => deps.onNameResolved(item.cid));
             // Fully settled: store the terminal valid verdict (same shape the forward-gate caches).
             cache.set(item.cid, { valid: true, resolvedNames: item.resolvedNames });
@@ -583,7 +592,15 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         enqueue(entries: PendingBundle[]): void {
             for (const entry of entries) {
                 const key = entry.cid.toString();
-                if (inFlight.has(key)) continue;
+                const existing = inFlight.get(key);
+                if (existing) {
+                    // Already queued or in flight: verified once. But the caller is recording this
+                    // bundle afresh (the same ballot re-signed in the same bucket is the same CID),
+                    // which resets its checks to pending — so a gate pass already reported must
+                    // be reported again. The gate itself is not re-read.
+                    existing.gateNotified = false;
+                    continue;
+                }
                 const item: QueueItem = {
                     ...entry,
                     gateDone: false,

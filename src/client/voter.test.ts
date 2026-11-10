@@ -3474,6 +3474,41 @@ describe("publisher verification states", () => {
         await contest.stop();
     });
 
+    it("reaches verified-locally when the same ballot is re-published while its name check is still retrying", async () => {
+        // Same votes in the same bucket sign the same bytes, so the re-publish is the SAME CID.
+        // Re-recording it resets its checks to pending while the background verifier still holds
+        // the item, past its gate stage, so the gate pass has to be reported again.
+        vi.useFakeTimers();
+        let registryDown = true;
+        const resolver: NameResolver = {
+            key: "flaky",
+            provider: "test",
+            canResolve: ({ name }) => name.endsWith(".bso"),
+            resolve: async () => {
+                if (registryDown) throw new Error("registry briefly down");
+                return { publicKey: VALID_KEY };
+            }
+        };
+        const voter = new PubsubVoter({ dataPath: false, helia: fakeHelia(), chains: stubChains(), nameResolvers: [resolver] });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        contest.on("error", () => {}); // the name stage's retries surface here
+        await contest.update();
+        const vote = await voter.createContestVote({ criteria: bizCriteria(), votes: NAMED_VOTE, signer: fakeSigner() });
+
+        const first = await vote.publish(); // preflight fails open: the name check is deferred
+        await vi.waitFor(() => expect(contest.checksFor(first.cid)).toEqual({ chainVerified: true, nameResolved: false }));
+
+        registryDown = false;
+        const second = await vote.publish(); // preflight resolves this time
+        expect(second.cid.equals(first.cid)).toBe(true);
+
+        await vi.advanceTimersByTimeAsync(60_000); // past the name stage's retry backoff
+        await vi.waitFor(() => expect(contest.checksFor(second.cid)).toEqual({ chainVerified: true, nameResolved: true }));
+        expect(vote.publishingState).toBe("verified-locally");
+        await contest.stop();
+        vi.useRealTimers();
+    });
+
     it("trackOwnBundle is idempotent and attributes nothing for a bundle this contest does not hold", async () => {
         vi.useFakeTimers();
         const { helia } = checkpointHelia();
