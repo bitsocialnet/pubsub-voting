@@ -155,29 +155,58 @@ async function measureOne(m, n, i) {
     // Seeding M contests × N voters through the real gate grows with M×N (sign + gate-verify every
     // bundle, on both seeder and joiner); give it generous headroom that scales with the bundle count.
     const seedTimeout = 300_000 + m * n * 40;
-    const { child: seeder, match } = await spawnUntil(
-        "ssh",
-        ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && ${SEEDER_ENV}node benchmark/directory-seeder.js ${m} ${n} ${remotePort}`],
-        /SEEDER_READY peerId=(\S+) port=\d+ m=\d+ n=\d+/,
-        seedTimeout,
-        `dir-seeder(M=${m},N=${n})`
-    );
-    const peerId = match[1];
-    seeder.stdout.on("data", () => {});
-    seeder.stderr.on("data", () => {});
-
-    const providerAddr = providerMultiaddr(DIAL_HOST, remotePort, peerId);
+    let seeder;
+    // Set once the seeder's ssh session exits after READY: every later rep would only burn its
+    // join timeout against a dead seeder, so the row stops there and says why.
+    let seederExit;
+    // Why this row is short of REPEATS results (a failed start, or the seeder dying mid-sweep).
+    let reason;
     let results = [];
     try {
+        const spawned = await spawnUntil(
+            "ssh",
+            ["-tt", "-o", "ControlPath=none", HOST, `cd ${REMOTE_DIR} && ${SEEDER_ENV}node benchmark/directory-seeder.js ${m} ${n} ${remotePort}`],
+            /SEEDER_READY peerId=(\S+) port=\d+ m=\d+ n=\d+/,
+            seedTimeout,
+            `dir-seeder(M=${m},N=${n})`
+        );
+        seeder = spawned.child;
+        const peerId = spawned.match[1];
+        seeder.stdout.on("data", () => {});
+        seeder.stderr.on("data", () => {});
+        seeder.once("exit", (code, signal) => {
+            seederExit = `seeder exited after READY (code ${code}, signal ${signal})`;
+        });
+
+        const providerAddr = providerMultiaddr(DIAL_HOST, remotePort, peerId);
         await waitPort(DIAL_HOST, remotePort, 25_000);
         for (let r = 0; r < REPEATS; r++) {
+            if (seederExit) {
+                reason = `${reason ?? seederExit}; skipped the last ${REPEATS - r} of ${REPEATS} reps`;
+                console.error(`[bench] M=${m} N=${n}: ${reason}`);
+                break;
+            }
             const cj = await run("node", [JOIN_JS, providerAddr, peerId, String(m), String(n)], { env: { ...process.env } });
+            // The seeder can also die while a rep runs, including the last (or only) one, where no
+            // later rep is skipped: record it here so a short or empty row still says why.
+            if (seederExit && !reason) reason = `${seederExit} during rep ${r + 1}/${REPEATS}`;
             const line = cj.stdout.split("\n").find((l) => l.startsWith("RESULT "));
             if (!line) {
-                console.error(`[bench] M=${m} N=${n} rep ${r}: no RESULT\n${cj.stderr.split("\n").slice(-8).join("\n")}`);
+                console.error(
+                    `[bench] M=${m} N=${n} rep ${r}: no RESULT${seederExit ? ` (${seederExit})` : ""}\n${cj.stderr.split("\n").slice(-8).join("\n")}`
+                );
                 continue;
             }
             const parsed = JSON.parse(line.slice("RESULT ".length));
+            // directory-join prints a RESULT at its deadline too, so a rep the seeder died under still
+            // returns one, with no connection and partial counts. Unless it fully converged and
+            // verified (the seeder served it before dying), it measured the dead seeder: drop it
+            // instead of medianing it in.
+            if (seederExit && !(parsed.converged && parsed.allVerified)) {
+                reason = `${seederExit} during rep ${r + 1}/${REPEATS}, which was dropped (converged ${parsed.readyCount}/${m}, verified ${parsed.verifiedCount}/${m})`;
+                console.error(`[bench] M=${m} N=${n}: ${reason}`);
+                continue;
+            }
             results.push(parsed);
             const byOp = parsed.gateRpc?.byOp;
             const rpcDetail = byOp
@@ -192,11 +221,17 @@ async function measureOne(m, n, i) {
                     `verify+merge=${s(parsed.verifyMergeMs)}${rpcDetail} start→all=${s(parsed.allTalliesReadyMs)} start→all-verified=${s(parsed.allVerifiedMs)}`
             );
         }
+    } catch (err) {
+        // A seeder that never got READY (or never became dialable) fails this row, not the sweep. The
+        // table keeps the first line; stderr gets the whole error, which for an early exit carries
+        // the seeder's own output (the ssh error or the remote stack trace).
+        reason = (err instanceof Error ? err.message : String(err)).split("\n")[0] + (seederExit ? ` (${seederExit})` : "");
+        console.error(`[bench] M=${m} N=${n}: row failed${seederExit ? ` (${seederExit})` : ""}:`, err);
     } finally {
-        seeder.kill("SIGKILL");
+        seeder?.kill("SIGKILL");
         await run("ssh", [HOST, `pkill -f "directory-seeder.js ${m} ${n} ${remotePort}" || true`]);
     }
-    if (results.length === 0) return { m, n, ok: false };
+    if (results.length === 0) return { m, n, ok: false, reason };
     const med = (pick) => median(results.map(pick).filter((x) => x != null));
     // Percentile of a single run's convergence curve (when the k-th contest became ready).
     const pct = (arr, p) => (arr && arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * p))] : null);
@@ -204,6 +239,8 @@ async function measureOne(m, n, i) {
         m,
         n,
         ok: true,
+        reps: results.length,
+        reason,
         convergedCount: med((r) => r.readyCount),
         verifiedCount: med((r) => r.verifiedCount),
         seederConnections: med((r) => r.seederConnections),
@@ -275,13 +312,16 @@ async function main() {
     console.log("M(contests)  N/ct  bundles   router   connect   identify   fetch/ct   bitswap/ct   verify+merge   START→ALL-TALLIES   START→ALL-VERIFIED");
     for (const r of rows) {
         if (!r.ok) {
-            console.log(`${String(r.m).padEnd(12) } ${n(r.n, 4)}  ${b(r.m, r.n)}   (no successful cold join)`);
+            console.log(`${String(r.m).padEnd(12) } ${n(r.n, 4)}  ${b(r.m, r.n)}   (no successful cold join${r.reason ? `: ${r.reason}` : ""})`);
             continue;
         }
         console.log(
             `${String(r.m).padEnd(12)} ${n(r.n, 4)}  ${b(r.m, r.n)}   ${s(r.routerMs)}   ${s(r.connectMs)}   ${s(r.identifyMs)}     ` +
                 `${s(r.fetchPerContestMs)}     ${s(r.bitswapPerContestMs)}      ${s(r.verifyMergeMs)}          ${s(r.allTalliesReadyMs)}              ${s(r.allVerifiedMs)}`
         );
+    }
+    for (const r of rows) {
+        if (r.ok && r.reps < REPEATS) console.log(`  M=${r.m} N=${r.n}: median of ${r.reps}/${REPEATS} reps only${r.reason ? ` — ${r.reason}` : ""}`);
     }
 
     // Table 2 — parallelism / convergence detail. Σ columns are the sum across the M concurrent ops
