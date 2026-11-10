@@ -186,7 +186,7 @@ async function measureOne(m, n, i) {
                   `)`
                 : "";
             console.log(
-                `[bench] M=${m} N=${n} rep ${r + 1}/${REPEATS}: conns=${parsed.seederConnections} converged=${parsed.readyCount}/${m} ` +
+                `[bench] M=${m} N=${n} rep ${r + 1}/${REPEATS}: conns=${parsed.seederConnections} converged=${parsed.readyCount}/${m} verified=${parsed.verifiedCount}/${m} ` +
                     `connect=${s(parsed.connectMs)} fetch=${s(parsed.fetch.totalMs)} (${parsed.fetch.count}x) ` +
                     `bitswap=${s(parsed.blockGets.totalMs)} (${(parsed.blockGets.bytes / 1024).toFixed(0)}KiB) ` +
                     `verify+merge=${s(parsed.verifyMergeMs)}${rpcDetail} start→all=${s(parsed.allTalliesReadyMs)} start→all-verified=${s(parsed.allVerifiedMs)}`
@@ -205,6 +205,7 @@ async function measureOne(m, n, i) {
         n,
         ok: true,
         convergedCount: med((r) => r.readyCount),
+        verifiedCount: med((r) => r.verifiedCount),
         seederConnections: med((r) => r.seederConnections),
         // Amortized once across all M contests (one shared connection):
         routerMs: med((r) => r.router.firstDurMs),
@@ -287,11 +288,12 @@ async function main() {
     // (not wall-clock); p50/p90 are the convergence curve — when the median / 90th-percentile contest
     // tally became ready — so a directory that fills in progressively is visible.
     console.log(`\nDirectory cold-load — parallelism + convergence — median of ${REPEATS}`);
-    console.log("M(contests)  N/ct  bundles   conns  converged  fetches  Σfetch   Σbitswap  KiB     conv-p50  conv-p90  START→ALL");
+    console.log("M(contests)  N/ct  bundles   conns  converged  verified  fetches  Σfetch   Σbitswap  KiB     conv-p50  conv-p90  START→ALL");
     for (const r of rows) {
         if (!r.ok) continue;
         console.log(
             `${String(r.m).padEnd(12)} ${n(r.n, 4)}  ${b(r.m, r.n)}   ${n(r.seederConnections, 4)}  ${n(r.convergedCount, 3)}/${String(r.m).padEnd(3)}  ` +
+                `${n(r.verifiedCount, 3)}/${String(r.m).padEnd(3)} ` +
                 `${n(r.fetchCount, 5)}   ${s(r.fetchMs)}  ${s(r.bitswapMs)}  ${n(r.bitswapKiB, 5)}   ${s(r.p50Ms)}    ${s(r.p90Ms)}    ${s(r.allTalliesReadyMs)}`
         );
     }
