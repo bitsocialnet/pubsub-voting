@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.12](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.11...v0.7.12) (2026-11-10)
+
+### Dependencies
+
+* **deps:** bump pkc-js to 0.0.138, libp2p and helia to latest ([d269052](https://github.com/bitsocialnet/pubsub-voting/commit/d2690525743ae39c8cbfbf5bdda8ba4bc819eb8f))
+
 ## [0.7.11](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.10...v0.7.11) (2026-10-30)
 
 ### Dependencies
