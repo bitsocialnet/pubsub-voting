@@ -428,7 +428,7 @@ describe("Contest read view + tally", () => {
     it("purges persisted gate entries the rule declares dead as its head epoch rolls", async () => {
         // Purging moved INTO the rule with the keys: the engine no longer knows what an entry is
         // keyed by, so only the rule can say what is unreachable. `erc5192-min-balance` keys its
-        // head reads by a coarse head window and drops everything behind the current one
+        // head reads by a one-minute window and drops everything behind the current one
         // (rules/cache.ts `purgeBelow`), so a long-lived node sheds them instead of leaving them
         // to the store's LRU backstop.
         const { mkdtempSync } = await import("node:fs");
@@ -437,21 +437,24 @@ describe("Contest read view + tally", () => {
         const { makeStorage } = await import("../storage/node.js");
         const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-voter-test-"));
 
-        let block = 43200n * 40n; // divisible by the rule's 30-block epoch, so the epoch is this
-        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: advancingChains(() => block) });
+        // Only the clock is faked: the window is wall-clock minutes, and this starts one.
+        const firstMinuteMs = 1_800_000_000_000;
+        vi.useFakeTimers({ toFake: ["Date"], now: firstMinuteMs });
+        const voter = new PubsubVoter({ dataPath, helia: fakeHelia(), chains: advancingChains(() => 43200n * 40n) });
         await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         const contest = await voter.createContest({ criteria: bizCriteria() });
         await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
 
         const reader = makeStorage({ dataPath }).openLru({ cacheName: "gate-results", maxItems: 50_000 });
-        const firstEpochKey = (keys: string[]) => keys.find((k) => k.includes("head/") && k.endsWith(`:${43200 * 40}`));
+        const firstEpochKey = (keys: string[]) => keys.find((k) => k.includes("head-minute/") && k.endsWith(`:${firstMinuteMs / 60_000}`));
         await vi.waitFor(async () => expect(firstEpochKey(await reader.keys())).toBeDefined());
 
-        // The head moves past the window, and the next gate read purges what it left behind.
-        block += 300n;
+        // The window rolls, and the next gate read purges what the old one left behind.
+        vi.setSystemTime(firstMinuteMs + 2 * 60_000);
         await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
         await vi.waitFor(async () => expect(firstEpochKey(await reader.keys())).toBeUndefined());
         await voter.destroy();
+        vi.useRealTimers();
     });
 
     it("emits an update event when a row's chainVerified flips after the background gate read lands", async () => {

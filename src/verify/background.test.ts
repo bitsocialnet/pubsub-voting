@@ -4,7 +4,8 @@ import { z } from "zod";
 import { makeBackgroundVerifier, type BackgroundVerifierDeps } from "./background.js";
 import { makeMemoryRuleCache } from "../rules/cache.js";
 import { makeVerdictCache } from "./cache.js";
-import { Erc5192MinBalanceOptionsSchema } from "../rules/erc5192-min-balance.js";
+import { Erc5192MinBalanceOptionsSchema, erc5192MinBalance } from "../rules/erc5192-min-balance.js";
+import { GATE_GRACE_MS, GATE_RETRY_MS } from "./gate-grace.js";
 import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import type { VerifyFail } from "./types.js";
 import { makeBucketMath } from "../chain/bucket.js";
@@ -794,6 +795,42 @@ describe("makeBackgroundVerifier: a rule that scores at the head (rules/types.ts
         expect(h.evicted).toEqual([{ cid: entry.cid.toString(), disposition: "ignore" }]);
         expect(h.cache.get(entry.cid)).toBeUndefined();
         expect(h.verifier.pendingCount()).toBe(0);
+    });
+});
+
+describe("makeBackgroundVerifier over the real v1 gate rule", () => {
+    it("re-reads a head-scored 0n inside the grace window on a chain with 12 s blocks", async () => {
+        // The grace window only helps if the rule's memoized negative expires inside it. A head
+        // memo that lasts 30 BLOCKS is one minute on Base but six on a 12 s chain: every
+        // re-examination was served the stale 0n and the vote was evicted at 120 s although
+        // the wallet had held the Pass since the second block.
+        vi.useFakeTimers();
+        try {
+            const start = Date.now();
+            const FIRST_HEAD = 999_990; // a multiple of 30: a block-numbered epoch starts here
+            const head = (): number => FIRST_HEAD + Math.floor((Date.now() - start) / 12_000);
+            let mintedAt = Number.POSITIVE_INFINITY;
+            const chain = {
+                readContract: async ({ functionName, blockNumber }: { functionName: string; blockNumber: bigint }) =>
+                    functionName === "supportsInterface" ? true : Number(blockNumber) >= mintedAt ? 1n : 0n
+            } as unknown as ChainClient;
+            const h = harness({
+                registry: { "erc5192-min-balance": erc5192MinBalance },
+                chain,
+                readHead: async () => ({ block: head() })
+            });
+            const entry = await pending(bundle("0xbee")); // signed before the mint: 0n at its pinned block too
+            h.verifier.enqueue([entry]);
+            await vi.advanceTimersByTimeAsync(0); // first round: 0n at the head, memoized → "not yet"
+            expect(h.verifier.pendingCount()).toBe(1);
+
+            mintedAt = head() + 1; // the mint lands in the next block
+            await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS);
+            expect(h.evicted).toEqual([]);
+            expect(h.gateVerified).toEqual([entry.cid.toString()]);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 
