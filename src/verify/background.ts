@@ -94,7 +94,11 @@ export interface BackgroundVerifierDeps {
     onNameResolved: (cid: CID) => void;
     /** Remove a failed bundle from the working set (gate `0n`, or a name that did not check out). */
     onEvict: (cid: CID, verdict: VerifyFail) => void;
-    /** An infra-class failure (RPC/resolver threw): the round will retry; surface the degradation. */
+    /**
+     * An infra-class failure (RPC/resolver threw): the round will retry; surface the degradation.
+     * Also receives what one of the callbacks above threw — reported, never allowed to unwind a
+     * round. A throw from this callback itself is swallowed.
+     */
     onError: (error: unknown) => void;
     /**
      * Does the host still hold this bundle (it was not evicted, superseded or expired since it
@@ -191,8 +195,8 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     const { representatives, ofLeaf } = dedupeLeaves(leaves);
 
     const queue: QueueItem[] = [];
-    /** CIDs queued or in-flight, so a re-chased root cannot double-verify a bundle. */
-    const inFlight = new Set<string>();
+    /** Items queued or in-flight, by CID, so a re-chased root cannot double-verify a bundle. */
+    const inFlight = new Map<string, QueueItem>();
     let draining = false;
     let stopped = false;
     /** Consecutive infra-failed rounds, driving the backoff exponent. */
@@ -215,6 +219,27 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     }
 
     /**
+     * Run a host callback. The voter's callbacks call host listeners synchronously, and a throw
+     * from one must not unwind a round half-way: it is reported, and the round carries on.
+     */
+    function notify(callback: () => void): void {
+        try {
+            callback();
+        } catch (error) {
+            report(error);
+        }
+    }
+
+    /** Surface an error through `onError` — host code too, so its own throw is swallowed. */
+    function report(error: unknown): void {
+        try {
+            deps.onError(error);
+        } catch {
+            // Nowhere left to report it, and the verifier's own state is already consistent.
+        }
+    }
+
+    /**
      * Surface the running round's infra failure the moment it happens: the round goes on (the
      * re-asks of a failed batch, then the name checks), and a down RPC must not stay silent
      * meanwhile.
@@ -222,7 +247,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     function reportInfra(error: unknown): void {
         if (infraReported) return;
         infraReported = true;
-        deps.onError(error);
+        report(error);
     }
 
     /** The wallet's gate score at its bundle's bucket sample block. */
@@ -379,7 +404,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             if (!resolver) {
                 // `ignore`-class, view-dependent (a missing resolver differs per verifier) — evict,
                 // never cache (see verify/bundle.ts step 4).
-                deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `no resolver handles community name "${name}"` });
+                notify(() => deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `no resolver handles community name "${name}"` }));
                 return "evicted";
             }
             let resolution = resolutions.get(name);
@@ -389,15 +414,17 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             }
             const record = await resolution;
             if (!record) {
-                deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `community name "${name}" does not resolve` });
+                notify(() => deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `community name "${name}" does not resolve` }));
                 return "evicted";
             }
             if (record.publicKey !== v.community.publicKey) {
-                deps.onEvict(item.cid, {
-                    valid: false,
-                    disposition: "ignore",
-                    reason: `community name "${name}" resolves to ${record.publicKey}, not the claimed ${v.community.publicKey}`
-                });
+                notify(() =>
+                    deps.onEvict(item.cid, {
+                        valid: false,
+                        disposition: "ignore",
+                        reason: `community name "${name}" resolves to ${record.publicKey}, not the claimed ${v.community.publicKey}`
+                    })
+                );
                 return "evicted";
             }
             item.resolvedNames[name] = record.publicKey;
@@ -420,13 +447,9 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         let infraError: unknown;
 
         // Gate stage first, whole batch: this is where batching wins (one multicall per sample
-        // block instead of one read per wallet). An infra throw leaves the un-gated items intact.
-        try {
-            const failed = await gateStage(batch);
-            if (failed) infraError = failed.error;
-        } catch (error) {
-            infraError = error;
-        }
+        // block instead of one read per wallet). A failed read leaves its items un-gated, intact.
+        const failed = await gateStage(batch);
+        if (failed) infraError = failed.error;
 
         const resolutions = new Map<string, Promise<{ publicKey: string } | undefined>>();
         for (const item of batch) {
@@ -451,7 +474,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                         failures
                     };
                     cache.set(item.cid, verdict);
-                    deps.onEvict(item.cid, verdict);
+                    notify(() => deps.onEvict(item.cid, verdict));
                     settle(item);
                     continue;
                 }
@@ -476,13 +499,13 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                     reason: `not admitted: ${reason} (still true after the grace window)`,
                     failures
                 };
-                deps.onEvict(item.cid, verdict);
+                notify(() => deps.onEvict(item.cid, verdict));
                 settle(item);
                 continue;
             }
             if (!item.gateNotified) {
                 item.gateNotified = true;
-                deps.onGateVerified(item.cid);
+                notify(() => deps.onGateVerified(item.cid));
             }
             try {
                 if ((await nameStage(item, resolutions)) === "evicted") {
@@ -494,7 +517,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 requeue.push(item); // gateDone survives — the retry only re-runs names
                 continue;
             }
-            if (item.bundle.votes.some((v) => v.community.name)) deps.onNameResolved(item.cid);
+            if (item.bundle.votes.some((v) => v.community.name)) notify(() => deps.onNameResolved(item.cid));
             // Fully settled: store the terminal valid verdict (same shape the forward-gate caches).
             cache.set(item.cid, { valid: true, resolvedNames: item.resolvedNames });
             settle(item);
@@ -539,6 +562,16 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             try {
                 // A round that infra-fails re-queues and arms the retry timer instead of spinning.
                 while (queue.length > 0 && !stopped && retryTimer === undefined) await round();
+            } catch (error) {
+                // Not a failed read (those never escape a round) but a throw from the verifier's
+                // own bookkeeping, unwinding a round mid-batch. Only one round runs at a time, so
+                // what is in flight but not queued is exactly what it took and had not settled:
+                // put that back (`enqueue` would skip it forever) and back off like a failed round.
+                const queued = new Set(queue);
+                for (const item of inFlight.values()) if (!queued.has(item)) queue.push(item);
+                failedRounds += 1;
+                report(error);
+                armRetry();
             } finally {
                 draining = false;
                 maybeResolveIdle();
@@ -551,8 +584,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             for (const entry of entries) {
                 const key = entry.cid.toString();
                 if (inFlight.has(key)) continue;
-                inFlight.add(key);
-                queue.push({
+                const item: QueueItem = {
                     ...entry,
                     gateDone: false,
                     gateNotified: false,
@@ -560,7 +592,9 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                     gate: undefined,
                     resolvedNames: {},
                     queuedAt: Date.now()
-                });
+                };
+                inFlight.set(key, item);
+                queue.push(item);
             }
             kickDrain();
         },

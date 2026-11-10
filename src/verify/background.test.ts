@@ -550,6 +550,84 @@ describe("makeBackgroundVerifier", () => {
         });
     });
 
+    it("finishes the round when a host callback throws, and reports the throw", async () => {
+        // The voter's callbacks run host listeners synchronously (`publishingstatechange`,
+        // `error`). One that throws must not unwind the round: the bundles after it were already
+        // taken off the queue, and `enqueue` skips anything still marked in flight.
+        const notified: string[] = [];
+        const errors: unknown[] = [];
+        const listenerBug = new Error("host listener threw");
+        const h = harness({
+            onGateVerified: (cid) => {
+                notified.push(cid.toString());
+                if (notified.length === 1) throw listenerBug;
+            },
+            onError: (error) => errors.push(error)
+        });
+        const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2")), pending(bundle("0x3"))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        expect(notified.sort()).toEqual(entries.map((e) => e.cid.toString()).sort());
+        expect(entries.every((e) => h.cache.get(e.cid)?.valid === true)).toBe(true);
+        expect(h.verifier.pendingCount()).toBe(0);
+        expect(errors).toEqual([listenerBug]);
+    });
+
+    it("still arms the retry when the onError listener itself throws", async () => {
+        let failures = 1;
+        const rule: Rule = {
+            type: "erc5192-min-balance",
+            optionsSchema: Erc5192MinBalanceOptionsSchema,
+            async evaluate() {
+                if (failures > 0) {
+                    failures--;
+                    throw new Error("RPC down");
+                }
+                return { success: true, score: 1n };
+            }
+        };
+        const gateVerified: string[] = [];
+        const h = harness({
+            registry: { "erc5192-min-balance": rule },
+            onGateVerified: (cid) => gateVerified.push(cid.toString()),
+            onError: () => {
+                throw new Error("error listener threw");
+            }
+        });
+        const entry = await pending(bundle("0x1"));
+        h.verifier.enqueue([entry]);
+        await h.verifier.idle();
+        expect(gateVerified).toEqual([entry.cid.toString()]);
+        expect(h.verifier.pendingCount()).toBe(0);
+    });
+
+    it("puts back what a round had not reached when it throws unexpectedly, then retries", async () => {
+        // Not a read failure: a throw from the verifier's own bookkeeping (here the verdict cache).
+        // The items after it must not be stranded in flight with no queue entry and no timer.
+        const errors: unknown[] = [];
+        const verdicts = makeVerdictCache();
+        const storeBug = new Error("verdict cache write failed");
+        let writes = 0;
+        const h = harness({
+            cache: {
+                ...verdicts,
+                set: (cid, verdict) => {
+                    if (++writes === 1) throw storeBug;
+                    verdicts.set(cid, verdict);
+                }
+            },
+            onError: (error) => errors.push(error)
+        });
+        const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2"))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        expect(entries.every((e) => verdicts.get(e.cid)?.valid === true)).toBe(true);
+        expect(h.verifier.pendingCount()).toBe(0);
+        expect(errors).toEqual([storeBug]);
+    });
+
     it("stop() pauses the retry loop and resume() drains what was left pending", async () => {
         let failing = true;
         const rule: Rule = {
