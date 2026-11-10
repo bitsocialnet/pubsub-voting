@@ -387,7 +387,9 @@ export interface ContestVote {
      * failure: `InvalidCommunityNameError` when a vote's carried `community.name` definitively does
      * not resolve to its claimed `publicKey` (checked BEFORE signing or joining — every verifier
      * drops such a bundle silently, so it is refused here instead of published into a network-wide
-     * silent drop; a resolver outage does not block the publish). This library does not re-publish: to keep the vote alive, call `publish()`
+     * silent drop; a resolver outage does not block the publish). A failure after signing (the
+     * broadcast threw, or a `stop()`/`destroy()` left the topic while the wallet was signing) also
+     * takes the vote back out of the local tally: nothing reached the network. This library does not re-publish: to keep the vote alive, call `publish()`
      * again before it expires.
      */
     publish(): Promise<PublishOutcome>;
@@ -1357,6 +1359,16 @@ class ContestEngine {
      */
     readonly #ownCids = new Set<string>();
     /**
+     * Own bundles {@link signVote} newly admitted whose broadcast has not gone out yet, CID → the
+     * encoded bytes that signVote call returned (the identity of that one publish). If its
+     * broadcast fails, {@link retractUnsent} takes the bundle back out: nothing reached the wire,
+     * so it must be neither counted here nor served to peers. A bundle that was ALREADY admitted
+     * when signed (an earlier publish of the byte-identical ballot reached the wire, or a peer
+     * served it back) never enters, and re-signing those bytes while one publish is in flight
+     * removes the entry: neither is a failed publish's to retract.
+     */
+    readonly #unsent = new Map<string, Uint8Array>();
+    /**
      * Roots we decoded → which of OUR CIDs that checkpoint contained. Kept so a peer that
      * advertises an ALREADY-decoded root is attributed without re-chasing it (the common case:
      * many peers converge on one root). Bounded by {@link DECODED_ROOTS_MAX}, oldest evicted first.
@@ -2111,6 +2123,10 @@ class ContestEngine {
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
         const cid = await this.#crdt.add(bundle);
+        const encoded = encodeBundle(bundle);
+        // Read before #recordChecks below: was this exact bundle admitted before this call?
+        if (this.#checks.has(cid.toString())) this.#unsent.delete(cid.toString());
+        else this.#unsent.set(cid.toString(), encoded);
         // Own bundles take the same deferred path as a chased checkpoint's: admitted
         // provisionally, then confirmed (or evicted) by the background gate read — so an
         // ineligible wallet's local tally does not silently disagree with the network's, and
@@ -2124,15 +2140,43 @@ class ContestEngine {
         if (opts.onCheckpointedByPeer) this.#ownCheckpointCbs.set(cid.toString(), opts.onCheckpointedByPeer);
         this.#background.enqueue([{ cid, bundle }]);
         this.#onStateChanged();
-        return { bundle, encoded: encodeBundle(bundle), cid };
+        return { bundle, encoded, cid };
     }
 
     /**
      * Broadcast an encoded bundle inline as a live delta (this wallet's own delta, never the set).
-     * Returns how many peers gossipsub sent it directly to (0 if there is no live transport).
+     * Returns how many peers gossipsub sent it directly to. Throws when there is no live transport:
+     * a `stop()` (or `destroy()`) landed while the wallet was signing, and resolving with zero
+     * recipients would report a vote that never left this node as published.
      */
-    async broadcastBundle(encoded: Uint8Array): Promise<{ recipientCount: number }> {
-        return (await this.#transport?.publishBundle(encoded)) ?? { recipientCount: 0 };
+    async broadcastBundle(cid: CID, encoded: Uint8Array): Promise<{ recipientCount: number }> {
+        const transport = this.#transport;
+        if (transport === undefined) {
+            if (this.#destroyed) throw new VoterDestroyedError();
+            throw new Error(
+                "This vote was signed but not broadcast: its contest left the topic (stop()) while the wallet " +
+                    "was signing. Nothing reached the network; publish again to send it."
+            );
+        }
+        const sent = await transport.publishBundle(encoded);
+        if (this.#unsent.get(cid.toString()) === encoded) this.#unsent.delete(cid.toString());
+        return sent;
+    }
+
+    /**
+     * Undo {@link signVote}'s local admission of a bundle whose broadcast never went out, if that
+     * admission was this publish's (see {@link #unsent}). Without it a `"failed"` publish stayed in
+     * the local tally and, once its deferred check settled, in the checkpoint served to every peer.
+     * A withdrawal of our own unsent vote, not an eviction: no `VoteEvictedError`.
+     */
+    retractUnsent(cid: CID, encoded: Uint8Array): void {
+        const key = cid.toString();
+        if (this.#unsent.get(key) !== encoded) return;
+        this.#unsent.delete(key);
+        this.#crdt.remove(cid);
+        this.#checks.delete(key);
+        this.#forgetOwnBundle(key);
+        this.#onStateChanged();
     }
 
     /** Invalidate the on-demand checkpoint cache: the winner-set changed (publish/merge/chase). */
@@ -2849,6 +2893,9 @@ class ContestVotePublication implements ContestVote {
         // counter ticks — even though its bundle is still live and still verifiable.
         const attempt = ++this.#attempt;
         this.#evicted = false;
+        // Set once signVote admitted the bundle locally, cleared once the broadcast went out: a
+        // failure in between leaves nothing on the wire, so the catch takes the admit back.
+        let unsent: { cid: CID; encoded: Uint8Array } | undefined;
         try {
             // Name preflight, also before joining: a vote whose carried community name
             // definitively fails to resolve to its claimed key would be silently dropped by
@@ -2877,12 +2924,14 @@ class ContestVotePublication implements ContestVote {
                     this.#fail(error);
                 }
             });
+            unsent = { cid, encoded };
             this.#bundle = bundle;
             this.#cid = cid;
             // Only from "signing": a deferred check can settle before this line runs (a cached
             // verdict needs no round trip), and "publishing" would walk that verdict backwards.
             if (this.#state === "signing") this.#setState("publishing");
-            const { recipientCount } = await this.#engine.broadcastBundle(encoded);
+            const { recipientCount } = await this.#engine.broadcastBundle(cid, encoded);
+            unsent = undefined;
             // An eviction that landed mid-broadcast already failed this attempt; the outcome
             // still resolves (the bundle DID hit the wire) but the state stays "failed". A
             // check that SETTLED mid-broadcast is not stomped either: "published" describes
@@ -2890,6 +2939,9 @@ class ContestVotePublication implements ContestVote {
             if (!this.#evicted && this.#state === "publishing") this.#setState("published");
             return { bundle, recipientCount, cid };
         } catch (error) {
+            // Signed and admitted, but never broadcast: a "failed" vote must not stay counted
+            // here or, once verified, be served to peers (see ContestEngine.retractUnsent).
+            if (unsent !== undefined) this.#engine.retractUnsent(unsent.cid, unsent.encoded);
             // Same scoping: two overlapping `publish()` calls are a misuse, but the loser's
             // rejection belongs to ITS caller (it is rethrown), not to the state machine a
             // later attempt now owns.
