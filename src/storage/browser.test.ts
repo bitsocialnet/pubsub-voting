@@ -106,6 +106,31 @@ describe("LocalForageLruStorage (browser round-robin LRU)", () => {
         await Promise.all([store.setItem("c", 3), store.setItem("d", 4)]);
         expect((await store.keys()).sort()).toEqual(["a", "b", "c", "d"]);
     });
+
+    it("keeps the half the last rotation made active across a reload, even after a purge shrank the retired one", async () => {
+        // Sizes alone cannot tell the halves apart: right after a rotation the retired half sits
+        // at maxItems, but the expiry purge removes keys from both halves, so on reload it can be
+        // below maxItems and still the larger one. The size rule then picked it as active, and its
+        // next fill swapped and cleared the NEWER half. Two rotations cover both halves.
+        const cacheName = `test-${++cacheCounter}`;
+        const reload = () => makeStorage({ dataPath: undefined }).openLru({ cacheName, maxItems: 3 });
+
+        const first = reload();
+        for (const [key, value] of [["a", 1], ["b", 2], ["c", 3], ["d", 4]] as const) await first.setItem(key, value);
+        await first.removeItem("a"); // purge: retired {b, c} is now 2, still >= active {d}
+        const second = reload();
+        await second.setItem("e", 5);
+        await second.setItem("f", 6); // the active half fills and rotates
+        expect(await second.getItem("d")).toBe(4); // the newest entry outlived the rotation
+
+        // The same from the other half (`d` was promoted into the half that just became active).
+        await second.setItem("g", 7);
+        await second.removeItem("d"); // purge: retired {e, f} is 2, still >= active {g}
+        const third = reload();
+        await third.setItem("h", 8);
+        await third.setItem("i", 9);
+        expect(await third.getItem("g")).toBe(7);
+    });
 });
 
 describe("LocalForageSnapshotStorage (browser checkpoint snapshots)", () => {
