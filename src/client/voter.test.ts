@@ -870,6 +870,55 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         await voter.destroy();
     });
 
+    it("lets a snapshot write the debounce timer already started land before destroy() closes the store", async () => {
+        const dataPath = await tempDataPath();
+        const topic = await topicFor(bizCriteria());
+        // Stall the encode's blockstore puts on demand: the write the timer starts is then still
+        // in flight (no timer armed any more) when destroy() runs.
+        const helia = fakeHelia();
+        const bs = (helia as unknown as { blockstore: { put(cid: CID, bytes: Uint8Array): Promise<CID> } }).blockstore;
+        const origPut = bs.put.bind(bs);
+        let stall: Promise<void> | undefined;
+        let unstall!: () => void;
+        let stalledPuts = 0;
+        bs.put = async (cid, bytes) => {
+            if (stall !== undefined) {
+                stalledPuts += 1;
+                await stall;
+            }
+            return origPut(cid, bytes);
+        };
+        vi.useFakeTimers();
+        let voter: PubsubVoter;
+        try {
+            voter = new PubsubVoter({ dataPath, helia, chains: countingChains().chains });
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: realSigner() })).publish();
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+            stall = new Promise((resolve) => (unstall = resolve));
+            await vi.advanceTimersByTimeAsync(10_000); // SNAPSHOT_DEBOUNCE_MS: the timer fires, the write starts
+            expect(stalledPuts).toBeGreaterThan(0); // ...and is parked in the encode
+        } finally {
+            vi.useRealTimers();
+        }
+
+        let destroyed = false;
+        const destroying = voter.destroy().then(() => (destroyed = true));
+        // Ample real time for a teardown that does not wait for the write to close the store.
+        await Promise.race([destroying, new Promise((resolve) => setTimeout(resolve, 100))]);
+        const destroyedWhileWriting = destroyed;
+        unstall();
+        await destroying;
+        await new Promise((resolve) => setTimeout(resolve, 0)); // an orphaned write resumes here
+
+        const { makeStorage } = await import("../storage/node.js");
+        const reader = makeStorage({ dataPath });
+        const persisted = await reader.openSnapshots().get(topic);
+        await reader.destroy();
+        expect(persisted).toBeDefined(); // the verified vote reached checkpoints.db
+        expect(destroyedWhileWriting).toBe(false); // destroy() waited for the write
+    });
+
     /**
      * A chain client whose head read fails on demand — the production shape of issue #45's
      * incident: a seeder boots, restores ~64 topics at once, and one rate-limit window makes the

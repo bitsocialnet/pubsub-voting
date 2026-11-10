@@ -1179,6 +1179,12 @@ class ContestEngine {
     #heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
     /** The armed (debounced) snapshot-write timer; flushed by `leave()`. See {@link #writeSnapshot}. */
     #snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+    /**
+     * The write that timer started, until it lands (the encode awaits chain and blockstore I/O).
+     * Once the timer has fired there is nothing armed for `leave()` to flush, so `leave()` waits
+     * for this instead: `PubsubVoter.destroy()` closes the store right after it returns.
+     */
+    #snapshotWrite: Promise<void> | undefined;
     /** Consecutive failed snapshot writes in the current run (see {@link SNAPSHOT_WRITE_ATTEMPTS}). */
     #snapshotWriteFailures = 0;
     /**
@@ -2010,7 +2016,11 @@ class ContestEngine {
         // Flush the debounced snapshot write so a clean shutdown persists the latest state
         // (still skipped if checks are pending, or a restore backlog is outstanding — the
         // stale-but-good snapshot stays put). `retry: false`: a failed flush must not arm a
-        // timer that outlives the join.
+        // timer that outlives the join. A write the timer already started is not armed any
+        // more but may still be encoding: wait for it first (its retry or a state change may
+        // re-arm the timer, which the flush then takes), so `destroy()` never closes the store
+        // under a write.
+        while (this.#snapshotWrite !== undefined) await this.#snapshotWrite;
         if (this.#snapshotTimer !== undefined) {
             clearTimeout(this.#snapshotTimer);
             this.#snapshotTimer = undefined;
@@ -2132,7 +2142,10 @@ class ContestEngine {
         if (!this.#joined || this.#snapshotTimer !== undefined) return;
         const timer = setTimeout(() => {
             this.#snapshotTimer = undefined;
-            void this.#writeSnapshot();
+            const write = this.#writeSnapshot().finally(() => {
+                if (this.#snapshotWrite === write) this.#snapshotWrite = undefined;
+            });
+            this.#snapshotWrite = write;
         }, SNAPSHOT_DEBOUNCE_MS);
         // Don't hold a Node process open; no-op in the browser.
         (timer as { unref?: () => void }).unref?.();
@@ -3194,7 +3207,8 @@ export class PubsubVoter implements VoteClient {
         this.#unregisterResponder();
         await this.stop();
         // Close the persistent caches last (Node: the sqlite handles) — engines are already
-        // terminal, so nothing can race a write. `stop()` deliberately leaves them open: a
+        // terminal and each `leave()` waited for its snapshot write in flight, so nothing can
+        // race a write. `stop()` deliberately leaves them open: a
         // stopped voter is reusable and its caches stay warm.
         await this.#storage.destroy();
     }
