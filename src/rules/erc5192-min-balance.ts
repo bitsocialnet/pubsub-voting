@@ -1,4 +1,11 @@
-import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, getAddress } from "viem";
+import {
+    BaseError,
+    ContractFunctionExecutionError,
+    ContractFunctionRevertedError,
+    ContractFunctionZeroDataError,
+    InternalRpcError,
+    getAddress
+} from "viem";
 import { z } from "zod";
 import { balanceOf, balancesOfBatched, canBatch, scoreOf, shortfallError } from "./nft-balance.js";
 import type { ChainReadContext, Rule, RuleResult } from "./types.js";
@@ -70,10 +77,21 @@ export type Erc5192MinBalanceOptions = z.infer<typeof Erc5192MinBalanceOptionsSc
  * everywhere (gossip `ignore`, background retry) precisely so a flaky gateway never turns into a
  * consensus `reject` that scores honest relayers down. So only viem's revert/zero-data errors
  * map to "does not declare"; everything else (transport, timeout, rate limit) rethrows.
+ *
+ * And only when they are the PROBE's own: viem builds the same two error classes for gateway
+ * failures, so the answer is a refusal only when the failed call viem names is
+ * `supportsInterface` (a coalesced multicall whose `aggregate3` round trip failed or came back
+ * empty names `aggregate3`), and no JSON-RPC -32603 "internal error" is in the chain (viem reads
+ * that code as a revert, but it is the gateway failing; a node that reports real reverts with
+ * it makes the probe infra-class, which admits nobody either way). A wrong refusal would be
+ * memoized, and on the pinned leg for good.
  */
 function isContractRefusal(err: unknown): boolean {
     if (!(err instanceof BaseError)) return false;
-    return err.walk((cause) => cause instanceof ContractFunctionRevertedError || cause instanceof ContractFunctionZeroDataError) !== null;
+    const call = err.walk((cause) => cause instanceof ContractFunctionExecutionError);
+    if (!(call instanceof ContractFunctionExecutionError) || call.functionName !== "supportsInterface") return false;
+    if (!(call.cause instanceof ContractFunctionRevertedError || call.cause instanceof ContractFunctionZeroDataError)) return false;
+    return err.walk((cause) => typeof cause === "object" && cause !== null && "code" in cause && cause.code === InternalRpcError.code) === null;
 }
 
 /**

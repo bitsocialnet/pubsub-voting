@@ -1,7 +1,22 @@
 import { describe, it, expect } from "vitest";
 import { scoreOrZero } from "./result.js";
-import { BaseError, ContractFunctionExecutionError, ContractFunctionRevertedError, HttpRequestError, createPublicClient, http } from "viem";
+import {
+    BaseError,
+    ContractFunctionExecutionError,
+    ContractFunctionRevertedError,
+    HttpRequestError,
+    RpcRequestError,
+    createPublicClient,
+    custom,
+    decodeFunctionData,
+    encodeAbiParameters,
+    encodeFunctionResult,
+    http,
+    multicall3Abi
+} from "viem";
+import { base } from "viem/chains";
 import type { ChainClient } from "../chain/types.js";
+import { coalescingChainClient } from "../chain/coalescer.js";
 import type { ChainReadContext, Rule } from "./types.js";
 import { makeMemoryRuleCache } from "./cache.js";
 import { erc721MinBalance } from "./erc721-min-balance.js";
@@ -195,6 +210,99 @@ describe("erc5192-min-balance (the v1 gate: soulbound Pass via score > 0)", () =
             }
         });
         await expect(erc5192MinBalance.evaluate({ options, wallet: at(wallet), ctx: ctxOver(chain) })).rejects.toBeInstanceOf(BaseError);
+    });
+});
+
+/**
+ * The same probe over a REAL viem client — only the transport is stubbed — because "revert or
+ * gateway failure" is decided by the error shapes viem builds, and two gateway failures come out
+ * looking like a revert: a JSON-RPC -32603 (viem reads that code as a revert) and an empty reply.
+ * When the probe rides the coalesced multicall, viem also names `aggregate3`, not the probe, as
+ * the function that failed.
+ */
+describe("erc5192-min-balance probe over a real viem client: refusal vs gateway failure", () => {
+    const options = { type: "erc5192-min-balance" as const, chain: "base", contract: "0x00000000000000000000000000000000000000fa", min: 1 };
+    const wallet = "0x000000000000000000000000000000000000aaaa";
+    // Both above Base's multicall3 deployment, so viem will coalesce reads at either block.
+    const HEAD = 1_000_000;
+    const PINNED = 900_000;
+    const SUPPORTS_INTERFACE = "0x01ffc9a7";
+
+    const rpcError = (code: number, message: string, data?: `0x${string}`) =>
+        new RpcRequestError({ body: {}, error: { code, message, ...(data === undefined ? {} : { data }) }, url: "https://rpc.invalid" });
+    const word = (value: boolean | bigint): `0x${string}` =>
+        typeof value === "boolean" ? encodeAbiParameters([{ type: "bool" }], [value]) : encodeAbiParameters([{ type: "uint256" }], [value]);
+
+    /** A viem client on Base whose `eth_call`s `answer` serves (transport retries off). */
+    function viemChain(answer: (call: { to: string; data: `0x${string}` }) => `0x${string}`): ChainClient {
+        const client = createPublicClient({
+            chain: base,
+            transport: custom(
+                {
+                    request: async ({ method, params }: { method: string; params?: unknown }) => {
+                        if (method !== "eth_call") throw new Error(`unexpected ${method}`);
+                        return answer((params as [{ to: string; data: `0x${string}` }])[0]);
+                    }
+                },
+                { retryCount: 0 }
+            )
+        });
+        return client as unknown as ChainClient;
+    }
+
+    /** An `aggregate3` reply giving each inner call `inner(callData)`. */
+    const aggregate3 = (data: `0x${string}`, inner: (callData: `0x${string}`) => { success: boolean; returnData: `0x${string}` }) => {
+        const { args } = decodeFunctionData({ abi: multicall3Abi, data });
+        const calls = args[0] as ReadonlyArray<{ callData: `0x${string}` }>;
+        return encodeFunctionResult({ abi: multicall3Abi, functionName: "aggregate3", result: calls.map((call) => inner(call.callData)) });
+    };
+
+    const evaluate = (chain: ChainClient) => erc5192MinBalance.evaluate({ options, wallet: at(wallet, PINNED), ctx: ctxOver(chain, HEAD) });
+    const coalesced = (answer: Parameters<typeof viemChain>[0]) => coalescingChainClient(viemChain(answer), { windowMs: 1 });
+
+    it("rethrows when the multicall carrying the probe gets a JSON-RPC internal error (-32603)", async () => {
+        const chain = coalesced(() => {
+            throw rpcError(-32603, "internal error");
+        });
+        await expect(evaluate(chain)).rejects.toBeInstanceOf(BaseError);
+    });
+
+    it("rethrows when the multicall carrying the probe comes back empty", async () => {
+        await expect(evaluate(coalesced(() => "0x"))).rejects.toBeInstanceOf(BaseError);
+    });
+
+    it("rethrows when a direct probe gets a JSON-RPC internal error (-32603)", async () => {
+        const chain = viemChain(() => {
+            throw rpcError(-32603, "internal error");
+        });
+        await expect(evaluate(chain)).rejects.toBeInstanceOf(BaseError);
+    });
+
+    it("still reads the probe's own revert inside a multicall as 'does not declare'", async () => {
+        const chain = coalesced(({ data }) =>
+            aggregate3(data, (callData) =>
+                callData.startsWith(SUPPORTS_INTERFACE) ? { success: false, returnData: "0x" } : { success: true, returnData: word(5n) }
+            )
+        );
+        const result = await evaluate(chain);
+        expect(result).toMatchObject({ success: false, penalize: false });
+        expect((result as { error: string }).error).toContain("does not declare ERC-5192");
+    });
+
+    it("still reads a direct probe's execution-reverted error as 'does not declare'", async () => {
+        const chain = viemChain(({ data }) => {
+            if (data.startsWith(SUPPORTS_INTERFACE)) throw rpcError(3, "execution reverted", "0x");
+            return word(5n);
+        });
+        const result = await evaluate(chain);
+        expect((result as { error: string }).error).toContain("does not declare ERC-5192");
+    });
+
+    it("scores a holder when the probe answers true through the multicall", async () => {
+        const chain = coalesced(({ data }) =>
+            aggregate3(data, (callData) => ({ success: true, returnData: callData.startsWith(SUPPORTS_INTERFACE) ? word(true) : word(5n) }))
+        );
+        expect(await evaluate(chain)).toEqual({ success: true, score: 5n });
     });
 });
 
