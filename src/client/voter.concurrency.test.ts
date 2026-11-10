@@ -18,6 +18,8 @@ const VALID_KEY = "12D3KooWEyoppNCUx8Yx66oV9fVnrJmG92pTuY6zbLDaz8T5XCiL";
 const OTHER_KEY = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust";
 const VOTE = [{ community: { publicKey: VALID_KEY }, vote: 1 }];
 const OTHER_VOTE = [{ community: { publicKey: OTHER_KEY }, vote: 1 }];
+const THIRD_KEY = "12D3KooWJMAhZsN5twuG3u846uLTcTe6hrDyriB7YnCt8svHJBRg";
+const THIRD_VOTE = [{ community: { publicKey: THIRD_KEY }, vote: 1 }];
 const WALLET_A = "0x00000000000000000000000000000000000000aa";
 const WALLET_B = "0x00000000000000000000000000000000000000bb";
 const WALLET_C = "0x00000000000000000000000000000000000000cc";
@@ -74,6 +76,40 @@ function promptSigner(address = WALLET_A): { signer: VoteSigner; prompting: () =
         },
         prompting: () => prompting,
         release
+    };
+}
+
+/**
+ * A chain whose bucket-boundary block read (the tally's tie-break seed, `getBlock`) can be made to
+ * fail, or its next read made to hang. Nothing else reads `getBlock`, so only a tally compute over
+ * a weight TIE is affected: the gate read, the publish path and the background verifier stay healthy.
+ * A parked read checks `fail` when it is released, not when it started.
+ */
+function tieReadChains(): { chains: ChainClientFactory; fail: (on: boolean) => void; hang: () => () => void; blockReads: () => number } {
+    let failing = false;
+    let hanging: Promise<void> | undefined;
+    let blockReads = 0;
+    const client = {
+        getBlockNumber: async () => 43200n,
+        getBlock: async () => {
+            blockReads += 1;
+            const parked = hanging;
+            hanging = undefined; // only the next read parks
+            if (parked !== undefined) await parked;
+            if (failing) throw new Error("boundary block read failed");
+            return { hash: `0x${"11".repeat(32)}` };
+        },
+        readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : 1n)
+    };
+    return {
+        chains: () => client as unknown as ChainClient,
+        fail: (on) => (failing = on),
+        hang: () => {
+            let release!: () => void;
+            hanging = new Promise<void>((resolve) => (release = resolve));
+            return release;
+        },
+        blockReads: () => blockReads
     };
 }
 
@@ -224,5 +260,133 @@ describe("a failed broadcast takes the vote back out of the local state", () => 
         prompt.release();
         await expect(publishing).rejects.toThrow(VoterDestroyedError);
         expect(ballot.checks).toBeUndefined();
+    });
+});
+
+describe("tally recompute recovery and ordering", () => {
+    it("retries a failed recompute, so a quiet topic does not keep a stale tally", async () => {
+        vi.useFakeTimers();
+        try {
+            const chain = tieReadChains();
+            const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: chain.chains });
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            const errors: unknown[] = [];
+            contest.on("error", (error) => errors.push(error));
+            await contest.update();
+
+            // Two wallets, two communities, weight 1 each: a tie, so every compute reads the
+            // boundary block — and that read fails.
+            chain.fail(true);
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_A) })).publish();
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: fakeSigner(WALLET_B) })).publish();
+            await vi.advanceTimersByTimeAsync(500); // the deferred gate reads settle; their recomputes fail too
+            expect(errors.length).toBeGreaterThan(0);
+            expect(contest.tally?.ranking.length ?? 0).toBeLessThan(2); // stale: wallet B's vote is missing
+
+            // The RPC recovers. Nothing else happens on this topic: only a retry can catch up.
+            chain.fail(false);
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(contest.tally?.ranking.map((row) => row.weight)).toEqual([1n, 1n]);
+            await voter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("a recompute that succeeds before the retry fires cancels the retry", async () => {
+        vi.useFakeTimers();
+        try {
+            const chain = tieReadChains();
+            const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: chain.chains });
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            await contest.update();
+            chain.fail(true);
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_A) })).publish();
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: fakeSigner(WALLET_B) })).publish();
+            await vi.advanceTimersByTimeAsync(500); // failed recomputes: a retry is armed
+            chain.fail(false);
+
+            // A new vote (breaking the tie) recomputes successfully before the retry is due.
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_C) })).publish();
+            await vi.advanceTimersByTimeAsync(500);
+            expect(contest.tally?.ranking.map((row) => row.weight)).toEqual([2n, 1n]);
+            let updates = 0;
+            contest.on("update", () => {
+                updates += 1;
+            });
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(updates).toBe(0); // the stale retry did not fire a redundant recompute
+            await voter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("an older compute finishing late never overwrites a newer tally", async () => {
+        const chain = tieReadChains();
+        const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: chain.chains });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const a = await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_A) })).publish();
+        const b = await (await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: fakeSigner(WALLET_B) })).publish();
+        // Settled before the view subscribes, so no settlement can start a loop compute of its own.
+        await vi.waitFor(() => expect([a.cid, b.cid].map((cid) => contest.checksFor(cid)?.chainVerified)).toEqual([true, true]));
+
+        // update()'s initial compute sees the 1–1 tie and parks on the boundary block read.
+        const releaseTieRead = chain.hang();
+        const updating = contest.update();
+        await vi.waitFor(() => expect(chain.blockReads()).toBe(1));
+
+        // Meanwhile a third wallet breaks the tie; the refresh loop computes the newer tally.
+        const third = await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_C) })).publish();
+        await vi.waitFor(() => expect(contest.checksFor(third.cid)?.chainVerified).toBe(true));
+        await vi.waitFor(() => expect(contest.tally?.ranking.every((row) => row.chainVerified)).toBe(true));
+        expect(contest.tally?.ranking.map((row) => row.weight)).toEqual([2n, 1n]);
+
+        // The stale compute finally lands: it must not roll the tally back to the tie.
+        releaseTieRead();
+        await updating;
+        expect(contest.tally?.ranking.map((row) => row.weight)).toEqual([2n, 1n]);
+        await voter.destroy();
+    });
+
+    it("an older compute finishing after a newer one failed keeps the retry armed", async () => {
+        vi.useFakeTimers();
+        try {
+            const chain = tieReadChains();
+            const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: chain.chains });
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            const a = await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_A) })).publish();
+            const b = await (await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: fakeSigner(WALLET_B) })).publish();
+            await vi.advanceTimersByTimeAsync(500);
+            expect([a.cid, b.cid].map((cid) => contest.checksFor(cid)?.chainVerified)).toEqual([true, true]);
+
+            // update()'s initial compute sees the 1–1 tie and parks on the boundary block read.
+            const releaseTieRead = chain.hang();
+            const updating = contest.update();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(chain.blockReads()).toBe(1);
+
+            // A third wallet votes for a third community: a 3-way tie, whose boundary read fails, so
+            // the refresh loop's newer computes fail and arm a retry.
+            chain.fail(true);
+            const third = await (await voter.createContestVote({ criteria: bizCriteria(), votes: THIRD_VOTE, signer: fakeSigner(WALLET_C) })).publish();
+            await vi.advanceTimersByTimeAsync(500);
+            expect(contest.checksFor(third.cid)?.chainVerified).toBe(true);
+            expect(chain.blockReads()).toBeGreaterThan(1);
+
+            // The RPC recovers and the older compute lands before the retry is due. It may show its
+            // two-row tally, but it predates wallet C's vote and must not cancel the retry.
+            chain.fail(false);
+            releaseTieRead();
+            await updating;
+            expect(contest.tally?.ranking.length).toBe(2);
+
+            // Nothing else happens on this topic: only the retry can catch up.
+            await vi.advanceTimersByTimeAsync(3_000);
+            expect(contest.tally?.ranking.map((row) => row.weight)).toEqual([1n, 1n, 1n]);
+            await voter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });

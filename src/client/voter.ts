@@ -699,6 +699,14 @@ const RESTORE_RETRY_CAP_MS = 600_000;
  * again must not keep a stale snapshot forever because ONE write failed (issue #45).
  */
 const SNAPSHOT_WRITE_ATTEMPTS = 3;
+/**
+ * Retry delay after a failed tally recompute (a head or tie-break block read that threw), doubling
+ * per consecutive failure up to {@link TALLY_RETRY_CAP_MS} — the background verifier's backoff. The
+ * recompute is otherwise only re-run by the next state change, which a quiet topic may not see for
+ * hours, so without a retry one RPC error left `Contest.tally` stale that long.
+ */
+const TALLY_RETRY_MS = 2_000;
+const TALLY_RETRY_CAP_MS = 60_000;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
@@ -1159,6 +1167,21 @@ class ContestEngine {
     /** Coalescing flags for the background tally recompute (one recompute per gossip burst). */
     #tallyDirty = true;
     #tallyRefreshing = false;
+    /**
+     * Start order of tally computes, and the newest one whose result is in {@link #cachedTally}.
+     * `update()`'s initial compute runs beside the refresh loop, so two can be in flight: the one
+     * that started first may finish last with an older winner set, and must not overwrite the newer.
+     */
+    #tallyStarted = 0;
+    #tallyApplied = 0;
+    /** Start order of the newest compute that failed: only a success started after it settles the retry. */
+    #tallyFailed = 0;
+    /**
+     * The armed retry after a failed recompute; cleared by `leave()` and by a successful compute that
+     * started after every failed one (an older compute finishing late predates the failure's state).
+     */
+    #tallyRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    #tallyRetryAttempts = 0;
 
     /**
      * Last-known current bucket on the gating chain, refreshed by {@link #refreshBucket} on
@@ -1673,18 +1696,46 @@ class ContestEngine {
         return this.#tally.compute();
     }
 
-    /** Compute the tally once, cache it, and emit `update`; on failure emit `error` instead. */
+    /**
+     * Compute the tally once, cache it, and emit `update`; on failure emit `error` instead and arm
+     * a retry (see {@link TALLY_RETRY_MS}). A compute that a later-started one already overtook is
+     * dropped rather than applied (see {@link #tallyStarted}).
+     */
     async #computeAndEmit(): Promise<void> {
         this.#tallyDirty = false;
+        const started = ++this.#tallyStarted;
         let tally: ContestTally;
         try {
             tally = await this.computeTally();
         } catch (error) {
+            this.#tallyFailed = Math.max(this.#tallyFailed, started);
             this.#emitError(error);
+            this.#armTallyRetry();
             return;
+        }
+        if (started < this.#tallyApplied) return;
+        this.#tallyApplied = started;
+        if (started > this.#tallyFailed) {
+            if (this.#tallyRetryTimer !== undefined) clearTimeout(this.#tallyRetryTimer);
+            this.#tallyRetryTimer = undefined;
+            this.#tallyRetryAttempts = 0;
         }
         this.#cachedTally = tally;
         for (const cb of [...this.#updateListeners]) cb();
+    }
+
+    /** Re-run the recompute after a failure, backing off; one timer at a time. */
+    #armTallyRetry(): void {
+        if (this.#tallyRetryTimer !== undefined) return;
+        const delay = Math.min(TALLY_RETRY_MS * 2 ** this.#tallyRetryAttempts, TALLY_RETRY_CAP_MS);
+        this.#tallyRetryAttempts += 1;
+        const timer = setTimeout(() => {
+            this.#tallyRetryTimer = undefined;
+            this.#kickTallyRefresh(); // a no-op once no view is subscribed
+        }, delay);
+        // Don't hold a Node process open; no-op in the browser.
+        (timer as { unref?: () => void }).unref?.();
+        this.#tallyRetryTimer = timer;
     }
 
     /** Force one recompute + emit now (used by a view's `update()` for the initial tally). */
@@ -2058,6 +2109,9 @@ class ContestEngine {
         this.#restoreBacklog = [];
         this.#restoreAttempts = 0;
         this.#snapshotWriteFailures = 0;
+        if (this.#tallyRetryTimer !== undefined) clearTimeout(this.#tallyRetryTimer);
+        this.#tallyRetryTimer = undefined;
+        this.#tallyRetryAttempts = 0;
         // Pause the background verifier's retry timer; pending state survives for a re-join.
         this.#background.stop();
         this.#disarmSubscriptionRepull();
