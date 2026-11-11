@@ -3340,12 +3340,17 @@ export class PubsubVoter implements VoteClient {
 
     async stop(): Promise<void> {
         // Reset each read view (detach its engine listeners, clear `#subscribed`) so it can
-        // `update()` again — this is what keeps `stop()` reusable. Then leave any engine with no
-        // view (created via `createContestVote`); `leave()` is idempotent, so double-leaving a
-        // view's engine is a no-op. Each real leave notifies `#onTopicLeft`, so the responder
-        // unregisters exactly when the last joined topic is left.
-        await Promise.all([...this.#views.values()].map((view) => view.stop()));
-        await Promise.all([...this.#engines.values()].map((engine) => engine.leave()));
+        // `update()` again — this is what keeps `stop()` reusable. Also leave every engine, which
+        // covers those with no view (created via `createContestVote`); `leave()` is idempotent, so
+        // double-leaving a view's engine is a no-op. Each real leave notifies `#onTopicLeft`, so the
+        // responder unregisters exactly when the last joined topic is left. Every leave is queued
+        // before the first await: an `update()` racing this stop then joins after all of them.
+        // Queued in two passes, its join landed between a view's leave and the second leave of the
+        // same engine, which left the topic under a view that stayed subscribed.
+        await Promise.all([
+            ...[...this.#views.values()].map((view) => view.stop()),
+            ...[...this.#engines.values()].map((engine) => engine.leave())
+        ]);
     }
 
     async destroy(): Promise<void> {

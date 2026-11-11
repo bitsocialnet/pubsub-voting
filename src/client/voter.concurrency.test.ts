@@ -173,6 +173,20 @@ describe("join/leave transitions never interleave", () => {
         await voter.destroy();
     });
 
+    it("an update() racing a voter-wide stop() leaves the view subscribed on a joined engine", async () => {
+        const node = recordingHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+
+        // The re-join must come after every leave the voter's stop() makes of this engine.
+        await Promise.all([voter.stop(), contest.update()]);
+
+        expect(node.topicValidators.has(contest.topic)).toBe(true);
+        expect(node.responderRegistered()).toBe(true);
+        await voter.destroy();
+    });
+
     it("two joins in the same tick count as one, so the last leave unregisters the responder", async () => {
         const node = recordingHelia();
         const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
