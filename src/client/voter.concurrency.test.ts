@@ -27,8 +27,9 @@ const WALLET_C = "0x00000000000000000000000000000000000000cc";
 /**
  * A host node that records what the voter did to it: the bundles it broadcast, which topics
  * carry an installed forward-gate (the transport's live subscription), and whether the
- * root-record responder is registered. `publish` may be overridden to make broadcasts fail, and
- * `parkNextPut` parks the next blockstore write (e.g. a leave's snapshot flush) until released.
+ * root-record responder is registered. `publish` may be overridden to make broadcasts fail,
+ * `parkNextPut` parks the next blockstore write (e.g. a leave's snapshot flush) until released,
+ * and `puts` counts blockstore writes (a checkpoint encode writes its blocks).
  */
 function recordingHelia(publishImpl?: () => Promise<{ recipients?: readonly PeerId[] }>) {
     const broadcasts: string[] = [];
@@ -57,9 +58,11 @@ function recordingHelia(publishImpl?: () => Promise<{ recipients?: readonly Peer
     };
     let parkPut: Promise<void> | undefined;
     let putParked = false;
+    let puts = 0;
     const blockstore = {
         get: async () => new Uint8Array(),
         put: async (cid: unknown) => {
+            puts += 1;
             const parked = parkPut;
             parkPut = undefined; // only the next write parks
             if (parked !== undefined) {
@@ -77,7 +80,7 @@ function recordingHelia(publishImpl?: () => Promise<{ recipients?: readonly Peer
         putParked = false;
         return { parked: () => putParked, release };
     };
-    return { helia, broadcasts, topicValidators, responderRegistered: () => registered, parkNextPut };
+    return { helia, broadcasts, topicValidators, responderRegistered: () => registered, parkNextPut, puts: () => puts };
 }
 
 /** A signer that parks inside `signBallot` (a wallet prompt left open) until `release()`. */
@@ -272,6 +275,41 @@ describe("a publish never reports a broadcast that did not happen", () => {
         expect(String(outcome)).toMatch(/not broadcast/);
         expect(state).toBe("failed");
         expect(broadcasts).toEqual([topic]);
+    });
+
+    it("a wallet answering while the leave flushes arms no snapshot write that outlives the leave", async () => {
+        vi.useFakeTimers();
+        try {
+            const node = recordingHelia();
+            const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            await contest.update();
+            // A settled vote arms the debounced snapshot write, so the leave flushes it first.
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_B) })).publish();
+            await vi.advanceTimersByTimeAsync(500);
+            const prompt = promptSigner();
+            const ballot = await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: prompt.signer });
+            const publishing = ballot.publish().catch(() => {});
+            await vi.waitFor(() => expect(prompt.prompting()).toBe(true));
+
+            // The signed vote and its retraction both change state while the flush is parked. One
+            // leave: the contest's stop() leaves the engine the ballot published through.
+            const flush = node.parkNextPut();
+            const stopping = contest.stop();
+            await vi.waitFor(() => expect(flush.parked()).toBe(true));
+            prompt.release();
+            await publishing;
+            flush.release();
+            await stopping;
+
+            // The topic is left: no debounced write may re-encode and persist the checkpoint later.
+            const puts = node.puts();
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(node.puts()).toBe(puts);
+            await voter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 

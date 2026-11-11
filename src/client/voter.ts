@@ -1156,7 +1156,8 @@ class ContestEngine {
     /**
      * True while a leave runs. It keeps {@link #transport} (and `#joined`) until its snapshot flush
      * and the unsubscribe are done, so {@link broadcastBundle} reads this to refuse a vote whose
-     * wallet answered after a `stop()`/`destroy()` had already begun taking the topic down.
+     * wallet answered after a `stop()`/`destroy()` had already begun taking the topic down, and
+     * {@link #scheduleSnapshotWrite} to arm no write that would fire after the leave.
      */
     #leaving = false;
     /**
@@ -2272,10 +2273,12 @@ class ContestEngine {
      * Arm the debounced snapshot write (announcer-style: the first change in a window arms the
      * timer, the rest coalesce into it). Only while joined — a never-joined engine (a ballot
      * created but never published) holds no view worth persisting, and `leave()` flushes the
-     * armed timer so nothing fires after teardown.
+     * armed timer so nothing fires after teardown. Not once a leave has started either: `#joined`
+     * stays true through its flush, and a state change landing there (a wallet answering, then
+     * its refused broadcast's retraction) armed a timer that outlived the leave.
      */
     #scheduleSnapshotWrite(): void {
-        if (!this.#joined || this.#snapshotTimer !== undefined) return;
+        if (!this.#joined || this.#leaving || this.#snapshotTimer !== undefined) return;
         const timer = setTimeout(() => {
             this.#snapshotTimer = undefined;
             void this.#writeSnapshot();
