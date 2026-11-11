@@ -199,10 +199,11 @@ async function measureOne(m, n, i) {
             }
             const parsed = JSON.parse(line.slice("RESULT ".length));
             // directory-join prints a RESULT at its deadline too, so a rep the seeder died under still
-            // returns one, with no connection and partial counts. Unless it fully converged and
-            // verified (the seeder served it before dying), it measured the dead seeder: drop it
-            // instead of medianing it in.
-            if (seederExit && !(parsed.converged && parsed.allVerified)) {
+            // returns one, with no connection and partial counts. Unless every tally converged (the
+            // seeder served all its data before dying), it measured the dead seeder: drop it instead
+            // of medianing it in. A converged rep is kept even if its verification timed out: the
+            // gate reads go to the joiner's own RPC gateway, not the seeder, so that timeout is real.
+            if (seederExit && !parsed.converged) {
                 reason = `${seederExit} during rep ${r + 1}/${REPEATS}, which was dropped (converged ${parsed.readyCount}/${m}, verified ${parsed.verifiedCount}/${m})`;
                 console.error(`[bench] M=${m} N=${n}: ${reason}`);
                 continue;
