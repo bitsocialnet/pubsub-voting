@@ -1,9 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import pLimit from "p-limit";
 import { z } from "zod";
 import { makeBackgroundVerifier, type BackgroundVerifierDeps } from "./background.js";
 import { makeMemoryRuleCache } from "../rules/cache.js";
 import { makeVerdictCache } from "./cache.js";
-import { Erc5192MinBalanceOptionsSchema } from "../rules/erc5192-min-balance.js";
+import { Erc5192MinBalanceOptionsSchema, erc5192MinBalance } from "../rules/erc5192-min-balance.js";
+import { GATE_GRACE_MS, GATE_RETRY_MS } from "./gate-grace.js";
 import type { Rule, RuleRegistry, RuleResult } from "../rules/types.js";
 import type { VerifyFail } from "./types.js";
 import { makeBucketMath } from "../chain/bucket.js";
@@ -316,6 +318,370 @@ describe("makeBackgroundVerifier", () => {
         expect(h.errors).toHaveLength(1);
     });
 
+    it.each([
+        { batched: true, path: "a batched read" },
+        { batched: false, path: "the per-wallet fallback" }
+    ])("settles the rest of a round when $path always throws for ONE wallet", async ({ batched }) => {
+        // A read that can never succeed for one wallet (a pinned block the gateway cannot serve,
+        // say) must cost that bundle its round and nothing more.
+        // Re-queueing the whole round for it held every other provisional bundle unverified
+        // until a restart.
+        const poison = bundle("0xdead");
+        const { rule } = stubRule({ [poison.address.toLowerCase()]: new Error("missing trie node") }, { batched });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
+        const [a, bad, b] = await Promise.all([pending(bundle("0x1")), pending(poison), pending(bundle("0x2"))]);
+        h.verifier.enqueue([a!, bad!, b!]);
+
+        await vi.waitFor(() => expect(h.gateVerified.sort()).toEqual([a!.cid.toString(), b!.cid.toString()].sort()));
+        // The wallet whose read threw is still nobody's verdict: pending, surfaced, never evicted.
+        expect(h.verifier.pendingCount()).toBe(1);
+        expect(h.errors.length).toBeGreaterThan(0);
+        expect(h.evicted).toEqual([]);
+        h.verifier.stop();
+    });
+
+    it("drops a pending bundle that left the host's working set, without a verdict", async () => {
+        // The only way out for a bundle whose read keeps throwing: once the host no longer holds
+        // it (expired, superseded, evicted), there is nothing left to verify it for.
+        const { rule } = stubRule({ [padAddress("0xdead").toLowerCase()]: new Error("missing trie node") }, { batched: true });
+        const entry = await pending(bundle("0xdead"));
+        const admitted = new Set([entry.cid.toString()]);
+        const h = harness({ registry: { "erc5192-min-balance": rule }, isAdmitted: (cid) => admitted.has(cid.toString()) });
+        h.verifier.enqueue([entry]);
+        await vi.waitFor(() => expect(h.errors.length).toBeGreaterThan(0));
+        expect(h.verifier.pendingCount()).toBe(1);
+
+        admitted.delete(entry.cid.toString()); // e.g. the expiry prune removed it
+        await h.verifier.idle();
+        expect(h.verifier.pendingCount()).toBe(0);
+        expect(h.evicted).toEqual([]); // the host already dropped it: no eviction to report
+        expect(h.gateVerified).toEqual([]);
+        expect(h.cache.get(entry.cid)).toBeUndefined();
+    });
+
+    it("settles the rest when more wallets than one wave always throw, and they were queued first", async () => {
+        // The re-asks of a failed batch stop when the wave of 8 wallets asked alone first all throw
+        // (see the outage tests below). That wave can be bad wallets rather than a down RPC, so a
+        // wallet whose own read threw goes to the back of the line and the stop cannot hold the
+        // others.
+        const bad = Array.from({ length: 10 }, (_, i) => bundle(`0xbad${i}`));
+        const { rule } = stubRule(Object.fromEntries(bad.map((b) => [b.address.toLowerCase(), new Error("missing trie node")])), { batched: true });
+        const h = harness({ registry: { "erc5192-min-balance": rule } });
+        const poison = await Promise.all(bad.map(pending));
+        const good = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2"))]);
+        h.verifier.enqueue([...poison, ...good]); // the first wave of re-asks is all bad wallets
+
+        await vi.waitFor(() => expect(h.gateVerified.sort()).toEqual(good.map((e) => e.cid.toString()).sort()));
+        expect(h.verifier.pendingCount()).toBe(poison.length);
+        expect(h.evicted).toEqual([]);
+        h.verifier.stop();
+    });
+
+    it.each([
+        { waited: "queued behind 8 of them", outageFirst: false, settlesIn: 2 },
+        { waited: "asked alone once, during an outage", outageFirst: true, settlesIn: 3 }
+    ])("reaches a bundle already waiting ($waited) while 8 always-failing bundles arrive in every round", async ({ outageFirst, settlesIn }) => {
+        // Bundles queued while a round runs must line up behind the ones already waiting. If 8
+        // fresh always-failing bundles a round could go first, they would be the whole first wave
+        // of re-asks every round, the stop would end every round there, and the waiting bundle
+        // would never be asked.
+        const ARRIVING = 12; // rounds in which 8 more always-failing bundles arrive
+        const bad = Array.from({ length: 8 * (ARRIVING + 1) }, (_, i) => bundle(`0xbad${i.toString(16)}`));
+        const healthy = bundle("0x1");
+        let down = outageFirst; // every read throws, the healthy wallet's too
+        const isBad = new Set(bad.map((b) => b.address.toLowerCase()));
+        const rule: Rule = {
+            type: "erc5192-min-balance",
+            optionsSchema: Erc5192MinBalanceOptionsSchema,
+            evaluate: async () => {
+                throw new Error("unused: the rule is batched");
+            },
+            evaluateMany: async ({ wallets }) => {
+                if (down || wallets.some((w) => isBad.has(w.address.toLowerCase()))) throw new Error("missing trie node");
+                return { results: wallets.map((): RuleResult => ({ success: true, score: 1n })) };
+            }
+        };
+        const [waiting, ...poison] = await Promise.all([healthy, ...bad].map(pending));
+        let round = 0;
+        let verifiedIn: number | undefined; // the round in which the waiting bundle passed its gate
+        const h = harness({
+            registry: { "erc5192-min-balance": rule },
+            onGateVerified: (cid) => {
+                if (cid.equals(waiting!.cid)) verifiedIn = round;
+            },
+            onError: () => {
+                // Once per round, as soon as its batched read throws: 8 more always-failing bundles.
+                round += 1;
+                if (round >= 2) down = false; // the outage lasts one round
+                if (round <= ARRIVING) h.verifier.enqueue(poison.slice(8 * round, 8 * round + 8));
+            }
+        });
+        const first = poison.slice(0, 8);
+        h.verifier.enqueue(outageFirst ? [waiting!, ...first] : [...first, waiting!]);
+
+        await vi.waitFor(() => expect(verifiedIn).toBeDefined());
+        expect(verifiedIn).toBe(settlesIn);
+        expect(h.evicted).toEqual([]);
+        h.verifier.stop();
+    });
+
+    describe("what a failed read costs with 200 bundles pending", () => {
+        // A failed batched read is re-asked in smaller pieces so one bad read cannot hold the
+        // round. Those re-asks must not cost a down RPC, or one that answers again a moment
+        // later, one call per pending bundle, nor hold back the `error` signal ("RPC down is
+        // not silent") behind the backlog.
+        const PENDING = 200;
+        const CALL_MS = 50; // every rule call takes this long, whether it answers or throws
+
+        /** A gate rule whose calls each take CALL_MS; `throws(call, wallets)` picks the ones that throw. */
+        function slowRule(batched: boolean, throws: (call: number, wallets: string[]) => boolean): { rule: Rule; sizes: number[] } {
+            const sizes: number[] = []; // wallets per rule call, in call order
+            const answer = async (wallets: string[]): Promise<RuleResult[]> => {
+                const call = sizes.push(wallets.length) - 1;
+                await new Promise((resolve) => setTimeout(resolve, CALL_MS));
+                if (throws(call, wallets)) throw new Error("RPC down");
+                return wallets.map((): RuleResult => ({ success: true, score: 1n }));
+            };
+            const rule: Rule = {
+                type: "erc5192-min-balance",
+                optionsSchema: Erc5192MinBalanceOptionsSchema,
+                evaluate: async ({ wallet }) => (await answer([wallet.address]))[0]!,
+                ...(batched
+                    ? { evaluateMany: async ({ wallets }: { wallets: Array<{ address: string }> }) => ({ results: await answer(wallets.map((w) => w.address)) }) }
+                    : {})
+            };
+            return { rule, sizes };
+        }
+
+        async function start(batched: boolean, throws: (call: number, wallets: string[]) => boolean) {
+            const { rule, sizes } = slowRule(batched, throws);
+            const limit = pLimit(8);
+            const errorsAt: number[] = []; // rule calls made when each error surfaced
+            const h = harness({
+                registry: { "erc5192-min-balance": rule },
+                limit: (fn) => limit(fn),
+                limitConcurrency: 8,
+                retryBaseMs: 60_000,
+                retryCapMs: 60_000,
+                onError: () => errorsAt.push(sizes.length)
+            });
+            const entries = await Promise.all(Array.from({ length: PENDING }, (_, i) => pending(bundle((i + 1).toString(16)))));
+            h.verifier.enqueue(entries);
+            return { h, sizes, errorsAt, entries };
+        }
+
+        /** Run `test` on fake timers, with every backoff landing at half its ceiling (30 s). */
+        async function onFakeTime(test: () => Promise<void>): Promise<void> {
+            vi.useFakeTimers();
+            vi.spyOn(Math, "random").mockReturnValue(0.5);
+            try {
+                await test();
+            } finally {
+                vi.restoreAllMocks();
+                vi.useRealTimers();
+            }
+        }
+
+        /** `n` rule calls of `size` wallets each, as `sizes` records them. */
+        const calls = (n: number, size = 1): number[] => Array<number>(n).fill(size);
+
+        describe("during a full RPC outage (every read throws)", () => {
+            it("surfaces a failed batch at once and re-asks at most one wave of wallets alone per round", () =>
+                onFakeTime(async () => {
+                    const { h, sizes, errorsAt } = await start(true, () => true);
+                    const round = [PENDING, ...calls(8)]; // the batch, then one wave of 8
+
+                    await vi.advanceTimersByTimeAsync(CALL_MS); // the batched read fails...
+                    expect(errorsAt).toEqual([1]); // ...and is surfaced before any wallet is re-asked
+                    await vi.advanceTimersByTimeAsync(CALL_MS); // the first wave fails as well
+                    expect(sizes).toEqual(round); // so the other 192 wallets are not asked again
+
+                    await vi.advanceTimersByTimeAsync(30_000 + 2 * CALL_MS); // the retry round, same shape
+                    expect(sizes).toEqual([...round, ...round]);
+                    expect(errorsAt).toEqual([1, round.length + 1]); // one report per round, at its start
+                    expect(h.verifier.pendingCount()).toBe(PENDING); // still nobody's verdict
+                    expect(h.evicted).toEqual([]);
+                    h.verifier.stop();
+                }));
+
+            it("surfaces the first failed read of a rule without a batched form at once", () =>
+                onFakeTime(async () => {
+                    const { h, sizes, errorsAt } = await start(false, () => true);
+
+                    await vi.advanceTimersByTimeAsync(CALL_MS); // the first wave of reads fails
+                    expect(errorsAt).toHaveLength(1); // surfaced now, not once all 200 reads have failed
+                    await vi.advanceTimersByTimeAsync((PENDING / 8) * CALL_MS);
+                    expect(sizes).toHaveLength(PENDING); // one read per wallet per round, as it always was
+                    expect(errorsAt).toHaveLength(1);
+                    h.verifier.stop();
+                }));
+        });
+
+        describe("while the RPC answers", () => {
+            it("settles every bundle two call times after the batch failed, when it failed only once", () =>
+                onFakeTime(async () => {
+                    // A blip: the batch throws, every later call answers. Asking the 200 wallets
+                    // again one at a time would take 26 call times and 201 calls; re-queueing the
+                    // whole round takes 2 calls but waits out a backoff (up to 2 s) first.
+                    const { h, sizes, errorsAt, entries } = await start(true, (call) => call === 0);
+
+                    await vi.advanceTimersByTimeAsync(3 * CALL_MS);
+                    expect(h.gateVerified.sort()).toEqual(entries.map((e) => e.cid.toString()).sort());
+                    // The batch, the first 8 wallets alone, then the other 192 in 8 parts of 24.
+                    expect(sizes).toEqual([PENDING, ...calls(8), ...calls(8, 24)]);
+                    expect(errorsAt).toEqual([1]);
+                    expect(h.verifier.pendingCount()).toBe(0);
+                }));
+
+            it("isolates one wallet whose read always throws in a few call times, not one call per bundle", () =>
+                onFakeTime(async () => {
+                    // Asking every other wallet alone to find it would take 26 call times and 201 calls.
+                    const poison = padAddress(PENDING.toString(16)); // the last of the 200
+                    const { h, sizes, errorsAt } = await start(true, (_, wallets) => wallets.includes(poison));
+
+                    await vi.advanceTimersByTimeAsync(6 * CALL_MS);
+                    expect(h.gateVerified).toHaveLength(PENDING - 1);
+                    // Each part that throws is split again the same way: 8 alone, the rest in 8 parts.
+                    expect(sizes).toEqual([PENDING, ...calls(8), ...calls(8, 24), ...calls(8), ...calls(8, 2), 1, 1]);
+                    expect(errorsAt).toEqual([1]);
+                    expect(h.verifier.pendingCount()).toBe(1); // still nobody's verdict
+                    expect(h.evicted).toEqual([]);
+                    h.verifier.stop();
+                }));
+        });
+    });
+
+    describe("a CID re-enqueued after its gate passed (the host re-recorded its checks as pending)", () => {
+        it("reports the gate pass again when the item is still waiting on a name retry", async () => {
+            // An own vote re-signed in the same bucket is the same CID, and the voter resets its
+            // checks when it records it again. The verifier keeps one item per CID, so it must
+            // say "gate verified" again or the bundle ends name-resolved but never chain-verified.
+            let registryDown = true;
+            const flaky: NameResolver = {
+                key: "flaky",
+                provider: "test",
+                canResolve: ({ name }) => name.endsWith(".bso"),
+                resolve: async () => {
+                    if (registryDown) throw new Error("resolver down");
+                    return { publicKey: KEY_A };
+                }
+            };
+            const h = harness({ nameResolvers: [flaky] });
+            const entry = await pending(bundle("0x1", { name: "memes.bso" }));
+            h.verifier.enqueue([entry]);
+            await vi.waitFor(() => expect(h.errors.length).toBeGreaterThan(0));
+            expect(h.gateVerified).toEqual([entry.cid.toString()]);
+
+            h.verifier.enqueue([entry]); // the re-publish
+            registryDown = false;
+            await h.verifier.idle();
+            expect(h.gateVerified).toEqual([entry.cid.toString(), entry.cid.toString()]);
+            expect(h.nameResolved).toEqual([entry.cid.toString()]);
+        });
+
+        it("reports the gate pass again when the re-enqueue lands while the name stage is awaited", async () => {
+            let release!: () => void;
+            const answered = new Promise<void>((resolve) => (release = resolve));
+            const slow: NameResolver = {
+                key: "slow",
+                provider: "test",
+                canResolve: ({ name }) => name.endsWith(".bso"),
+                resolve: async () => {
+                    await answered;
+                    return { publicKey: KEY_A };
+                }
+            };
+            const h = harness({ nameResolvers: [slow] });
+            const entry = await pending(bundle("0x1", { name: "memes.bso" }));
+            h.verifier.enqueue([entry]);
+            await vi.waitFor(() => expect(h.gateVerified).toEqual([entry.cid.toString()]));
+
+            h.verifier.enqueue([entry]); // the re-publish, mid name stage
+            release();
+            await h.verifier.idle();
+            expect(h.gateVerified).toEqual([entry.cid.toString(), entry.cid.toString()]);
+            expect(h.verifier.pendingCount()).toBe(0);
+        });
+    });
+
+    it("finishes the round when a host callback throws, and reports the throw", async () => {
+        // The voter's callbacks run host listeners synchronously (`publishingstatechange`,
+        // `error`). One that throws must not unwind the round: the bundles after it were already
+        // taken off the queue, and `enqueue` skips anything still marked in flight.
+        const notified: string[] = [];
+        const errors: unknown[] = [];
+        const listenerBug = new Error("host listener threw");
+        const h = harness({
+            onGateVerified: (cid) => {
+                notified.push(cid.toString());
+                if (notified.length === 1) throw listenerBug;
+            },
+            onError: (error) => errors.push(error)
+        });
+        const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2")), pending(bundle("0x3"))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        expect(notified.sort()).toEqual(entries.map((e) => e.cid.toString()).sort());
+        expect(entries.every((e) => h.cache.get(e.cid)?.valid === true)).toBe(true);
+        expect(h.verifier.pendingCount()).toBe(0);
+        expect(errors).toEqual([listenerBug]);
+    });
+
+    it("still arms the retry when the onError listener itself throws", async () => {
+        let failures = 1;
+        const rule: Rule = {
+            type: "erc5192-min-balance",
+            optionsSchema: Erc5192MinBalanceOptionsSchema,
+            async evaluate() {
+                if (failures > 0) {
+                    failures--;
+                    throw new Error("RPC down");
+                }
+                return { success: true, score: 1n };
+            }
+        };
+        const gateVerified: string[] = [];
+        const h = harness({
+            registry: { "erc5192-min-balance": rule },
+            onGateVerified: (cid) => gateVerified.push(cid.toString()),
+            onError: () => {
+                throw new Error("error listener threw");
+            }
+        });
+        const entry = await pending(bundle("0x1"));
+        h.verifier.enqueue([entry]);
+        await h.verifier.idle();
+        expect(gateVerified).toEqual([entry.cid.toString()]);
+        expect(h.verifier.pendingCount()).toBe(0);
+    });
+
+    it("puts back what a round had not reached when it throws unexpectedly, then retries", async () => {
+        // Not a read failure: a throw from the verifier's own bookkeeping (here the verdict cache).
+        // The items after it must not be stranded in flight with no queue entry and no timer.
+        const errors: unknown[] = [];
+        const verdicts = makeVerdictCache();
+        const storeBug = new Error("verdict cache write failed");
+        let writes = 0;
+        const h = harness({
+            cache: {
+                ...verdicts,
+                set: (cid, verdict) => {
+                    if (++writes === 1) throw storeBug;
+                    verdicts.set(cid, verdict);
+                }
+            },
+            onError: (error) => errors.push(error)
+        });
+        const entries = await Promise.all([pending(bundle("0x1")), pending(bundle("0x2"))]);
+        h.verifier.enqueue(entries);
+        await h.verifier.idle();
+
+        expect(entries.every((e) => verdicts.get(e.cid)?.valid === true)).toBe(true);
+        expect(h.verifier.pendingCount()).toBe(0);
+        expect(errors).toEqual([storeBug]);
+    });
+
     it("stop() pauses the retry loop and resume() drains what was left pending", async () => {
         let failing = true;
         const rule: Rule = {
@@ -429,6 +795,42 @@ describe("makeBackgroundVerifier: a rule that scores at the head (rules/types.ts
         expect(h.evicted).toEqual([{ cid: entry.cid.toString(), disposition: "ignore" }]);
         expect(h.cache.get(entry.cid)).toBeUndefined();
         expect(h.verifier.pendingCount()).toBe(0);
+    });
+});
+
+describe("makeBackgroundVerifier over the real v1 gate rule", () => {
+    it("re-reads a head-scored 0n inside the grace window on a chain with 12 s blocks", async () => {
+        // The grace window only helps if the rule's memoized negative expires inside it. A head
+        // memo that lasts 30 BLOCKS is one minute on Base but six on a 12 s chain: every
+        // re-examination was served the stale 0n and the vote was evicted at 120 s although
+        // the wallet had held the Pass since the second block.
+        vi.useFakeTimers();
+        try {
+            const start = Date.now();
+            const FIRST_HEAD = 999_990; // a multiple of 30: a block-numbered epoch starts here
+            const head = (): number => FIRST_HEAD + Math.floor((Date.now() - start) / 12_000);
+            let mintedAt = Number.POSITIVE_INFINITY;
+            const chain = {
+                readContract: async ({ functionName, blockNumber }: { functionName: string; blockNumber: bigint }) =>
+                    functionName === "supportsInterface" ? true : Number(blockNumber) >= mintedAt ? 1n : 0n
+            } as unknown as ChainClient;
+            const h = harness({
+                registry: { "erc5192-min-balance": erc5192MinBalance },
+                chain,
+                readHead: async () => ({ block: head() })
+            });
+            const entry = await pending(bundle("0xbee")); // signed before the mint: 0n at its pinned block too
+            h.verifier.enqueue([entry]);
+            await vi.advanceTimersByTimeAsync(0); // first round: 0n at the head, memoized → "not yet"
+            expect(h.verifier.pendingCount()).toBe(1);
+
+            mintedAt = head() + 1; // the mint lands in the next block
+            await vi.advanceTimersByTimeAsync(GATE_GRACE_MS + GATE_RETRY_MS);
+            expect(h.evicted).toEqual([]);
+            expect(h.gateVerified).toEqual([entry.cid.toString()]);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 

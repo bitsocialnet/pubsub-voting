@@ -1,4 +1,11 @@
-import { BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, getAddress } from "viem";
+import {
+    BaseError,
+    ContractFunctionExecutionError,
+    ContractFunctionRevertedError,
+    ContractFunctionZeroDataError,
+    InternalRpcError,
+    getAddress
+} from "viem";
 import { z } from "zod";
 import { balanceOf, balancesOfBatched, canBatch, scoreOf, shortfallError } from "./nft-balance.js";
 import type { ChainReadContext, Rule, RuleResult } from "./types.js";
@@ -70,14 +77,25 @@ export type Erc5192MinBalanceOptions = z.infer<typeof Erc5192MinBalanceOptionsSc
  * everywhere (gossip `ignore`, background retry) precisely so a flaky gateway never turns into a
  * consensus `reject` that scores honest relayers down. So only viem's revert/zero-data errors
  * map to "does not declare"; everything else (transport, timeout, rate limit) rethrows.
+ *
+ * And only when they are the PROBE's own: viem builds the same two error classes for gateway
+ * failures, so the answer is a refusal only when the failed call viem names is
+ * `supportsInterface` (a coalesced multicall whose `aggregate3` round trip failed or came back
+ * empty names `aggregate3`), and no JSON-RPC -32603 "internal error" is in the chain (viem reads
+ * that code as a revert, but it is the gateway failing; a node that reports real reverts with
+ * it makes the probe infra-class, which admits nobody either way). A wrong refusal would be
+ * memoized, and on the pinned leg for good.
  */
 function isContractRefusal(err: unknown): boolean {
     if (!(err instanceof BaseError)) return false;
-    return err.walk((cause) => cause instanceof ContractFunctionRevertedError || cause instanceof ContractFunctionZeroDataError) !== null;
+    const call = err.walk((cause) => cause instanceof ContractFunctionExecutionError);
+    if (!(call instanceof ContractFunctionExecutionError) || call.functionName !== "supportsInterface") return false;
+    if (!(call.cause instanceof ContractFunctionRevertedError || call.cause instanceof ContractFunctionZeroDataError)) return false;
+    return err.walk((cause) => typeof cause === "object" && cause !== null && "code" in cause && cause.code === InternalRpcError.code) === null;
 }
 
 /**
- * How coarsely a head-scored read is memoized, in blocks (~1 minute on Base's 2 s blocks).
+ * How coarsely a head-scored read is memoized: one minute of wall-clock time.
  *
  * The read itself is at the freshest head this verifier has — that is the whole point, a Pass
  * acquired seconds ago must count now. Only the cache EPOCH is quantized, and it has to be:
@@ -90,11 +108,20 @@ function isContractRefusal(err: unknown): boolean {
  * cannot stop being true), and re-reading one when the epoch rolls is a wasted read, never a
  * wrong answer. Local resource policy, NOT consensus: two peers may quantize differently and
  * still agree on every verdict, which is why it lives here and not in the criteria.
+ *
+ * It is measured in TIME, not blocks, because what it must stay under is the pipeline's grace
+ * window (`GATE_GRACE_MS` in verify/gate-grace.ts, 120 s): a stale negative that outlives the
+ * window is served to every re-examination, and the vote is evicted although the wallet now
+ * holds the Pass. 30 blocks was a minute on Base's 2 s blocks but six on a 12 s chain.
  */
-const HEAD_EPOCH_BLOCKS = 30;
+const HEAD_EPOCH_MS = 60_000;
 
-/** Cache-key prefixes: head-scored entries expire with the head, pinned ones never do. */
-const HEAD_PREFIX = "head/";
+/**
+ * Cache-key prefixes: head-scored entries expire with the window, pinned ones never do. The head
+ * prefix changed when its epochs went from block numbers to minutes, so an entry left from the
+ * old numbering can never be read under the new one (the store's LRU bound reclaims it).
+ */
+const HEAD_PREFIX = "head-minute/";
 const PINNED_PREFIX = "pin/";
 
 /**
@@ -230,7 +257,7 @@ export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
      * can close. Its cost is that a verifier still needs archive depth for that leg.
      *
      * **Two epochs**, which is why this caching lives in the rule: the head leg expires with the
-     * head (a stale `0n` must not outlive {@link HEAD_EPOCH_BLOCKS}), while the pinned leg is a
+     * head (a stale `0n` must not outlive {@link HEAD_EPOCH_MS}), while the pinned leg is a
      * historical read that is true forever and is keyed by the block itself.
      *
      * **`penalize: false`** on every failure: neither leg makes one attributable. The peer that
@@ -246,7 +273,7 @@ export const erc5192MinBalance: Rule<Erc5192MinBalanceOptions> = {
     async evaluateMany({ options, wallets, ctx }) {
         const contract = getAddress(options.contract);
         const { block: head } = await ctx.head();
-        const epoch = Math.floor(head / HEAD_EPOCH_BLOCKS) * HEAD_EPOCH_BLOCKS;
+        const epoch = Math.floor(Date.now() / HEAD_EPOCH_MS);
         // Everything behind the current window is unreachable — nothing will look it up again.
         // Scoped to the head keys, so the permanently-valid pinned entries are left alone.
         ctx.cache.purgeBelow({ epoch, keyPrefix: HEAD_PREFIX });
