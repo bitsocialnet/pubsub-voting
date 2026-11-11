@@ -8,6 +8,8 @@ import { makeStorage } from "./browser.js";
  * IndexedDB does).
  */
 const databases = vi.hoisted(() => new Map<string, Map<string, unknown>>());
+/** Databases whose clear() never commits (the tab is closed before it lands). */
+const stalledClears = vi.hoisted(() => new Set<string>());
 vi.mock("localforage", () => ({
     default: {
         createInstance: ({ name }: { name: string }) => {
@@ -27,6 +29,7 @@ vi.mock("localforage", () => ({
                 },
                 keys: async () => [...store.keys()],
                 clear: async () => {
+                    if (stalledClears.has(name)) return new Promise<void>(() => {});
                     store.clear();
                 },
                 length: async () => store.size
@@ -130,6 +133,29 @@ describe("LocalForageLruStorage (browser round-robin LRU)", () => {
         await third.setItem("h", 8);
         await third.setItem("i", 9);
         expect(await third.getItem("g")).toBe(7);
+    });
+
+    it("records the new active half only after its clear lands (an interrupted clear never wipes the newer half)", async () => {
+        // The clear and the role record hit separate databases, which commit independently. A
+        // record naming the new half while its clear never landed made the next load treat that
+        // half (still holding the OLDEST entries, at maxItems) as active, so its next fill
+        // rotated and cleared the newer half.
+        const cacheName = `test-${++cacheCounter}`;
+        const reload = () => makeStorage({ dataPath: undefined }).openLru({ cacheName, maxItems: 2 });
+
+        const first = reload();
+        await first.setItem("a", 1);
+        await first.setItem("b", 2); // rotates: {a, b} retired, the second half is active
+        await first.setItem("c", 3);
+        stalledClears.add(`pubsub-voting-${cacheName}`);
+        void first.setItem("d", 4); // fills {c, d} and rotates back, but the clear of {a, b} never lands
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        stalledClears.clear();
+
+        const second = reload(); // the tab is reopened
+        await second.setItem("e", 5); // the active half is full: this rotates
+        expect(await second.getItem("d")).toBe(4); // the newest entries outlived the rotation
+        expect(await second.getItem("c")).toBe(3);
     });
 });
 

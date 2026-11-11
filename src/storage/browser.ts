@@ -63,7 +63,12 @@ class LocalForageLruStorage implements LruStorage {
             const swap = async () => {
                 activeSize = 0;
                 [active, inactive] = [inactive, active];
-                await Promise.all([active.clear(), roles.setItem(this.#name, active === database1 ? this.#name : name2)]);
+                // Record the new role only once its clear has landed: the two databases commit
+                // independently, and a record naming a half that still holds the oldest entries
+                // would make the next load trust it and clear the NEWER half on its next fill.
+                // Interrupted in between, the old record still names the full, newer half.
+                await active.clear();
+                await roles.setItem(this.#name, active === database1 ? this.#name : name2);
             };
             return {
                 active: () => active,
