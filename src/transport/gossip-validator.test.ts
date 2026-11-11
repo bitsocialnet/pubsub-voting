@@ -197,6 +197,45 @@ describe("makeGossipGate — bundle deltas", () => {
         expect(cache.has(cid)).toBe(false);
     });
 
+    it("does not cache a valid verdict whose admit failed — a re-publish re-verifies and admits it", async () => {
+        // The cache-hit path forwards a known-valid bundle WITHOUT admitting it again, so a valid
+        // verdict cached ahead of a failed admit (a blockstore put or CRDT merge that threw) would
+        // forward that vote forever while this node's own tally and checkpoint never hold it.
+        const { cid, message } = await makeDelta("0x1");
+        const cache = makeVerdictCache();
+        let verifies = 0;
+        let failNextAdmit = true;
+        const admitted: CID[] = [];
+        const g = gate({
+            cache,
+            verifier: {
+                verify: async () => {
+                    verifies++;
+                    return { valid: true, resolvedNames: {} };
+                }
+            },
+            admit: async ({ cid: c }) => {
+                if (failNextAdmit) {
+                    failNextAdmit = false;
+                    throw new Error("blockstore put failed");
+                }
+                admitted.push(c);
+            }
+        });
+        // Local storage failure, not the sender's fault: no forward, no penalty, nothing cached.
+        expect(await g.validate(message, "p")).toBe("ignore");
+        expect(cache.has(cid)).toBe(false);
+        // The re-publish runs the pipeline again and this time lands in the CRDT.
+        expect(await g.validate(message, "p")).toBe("accept");
+        expect(verifies).toBe(2);
+        expect(admitted.map((c) => c.toString())).toEqual([cid.toString()]);
+        // Admitted now, so the valid verdict is cached and a further re-publish costs one hash.
+        expect(cache.has(cid)).toBe(true);
+        expect(await g.validate(message, "p")).toBe("accept");
+        expect(verifies).toBe(2);
+        expect(admitted).toHaveLength(1);
+    });
+
     it("caches a provable reject so a re-publish is not re-verified", async () => {
         const { cid, message } = await makeDelta("0xbad");
         const cache = makeVerdictCache();

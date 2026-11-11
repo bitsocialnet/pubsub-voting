@@ -206,10 +206,16 @@ export function makeGossipGate(deps: GossipGateDeps): GossipGate {
         if (acceptedDedup?.isResignDuplicate(bundle)) return "ignore";
 
         const verdict = await limit(() => verifier.verify(bundle));
-        if (isCacheableVerdict(verdict)) cache.set(cid, verdict); // only terminal verdicts (accept / provable reject)
-        if (!verdict.valid) return verdict.disposition;
+        if (!verdict.valid) {
+            if (isCacheableVerdict(verdict)) cache.set(cid, verdict); // a provable reject is terminal; `ignore` stays uncached
+            return verdict.disposition;
+        }
 
         await admit({ cid, bytes: message.bundle, bundle });
+        // Cache the accept only once the admit landed: the cache-hit path above forwards without
+        // admitting again, so caching ahead of a failed admit (blockstore put, CRDT merge) would
+        // forward this vote on every re-publish while our own tally and checkpoint never hold it.
+        cache.set(cid, verdict);
         acceptedDedup?.record(bundle);
         onAccept?.(cid, bundle, from);
         return "accept";
