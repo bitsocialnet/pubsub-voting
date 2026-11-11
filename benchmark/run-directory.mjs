@@ -62,7 +62,8 @@ const median = (xs) => {
     const m = Math.floor(s.length / 2);
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
-const s = (ms) => (ms == null ? "  n/a " : `${(ms / 1000).toFixed(2)}s`.padStart(6));
+// `t/o`: a START→ALL median that landed on a rep the join deadline cut off (see `timed` in measureOne).
+const s = (ms) => (ms == null ? "  n/a " : ms === Infinity ? "  t/o " : `${(ms / 1000).toFixed(2)}s`.padStart(6));
 
 /** Run a command to completion, returning {code, stdout, stderr}. */
 function run(cmd, args, opts = {}) {
@@ -234,6 +235,11 @@ async function measureOne(m, n, i) {
     }
     if (results.length === 0) return { m, n, ok: false, reason };
     const med = (pick) => median(results.map(pick).filter((x) => x != null));
+    // A START→ALL milestone is null only when the join deadline cut it off: that rep took longer
+    // than the deadline, it was not unmeasured. Rank it above every finished rep instead of dropping
+    // it, so the median still covers every rep and reads `t/o` when the median rep timed out,
+    // rather than the time of the few reps that finished.
+    const timed = (pick) => median(results.map((r) => pick(r) ?? Infinity));
     // Percentile of a single run's convergence curve (when the k-th contest became ready).
     const pct = (arr, p) => (arr && arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * p))] : null);
     return {
@@ -260,8 +266,10 @@ async function measureOne(m, n, i) {
         verifyMergeMs: med((r) => r.verifyMergeMs),
         p50Ms: med((r) => pct(r.readyAtMs, 0.5)),
         p90Ms: med((r) => pct(r.readyAtMs, 0.9)),
-        allTalliesReadyMs: med((r) => r.allTalliesReadyMs),
-        allVerifiedMs: med((r) => r.allVerifiedMs),
+        allTalliesReadyMs: timed((r) => r.allTalliesReadyMs),
+        allVerifiedMs: timed((r) => r.allVerifiedMs),
+        talliesTimedOut: results.filter((r) => r.allTalliesReadyMs == null).length,
+        verifiedTimedOut: results.filter((r) => r.allVerifiedMs == null).length,
         rpcRequests: med((r) => r.gateRpc?.requests),
         rpcLatencyMs: med((r) => r.gateRpc?.latencyMs),
         rpcHead: med((r) => r.gateRpc?.byOp?.head),
@@ -323,6 +331,12 @@ async function main() {
     }
     for (const r of rows) {
         if (r.ok && r.reps < REPEATS) console.log(`  M=${r.m} N=${r.n}: median of ${r.reps}/${REPEATS} reps only${r.reason ? ` — ${r.reason}` : ""}`);
+        if (r.ok && (r.talliesTimedOut || r.verifiedTimedOut)) {
+            console.log(
+                `  M=${r.m} N=${r.n}: START→ALL-TALLIES timed out in ${r.talliesTimedOut}/${r.reps} reps, START→ALL-VERIFIED in ${r.verifiedTimedOut}/${r.reps} ` +
+                    `(a timed-out rep ranks above every finished one; t/o = the median rep timed out)`
+            );
+        }
     }
 
     // Table 2 — parallelism / convergence detail. Σ columns are the sum across the M concurrent ops
