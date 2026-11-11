@@ -1708,7 +1708,7 @@ class ContestEngine {
     /**
      * Compute the tally once, cache it, and emit `update`; on failure emit `error` instead and arm
      * a retry (see {@link TALLY_RETRY_MS}). A compute that a later-started one already overtook is
-     * dropped rather than applied (see {@link #tallyStarted}).
+     * dropped, result or failure, rather than applied or reported (see {@link #tallyStarted}).
      */
     async #computeAndEmit(): Promise<void> {
         this.#tallyDirty = false;
@@ -1717,6 +1717,9 @@ class ContestEngine {
         try {
             tally = await this.computeTally();
         } catch (error) {
+            // A newer compute is already applied and read everything this one would have: its
+            // failure is stale, so it neither warns the view nor arms a redundant retry.
+            if (started < this.#tallyApplied) return;
             this.#tallyFailed = Math.max(this.#tallyFailed, started);
             this.#emitError(error);
             this.#armTallyRetry();

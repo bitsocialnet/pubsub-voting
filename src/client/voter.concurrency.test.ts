@@ -501,6 +501,51 @@ describe("tally recompute recovery and ordering", () => {
         await voter.destroy();
     });
 
+    it("an older compute failing after a newer one was applied neither reports nor retries", async () => {
+        vi.useFakeTimers();
+        try {
+            const chain = tieReadChains();
+            const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: chain.chains });
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            const a = await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_A) })).publish();
+            const b = await (await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: fakeSigner(WALLET_B) })).publish();
+            await vi.advanceTimersByTimeAsync(500);
+            expect([a.cid, b.cid].map((cid) => contest.checksFor(cid)?.chainVerified)).toEqual([true, true]);
+
+            // update()'s initial compute sees the 1–1 tie and parks on the boundary block read.
+            const releaseTieRead = chain.hang();
+            const updating = contest.update();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(chain.blockReads()).toBe(1);
+
+            // A third wallet breaks the tie (no boundary read): the refresh loop applies the newer tally.
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_C) })).publish();
+            await vi.advanceTimersByTimeAsync(500);
+            expect(contest.tally?.ranking.map((row) => [row.weight, row.chainVerified])).toEqual([
+                [2n, true],
+                [1n, true]
+            ]);
+
+            // The parked compute now fails. A newer tally is already applied: nothing to report or retry.
+            const errors: unknown[] = [];
+            contest.on("error", (error) => errors.push(error));
+            let updates = 0;
+            contest.on("update", () => {
+                updates += 1;
+            });
+            chain.fail(true);
+            releaseTieRead();
+            await updating;
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(errors).toEqual([]);
+            expect(updates).toBe(0);
+            expect(contest.tally?.ranking.map((row) => row.weight)).toEqual([2n, 1n]);
+            await voter.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("an older compute finishing after a newer one failed keeps the retry armed", async () => {
         vi.useFakeTimers();
         try {
