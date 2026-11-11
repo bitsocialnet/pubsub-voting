@@ -919,6 +919,72 @@ describe("checkpoint snapshot persistence (dataPath)", () => {
         expect(destroyedWhileWriting).toBe(false); // destroy() waited for the write
     });
 
+    it("still waits for a slow snapshot write when a later timer's write started and finished meanwhile", async () => {
+        const dataPath = await tempDataPath();
+        const topic = await topicFor(bizCriteria());
+        // Stall the encode's blockstore puts on demand, as above: the first write parks there.
+        const helia = fakeHelia();
+        const bs = (helia as unknown as { blockstore: { put(cid: CID, bytes: Uint8Array): Promise<CID> } }).blockstore;
+        const origPut = bs.put.bind(bs);
+        let stall: Promise<void> | undefined;
+        let unstall!: () => void;
+        let stalledPuts = 0;
+        bs.put = async (cid, bytes) => {
+            if (stall !== undefined) {
+                stalledPuts += 1;
+                await stall;
+            }
+            return origPut(cid, bytes);
+        };
+        // Hold gate reads on demand: a second wallet's bundle then stays pending, so the second
+        // timer's write skips at once instead of encoding.
+        let holdGate: Promise<void> | undefined;
+        let releaseGate!: () => void;
+        const client = {
+            getBlockNumber: async () => 43200n,
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async () => {
+                if (holdGate !== undefined) await holdGate;
+                return 1n;
+            }
+        };
+        vi.useFakeTimers();
+        let voter: PubsubVoter;
+        try {
+            voter = new PubsubVoter({ dataPath, helia, chains: () => client as unknown as ChainClient });
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: realSigner() })).publish();
+            const contest = await voter.createContest({ criteria: bizCriteria() });
+            await vi.waitFor(async () => expect((await contest.getTally()).ranking[0]?.chainVerified).toBe(true));
+            stall = new Promise((resolve) => (unstall = resolve));
+            await vi.advanceTimersByTimeAsync(10_000); // SNAPSHOT_DEBOUNCE_MS: the first write starts
+            expect(stalledPuts).toBeGreaterThan(0); // ...and is parked in the encode
+            stall = undefined;
+            // A state change while it is parked arms the next timer; its write skips (pending check).
+            holdGate = new Promise((resolve) => (releaseGate = resolve));
+            const second = realSigner(SECOND_TEST_PRIVATE_KEY);
+            await (await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: second })).publish();
+            await vi.advanceTimersByTimeAsync(10_000);
+        } finally {
+            vi.useRealTimers();
+        }
+
+        let destroyed = false;
+        const destroying = voter.destroy().then(() => (destroyed = true));
+        await Promise.race([destroying, new Promise((resolve) => setTimeout(resolve, 100))]);
+        const destroyedWhileWriting = destroyed;
+        unstall();
+        await destroying;
+        await new Promise((resolve) => setTimeout(resolve, 0)); // an orphaned write resumes here
+        releaseGate();
+
+        const { makeStorage } = await import("../storage/node.js");
+        const reader = makeStorage({ dataPath });
+        const persisted = await reader.openSnapshots().get(topic);
+        await reader.destroy();
+        expect(persisted).toBeDefined(); // the first write's verified vote reached checkpoints.db
+        expect(destroyedWhileWriting).toBe(false); // destroy() waited for the first write too
+    });
+
     /**
      * A chain client whose head read fails on demand — the production shape of issue #45's
      * incident: a seeder boots, restores ~64 topics at once, and one rate-limit window makes the
