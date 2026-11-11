@@ -336,6 +336,28 @@ describe("a failed broadcast takes the vote back out of the local state", () => 
         await voter.destroy();
     });
 
+    it("a vote whose check settles while its broadcast is in flight is served only once the broadcast went out", async () => {
+        let send!: () => void;
+        const node = recordingHelia(
+            () => new Promise((resolve) => (send = () => resolve({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] })))
+        );
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const rootRecord = () => (contest as unknown as { rootRecord(): Promise<{ count: number }> }).rootRecord();
+        const ballot = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const publishing = ballot.publish();
+        await vi.waitFor(() => expect(node.broadcasts).toHaveLength(1));
+        const cid = await bundleCidForBytes(encodeBundle(ballot.bundle!));
+        await vi.waitFor(() => expect(contest.checksFor(cid)?.chainVerified).toBe(true));
+
+        // Verified, but a failing broadcast would still take it back: a peer must not fetch it yet.
+        expect((await rootRecord()).count).toBe(0);
+        send();
+        await publishing;
+        expect((await rootRecord()).count).toBe(1);
+        await voter.destroy();
+    });
+
     it("keeps an identical vote that an earlier publish already put on the wire", async () => {
         let publishes = 0;
         const node = recordingHelia(async () => {

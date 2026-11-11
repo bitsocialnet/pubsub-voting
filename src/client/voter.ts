@@ -1395,8 +1395,9 @@ class ContestEngine {
      * publishes in flight with those bytes, each identified by the encoded bytes its signVote
      * call returned. If every one of their broadcasts fails, the last {@link retractUnsent} takes
      * the bundle back out: nothing reached the wire, so it must be neither counted here nor
-     * served to peers. Any broadcast that goes out drops the entry, so no failure can retract
-     * bytes that are on the wire. A bundle that was ALREADY admitted when signed, with no publish
+     * served to peers, and until one goes out {@link rootRecord} leaves it out of the checkpoint
+     * even once its checks settled. Any broadcast that goes out drops the entry, so no failure can
+     * retract bytes that are on the wire. A bundle that was ALREADY admitted when signed, with no publish
      * of it in flight (an earlier publish of the byte-identical ballot reached the wire, or a
      * peer served it back), never enters: it is not a failed publish's to retract.
      */
@@ -2237,7 +2238,9 @@ class ContestEngine {
             );
         }
         const sent = await transport.publishBundle(encoded);
-        this.#unsent.delete(cid.toString()); // these bytes are on the wire: no failure may retract them
+        // These bytes are on the wire: no failure may retract them, and the checkpoint, which left
+        // them out while unsent, may serve them now if their checks already settled.
+        if (this.#unsent.delete(cid.toString()) && this.#isFullyVerified(cid)) this.#markStateChanged();
         return sent;
     }
 
@@ -2491,14 +2494,18 @@ class ContestEngine {
         if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
         // Serve only fully verified bundles: a provisional admit must not propagate through our
         // checkpoint, and the eligibility-filtered LWW reduction falls back to a wallet's newest
-        // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts).
+        // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts). Nor an own
+        // publish whose broadcast has not gone out (see #unsent): its check can settle first, and a
+        // peer that fetched it then would keep a vote a failed broadcast takes back here.
         //
         // Consume the dirty flag HERE, in the same synchronous window as the winner snapshot —
         // not after the encode. The encode below awaits, and a state change landing mid-encode
         // (e.g. a background settlement) re-dirties the flag; clearing it after the awaits would
         // silently clobber that invalidation and pin this record until the next state change.
         this.#checkpointDirty = false;
-        const winners = this.#crdt.currentEntries(bucket, (cid) => this.#isFullyVerified(cid)).map((e) => e.bundle);
+        const winners = this.#crdt
+            .currentEntries(bucket, (cid) => this.#isFullyVerified(cid) && !this.#unsent.has(cid.toString()))
+            .map((e) => e.bundle);
         const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
         const record: FetchRootRecord = {
