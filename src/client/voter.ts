@@ -387,7 +387,9 @@ export interface ContestVote {
      * failure: `InvalidCommunityNameError` when a vote's carried `community.name` definitively does
      * not resolve to its claimed `publicKey` (checked BEFORE signing or joining — every verifier
      * drops such a bundle silently, so it is refused here instead of published into a network-wide
-     * silent drop; a resolver outage does not block the publish). This library does not re-publish: to keep the vote alive, call `publish()`
+     * silent drop; a resolver outage does not block the publish). A failure after signing (the
+     * broadcast threw, or a `stop()`/`destroy()` left the topic while the wallet was signing) also
+     * takes the vote back out of the local tally: nothing reached the network. This library does not re-publish: to keep the vote alive, call `publish()`
      * again before it expires.
      */
     publish(): Promise<PublishOutcome>;
@@ -697,6 +699,14 @@ const RESTORE_RETRY_CAP_MS = 600_000;
  * again must not keep a stale snapshot forever because ONE write failed (issue #45).
  */
 const SNAPSHOT_WRITE_ATTEMPTS = 3;
+/**
+ * Retry delay after a failed tally recompute (a head or tie-break block read that threw), doubling
+ * per consecutive failure up to {@link TALLY_RETRY_CAP_MS} — the background verifier's backoff. The
+ * recompute is otherwise only re-run by the next state change, which a quiet topic may not see for
+ * hours, so without a retry one RPC error left `Contest.tally` stale that long.
+ */
+const TALLY_RETRY_MS = 2_000;
+const TALLY_RETRY_CAP_MS = 60_000;
 /** Per-root chase deadline (ms): a multi-block directed-bitswap pull, coarser than one message. */
 const CHASE_TIMEOUT_MS = 30_000;
 /** Concurrent root chases; a spray of divergent roots queues, never floods. */
@@ -1136,6 +1146,21 @@ class ContestEngine {
     /** True between `join()` and `leave()`; makes both idempotent so views and ballots compose. */
     #joined = false;
     /**
+     * The tail of the join/leave queue: each transition starts only once the previous one settled.
+     * Both bodies read {@link #joined} at entry and change shared state across awaits, so two of
+     * them interleaving produced states no call order can: a leave resuming after a re-join wiped
+     * the new transport (joined, nothing to publish through), or a join finding `#joined` still
+     * true mid-leave returned early and the leave then unsubscribed the view that just joined.
+     */
+    #transition: Promise<void> = Promise.resolve();
+    /**
+     * True while a leave runs. It keeps {@link #transport} (and `#joined`) until its snapshot flush
+     * and the unsubscribe are done, so {@link broadcastBundle} reads this to refuse a vote whose
+     * wallet answered after a `stop()`/`destroy()` had already begun taking the topic down, and
+     * {@link #scheduleSnapshotWrite} to arm no write that would fire after the leave.
+     */
+    #leaving = false;
+    /**
      * True once the owning voter was `destroy()`ed. Terminal: {@link join} then throws, so no view
      * or publication over this engine can go live again (see DESIGN.md / `VoterDestroyedError`).
      */
@@ -1149,6 +1174,21 @@ class ContestEngine {
     /** Coalescing flags for the background tally recompute (one recompute per gossip burst). */
     #tallyDirty = true;
     #tallyRefreshing = false;
+    /**
+     * Start order of tally computes, and the newest one whose result is in {@link #cachedTally}.
+     * `update()`'s initial compute runs beside the refresh loop, so two can be in flight: the one
+     * that started first may finish last with an older winner set, and must not overwrite the newer.
+     */
+    #tallyStarted = 0;
+    #tallyApplied = 0;
+    /** Start order of the newest compute that failed: only a success started after it settles the retry. */
+    #tallyFailed = 0;
+    /**
+     * The armed retry after a failed recompute; cleared by `leave()` and by a successful compute that
+     * started after every failed one (an older compute finishing late predates the failure's state).
+     */
+    #tallyRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    #tallyRetryAttempts = 0;
 
     /**
      * Last-known current bucket on the gating chain, refreshed by {@link #refreshBucket} on
@@ -1220,12 +1260,14 @@ class ContestEngine {
         this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
         const store = makeBlockstoreBundleStore(deps.blockstore);
         // The CRDT keeps a superseded bundle alive while its superseder's deferred checks are
-        // pending — the fallback winner if the background verifier evicts the newer bundle.
+        // pending — the fallback winner if the background verifier evicts the newer bundle — and
+        // while its superseder is an own publish not yet broadcast, which a failed broadcast
+        // retracts (see #unsent): the superseded vote went out earlier and is the wallet's again.
         this.#crdt = makeVoteCrdt({
             store,
             bucketMath: this.#bucketMath,
             voteExpiryBuckets: criteria.voteExpiryBuckets,
-            isProvisional: (cid) => this.#isPending(cid)
+            isProvisional: (cid) => this.#isPending(cid) || this.#unsent.has(cid.toString())
         });
 
         // One memo per gate leaf (rules/cache.ts), each shared between the inline forward-gate
@@ -1348,6 +1390,18 @@ class ContestEngine {
      * Dropped on eviction and on expiry prune.
      */
     readonly #ownCids = new Set<string>();
+    /**
+     * Own bundles {@link signVote} newly admitted whose broadcast has not gone out yet, CID → the
+     * publishes in flight with those bytes, each identified by the encoded bytes its signVote
+     * call returned. If every one of their broadcasts fails, the last {@link retractUnsent} takes
+     * the bundle back out: nothing reached the wire, so it must be neither counted here nor
+     * served to peers, and until one goes out {@link rootRecord} leaves it out of the checkpoint
+     * even once its checks settled. Any broadcast that goes out drops the entry, so no failure can
+     * retract bytes that are on the wire. A bundle that was ALREADY admitted when signed, with no publish
+     * of it in flight (an earlier publish of the byte-identical ballot reached the wire, or a
+     * peer served it back), never enters: it is not a failed publish's to retract.
+     */
+    readonly #unsent = new Map<string, Set<Uint8Array>>();
     /**
      * Roots we decoded → which of OUR CIDs that checkpoint contained. Kept so a peer that
      * advertises an ALREADY-decoded root is attributed without re-chasing it (the common case:
@@ -1653,18 +1707,49 @@ class ContestEngine {
         return this.#tally.compute();
     }
 
-    /** Compute the tally once, cache it, and emit `update`; on failure emit `error` instead. */
+    /**
+     * Compute the tally once, cache it, and emit `update`; on failure emit `error` instead and arm
+     * a retry (see {@link TALLY_RETRY_MS}). A compute that a later-started one already overtook is
+     * dropped, result or failure, rather than applied or reported (see {@link #tallyStarted}).
+     */
     async #computeAndEmit(): Promise<void> {
         this.#tallyDirty = false;
+        const started = ++this.#tallyStarted;
         let tally: ContestTally;
         try {
             tally = await this.computeTally();
         } catch (error) {
+            // A newer compute is already applied and read everything this one would have: its
+            // failure is stale, so it neither warns the view nor arms a redundant retry.
+            if (started < this.#tallyApplied) return;
+            this.#tallyFailed = Math.max(this.#tallyFailed, started);
             this.#emitError(error);
+            this.#armTallyRetry();
             return;
+        }
+        if (started < this.#tallyApplied) return;
+        this.#tallyApplied = started;
+        if (started > this.#tallyFailed) {
+            if (this.#tallyRetryTimer !== undefined) clearTimeout(this.#tallyRetryTimer);
+            this.#tallyRetryTimer = undefined;
+            this.#tallyRetryAttempts = 0;
         }
         this.#cachedTally = tally;
         for (const cb of [...this.#updateListeners]) cb();
+    }
+
+    /** Re-run the recompute after a failure, backing off; one timer at a time. */
+    #armTallyRetry(): void {
+        if (this.#tallyRetryTimer !== undefined) return;
+        const delay = Math.min(TALLY_RETRY_MS * 2 ** this.#tallyRetryAttempts, TALLY_RETRY_CAP_MS);
+        this.#tallyRetryAttempts += 1;
+        const timer = setTimeout(() => {
+            this.#tallyRetryTimer = undefined;
+            this.#kickTallyRefresh(); // a no-op once no view is subscribed
+        }, delay);
+        // Don't hold a Node process open; no-op in the browser.
+        (timer as { unref?: () => void }).unref?.();
+        this.#tallyRetryTimer = timer;
     }
 
     /** Force one recompute + emit now (used by a view's `update()` for the initial tally). */
@@ -1706,7 +1791,29 @@ class ContestEngine {
         this.#destroyed = true;
     }
 
-    async join(): Promise<void> {
+    /** Run one join/leave after every transition queued before it (see {@link #transition}). */
+    #serialize(step: () => Promise<void>): Promise<void> {
+        const run = this.#transition.then(step);
+        this.#transition = run.catch(() => {}); // a failed join must not wedge the next transition
+        return run;
+    }
+
+    join(): Promise<void> {
+        return this.#serialize(() => this.#join());
+    }
+
+    leave(): Promise<void> {
+        return this.#serialize(async () => {
+            this.#leaving = true;
+            try {
+                await this.#leave();
+            } finally {
+                this.#leaving = false;
+            }
+        });
+    }
+
+    async #join(): Promise<void> {
         if (this.#destroyed) throw new VoterDestroyedError();
         if (this.#joined) return;
         // A host may have collected this stopped contest's old checkpoint blocks.
@@ -2004,7 +2111,7 @@ class ContestEngine {
         }
     }
 
-    async leave(): Promise<void> {
+    async #leave(): Promise<void> {
         if (this.#heartbeatTimer !== undefined) clearTimeout(this.#heartbeatTimer);
         this.#heartbeatTimer = undefined;
         // Flush the debounced snapshot write so a clean shutdown persists the latest state
@@ -2023,6 +2130,9 @@ class ContestEngine {
         this.#restoreBacklog = [];
         this.#restoreAttempts = 0;
         this.#snapshotWriteFailures = 0;
+        if (this.#tallyRetryTimer !== undefined) clearTimeout(this.#tallyRetryTimer);
+        this.#tallyRetryTimer = undefined;
+        this.#tallyRetryAttempts = 0;
         // Pause the background verifier's retry timer; pending state survives for a re-join.
         this.#background.stop();
         this.#disarmSubscriptionRepull();
@@ -2088,6 +2198,12 @@ class ContestEngine {
         const bundle = VotesBundleSchema.parse({ address, votes, blockNumber, signature });
 
         const cid = await this.#crdt.add(bundle);
+        const encoded = encodeBundle(bundle);
+        // Read before #recordChecks below: was this exact bundle admitted before this call? If
+        // another publish of these bytes is still in flight, this one shares its rollback.
+        const inFlight = this.#unsent.get(cid.toString());
+        if (inFlight !== undefined) inFlight.add(encoded);
+        else if (!this.#checks.has(cid.toString())) this.#unsent.set(cid.toString(), new Set([encoded]));
         // Own bundles take the same deferred path as a chased checkpoint's: admitted
         // provisionally, then confirmed (or evicted) by the background gate read — so an
         // ineligible wallet's local tally does not silently disagree with the network's, and
@@ -2101,15 +2217,49 @@ class ContestEngine {
         if (opts.onCheckpointedByPeer) this.#ownCheckpointCbs.set(cid.toString(), opts.onCheckpointedByPeer);
         this.#background.enqueue([{ cid, bundle }]);
         this.#onStateChanged();
-        return { bundle, encoded: encodeBundle(bundle), cid };
+        return { bundle, encoded, cid };
     }
 
     /**
      * Broadcast an encoded bundle inline as a live delta (this wallet's own delta, never the set).
-     * Returns how many peers gossipsub sent it directly to (0 if there is no live transport).
+     * Returns how many peers gossipsub sent it directly to. Throws when a `stop()` (or `destroy()`)
+     * landed while the wallet was signing: once the leave finished there is no transport, and
+     * resolving with zero recipients would report a vote that never left this node as published;
+     * while the leave still flushes, the transport is up but the topic is being left, and sending
+     * then would broadcast after teardown began (after `destroy()`, a terminal voter).
      */
-    async broadcastBundle(encoded: Uint8Array): Promise<{ recipientCount: number }> {
-        return (await this.#transport?.publishBundle(encoded)) ?? { recipientCount: 0 };
+    async broadcastBundle(cid: CID, encoded: Uint8Array): Promise<{ recipientCount: number }> {
+        if (this.#destroyed) throw new VoterDestroyedError();
+        const transport = this.#transport;
+        if (transport === undefined || this.#leaving) {
+            throw new Error(
+                "This vote was signed but not broadcast: its contest left the topic (stop()) while the wallet " +
+                    "was signing. Nothing reached the network; publish again to send it."
+            );
+        }
+        const sent = await transport.publishBundle(encoded);
+        // These bytes are on the wire: no failure may retract them, and the checkpoint, which left
+        // them out while unsent, may serve them now if their checks already settled.
+        if (this.#unsent.delete(cid.toString()) && this.#isFullyVerified(cid)) this.#markStateChanged();
+        return sent;
+    }
+
+    /**
+     * Undo {@link signVote}'s local admission of a bundle whose broadcast never went out, if that
+     * admission was this publish's and no other publish of the same bytes is still in flight (see
+     * {@link #unsent}). Without it a `"failed"` publish stayed in the local tally and, once its
+     * deferred check settled, in the checkpoint served to every peer. A withdrawal of our own
+     * unsent vote, not an eviction: no `VoteEvictedError`.
+     */
+    retractUnsent(cid: CID, encoded: Uint8Array): void {
+        const key = cid.toString();
+        const inFlight = this.#unsent.get(key);
+        if (inFlight === undefined || !inFlight.delete(encoded) || inFlight.size > 0) return;
+        this.#unsent.delete(key);
+        this.#crdt.remove(cid);
+        this.#checks.delete(key);
+        this.#forgetOwnBundle(key);
+        this.#onStateChanged();
     }
 
     /** Invalidate the on-demand checkpoint cache: the winner-set changed (publish/merge/chase). */
@@ -2126,10 +2276,12 @@ class ContestEngine {
      * Arm the debounced snapshot write (announcer-style: the first change in a window arms the
      * timer, the rest coalesce into it). Only while joined — a never-joined engine (a ballot
      * created but never published) holds no view worth persisting, and `leave()` flushes the
-     * armed timer so nothing fires after teardown.
+     * armed timer so nothing fires after teardown. Not once a leave has started either: `#joined`
+     * stays true through its flush, and a state change landing there (a wallet answering, then
+     * its refused broadcast's retraction) armed a timer that outlived the leave.
      */
     #scheduleSnapshotWrite(): void {
-        if (!this.#joined || this.#snapshotTimer !== undefined) return;
+        if (!this.#joined || this.#leaving || this.#snapshotTimer !== undefined) return;
         const timer = setTimeout(() => {
             this.#snapshotTimer = undefined;
             void this.#writeSnapshot();
@@ -2342,14 +2494,18 @@ class ContestEngine {
         if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
         // Serve only fully verified bundles: a provisional admit must not propagate through our
         // checkpoint, and the eligibility-filtered LWW reduction falls back to a wallet's newest
-        // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts).
+        // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts). Nor an own
+        // publish whose broadcast has not gone out (see #unsent): its check can settle first, and a
+        // peer that fetched it then would keep a vote a failed broadcast takes back here.
         //
         // Consume the dirty flag HERE, in the same synchronous window as the winner snapshot —
         // not after the encode. The encode below awaits, and a state change landing mid-encode
         // (e.g. a background settlement) re-dirties the flag; clearing it after the awaits would
         // silently clobber that invalidation and pin this record until the next state change.
         this.#checkpointDirty = false;
-        const winners = this.#crdt.currentEntries(bucket, (cid) => this.#isFullyVerified(cid)).map((e) => e.bundle);
+        const winners = this.#crdt
+            .currentEntries(bucket, (cid) => this.#isFullyVerified(cid) && !this.#unsent.has(cid.toString()))
+            .map((e) => e.bundle);
         const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
         const record: FetchRootRecord = {
@@ -2826,6 +2982,9 @@ class ContestVotePublication implements ContestVote {
         // counter ticks — even though its bundle is still live and still verifiable.
         const attempt = ++this.#attempt;
         this.#evicted = false;
+        // Set once signVote admitted the bundle locally, cleared once the broadcast went out: a
+        // failure in between leaves nothing on the wire, so the catch takes the admit back.
+        let unsent: { cid: CID; encoded: Uint8Array } | undefined;
         try {
             // Name preflight, also before joining: a vote whose carried community name
             // definitively fails to resolve to its claimed key would be silently dropped by
@@ -2854,12 +3013,14 @@ class ContestVotePublication implements ContestVote {
                     this.#fail(error);
                 }
             });
+            unsent = { cid, encoded };
             this.#bundle = bundle;
             this.#cid = cid;
             // Only from "signing": a deferred check can settle before this line runs (a cached
             // verdict needs no round trip), and "publishing" would walk that verdict backwards.
             if (this.#state === "signing") this.#setState("publishing");
-            const { recipientCount } = await this.#engine.broadcastBundle(encoded);
+            const { recipientCount } = await this.#engine.broadcastBundle(cid, encoded);
+            unsent = undefined;
             // An eviction that landed mid-broadcast already failed this attempt; the outcome
             // still resolves (the bundle DID hit the wire) but the state stays "failed". A
             // check that SETTLED mid-broadcast is not stomped either: "published" describes
@@ -2867,6 +3028,9 @@ class ContestVotePublication implements ContestVote {
             if (!this.#evicted && this.#state === "publishing") this.#setState("published");
             return { bundle, recipientCount, cid };
         } catch (error) {
+            // Signed and admitted, but never broadcast: a "failed" vote must not stay counted
+            // here or, once verified, be served to peers (see ContestEngine.retractUnsent).
+            if (unsent !== undefined) this.#engine.retractUnsent(unsent.cid, unsent.encoded);
             // Same scoping: two overlapping `publish()` calls are a misuse, but the loser's
             // rejection belongs to ITS caller (it is rethrown), not to the state machine a
             // later attempt now owns.
@@ -3056,6 +3220,9 @@ export class PubsubVoter implements VoteClient {
     /** Build (or return the cached) engine for one already-validated criteria, keyed by topic. */
     async #engineFor(criteria: Criteria): Promise<ContestEngine> {
         const cid = await criteriaCid(criteria);
+        // Again after the await: a destroy() that ran meanwhile marked only the engines that existed
+        // then, so one built now would join, subscribe and serve on a voter whose storage is closed.
+        this.#assertLive();
         const topic = TOPIC_PREFIX + cid.toString();
         const existing = this.#engines.get(topic);
         if (existing) return existing;
@@ -3173,12 +3340,17 @@ export class PubsubVoter implements VoteClient {
 
     async stop(): Promise<void> {
         // Reset each read view (detach its engine listeners, clear `#subscribed`) so it can
-        // `update()` again — this is what keeps `stop()` reusable. Then leave any engine with no
-        // view (created via `createContestVote`); `leave()` is idempotent, so double-leaving a
-        // view's engine is a no-op. Each real leave notifies `#onTopicLeft`, so the responder
-        // unregisters exactly when the last joined topic is left.
-        await Promise.all([...this.#views.values()].map((view) => view.stop()));
-        await Promise.all([...this.#engines.values()].map((engine) => engine.leave()));
+        // `update()` again — this is what keeps `stop()` reusable. Also leave every engine, which
+        // covers those with no view (created via `createContestVote`); `leave()` is idempotent, so
+        // double-leaving a view's engine is a no-op. Each real leave notifies `#onTopicLeft`, so the
+        // responder unregisters exactly when the last joined topic is left. Every leave is queued
+        // before the first await: an `update()` racing this stop then joins after all of them.
+        // Queued in two passes, its join landed between a view's leave and the second leave of the
+        // same engine, which left the topic under a view that stayed subscribed.
+        await Promise.all([
+            ...[...this.#views.values()].map((view) => view.stop()),
+            ...[...this.#engines.values()].map((engine) => engine.leave())
+        ]);
     }
 
     async destroy(): Promise<void> {

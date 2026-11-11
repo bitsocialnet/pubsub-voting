@@ -106,7 +106,7 @@ Construction throws `MissingPubsubError`, `MissingBlockstoreError`, or `MissingF
 ```ts
 const contest = await voter.createContest({ criteria });  // criteria: the contest's full document (strictly validated here)
 contest.on("update", () => render(contest.tally));        // tally rides the object; recomputed before each emit
-contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed, the background verifier's RPC/resolver is down (retrying), a deferred check evicted THIS wallet's own vote (VoteEvictedError), or this node's persisted checkpoint could not be kept (SnapshotError)
+contest.on("error", (err) => showConnectivityWarning(err)); // tally chain read failed (retried on a backoff), the background verifier's RPC/resolver is down (retrying), a deferred check evicted THIS wallet's own vote (VoteEvictedError), or this node's persisted checkpoint could not be kept (SnapshotError)
 await contest.update();                                   // join the topic, cold-start, begin emitting
 // const fresh = await contest.getTally();                // or force a fresh read, bypassing the cache
 // await contest.stop();                                  // leave the topic
@@ -208,7 +208,7 @@ A ballot is required to name its wallet, so a client that holds no key simply ne
 
 A community's identity is its `publicKey`. The optional `name` is the community's resolvable domain (e.g. `memes.bso`) — unique per community, never a free label: the schema requires a TLD, the name is resolved through the injected `nameResolvers` (inline at the forward-gate for live votes, in the background verifier for cold-join admits), and any bundle whose name resolves to a different `publicKey` than claimed is dropped/evicted. Bundles must also name pairwise-distinct `community.publicKey`s. See [DESIGN.md, Votes wire](./DESIGN.md#votes-wire).
 
-`recipientCount` is the peer-reach hint gossipsub reports: how many peers it sent the vote *directly* to at publish time (first-hop fan-out, filtered for send failures) — **not** total network reach, and **not** an acceptance confirmation, since each recipient still runs the forward-gate before re-forwarding. Treat it as a coarse "did this reach anyone?" signal. Note that gossipsub *rejects* the publish with `NoPeersSubscribedToTopic` when it would reach zero peers (common right after joining, before the mesh grafts), unless the host enables `allowPublishToZeroTopicPeers` — so a resolved `recipientCount === 0` only occurs under that host setting; otherwise a no-reach publish surfaces as a thrown error (and a `failed` state).
+`recipientCount` is the peer-reach hint gossipsub reports: how many peers it sent the vote *directly* to at publish time (first-hop fan-out, filtered for send failures) — **not** total network reach, and **not** an acceptance confirmation, since each recipient still runs the forward-gate before re-forwarding. Treat it as a coarse "did this reach anyone?" signal. Note that gossipsub *rejects* the publish with `NoPeersSubscribedToTopic` when it would reach zero peers (common right after joining, before the mesh grafts), unless the host enables `allowPublishToZeroTopicPeers` — so a resolved `recipientCount === 0` only occurs under that host setting; otherwise a no-reach publish surfaces as a thrown error (and a `failed` state). A publish that fails after signing also takes the vote back out of the local tally and checkpoint: nothing reached the network, so this node does not count or serve it either.
 
 #### Rejection feedback
 
@@ -277,7 +277,7 @@ There is no separate seeder API: a node that joins a topic (via `update()` or `p
 
 ### Lifecycle (`stop` / `destroy`)
 
-`stop()` leaves every joined topic but keeps the voter **reusable** — each `Contest` can `update()` again and you can `createContest` afterward. `destroy()` is **terminal** (like pkc-js): it leaves every topic, unregisters the fetch responder, and marks the voter and its contests dead — any later `createContest`/`createContestVote`, or a pre-existing `Contest.update()`/`ContestVote.publish()`, throws `VoterDestroyedError`. Construct a new `PubsubVoter` to participate again. (There is no store to dispose — republishing is the client's concern.)
+`stop()` leaves every joined topic but keeps the voter **reusable** — each `Contest` can `update()` again and you can `createContest` afterward. `destroy()` is **terminal** (like pkc-js): it leaves every topic, unregisters the fetch responder, and marks the voter and its contests dead — any later `createContest`/`createContestVote`, or a pre-existing `Contest.update()`/`ContestVote.publish()`, throws `VoterDestroyedError` — including a `publish()` still waiting on its wallet signature when `destroy()` runs (a `stop()` landing in that window fails the publish too, since the topic it would broadcast on was left). Construct a new `PubsubVoter` to participate again. (There is no store to dispose — republishing is the client's concern.)
 
 ```ts
 const voter = new PubsubVoter({ helia, chains });

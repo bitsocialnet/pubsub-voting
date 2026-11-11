@@ -284,6 +284,28 @@ describe("makeRootChaser", () => {
         expect(h.admitted).toHaveLength(0);
     });
 
+    it("still defers the checks of what it admitted when a later bundle's step throws", async () => {
+        // Bundle 1 is admitted provisionally; bundle 2's admit hits a storage failure. Bundle 1's
+        // deferred checks must still be queued, or it stays pending with no verifier item: never
+        // served, never re-chased (it reads as admitted), and blocking every snapshot write.
+        const { root, getBlock } = await checkpointOf([bundle("0x1"), bundle("0x2")]);
+        const admitted: CID[] = [];
+        const h = harness({
+            getBlock,
+            admit: async ({ cid }) => {
+                if (admitted.length === 1) throw new Error("blockstore put failed");
+                admitted.push(cid);
+            }
+        });
+        h.chaser.chase(root);
+        await h.settle();
+        expect(admitted).toHaveLength(1);
+        expect(h.deferred).toHaveLength(1);
+        expect(h.deferred[0]?.map((entry) => entry.cid.toString())).toEqual([admitted[0]!.toString()]);
+        expect(h.merged()).toBe(1);
+        expect(h.chaser.inFlight()).toBe(0);
+    });
+
     it("yields nothing (and does not throw) when the root's blocks are unavailable", async () => {
         const { root } = await checkpointOf([bundle("0x1")]);
         const h = harness({ getBlock: async () => undefined });
