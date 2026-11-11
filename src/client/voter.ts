@@ -1389,14 +1389,15 @@ class ContestEngine {
     readonly #ownCids = new Set<string>();
     /**
      * Own bundles {@link signVote} newly admitted whose broadcast has not gone out yet, CID → the
-     * encoded bytes that signVote call returned (the identity of that one publish). If its
-     * broadcast fails, {@link retractUnsent} takes the bundle back out: nothing reached the wire,
-     * so it must be neither counted here nor served to peers. A bundle that was ALREADY admitted
-     * when signed (an earlier publish of the byte-identical ballot reached the wire, or a peer
-     * served it back) never enters, and re-signing those bytes while one publish is in flight
-     * removes the entry: neither is a failed publish's to retract.
+     * publishes in flight with those bytes, each identified by the encoded bytes its signVote
+     * call returned. If every one of their broadcasts fails, the last {@link retractUnsent} takes
+     * the bundle back out: nothing reached the wire, so it must be neither counted here nor
+     * served to peers. Any broadcast that goes out drops the entry, so no failure can retract
+     * bytes that are on the wire. A bundle that was ALREADY admitted when signed, with no publish
+     * of it in flight (an earlier publish of the byte-identical ballot reached the wire, or a
+     * peer served it back), never enters: it is not a failed publish's to retract.
      */
-    readonly #unsent = new Map<string, Uint8Array>();
+    readonly #unsent = new Map<string, Set<Uint8Array>>();
     /**
      * Roots we decoded → which of OUR CIDs that checkpoint contained. Kept so a peer that
      * advertises an ALREADY-decoded root is attributed without re-chasing it (the common case:
@@ -2191,9 +2192,11 @@ class ContestEngine {
 
         const cid = await this.#crdt.add(bundle);
         const encoded = encodeBundle(bundle);
-        // Read before #recordChecks below: was this exact bundle admitted before this call?
-        if (this.#checks.has(cid.toString())) this.#unsent.delete(cid.toString());
-        else this.#unsent.set(cid.toString(), encoded);
+        // Read before #recordChecks below: was this exact bundle admitted before this call? If
+        // another publish of these bytes is still in flight, this one shares its rollback.
+        const inFlight = this.#unsent.get(cid.toString());
+        if (inFlight !== undefined) inFlight.add(encoded);
+        else if (!this.#checks.has(cid.toString())) this.#unsent.set(cid.toString(), new Set([encoded]));
         // Own bundles take the same deferred path as a chased checkpoint's: admitted
         // provisionally, then confirmed (or evicted) by the background gate read — so an
         // ineligible wallet's local tally does not silently disagree with the network's, and
@@ -2228,19 +2231,21 @@ class ContestEngine {
             );
         }
         const sent = await transport.publishBundle(encoded);
-        if (this.#unsent.get(cid.toString()) === encoded) this.#unsent.delete(cid.toString());
+        this.#unsent.delete(cid.toString()); // these bytes are on the wire: no failure may retract them
         return sent;
     }
 
     /**
      * Undo {@link signVote}'s local admission of a bundle whose broadcast never went out, if that
-     * admission was this publish's (see {@link #unsent}). Without it a `"failed"` publish stayed in
-     * the local tally and, once its deferred check settled, in the checkpoint served to every peer.
-     * A withdrawal of our own unsent vote, not an eviction: no `VoteEvictedError`.
+     * admission was this publish's and no other publish of the same bytes is still in flight (see
+     * {@link #unsent}). Without it a `"failed"` publish stayed in the local tally and, once its
+     * deferred check settled, in the checkpoint served to every peer. A withdrawal of our own
+     * unsent vote, not an eviction: no `VoteEvictedError`.
      */
     retractUnsent(cid: CID, encoded: Uint8Array): void {
         const key = cid.toString();
-        if (this.#unsent.get(key) !== encoded) return;
+        const inFlight = this.#unsent.get(key);
+        if (inFlight === undefined || !inFlight.delete(encoded) || inFlight.size > 0) return;
         this.#unsent.delete(key);
         this.#crdt.remove(cid);
         this.#checks.delete(key);

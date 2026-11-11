@@ -318,6 +318,51 @@ describe("a failed broadcast takes the vote back out of the local state", () => 
         await voter.destroy();
     });
 
+    /**
+     * Two ballots of the same wallet and votes in one bucket sign byte-identical bundles. Both
+     * broadcasts are parked until `settle` decides each one's fate, so both are in flight at once.
+     */
+    async function duplicateInFlight(outcomes: ["send" | "fail", "send" | "fail"]) {
+        const parked: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+        const node = recordingHelia(
+            () =>
+                new Promise((resolve, reject) =>
+                    parked.push({ resolve: () => resolve({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] }), reject })
+                )
+        );
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const first = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const second = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const settled = Promise.allSettled([first.publish(), second.publish()]);
+        await vi.waitFor(() => expect(parked).toHaveLength(2));
+        outcomes.forEach((outcome, i) => (outcome === "send" ? parked[i]!.resolve() : parked[i]!.reject(new Error("NoPeersSubscribedToTopic"))));
+        const results = await settled;
+        expect(first.bundle).toEqual(second.bundle);
+        const cid = await bundleCidForBytes(encodeBundle(first.bundle!));
+        return { voter, contest, cid, results };
+    }
+
+    it("two in-flight publishes of the same bytes take the vote back when both broadcasts fail", async () => {
+        const { voter, contest, cid, results } = await duplicateInFlight(["fail", "fail"]);
+        expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+        expect(contest.checksFor(cid)).toBeUndefined();
+        expect((await contest.getTally()).ranking).toEqual([]);
+        await voter.destroy();
+    });
+
+    it("two in-flight publishes of the same bytes keep the vote when either broadcast went out", async () => {
+        for (const outcomes of [
+            ["send", "fail"],
+            ["fail", "send"]
+        ] as const) {
+            const { voter, contest, cid } = await duplicateInFlight([...outcomes]);
+            expect(contest.checksFor(cid)).toBeDefined();
+            expect((await contest.getTally()).ranking).toHaveLength(1);
+            await voter.destroy();
+        }
+    });
+
     it("a destroy() while the wallet is signing does not keep the unsent vote either", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: stubChains() });
         const prompt = promptSigner();
