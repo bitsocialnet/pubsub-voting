@@ -1154,6 +1154,12 @@ class ContestEngine {
      */
     #transition: Promise<void> = Promise.resolve();
     /**
+     * True while a leave runs. It keeps {@link #transport} (and `#joined`) until its snapshot flush
+     * and the unsubscribe are done, so {@link broadcastBundle} reads this to refuse a vote whose
+     * wallet answered after a `stop()`/`destroy()` had already begun taking the topic down.
+     */
+    #leaving = false;
+    /**
      * True once the owning voter was `destroy()`ed. Terminal: {@link join} then throws, so no view
      * or publication over this engine can go live again (see DESIGN.md / `VoterDestroyedError`).
      */
@@ -1789,7 +1795,14 @@ class ContestEngine {
     }
 
     leave(): Promise<void> {
-        return this.#serialize(() => this.#leave());
+        return this.#serialize(async () => {
+            this.#leaving = true;
+            try {
+                await this.#leave();
+            } finally {
+                this.#leaving = false;
+            }
+        });
     }
 
     async #join(): Promise<void> {
@@ -2199,14 +2212,16 @@ class ContestEngine {
 
     /**
      * Broadcast an encoded bundle inline as a live delta (this wallet's own delta, never the set).
-     * Returns how many peers gossipsub sent it directly to. Throws when there is no live transport:
-     * a `stop()` (or `destroy()`) landed while the wallet was signing, and resolving with zero
-     * recipients would report a vote that never left this node as published.
+     * Returns how many peers gossipsub sent it directly to. Throws when a `stop()` (or `destroy()`)
+     * landed while the wallet was signing: once the leave finished there is no transport, and
+     * resolving with zero recipients would report a vote that never left this node as published;
+     * while the leave still flushes, the transport is up but the topic is being left, and sending
+     * then would broadcast after teardown began (after `destroy()`, a terminal voter).
      */
     async broadcastBundle(cid: CID, encoded: Uint8Array): Promise<{ recipientCount: number }> {
+        if (this.#destroyed) throw new VoterDestroyedError();
         const transport = this.#transport;
-        if (transport === undefined) {
-            if (this.#destroyed) throw new VoterDestroyedError();
+        if (transport === undefined || this.#leaving) {
             throw new Error(
                 "This vote was signed but not broadcast: its contest left the topic (stop()) while the wallet " +
                     "was signing. Nothing reached the network; publish again to send it."

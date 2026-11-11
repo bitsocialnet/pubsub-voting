@@ -27,7 +27,8 @@ const WALLET_C = "0x00000000000000000000000000000000000000cc";
 /**
  * A host node that records what the voter did to it: the bundles it broadcast, which topics
  * carry an installed forward-gate (the transport's live subscription), and whether the
- * root-record responder is registered. `publish` may be overridden to make broadcasts fail.
+ * root-record responder is registered. `publish` may be overridden to make broadcasts fail, and
+ * `parkNextPut` parks the next blockstore write (e.g. a leave's snapshot flush) until released.
  */
 function recordingHelia(publishImpl?: () => Promise<{ recipients?: readonly PeerId[] }>) {
     const broadcasts: string[] = [];
@@ -54,9 +55,29 @@ function recordingHelia(publishImpl?: () => Promise<{ recipients?: readonly Peer
             registered = false;
         }
     };
-    const blockstore = { get: async () => new Uint8Array(), put: async (cid: unknown) => cid, has: async () => false };
+    let parkPut: Promise<void> | undefined;
+    let putParked = false;
+    const blockstore = {
+        get: async () => new Uint8Array(),
+        put: async (cid: unknown) => {
+            const parked = parkPut;
+            parkPut = undefined; // only the next write parks
+            if (parked !== undefined) {
+                putParked = true;
+                await parked;
+            }
+            return cid;
+        },
+        has: async () => false
+    };
     const helia = { libp2p: { services: { pubsub, fetch } }, blockstore } as unknown as HeliaInstance;
-    return { helia, broadcasts, topicValidators, responderRegistered: () => registered };
+    const parkNextPut = (): { parked: () => boolean; release: () => void } => {
+        let release!: () => void;
+        parkPut = new Promise<void>((resolve) => (release = resolve));
+        putParked = false;
+        return { parked: () => putParked, release };
+    };
+    return { helia, broadcasts, topicValidators, responderRegistered: () => registered, parkNextPut };
 }
 
 /** A signer that parks inside `signBallot` (a wallet prompt left open) until `release()`. */
@@ -204,6 +225,53 @@ describe("a publish never reports a broadcast that did not happen", () => {
         expect(ballot.publishingState).toBe("failed");
         expect(node.broadcasts).toEqual([]);
         await voter.destroy();
+    });
+
+    /**
+     * The leave keeps its transport until the snapshot flush and the unsubscribe are done, so a
+     * wallet answering while a stop() or destroy() is still flushing found a live transport and
+     * broadcast after teardown had begun. Parks that flush on the blockstore write it makes.
+     */
+    async function answerDuringLeaveFlush(leave: (voter: PubsubVoter) => Promise<void>) {
+        const node = recordingHelia();
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update();
+        // A settled vote arms the debounced snapshot write, so the leave flushes it first.
+        const first = await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner(WALLET_B) })).publish();
+        await vi.waitFor(() => expect(contest.checksFor(first.cid)?.chainVerified).toBe(true));
+        const prompt = promptSigner();
+        const ballot = await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: prompt.signer });
+        const publishing = ballot.publish();
+        await vi.waitFor(() => expect(prompt.prompting()).toBe(true));
+
+        const flush = node.parkNextPut();
+        const leaving = leave(voter);
+        await vi.waitFor(() => expect(flush.parked()).toBe(true));
+        prompt.release();
+        const outcome = await publishing.then(
+            () => undefined,
+            (error: unknown) => error
+        );
+        const broadcasts = [...node.broadcasts];
+        flush.release();
+        await leaving;
+        await voter.destroy();
+        return { outcome, broadcasts, topic: contest.topic, state: ballot.publishingState };
+    }
+
+    it("destroy() still flushing its snapshot when the wallet answers rejects the publish unsent", async () => {
+        const { outcome, broadcasts, topic, state } = await answerDuringLeaveFlush((voter) => voter.destroy());
+        expect(outcome).toBeInstanceOf(VoterDestroyedError);
+        expect(state).toBe("failed");
+        expect(broadcasts).toEqual([topic]); // the first vote's only
+    });
+
+    it("stop() still flushing its snapshot when the wallet answers fails the publish unsent", async () => {
+        const { outcome, broadcasts, topic, state } = await answerDuringLeaveFlush((voter) => voter.stop());
+        expect(String(outcome)).toMatch(/not broadcast/);
+        expect(state).toBe("failed");
+        expect(broadcasts).toEqual([topic]);
     });
 });
 
