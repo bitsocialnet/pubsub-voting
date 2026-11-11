@@ -1259,12 +1259,14 @@ class ContestEngine {
         this.#bucketMath = makeBucketMath(criteria.blocksPerBucket);
         const store = makeBlockstoreBundleStore(deps.blockstore);
         // The CRDT keeps a superseded bundle alive while its superseder's deferred checks are
-        // pending — the fallback winner if the background verifier evicts the newer bundle.
+        // pending — the fallback winner if the background verifier evicts the newer bundle — and
+        // while its superseder is an own publish not yet broadcast, which a failed broadcast
+        // retracts (see #unsent): the superseded vote went out earlier and is the wallet's again.
         this.#crdt = makeVoteCrdt({
             store,
             bucketMath: this.#bucketMath,
             voteExpiryBuckets: criteria.voteExpiryBuckets,
-            isProvisional: (cid) => this.#isPending(cid)
+            isProvisional: (cid) => this.#isPending(cid) || this.#unsent.has(cid.toString())
         });
 
         // One memo per gate leaf (rules/cache.ts), each shared between the inline forward-gate

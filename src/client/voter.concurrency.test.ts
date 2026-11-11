@@ -363,6 +363,45 @@ describe("a failed broadcast takes the vote back out of the local state", () => 
         }
     });
 
+    it("a failed re-vote leaves the wallet's earlier vote in place, even once the re-vote had settled", async () => {
+        let head = 43200n;
+        const client = {
+            getBlockNumber: async () => head,
+            getBlock: async () => ({ hash: `0x${"11".repeat(32)}` }),
+            readContract: async ({ functionName }: { functionName?: string } = {}) => (functionName === "supportsInterface" ? true : 1n)
+        };
+        let fail!: () => void;
+        const parked = new Promise<never>((_, reject) => (fail = () => reject(new Error("NoPeersSubscribedToTopic"))));
+        parked.catch(() => {});
+        let publishes = 0;
+        const node = recordingHelia(async () => {
+            publishes += 1;
+            if (publishes > 1) return parked;
+            return { recipients: [{ toString: () => "recipient1" } as unknown as PeerId] };
+        });
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: () => client as unknown as ChainClient });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        await contest.update(); // subscribed: each state change recomputes the tally, which prunes
+        const earlier = await (await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() })).publish();
+        await vi.waitFor(() => expect(contest.checksFor(earlier.cid)?.chainVerified).toBe(true));
+
+        // A bucket later the same wallet re-votes. Its broadcast hangs while its own deferred check
+        // settles and a recompute prunes the bundle it supersedes.
+        head += 43200n;
+        const revote = await voter.createContestVote({ criteria: bizCriteria(), votes: OTHER_VOTE, signer: fakeSigner() });
+        const publishing = revote.publish();
+        await vi.waitFor(() =>
+            expect(contest.tally?.ranking.map((row) => [row.community.publicKey, row.chainVerified])).toEqual([[OTHER_KEY, true]])
+        );
+
+        fail();
+        await expect(publishing).rejects.toThrow("NoPeersSubscribedToTopic");
+        // The re-vote never left; the earlier vote did, and is this wallet's vote again.
+        expect(contest.checksFor(earlier.cid)?.chainVerified).toBe(true);
+        expect((await contest.getTally()).ranking.map((row) => row.community.publicKey)).toEqual([VALID_KEY]);
+        await voter.destroy();
+    });
+
     it("a destroy() while the wallet is signing does not keep the unsent vote either", async () => {
         const voter = new PubsubVoter({ dataPath: false, helia: recordingHelia().helia, chains: stubChains() });
         const prompt = promptSigner();
