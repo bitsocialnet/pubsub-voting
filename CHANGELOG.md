@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.13](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.12...v0.7.13) (2026-11-18)
+
+### Bug Fixes
+
+* **chain:** retry a coalesced chunk whose aggregate3 round trip failed [skip github-alerts] ([214cfa5](https://github.com/bitsocialnet/pubsub-voting/commit/214cfa599649fb5d26e22a3d9406b82f82b04705))
+* **rules:** expire the v1 gate's head memo inside the grace window on any chain [skip github-alerts] ([e9efc2b](https://github.com/bitsocialnet/pubsub-voting/commit/e9efc2bd0f24f903f6be1209510115100b8d5676))
+* **rules:** read only the probe's own revert as "does not declare ERC-5192" [skip github-alerts] ([44c8ba4](https://github.com/bitsocialnet/pubsub-voting/commit/44c8ba43b4f5d8d064b9a647aea9a47469521846))
+* **verify:** keep the background round going when a host callback throws [skip github-alerts] ([91fa05c](https://github.com/bitsocialnet/pubsub-voting/commit/91fa05cdc20b3c48d5c9aa6f2147599420f055f9))
+* **verify:** report a gate pass again when an in-flight bundle is re-enqueued [skip github-alerts] ([12accc8](https://github.com/bitsocialnet/pubsub-voting/commit/12accc84447e05333c46d9566416c7051907696c))
+* **verify:** stop one always-failing gate read from holding back the round [skip github-alerts] ([ece86be](https://github.com/bitsocialnet/pubsub-voting/commit/ece86be5b6f4f7895fcc4174f384ac0142ba2501))
+
 ## [0.7.12](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.11...v0.7.12) (2026-11-10)
 
 ### Dependencies
