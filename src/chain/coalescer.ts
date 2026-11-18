@@ -1,4 +1,4 @@
-import { encodeFunctionData, type Abi } from "viem";
+import { ContractFunctionExecutionError, encodeFunctionData, type Abi } from "viem";
 import type { ChainClient, ChainClientFactory } from "./types.js";
 
 /**
@@ -123,9 +123,25 @@ export function coalescingChainClient(client: ChainClient, options: CoalescerOpt
                     batchSize: 0,
                     blockNumber
                 }) as Promise<Array<{ status: "success" | "failure"; result?: unknown; error?: unknown }>>;
+            // viem does not throw when the `aggregate3` round trip itself fails (rate limit,
+            // timeout, gateway error): under `allowFailure` it reports that one error against
+            // every read, as a failure of `aggregate3`. That is a failed chunk, not N failed
+            // reads, so it takes the retry too. A read that reverted inside a call that went
+            // through is that read's answer, and is not retried.
+            const attempt = async (): Promise<Awaited<ReturnType<typeof call>>> => {
+                const outcomes = await call();
+                const failed = outcomes.find(
+                    (outcome) =>
+                        outcome?.status === "failure" &&
+                        outcome.error instanceof ContractFunctionExecutionError &&
+                        outcome.error.functionName === "aggregate3"
+                );
+                if (failed) throw failed.error;
+                return outcomes;
+            };
             let results: Awaited<ReturnType<typeof call>>;
             try {
-                results = await call();
+                results = await attempt();
             } catch {
                 await delay(CHAIN_CHUNK_RETRY_DELAY_MS);
                 results = await call();

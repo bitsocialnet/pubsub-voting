@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { createPublicClient, erc721Abi, http } from "viem";
+import { HttpRequestError, createPublicClient, custom, decodeFunctionData, encodeAbiParameters, encodeFunctionResult, erc721Abi, http, multicall3Abi } from "viem";
+import { base } from "viem/chains";
 import type { ChainClient } from "./types.js";
 import { coalescingChainClient, coalescingChainFactory } from "./coalescer.js";
 
@@ -231,5 +232,58 @@ describe("coalescingChainFactory", () => {
     it("passes through an unresolved chain (factory returned undefined) without wrapping", () => {
         const factory = coalescingChainFactory(() => undefined);
         expect(factory({ chainId: 8453 })).toBeUndefined();
+    });
+});
+
+/**
+ * The same wrapper over a REAL viem client, whose transport is the only stub. The stub client
+ * above throws from `multicall` to simulate a failed round trip, but viem does not: with
+ * `allowFailure: true` it reports the failed `aggregate3` call as one error against every read.
+ */
+describe("coalescingChainClient over a real viem client", () => {
+    const uint = (value: bigint) => encodeAbiParameters([{ type: "uint256" }], [value]);
+
+    /** A viem client on Base whose `eth_call`s are answered by `answer` (transport retries off). */
+    function viemClient(answer: (data: `0x${string}`, attempt: number) => unknown): { chain: ChainClient; calls: () => number } {
+        let calls = 0;
+        const client = createPublicClient({
+            chain: base,
+            transport: custom(
+                {
+                    request: async ({ method, params }: { method: string; params?: unknown }) => {
+                        if (method !== "eth_call") throw new Error(`unexpected ${method}`);
+                        calls += 1;
+                        return answer((params as [{ data: `0x${string}` }])[0].data, calls);
+                    }
+                },
+                { retryCount: 0 }
+            )
+        });
+        return { chain: client as unknown as ChainClient, calls: () => calls };
+    }
+
+    /** An `aggregate3` answer giving each inner read `inner(i)`. */
+    const aggregate3 = (data: `0x${string}`, inner: (i: number) => { success: boolean; returnData: `0x${string}` }) => {
+        const { args } = decodeFunctionData({ abi: multicall3Abi, data });
+        return encodeFunctionResult({ abi: multicall3Abi, functionName: "aggregate3", result: (args[0] as readonly unknown[]).map((_, i) => inner(i)) });
+    };
+
+    it("retries a chunk once when its aggregate3 round trip fails, though viem reports that per read", async () => {
+        const { chain, calls } = viemClient((data, attempt) => {
+            if (attempt === 1) throw new HttpRequestError({ url: "https://rpc.invalid", status: 429 });
+            return aggregate3(data, () => ({ success: true, returnData: uint(5n) }));
+        });
+        const coalesced = coalescingChainClient(chain, { windowMs: 1 });
+        const results = await Promise.all([readBalance(coalesced, wallet(0), 100_000n), readBalance(coalesced, wallet(1), 100_000n)]);
+        expect(results).toEqual([5n, 5n]);
+        expect(calls()).toBe(2);
+    });
+
+    it("does not retry a chunk whose round trip succeeded with one failed read", async () => {
+        const { chain, calls } = viemClient((data) => aggregate3(data, (i) => (i === 1 ? { success: false, returnData: "0x" } : { success: true, returnData: uint(5n) })));
+        const coalesced = coalescingChainClient(chain, { windowMs: 1 });
+        const outcomes = await Promise.allSettled([readBalance(coalesced, wallet(0), 100_000n), readBalance(coalesced, wallet(1), 100_000n)]);
+        expect(outcomes.map((o) => o.status)).toEqual(["fulfilled", "rejected"]);
+        expect(calls()).toBe(1); // a revert is the read's answer, not a failed round trip
     });
 });

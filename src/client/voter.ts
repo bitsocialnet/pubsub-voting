@@ -1281,7 +1281,11 @@ class ContestEngine {
             onNameResolved: (cid) => this.#settleCheck(cid, "nameResolved"),
             onEvict: (cid, verdict) => this.#evictBundle(cid, verdict),
             onError: (error) => this.#emitError(error),
-            limit: (fn) => this.#backgroundLimit(fn)
+            // Same admission map as the chase's `isAdmitted`: dropped on evict and on prune, so a
+            // bundle whose read keeps failing leaves the queue once it expires or is superseded.
+            isAdmitted: (cid) => this.#checks.has(cid.toString()),
+            limit: (fn) => this.#backgroundLimit(fn),
+            limitConcurrency: GATE_CONCURRENCY
         });
 
         this.#tally = makeTally({
