@@ -372,6 +372,36 @@ describe("a failed broadcast takes the vote back out of the local state", () => 
         await voter.destroy();
     });
 
+    it("an encode that started before a broadcast went out does not replace the checkpoint that serves it", async () => {
+        let send!: () => void;
+        const node = recordingHelia(
+            () => new Promise((resolve) => (send = () => resolve({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] })))
+        );
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const rootRecord = () => (contest as unknown as { rootRecord(): Promise<{ count: number }> }).rootRecord();
+        const ballot = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const publishing = ballot.publish();
+        await vi.waitFor(() => expect(node.broadcasts).toHaveLength(1));
+        const cid = await bundleCidForBytes(encodeBundle(ballot.bundle!));
+        await vi.waitFor(() => expect(contest.checksFor(cid)?.chainVerified).toBe(true));
+
+        // An encode picks its winners while the vote is unsent, then parks storing its blocks.
+        const park = node.parkNextPut();
+        const older = rootRecord();
+        await vi.waitFor(() => expect(park.parked()).toBe(true));
+        // The broadcast goes out, and a newer encode serves the vote.
+        send();
+        await publishing;
+        expect((await rootRecord()).count).toBe(1);
+
+        // The older encode finishing last must not put its checkpoint back in the cache.
+        park.release();
+        expect((await older).count).toBe(0);
+        expect((await rootRecord()).count).toBe(1);
+        await voter.destroy();
+    });
+
     it("keeps an identical vote that an earlier publish already put on the wire", async () => {
         let publishes = 0;
         const node = recordingHelia(async () => {

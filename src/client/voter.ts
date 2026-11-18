@@ -1206,6 +1206,12 @@ class ContestEngine {
     #rootRecordCache: { record: FetchRootRecord; bucket: number; blocks: CheckpointBlock[] } | undefined = undefined;
     /** True when the winner-set changed since the last encode; the next `rootRecord()` re-encodes. */
     #checkpointDirty = true;
+    /**
+     * Encodes started so far, and which one made {@link #rootRecordCache}. Encodes overlap (each
+     * awaits its block writes), and an older one that finishes last must not replace a newer cache.
+     */
+    #encodesStarted = 0;
+    #cachedEncode = 0;
     /** Live once joined; chases advertised roots that differ from our own. */
     #chaser: RootChaser | undefined;
     /**
@@ -2507,6 +2513,7 @@ class ContestEngine {
         // (e.g. a background settlement) re-dirties the flag; clearing it after the awaits would
         // silently clobber that invalidation and pin this record until the next state change.
         this.#checkpointDirty = false;
+        const encode = ++this.#encodesStarted;
         const winners = this.#crdt
             .currentEntries(bucket, (cid) => this.#isFullyVerified(cid) && !this.#unsent.has(cid.toString()))
             .map((e) => e.bundle);
@@ -2522,7 +2529,12 @@ class ContestEngine {
             count: winners.length,
             sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
         };
-        this.#rootRecordCache = { record, bucket, blocks };
+        // An encode that started later may already have cached a newer winner-set (an own vote
+        // whose broadcast went out meanwhile, say) and consumed the dirty flag: keep that one.
+        if (encode > this.#cachedEncode) {
+            this.#rootRecordCache = { record, bucket, blocks };
+            this.#cachedEncode = encode;
+        }
         return record;
     }
 
@@ -2551,8 +2563,8 @@ class ContestEngine {
      */
     async rootRecordWithBlocks(): Promise<{ record: FetchRootRecord; chunkBlocks: CheckpointBlock[] }> {
         const record = await this.rootRecord();
-        // No await between the encode above and this read, so the cache is the one that made
-        // `record`; the by-CID lookup is still belt-and-braces over positional slicing.
+        // Usually the cache is the encode that made `record`. One that a newer encode overtook
+        // is not cached, so the by-CID lookup below then serves the record alone.
         const blocks = new Map((this.#rootRecordCache?.blocks ?? []).map((block) => [block.cid.toString(), block]));
         const chunkBlocks: CheckpointBlock[] = [];
         for (const chunk of record.chunks) {
