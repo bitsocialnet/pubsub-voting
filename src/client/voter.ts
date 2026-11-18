@@ -1122,6 +1122,17 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 /**
+ * One checkpoint encode: the root record, the bucket it was encoded at, its blocks, and the CIDs
+ * of the bundles it holds, which is what a peer advertising the same root demonstrably holds.
+ */
+interface CheckpointEncode {
+    record: FetchRootRecord;
+    bucket: number;
+    blocks: CheckpointBlock[];
+    cids: ReadonlySet<string>;
+}
+
+/**
  * One contest's engine: joins the topic behind the validate-before-forward gate, keeps the CRDT in
  * sync (live gossip + cold-start + chase + heartbeat), computes the tally, and signs/broadcasts this
  * wallet's ballots. Internal — the public {@link Contest} and {@link ContestVote} are thin views
@@ -1203,7 +1214,7 @@ class ContestEngine {
      * Invalidated by {@link #markStateChanged} (any merge/publish/chase admit) and by a bucket
      * advance (expiry changes the winner set without any message). See DESIGN.md "Checkpoints".
      */
-    #rootRecordCache: { record: FetchRootRecord; bucket: number; blocks: CheckpointBlock[] } | undefined = undefined;
+    #rootRecordCache: CheckpointEncode | undefined = undefined;
     /** True when the winner-set changed since the last encode; the next `rootRecord()` re-encodes. */
     #checkpointDirty = true;
     /**
@@ -2493,6 +2504,11 @@ class ContestEngine {
      * "Checkpoints", "On-demand encode").
      */
     async rootRecord(): Promise<FetchRootRecord> {
+        return (await this.#checkpoint()).record;
+    }
+
+    /** {@link rootRecord} together with the blocks and bundle CIDs of the encode that made it. */
+    async #checkpoint(): Promise<CheckpointEncode> {
         // Filter by the voter-wide head sample (shared across contests, at most one heartbeat
         // interval old) rather than by whatever this engine's last join / recompute / signing
         // left behind: on a quiet node nothing else advanced that cache, and a record filtered by
@@ -2501,7 +2517,7 @@ class ContestEngine {
         // an empty contest never reads at all.
         const bucket = this.#crdt.nodeCount() > 0 ? await this.#refreshBucket({ maxAgeMs: HEARTBEAT_INTERVAL_MS }) : this.#currentBucketCache;
         const cached = this.#rootRecordCache;
-        if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached.record;
+        if (!this.#checkpointDirty && cached !== undefined && cached.bucket === bucket) return cached;
         // Serve only fully verified bundles: a provisional admit must not propagate through our
         // checkpoint, and the eligibility-filtered LWW reduction falls back to a wallet's newest
         // VERIFIED bundle when its newest overall is still pending (see crdt/types.ts). Nor an own
@@ -2514,9 +2530,8 @@ class ContestEngine {
         // silently clobber that invalidation and pin this record until the next state change.
         this.#checkpointDirty = false;
         const encode = ++this.#encodesStarted;
-        const winners = this.#crdt
-            .currentEntries(bucket, (cid) => this.#isFullyVerified(cid) && !this.#unsent.has(cid.toString()))
-            .map((e) => e.bundle);
+        const entries = this.#crdt.currentEntries(bucket, (cid) => this.#isFullyVerified(cid) && !this.#unsent.has(cid.toString()));
+        const winners = entries.map((e) => e.bundle);
         const { root, chunks, blocks } = await encodeCheckpoint(winners);
         for (const block of blocks) await this.#deps.blockstore.put(block.cid, block.bytes);
         const record: FetchRootRecord = {
@@ -2529,13 +2544,14 @@ class ContestEngine {
             count: winners.length,
             sizeBytes: blocks.reduce((total, block) => total + block.bytes.length, 0)
         };
+        const encoded: CheckpointEncode = { record, bucket, blocks, cids: new Set(entries.map((e) => e.cid.toString())) };
         // An encode that started later may already have cached a newer winner-set (an own vote
         // whose broadcast went out meanwhile, say) and consumed the dirty flag: keep that one.
         if (encode > this.#cachedEncode) {
-            this.#rootRecordCache = { record, bucket, blocks };
+            this.#rootRecordCache = encoded;
             this.#cachedEncode = encode;
         }
-        return record;
+        return encoded;
     }
 
     /**
@@ -2562,10 +2578,10 @@ class ContestEngine {
      * excluded (a receiver handed a verified chunk index never fetches the manifest).
      */
     async rootRecordWithBlocks(): Promise<{ record: FetchRootRecord; chunkBlocks: CheckpointBlock[] }> {
-        const record = await this.rootRecord();
-        // Usually the cache is the encode that made `record`. One that a newer encode overtook
-        // is not cached, so the by-CID lookup below then serves the record alone.
-        const blocks = new Map((this.#rootRecordCache?.blocks ?? []).map((block) => [block.cid.toString(), block]));
+        const { record, blocks: encoded } = await this.#checkpoint();
+        // The blocks of the encode that made `record`; the by-CID lookup is still belt-and-braces
+        // over positional slicing.
+        const blocks = new Map(encoded.map((block) => [block.cid.toString(), block]));
         const chunkBlocks: CheckpointBlock[] = [];
         for (const chunk of record.chunks) {
             const block = blocks.get(chunk.toString());
@@ -2601,21 +2617,22 @@ class ContestEngine {
      */
     async #handleRootRecord(record: RootRecord, from?: string): Promise<void> {
         if (from !== undefined) this.#notePeerRoot(from, record.root);
-        const own = await this.rootRecord();
-        if (own.root.equals(record.root)) {
+        const own = await this.#checkpoint();
+        if (own.record.root.equals(record.root)) {
             this.#heardMatchingRoot = true;
             // Their checkpoint is ours byte for byte, so it demonstrably contains every bundle
-            // ours does — including our own. Nothing is chased here (there is no divergence to
-            // chase), so without this the ONE case tier-3 attribution most wants to catch — a
-            // healthy topic where we and the seeder have converged — would be the one case it
-            // never saw.
-            this.#indexRootContents(record.root, this.#ownVerifiedCids());
+            // ours does — including our own, but only those this encode put in it: not pending
+            // ones, not own publishes still unsent (see #unsent), not one that settled since.
+            // Nothing is chased here (there is no divergence to chase), so without this the ONE
+            // case tier-3 attribution most wants to catch — a healthy topic where we and the
+            // seeder have converged — would be the one case it never saw.
+            this.#indexRootContents(record.root, this.#ownAmong(own.cids));
             return;
         }
         this.#chaser?.chase(record.root, undefined, this.#sessionProvidersFor(record.root));
         if (!this.#publishedRootThisInterval) {
             this.#publishedRootThisInterval = true;
-            await this.#transport?.publishRootRecord(own);
+            await this.#transport?.publishRootRecord(own.record);
         }
     }
 
@@ -2651,16 +2668,10 @@ class ContestEngine {
         this.#indexRootContents(root, mine);
     }
 
-    /**
-     * Our own bundles that are in our OWN checkpoint right now — i.e. fully verified ones. A
-     * pending bundle is deliberately excluded: the encoder does not serve it, so a peer holding
-     * our root is not thereby holding it.
-     */
-    #ownVerifiedCids(): Set<string> {
+    /** Our own bundles among `cids`, the bundles one encode put in our checkpoint. */
+    #ownAmong(cids: ReadonlySet<string>): Set<string> {
         const mine = new Set<string>();
-        for (const key of this.#ownCids) {
-            if (this.#isFullyVerified(CID.parse(key))) mine.add(key);
-        }
+        for (const key of cids) if (this.#ownCids.has(key)) mine.add(key);
         return mine;
     }
 

@@ -3,6 +3,7 @@ import type { PeerId } from "@libp2p/interface";
 import { PubsubVoter, type PublishingState } from "./voter.js";
 import { VoterDestroyedError } from "../errors.js";
 import { bundleCidForBytes, encodeBundle } from "../crdt/codec.js";
+import { encodeRootMessage, type RootRecord } from "../transport/messages.js";
 import type { ChainClient, ChainClientFactory } from "../chain/types.js";
 import type { VoteSigner } from "../signer/types.js";
 import type { FetchServiceLike, HeliaInstance, PubsubService } from "../transport/types.js";
@@ -369,6 +370,37 @@ describe("a failed broadcast takes the vote back out of the local state", () => 
         send();
         await publishing;
         expect((await rootRecord()).count).toBe(1);
+        await voter.destroy();
+    });
+
+    it("a peer at our root is not credited with a vote our checkpoint left out as unsent", async () => {
+        let send!: () => void;
+        const node = recordingHelia(
+            () => new Promise((resolve) => (send = () => resolve({ recipients: [{ toString: () => "recipient1" } as unknown as PeerId] })))
+        );
+        const voter = new PubsubVoter({ dataPath: false, helia: node.helia, chains: stubChains() });
+        const contest = await voter.createContest({ criteria: bizCriteria() });
+        const ballot = await voter.createContestVote({ criteria: bizCriteria(), votes: VOTE, signer: fakeSigner() });
+        const publishing = ballot.publish();
+        await vi.waitFor(() => expect(node.broadcasts).toHaveLength(1));
+        const cid = await bundleCidForBytes(encodeBundle(ballot.bundle!));
+        await vi.waitFor(() => expect(contest.checksFor(cid)?.chainVerified).toBe(true));
+
+        // Our checkpoint leaves the unsent vote out, so a peer advertising the same root does not hold it.
+        const own = await (contest as unknown as { rootRecord(): Promise<RootRecord> }).rootRecord();
+        expect(own.count).toBe(0);
+        await node.topicValidators.get(contest.topic)!({ toString: () => "peerA" } as unknown as PeerId, {
+            topic: contest.topic,
+            data: encodeRootMessage(own)
+        } as never);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+
+        send();
+        await publishing;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(contest.checkpointPeersFor(cid)).toEqual([]);
+        expect(ballot.publishingState).not.toBe("verified-by-peer");
         await voter.destroy();
     });
 
