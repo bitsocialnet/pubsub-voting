@@ -43,7 +43,17 @@ import type { VerifyFail } from "./types.js";
  *   - RPC / resolver THREW        → infra, nobody's verdict: the bundle STAYS pending, the
  *                                   round retries with capped full-jitter backoff, and
  *                                   `onError` surfaces the degraded state to the host
- *                                   (Contest `error`) so "RPC down" is not silent.
+ *                                   (Contest `error`) so "RPC down" is not silent — once per
+ *                                   round, and for a gate read as soon as it throws rather
+ *                                   than at the end of the round. Only the bundles whose read
+ *                                   threw stay behind: a batched read that throws is asked
+ *                                   again in smaller pieces (see `ask`), so a read that can
+ *                                   never succeed for ONE wallet does not hold the rest. That
+ *                                   costs a few call times, not one call per pending bundle,
+ *                                   whether the RPC is down, answers again a moment later, or
+ *                                   fails one wallet. A pending bundle the host no longer
+ *                                   holds (`isAdmitted`) is dropped without a verdict — the
+ *                                   exit for one whose read keeps failing until it expires.
  *
  * Pure seams, no libp2p import — unit-testable offline like the rest of the engine.
  */
@@ -84,10 +94,25 @@ export interface BackgroundVerifierDeps {
     onNameResolved: (cid: CID) => void;
     /** Remove a failed bundle from the working set (gate `0n`, or a name that did not check out). */
     onEvict: (cid: CID, verdict: VerifyFail) => void;
-    /** An infra-class failure (RPC/resolver threw): the round will retry; surface the degradation. */
+    /**
+     * An infra-class failure (RPC/resolver threw): the round will retry; surface the degradation.
+     * Also receives what one of the callbacks above threw — reported, never allowed to unwind a
+     * round. A throw from this callback itself is swallowed.
+     */
     onError: (error: unknown) => void;
+    /**
+     * Does the host still hold this bundle (it was not evicted, superseded or expired since it
+     * was queued)? Checked at the start of every round; a bundle it no longer holds leaves the
+     * queue with no callback and no cached verdict. Omitted ⇒ every queued bundle is held.
+     */
+    isAdmitted?: (cid: CID) => boolean;
     /** Concurrency cap for the un-batched fallbacks (per-wallet reads, name resolutions). */
     limit: <T>(fn: () => Promise<T>) => Promise<T>;
+    /**
+     * How many calls `limit` runs at once: how many wallets of a failed batched read are asked
+     * alone, and into how many parts the rest are split. Defaults to {@link LIMIT_CONCURRENCY}.
+     */
+    limitConcurrency?: number;
     /** Infra-retry backoff base / cap (ms). Full-jittered exponential between rounds. */
     retryBaseMs?: number;
     retryCapMs?: number;
@@ -116,12 +141,33 @@ export interface BackgroundChainVerifier {
 
 const RETRY_BASE_MS = 2_000;
 const RETRY_CAP_MS = 60_000;
+const LIMIT_CONCURRENCY = 8;
+
+/**
+ * One wallet's answer to one gate question: the rule's result, or why there is none. `alone` is
+ * true when the read that threw asked about this wallet only, so the failure is its own rather
+ * than a batch's it was part of (or of a re-ask it never got).
+ */
+type Answer = { result: RuleResult } | { error: unknown; alone: boolean };
 
 /** Internal queue item: `gateDone`/`gate` survive an infra retry so no stage re-runs. */
 interface QueueItem extends PendingBundle {
     gateDone: boolean;
-    /** True once `onGateVerified` fired, so a name-stage retry does not re-notify. */
+    /**
+     * True once `onGateVerified` fired, so a name-stage retry does not re-notify. Cleared when the
+     * same CID is enqueued again while this item is in flight (see `enqueue`).
+     */
     gateNotified: boolean;
+    /**
+     * This item's place in line for the re-asks of a failed batch (see `ask`): a number drawn
+     * from one counter when it is queued, and drawn again each time its wallet is asked about
+     * alone and the read throws. gateStage lists items by it, so the wallets asked alone first
+     * are those that have waited longest since they were last asked alone. A wallet whose read
+     * throws goes behind every other pending item, bundles queued meanwhile included, so a run
+     * of bad wallets cannot end the re-asks round after round, and an item waits at most one
+     * extra round per `limitConcurrency` items ahead of it, however many arrive in the meantime.
+     */
+    turn: number;
     resolvedNames: Record<string, string>;
     /**
      * The folded gate tree for this wallet, or `undefined` before the gate stage ran. Carries
@@ -142,6 +188,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     const retryCapMs = deps.retryCapMs ?? RETRY_CAP_MS;
     const gateGraceMs = deps.gateGraceMs ?? GATE_GRACE_MS;
     const gateRetryMs = deps.gateRetryMs ?? GATE_RETRY_MS;
+    const wave = deps.limitConcurrency ?? LIMIT_CONCURRENCY;
 
     // Resolve every gate leaf — rule, options, chain, memo — once (same call as verify/bundle.ts,
     // so the two verifiers cannot resolve a gate differently).
@@ -151,13 +198,17 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
     const { representatives, ofLeaf } = dedupeLeaves(leaves);
 
     const queue: QueueItem[] = [];
-    /** CIDs queued or in-flight, so a re-chased root cannot double-verify a bundle. */
-    const inFlight = new Set<string>();
+    /** Items queued or in-flight, by CID, so a re-chased root cannot double-verify a bundle. */
+    const inFlight = new Map<string, QueueItem>();
     let draining = false;
     let stopped = false;
     /** Consecutive infra-failed rounds, driving the backoff exponent. */
     let failedRounds = 0;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    /** The running round already surfaced an infra failure: one report per round. */
+    let infraReported = false;
+    /** The next {@link QueueItem.turn}. */
+    let turns = 0;
     const idleResolvers: Array<() => void> = [];
 
     function settle(item: QueueItem): void {
@@ -168,6 +219,38 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         if (queue.length === 0 && !draining && retryTimer === undefined) {
             for (const resolve of idleResolvers.splice(0)) resolve();
         }
+    }
+
+    /**
+     * Run a host callback. The voter's callbacks call host listeners synchronously, and a throw
+     * from one must not unwind a round half-way: it is reported, and the round carries on.
+     */
+    function notify(callback: () => void): void {
+        try {
+            callback();
+        } catch (error) {
+            report(error);
+        }
+    }
+
+    /** Surface an error through `onError` — host code too, so its own throw is swallowed. */
+    function report(error: unknown): void {
+        try {
+            deps.onError(error);
+        } catch {
+            // Nowhere left to report it, and the verifier's own state is already consistent.
+        }
+    }
+
+    /**
+     * Surface the running round's infra failure the moment it happens: the round goes on (the
+     * re-asks of a failed batch, then the name checks), and a down RPC must not stay silent
+     * meanwhile.
+     */
+    function reportInfra(error: unknown): void {
+        if (infraReported) return;
+        infraReported = true;
+        report(error);
     }
 
     /** The wallet's gate score at its bundle's bucket sample block. */
@@ -190,12 +273,15 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
      * No grouping and no cache lookups here: which block each wallet is read at, and what may be
      * memoized under which key, are the rule's decisions (rules/types.ts, rules/cache.ts).
      * Duplicate wallets are still collapsed before the calls, because that is a property of THIS
-     * batch rather than of any rule. Throws on the FIRST infra failure: the round's unfinished
-     * items are re-queued by the caller.
+     * batch rather than of any rule. An item whose wallet's read threw on ANY leaf is left
+     * un-gated for the caller to re-queue (an unreadable leaf is not an answer); every other item
+     * is gated. Returns the first such infra failure, if any.
      */
-    async function gateStage(items: QueueItem[]): Promise<void> {
+    async function gateStage(items: QueueItem[]): Promise<{ error: unknown } | undefined> {
         const pending = items.filter((item) => !item.gateDone);
-        if (pending.length === 0) return;
+        if (pending.length === 0) return undefined;
+        // In line for the re-asks of a failed batch (`ask`): longest wait since asked alone first.
+        pending.sort((a, b) => a.turn - b.turn);
 
         const wallets: RuleWallet[] = [];
         const at = new Map<string, number>();
@@ -211,24 +297,97 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         // for the whole round, and the voter's per-client in-flight budget still bounds what
         // reaches an RPC. A rule named twice in one gate ("any two of these three") is asked once
         // and its answer fanned back out to both positions.
-        const byQuestion: RuleResult[][] = await Promise.all(
-            representatives.map((leaf) => {
-                const { rule, options, ctx } = leaves[leaf]!;
-                return rule.evaluateMany
-                    ? rule.evaluateMany({ options, wallets, ctx }).then(({ results }) => results)
-                    : Promise.all(wallets.map((wallet) => limit(() => rule.evaluate({ options, wallet, ctx }))));
-            })
-        );
+        const byQuestion: Answer[][] = await Promise.all(representatives.map((leaf) => ask(leaf, wallets)));
 
+        let failure: { error: unknown } | undefined;
         for (const item of pending) {
             const wallet = at.get(`${item.bundle.address.toLowerCase()}:${sampleBlockFor(item.bundle)}`)!;
+            const results: RuleResult[] = [];
+            let failedAlone = false;
+            for (const answers of byQuestion) {
+                const answer = answers[wallet]!;
+                if ("result" in answer) {
+                    results.push(answer.result);
+                    continue;
+                }
+                failure ??= answer;
+                failedAlone ||= answer.alone;
+            }
+            if (results.length < byQuestion.length) {
+                if (failedAlone) item.turn = turns++; // to the back of the line
+                continue; // a read never happened: no verdict
+            }
             // Every leaf is already scored, so this "evaluation" reads the batch — no chain work.
             item.gate = await evaluateGate({
                 node: criteria.gate,
-                evaluate: async (leaf) => byQuestion[ofLeaf[leaf]!]![wallet]!,
+                evaluate: async (leaf) => results[ofLeaf[leaf]!]!,
                 collectAll: true
             });
             item.gateDone = true;
+        }
+        return failure;
+    }
+
+    /**
+     * Ask one gate question about `wallets`, answering per wallet. A batched call is
+     * all-or-nothing, so when it throws, `isolate` asks again in smaller pieces (still
+     * `limit`-bounded, and still coalesced below the rule): a read that can never succeed for ONE
+     * wallet — a pinned block the gateway cannot serve, say — then fails that wallet alone
+     * instead of every bundle in the round, round after round.
+     */
+    async function ask(leaf: number, wallets: RuleWallet[]): Promise<Answer[]> {
+        const { rule, options, ctx } = leaves[leaf]!;
+        const alone = async (read: () => Promise<RuleResult>): Promise<Answer> => {
+            try {
+                return { result: await limit(read) };
+            } catch (error) {
+                reportInfra(error);
+                return { error, alone: true };
+            }
+        };
+        if (!rule.evaluateMany) return Promise.all(wallets.map((wallet) => alone(() => rule.evaluate({ options, wallet, ctx }))));
+        // Called on `rule`, never detached: a rule may rely on `this` (issue #29).
+        const many = (batch: RuleWallet[]) => rule.evaluateMany!({ options, wallets: batch, ctx });
+
+        /**
+         * Answer per wallet for `group`, whose batched read just threw `error`. Its first
+         * `limitConcurrency` wallets are asked alone, in `group` order. If every one of those
+         * throws as well, that is what a down RPC looks like: the rest are not asked this round,
+         * because asking them would add a failing call per pending bundle to every round and
+         * stretch it by the backlog. If gateStage's order put bad wallets there instead, they go
+         * to the back of the line, and the next round asks the next ones. Otherwise the RPC
+         * answers, and the batch threw for one of its wallets or for a blip: the rest are asked
+         * again in `limitConcurrency` parts, and a part that throws is isolated the same way. A
+         * blip then costs two more call times, and one wallet whose read always throws about two
+         * call times per eight-fold split of the batch (6 for 200 wallets, 7 for 1000).
+         */
+        const isolate = async (group: RuleWallet[], error: unknown): Promise<Answer[]> => {
+            if (group.length === 1) return [{ error, alone: true }];
+            const first = await Promise.all(group.slice(0, wave).map((wallet) => alone(async () => (await many([wallet])).results[0]!)));
+            const rest = group.slice(wave);
+            if (first.every((answer) => "error" in answer)) return [...first, ...rest.map((): Answer => ({ error, alone: false }))];
+            const size = Math.ceil(rest.length / wave);
+            const parts: RuleWallet[][] = [];
+            for (let start = 0; start < rest.length; start += size) parts.push(rest.slice(start, start + size));
+            const answered = await Promise.all(
+                parts.map(async (part): Promise<Answer[]> => {
+                    try {
+                        const { results } = await limit(() => many(part));
+                        return results.map((result) => ({ result }));
+                    } catch (failure) {
+                        return isolate(part, failure); // the round already reported its first throw
+                    }
+                })
+            );
+            return [...first, ...answered.flat()];
+        };
+
+        try {
+            const { results } = await many(wallets);
+            return results.map((result) => ({ result }));
+        } catch (error) {
+            reportInfra(error); // now, before the re-asks: with the RPC down they all fail too
+            return isolate(wallets, error);
         }
     }
 
@@ -248,7 +407,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             if (!resolver) {
                 // `ignore`-class, view-dependent (a missing resolver differs per verifier) — evict,
                 // never cache (see verify/bundle.ts step 4).
-                deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `no resolver handles community name "${name}"` });
+                notify(() => deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `no resolver handles community name "${name}"` }));
                 return "evicted";
             }
             let resolution = resolutions.get(name);
@@ -258,15 +417,17 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             }
             const record = await resolution;
             if (!record) {
-                deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `community name "${name}" does not resolve` });
+                notify(() => deps.onEvict(item.cid, { valid: false, disposition: "ignore", reason: `community name "${name}" does not resolve` }));
                 return "evicted";
             }
             if (record.publicKey !== v.community.publicKey) {
-                deps.onEvict(item.cid, {
-                    valid: false,
-                    disposition: "ignore",
-                    reason: `community name "${name}" resolves to ${record.publicKey}, not the claimed ${v.community.publicKey}`
-                });
+                notify(() =>
+                    deps.onEvict(item.cid, {
+                        valid: false,
+                        disposition: "ignore",
+                        reason: `community name "${name}" resolves to ${record.publicKey}, not the claimed ${v.community.publicKey}`
+                    })
+                );
                 return "evicted";
             }
             item.resolvedNames[name] = record.publicKey;
@@ -276,19 +437,22 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
 
     /** One drain round over everything currently queued. Re-queues + backs off on infra failure. */
     async function round(): Promise<void> {
-        const batch = queue.splice(0);
+        infraReported = false;
+        const batch: QueueItem[] = [];
+        for (const item of queue.splice(0)) {
+            // The host dropped it while it waited (expired, superseded, evicted): nothing to settle.
+            if (deps.isAdmitted && !deps.isAdmitted(item.cid)) settle(item);
+            else batch.push(item);
+        }
         const requeue: QueueItem[] = [];
         /** Unattributable `0n` items still inside their grace window: re-examined, not a failure. */
         const notYet: QueueItem[] = [];
         let infraError: unknown;
 
         // Gate stage first, whole batch: this is where batching wins (one multicall per sample
-        // block instead of one read per wallet). An infra throw leaves every un-gated item intact.
-        try {
-            await gateStage(batch);
-        } catch (error) {
-            infraError = error;
-        }
+        // block instead of one read per wallet). A failed read leaves its items un-gated, intact.
+        const failed = await gateStage(batch);
+        if (failed) infraError = failed.error;
 
         const resolutions = new Map<string, Promise<{ publicKey: string } | undefined>>();
         for (const item of batch) {
@@ -313,7 +477,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                         failures
                     };
                     cache.set(item.cid, verdict);
-                    deps.onEvict(item.cid, verdict);
+                    notify(() => deps.onEvict(item.cid, verdict));
                     settle(item);
                     continue;
                 }
@@ -338,13 +502,13 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                     reason: `not admitted: ${reason} (still true after the grace window)`,
                     failures
                 };
-                deps.onEvict(item.cid, verdict);
+                notify(() => deps.onEvict(item.cid, verdict));
                 settle(item);
                 continue;
             }
             if (!item.gateNotified) {
                 item.gateNotified = true;
-                deps.onGateVerified(item.cid);
+                notify(() => deps.onGateVerified(item.cid));
             }
             try {
                 if ((await nameStage(item, resolutions)) === "evicted") {
@@ -356,7 +520,13 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
                 requeue.push(item); // gateDone survives — the retry only re-runs names
                 continue;
             }
-            if (item.bundle.votes.some((v) => v.community.name)) deps.onNameResolved(item.cid);
+            // The CID was enqueued again while the names were awaited, so the host has recorded
+            // its checks afresh: report the gate pass again (from the result already held).
+            if (!item.gateNotified) {
+                item.gateNotified = true;
+                notify(() => deps.onGateVerified(item.cid));
+            }
+            if (item.bundle.votes.some((v) => v.community.name)) notify(() => deps.onNameResolved(item.cid));
             // Fully settled: store the terminal valid verdict (same shape the forward-gate caches).
             cache.set(item.cid, { valid: true, resolvedNames: item.resolvedNames });
             settle(item);
@@ -365,7 +535,7 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         if (requeue.length > 0) {
             queue.push(...requeue, ...notYet);
             failedRounds += 1;
-            deps.onError(infraError);
+            reportInfra(infraError); // unless the gate stage already did
             armRetry();
         } else if (notYet.length > 0) {
             // "Not yet" is nobody's failure: no `onError`, no backoff escalation, just a fixed
@@ -401,6 +571,16 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
             try {
                 // A round that infra-fails re-queues and arms the retry timer instead of spinning.
                 while (queue.length > 0 && !stopped && retryTimer === undefined) await round();
+            } catch (error) {
+                // Not a failed read (those never escape a round) but a throw from the verifier's
+                // own bookkeeping, unwinding a round mid-batch. Only one round runs at a time, so
+                // what is in flight but not queued is exactly what it took and had not settled:
+                // put that back (`enqueue` would skip it forever) and back off like a failed round.
+                const queued = new Set(queue);
+                for (const item of inFlight.values()) if (!queued.has(item)) queue.push(item);
+                failedRounds += 1;
+                report(error);
+                armRetry();
             } finally {
                 draining = false;
                 maybeResolveIdle();
@@ -412,16 +592,26 @@ export function makeBackgroundVerifier(deps: BackgroundVerifierDeps): Background
         enqueue(entries: PendingBundle[]): void {
             for (const entry of entries) {
                 const key = entry.cid.toString();
-                if (inFlight.has(key)) continue;
-                inFlight.add(key);
-                queue.push({
+                const existing = inFlight.get(key);
+                if (existing) {
+                    // Already queued or in flight: verified once. But the caller is recording this
+                    // bundle afresh (the same ballot re-signed in the same bucket is the same CID),
+                    // which resets its checks to pending — so a gate pass already reported must
+                    // be reported again. The gate itself is not re-read.
+                    existing.gateNotified = false;
+                    continue;
+                }
+                const item: QueueItem = {
                     ...entry,
                     gateDone: false,
                     gateNotified: false,
+                    turn: turns++,
                     gate: undefined,
                     resolvedNames: {},
                     queuedAt: Date.now()
-                });
+                };
+                inFlight.set(key, item);
+                queue.push(item);
             }
             kickDrain();
         },
