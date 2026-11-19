@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.7.14](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.13...v0.7.14) (2026-11-19)
+
+### Bug Fixes
+
+* **client:** arm no snapshot write once a leave has started [skip github-alerts] ([e357cd6](https://github.com/bitsocialnet/pubsub-voting/commit/e357cd62675c9bd46885d3328002095248b46056)), references [#joined](https://github.com/bitsocialnet/pubsub-voting/issues/joined) [#scheduleSnapshotWrite](https://github.com/bitsocialnet/pubsub-voting/issues/scheduleSnapshotWrite)
+* **client:** credit a peer at our root only with what that checkpoint holds ([5a79542](https://github.com/bitsocialnet/pubsub-voting/commit/5a79542d9022cde02c21b4720ccefe67c7991030))
+* **client:** drop the failure of an overtaken tally compute [skip github-alerts] ([b8aacc6](https://github.com/bitsocialnet/pubsub-voting/commit/b8aacc64128cfe2d1f2cdf90d1d8cbe838ecdb33))
+* **client:** keep a newer checkpoint when an overtaken encode finishes last ([f70380f](https://github.com/bitsocialnet/pubsub-voting/commit/f70380ff43f784c51c05513b5ae2015bb641128a))
+* **client:** keep a re-vote's predecessor until the re-vote is sent [skip github-alerts] ([8bea600](https://github.com/bitsocialnet/pubsub-voting/commit/8bea6007e50bd75a080d51e243dfb3dc0f88bf74)), references [#unsent](https://github.com/bitsocialnet/pubsub-voting/issues/unsent)
+* **client:** never report or keep a vote whose broadcast did not go out [skip github-alerts] ([18928fe](https://github.com/bitsocialnet/pubsub-voting/commit/18928fe6674596decb96a28fefa79aac54f2651a))
+* **client:** queue every leave of voter.stop() before a racing update joins [skip github-alerts] ([17c2d8e](https://github.com/bitsocialnet/pubsub-voting/commit/17c2d8e3f559085d25b635dfa88c1d79ec72230a))
+* **client:** refuse a broadcast once a leave has started [skip github-alerts] ([8d71c37](https://github.com/bitsocialnet/pubsub-voting/commit/8d71c3789c440b7ece416d1ddb97d55c681c0bc2)), references [#leaving](https://github.com/bitsocialnet/pubsub-voting/issues/leaving)
+* **client:** reject a create that races destroy() [skip github-alerts] ([aa1f486](https://github.com/bitsocialnet/pubsub-voting/commit/aa1f486628796c9f2ef0bbbde15838a503169f95)), references [#destroyed](https://github.com/bitsocialnet/pubsub-voting/issues/destroyed) [#engineFor](https://github.com/bitsocialnet/pubsub-voting/issues/engineFor)
+* **client:** retry a failed tally recompute and drop overtaken ones [skip github-alerts] ([4a68992](https://github.com/bitsocialnet/pubsub-voting/commit/4a689927214df3a198f69433fc7a8f00d33b0ab9)), references [#computeAndEmit](https://github.com/bitsocialnet/pubsub-voting/issues/computeAndEmit) [#tallyDirty](https://github.com/bitsocialnet/pubsub-voting/issues/tallyDirty) [#cachedTally](https://github.com/bitsocialnet/pubsub-voting/issues/cachedTally)
+* **client:** serialize contest join and leave transitions [skip github-alerts] ([18032a7](https://github.com/bitsocialnet/pubsub-voting/commit/18032a7440b72324466271a9696fafeb4de0247b)), references [#joined](https://github.com/bitsocialnet/pubsub-voting/issues/joined) [#transport](https://github.com/bitsocialnet/pubsub-voting/issues/transport) [#joined](https://github.com/bitsocialnet/pubsub-voting/issues/joined)
+* **client:** serve an own vote in the checkpoint only once it was broadcast [skip github-alerts] ([8ef6086](https://github.com/bitsocialnet/pubsub-voting/commit/8ef60864b249578e88ad4e383b1f1831b75569fa)), references [#unsent](https://github.com/bitsocialnet/pubsub-voting/issues/unsent)
+* **client:** share the rollback of identical in-flight publishes [skip github-alerts] ([f1467ab](https://github.com/bitsocialnet/pubsub-voting/commit/f1467ab229d56f5655158e44648728a9c0435a76)), references [#unsent](https://github.com/bitsocialnet/pubsub-voting/issues/unsent) [#unsent](https://github.com/bitsocialnet/pubsub-voting/issues/unsent)
+* **transport:** verify what a chase admitted even when a later bundle throws [skip github-alerts] ([9c244b5](https://github.com/bitsocialnet/pubsub-voting/commit/9c244b5ce48990f70c918f5fd69a01d5be42289c))
+
 ## [0.7.13](https://github.com/bitsocialnet/pubsub-voting/compare/v0.7.12...v0.7.13) (2026-11-18)
 
 ### Bug Fixes
