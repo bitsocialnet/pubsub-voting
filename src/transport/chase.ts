@@ -260,39 +260,46 @@ export function makeRootChaser(deps: RootChaserDeps): RootChaser {
             let merged = false;
             const pending: PendingBundle[] = [];
             const contained: CID[] = [];
-            for (const bundle of winners) {
-                if (controller.signal.aborted) break;
-                // Re-encoding the decoded bundle reproduces the exact block bytes (the codec is
-                // canonical), so the CID matches the advertiser's block and dedups everywhere.
-                const bytes = encodeBundle(bundle);
-                const cid = await bundleCidForBytes(bytes);
-                contained.push(cid); // recorded BEFORE the skip below — see onCheckpointContents
-                if (await isAdmitted(cid)) continue; // already in the winner-set — nothing to verify
-                const cached = cache.get(cid);
-                if (cached) {
-                    if (!cached.valid) continue; // known bad — skip
-                    await admit({ cid, bytes, bundle, verified: true }); // full pipeline already passed
+            try {
+                for (const bundle of winners) {
+                    if (controller.signal.aborted) break;
+                    // Re-encoding the decoded bundle reproduces the exact block bytes (the codec is
+                    // canonical), so the CID matches the advertiser's block and dedups everywhere.
+                    const bytes = encodeBundle(bundle);
+                    const cid = await bundleCidForBytes(bytes);
+                    contained.push(cid); // recorded BEFORE the skip below — see onCheckpointContents
+                    if (await isAdmitted(cid)) continue; // already in the winner-set — nothing to verify
+                    const cached = cache.get(cid);
+                    if (cached) {
+                        if (!cached.valid) continue; // known bad — skip
+                        await admit({ cid, bytes, bundle, verified: true }); // full pipeline already passed
+                        merged = true;
+                        continue;
+                    }
+                    if (isEvaluableNow && !(await isEvaluableNow(bundle))) continue; // transient, uncached
+                    const offline = await verifyOffline(bundle);
+                    if (!offline.valid) {
+                        // A liar's forged/malformed bundle dies here, before admit. A provable
+                        // offline reject (bad signature, constraints) is terminal — cache it so a
+                        // re-served copy short-circuits; a transient `ignore` stays uncached.
+                        if (offline.disposition === "reject") cache.set(cid, offline);
+                        continue;
+                    }
+                    await admit({ cid, bytes, bundle, verified: false });
+                    pending.push({ cid, bundle });
                     merged = true;
-                    continue;
                 }
-                if (isEvaluableNow && !(await isEvaluableNow(bundle))) continue; // transient, uncached
-                const offline = await verifyOffline(bundle);
-                if (!offline.valid) {
-                    // A liar's forged/malformed bundle dies here, before admit. A provable
-                    // offline reject (bad signature, constraints) is terminal — cache it so a
-                    // re-served copy short-circuits; a transient `ignore` stays uncached.
-                    if (offline.disposition === "reject") cache.set(cid, offline);
-                    continue;
-                }
-                await admit({ cid, bytes, bundle, verified: false });
-                pending.push({ cid, bundle });
-                merged = true;
+                if (contained.length > 0) onCheckpointContents?.(root, contained);
+            } finally {
+                // Even when a later bundle's step threw (a head read in isEvaluableNow, a blockstore
+                // put in admit): every bundle admitted so far is provisional and only the background
+                // verifier settles it. Skipping this left it pending with no verifier item — never
+                // served, never re-chased (it reads as admitted), blocking every snapshot write.
+                // One batch per chased root: the background verifier groups these by sample block
+                // and batches the gate reads (see verify/background.ts).
+                if (pending.length > 0) deferVerify(pending);
+                if (merged) onMerged?.();
             }
-            // One batch per chased root: the background verifier groups these by sample block
-            // and batches the gate reads (see verify/background.ts).
-            if (pending.length > 0) deferVerify(pending);
-            if (contained.length > 0) onCheckpointContents?.(root, contained);
-            if (merged) onMerged?.();
         } finally {
             clearTimeout(timer);
             flight.session?.close();
