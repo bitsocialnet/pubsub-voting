@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PubsubVoter } from "../dist/client/voter.js";
@@ -134,15 +134,21 @@ async function main(): Promise<void> {
     for (const n of sweep) {
         if (!Number.isInteger(n) || n <= 0) throw new Error(`bad N: ${n}`);
         const dataPath = mkdtempSync(join(tmpdir(), "pubsub-voting-warm-restart-"));
-        process.stderr.write(`[warm-restart] N=${n}: seeding…\n`);
-        const { snapshotBytes } = await seedSession(dataPath, n);
-        process.stderr.write(`[warm-restart] N=${n}: restarting…\n`);
-        const result = await restartSession(dataPath, n);
-        process.stdout.write(
-            `WARM_RESTART n=${n} snapshotBytes=${snapshotBytes} ` +
-                `startToTallyMs=${result.tallyMs.toFixed(0)} startToVerifiedMs=${result.verifiedMs.toFixed(0)} ` +
-                `gateReads=${result.gateReads}\n`
-        );
+        try {
+            process.stderr.write(`[warm-restart] N=${n}: seeding…\n`);
+            const { snapshotBytes } = await seedSession(dataPath, n);
+            process.stderr.write(`[warm-restart] N=${n}: restarting…\n`);
+            const result = await restartSession(dataPath, n);
+            process.stdout.write(
+                `WARM_RESTART n=${n} snapshotBytes=${snapshotBytes} ` +
+                    `startToTallyMs=${result.tallyMs.toFixed(0)} startToVerifiedMs=${result.verifiedMs.toFixed(0)} ` +
+                    `gateReads=${result.gateReads}\n`
+            );
+        } finally {
+            // Both sessions have closed their sqlite handles (voter.destroy() / storage.destroy()
+            // are awaited) on the success path; on a throw the files are just unlinked under them.
+            rmSync(dataPath, { recursive: true, force: true });
+        }
     }
 }
 

@@ -209,10 +209,22 @@ async function round(n) {
     // in IndexedDB and would otherwise restore the tally instead of pulling it.
     const userDataDir = fs.mkdtempSync(path.join(process.env.PROFILE_BASE || "/tmp", `cpubench-${LABEL}-${n}-`));
     const CHROME_PATH = process.env.CHROME_PATH || "/home/user2/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome";
-    const context = await chromium.launchPersistentContext(userDataDir, {
-        headless: !process.env.HEADED,
-        executablePath: fs.existsSync(CHROME_PATH) ? CHROME_PATH : undefined
-    });
+    let context;
+    try {
+        context = await chromium.launchPersistentContext(userDataDir, {
+            headless: !process.env.HEADED,
+            executablePath: fs.existsSync(CHROME_PATH) ? CHROME_PATH : undefined
+        });
+        return await measureRound(n, context, userDataDir);
+    } finally {
+        // Also on a throw (no chrome pid found, a failed goto, a CDP error): never leave a
+        // browser running or a full Chromium profile behind.
+        await context?.close().catch(() => {});
+        try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch {}
+    }
+}
+
+async function measureRound(n, context, userDataDir) {
     const rootPid = findChromePid(userDataDir);
     const page = context.pages()[0] ?? (await context.newPage());
     const session = await context.newCDPSession(page);
@@ -246,9 +258,6 @@ async function round(n) {
     const steadyMetrics = await metrics(session);
     const steadyCounts = await evalSafe();          // rate + histogram only
     const fetchEnd = await page.evaluate(FETCH_IN_PAGE).catch(() => undefined);
-
-    await context.close();
-    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch {}
 
     const coldCpu = afterCold.cpuSec - base.cpuSec;
     const steadyCpu = afterSteady.cpuSec - afterCold.cpuSec;

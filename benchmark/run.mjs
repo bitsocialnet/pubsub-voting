@@ -200,6 +200,11 @@ async function measureOne(n, i) {
         `BENCH_ROUTER_URL=http://127.0.0.1:${remoteRouterPort}/ ` +
         `BENCH_ANNOUNCE_ADDR=${announceMultiaddr(DIAL_HOST, remotePort)}`;
     let seeder;
+    // Set once the seeder's ssh session exits after READY: every later rep would only burn its
+    // join timeout against a dead seeder, so the row stops there and says why.
+    let seederExit;
+    // Why this row is short of REPEATS results (a failed start, or the seeder dying mid-sweep).
+    let reason;
     let results = [];
     try {
         const spawned = await spawnUntil(
@@ -223,6 +228,9 @@ async function measureOne(n, i) {
         const topic = match[2];
         seeder.stdout.on("data", () => {});
         seeder.stderr.on("data", () => {});
+        seeder.once("exit", (code, signal) => {
+            seederExit = `seeder exited after READY (code ${code}, signal ${signal})`;
+        });
 
         // 3) The joiner dials the seeder directly at its announced public multiaddr over the real
         //    internet — no tunnel, so the measured RTT is the true path. Wait until the remote port
@@ -238,12 +246,24 @@ async function measureOne(n, i) {
         // 4) Run REPEATS fresh cold joins against the same static seeder; each one discovers the
         //    seeder from the ANNOUNCED record (cold-join resets the router's one-time latency).
         for (let r = 0; r < REPEATS; r++) {
+            if (seederExit) {
+                reason = `${reason ?? seederExit}; skipped the last ${REPEATS - r} of ${REPEATS} reps`;
+                console.error(`[bench] N=${n}: ${reason}`);
+                break;
+            }
             const cj = await run("node", [COLD_JOIN_JS, router.url, peerId, topic, String(n)], {
                 env: { ...process.env }
             });
+            // The seeder can also die while a rep runs, including the last (or only) one, where no
+            // later rep is skipped: record it here so a short or empty row still says why. A RESULT
+            // from such a rep is kept: cold-join only prints one once the tally has converged, so
+            // the seeder served that rep before it died.
+            if (seederExit && !reason) reason = `${seederExit} during rep ${r + 1}/${REPEATS}`;
             const line = cj.stdout.split("\n").find((l) => l.startsWith("RESULT "));
             if (!line) {
-                console.error(`[bench] N=${n} rep ${r}: no RESULT\n${cj.stderr.split("\n").slice(-6).join("\n")}`);
+                console.error(
+                    `[bench] N=${n} rep ${r}: no RESULT${seederExit ? ` (${seederExit})` : ""}\n${cj.stderr.split("\n").slice(-6).join("\n")}`
+                );
                 continue;
             }
             const parsed = JSON.parse(line.slice("RESULT ".length));
@@ -262,16 +282,25 @@ async function measureOne(n, i) {
                     `start→tally=${s(parsed.tallyReadyMs)} start→verified=${s(parsed.verifiedTallyMs)}`
             );
         }
+    } catch (err) {
+        // A seeder that never got READY, never became dialable or never announced fails this row,
+        // not the sweep: the rows already measured still reach the summary table. The table keeps
+        // the first line; stderr gets the whole error, which for an early exit carries the seeder's
+        // own output (the ssh error or the remote stack trace).
+        reason = (err instanceof Error ? err.message : String(err)).split("\n")[0] + (seederExit ? ` (${seederExit})` : "");
+        console.error(`[bench] N=${n}: row failed${seederExit ? ` (${seederExit})` : ""}:`, err);
     } finally {
         seeder?.kill("SIGKILL");
         await run("ssh", [HOST, `pkill -f "seeder.js ${n} ${remotePort}" || true`]);
         await router.stop().catch(() => {});
     }
-    if (results.length === 0) return { n, ok: false };
+    if (results.length === 0) return { n, ok: false, reason };
     const med = (pick) => median(results.map(pick).filter((x) => x != null));
     return {
         n,
         ok: true,
+        reps: results.length,
+        reason,
         routerMs: med((r) => r.router.durMs),
         connectMs: med((r) => r.connectMs),
         fetchMs: med((r) => r.fetch.totalMs),
@@ -322,7 +351,7 @@ async function main() {
     console.log("N(voters)  router   connect   fetch    bitswap  verify+merge   gate-RPC   START→TALLY   START→VERIFIED");
     for (const r of rows) {
         if (!r.ok) {
-            console.log(`${String(r.n).padEnd(10)} (no successful cold join)`);
+            console.log(`${String(r.n).padEnd(10)} (no successful cold join${r.reason ? `: ${r.reason}` : ""})`);
             continue;
         }
         console.log(
@@ -330,6 +359,9 @@ async function main() {
                 `${s(r.bitswapMs)}  ${s(r.verifyMergeMs)}         ${r.gateRpcRequests ?? "n/a"}          ` +
                 `${s(r.tallyReadyMs)}        ${s(r.verifiedTallyMs)}`
         );
+    }
+    for (const r of rows) {
+        if (r.ok && r.reps < REPEATS) console.log(`  N=${r.n}: median of ${r.reps}/${REPEATS} reps only${r.reason ? ` — ${r.reason}` : ""}`);
     }
     console.log("\nfetch sub-phase split (median → s):");
     console.log("N(voters)  fetch    negotiate  write→read");

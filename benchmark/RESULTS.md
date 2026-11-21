@@ -375,6 +375,14 @@ pull"): ALL-TALLIES 3.26s / 2.56s / 3.66s (median of 3) — M=63 within-to-below
 reps spanned 4.3–12.0s); a back-to-back master control confirmed it was the link, not the change
 (master 6.70s vs sessions 6.07s median under identical conditions).*
 
+*Caveat, pending a re-measure: every directory run on this page predates the mock-router fix that
+makes all provider lookups arriving inside the first ~1 s window wait for it (`benchmark/router.ts`).
+Before it only the first of the `M` concurrent lookups paid the second and the others answered at
+once, so at M ≥ 2 the seeder was dialed at t≈0 — that is why `connect` reads 0.60s under a 1.00s
+`router` at M=10/63 but 1.62s at M=1. The M ≥ 2 `connect`, `identify` and START→ALL figures (here
+and in the real-chain directory table below) are understated by up to the router latency; the M=1
+rows and the single-contest tables (one lookup per join) are unaffected.*
+
 ## Parallelism + convergence (N=10 voters/contest, median of 5)
 
 `Σfetch`/`Σbitswap` are the sum across the `M` concurrent ops (not wall-clock); `conv-p50`/`conv-p90`

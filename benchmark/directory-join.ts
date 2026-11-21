@@ -42,17 +42,17 @@ export interface DirectoryJoinMilestones {
     fetch: { count: number; totalMs: number };
     /** Checkpoint block pulls over bitswap: count + total ms + total bytes + net (non-local) count. */
     blockGets: { count: number; totalMs: number; bytes: number; networkCount: number };
-    /** Residual verify+merge+decode time: allTalliesReady − (end of the last network op), ms. */
+    /** Residual verify+merge+decode time: allTalliesReady − (end of the last network op), ms (null if not converged). */
     verifyMergeMs: number | null;
-    /** Did ALL M contests converge before the timeout? If false, `allTalliesReadyMs` is the timeout. */
+    /** Did ALL M contests converge before the timeout? If false, `allTalliesReadyMs` is null. */
     converged: boolean;
     /** How many of the M contests reached a full tally (== M when converged). */
     readyCount: number;
     /** t0-relative ms at which the k-th contest tally became ready (sorted) — the convergence curve. */
     readyAtMs: number[];
-    /** `start()` → EVERY one of the M contests' tally reflects all N voters — end-to-end, ms. */
-    allTalliesReadyMs: number;
-    /** Did ALL M contests also chain-verify before the timeout? */
+    /** `start()` → EVERY one of the M contests' tally reflects all N voters — end-to-end, ms (null on timeout). */
+    allTalliesReadyMs: number | null;
+    /** Did ALL M contests also chain-verify before the timeout? If false, `allVerifiedMs` is null. */
     allVerified: boolean;
     /** How many of the M contests' ranking rows read `chainVerified: true` (== M when allVerified). */
     verifiedCount: number;
@@ -60,8 +60,9 @@ export interface DirectoryJoinMilestones {
      * `start()` → EVERY contest's ranking row reads `chainVerified: true` (every deferred gate
      * read landed) — the trust-ready end-to-end, the directory analogue of the single-contest
      * bench's `start→verified`. `allTalliesReadyMs` is the render-ready milestone before it.
+     * Null when the timeout hit first (like the single-contest bench's `verifiedTallyMs`).
      */
-    allVerifiedMs: number;
+    allVerifiedMs: number | null;
     /**
      * Gate-read RPC traffic across the WHOLE directory join (t0-relative requests): HTTP round
      * trips paid, split by the library operation that caused each (`byOp` — see rpc-gateway.ts
@@ -277,10 +278,13 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
         }
         readyAtMs.sort((a, b) => a - b);
         verifiedAtMs.sort((a, b) => a - b);
+        // A milestone the deadline cut off has no latency: report it as null (never the elapsed
+        // time at the deadline, which would read as a measured value); `converged`/`readyCount`
+        // and `allVerified`/`verifiedCount` say how far the join got.
         const converged = readyAtMs.length === networks.length;
-        const allTalliesReadyMs = converged ? readyAtMs[readyAtMs.length - 1]! : performance.now() - t0;
+        const allTalliesReadyMs = converged ? readyAtMs[readyAtMs.length - 1]! : null;
         const allVerified = verifiedAtMs.length === networks.length;
-        const allVerifiedMs = allVerified ? verifiedAtMs[verifiedAtMs.length - 1]! : performance.now() - t0;
+        const allVerifiedMs = allVerified ? verifiedAtMs[verifiedAtMs.length - 1]! : null;
 
         // --- assemble the aggregate breakdown (t0-relative) ---
         const ops = events.filter((e) => e.end >= t0);
@@ -318,7 +322,7 @@ export async function measureDirectoryJoin(args: DirectoryJoinArgs): Promise<Dir
                 bytes: blockOps.reduce((s, o) => s + (o.bytes ?? 0), 0),
                 networkCount: networkBlocks.length
             },
-            verifyMergeMs: lastNetEndMs > 0 ? allTalliesReadyMs - lastNetEndMs : null,
+            verifyMergeMs: allTalliesReadyMs !== null && lastNetEndMs > 0 ? allTalliesReadyMs - lastNetEndMs : null,
             converged,
             readyCount: readyAtMs.length,
             readyAtMs,
@@ -368,7 +372,8 @@ async function main(): Promise<void> {
             `  converge:    ${r.readyCount}/${r.m} ready` +
             (r.readyAtMs.length ? ` (p50=${s(r.readyAtMs[Math.floor(r.readyAtMs.length / 2)] ?? null)} p90=${s(r.readyAtMs[Math.floor(r.readyAtMs.length * 0.9)] ?? null)} last=${s(r.readyAtMs[r.readyAtMs.length - 1] ?? null)})` : "") +
             `\n` +
-            `  total:       start->all-tallies=${s(r.allTalliesReadyMs)}${r.converged ? "" : " (TIMEOUT — not all converged)"}\n`
+            `  total:       start->all-tallies=${s(r.allTalliesReadyMs)}${r.converged ? "" : " (TIMEOUT — not all converged)"} ` +
+            `start->all-verified=${s(r.allVerifiedMs)}${r.allVerified ? "" : ` (TIMEOUT — ${r.verifiedCount}/${r.m} verified)`}\n`
     );
     process.stdout.write(`RESULT ${JSON.stringify(r)}\n`);
 }

@@ -46,7 +46,7 @@ export interface RouterOptions {
      * announced ones. Any unknown CID answers no providers.
      */
     providers?: Map<string, RouterProvider>;
-    /** Artificial latency (ms) before a provider-hit lookup responds — paid once (see below). Default 1000. */
+    /** Artificial latency (ms) before a provider-hit lookup responds — paid once per reset, by every hit in that first window (see below). Default 1000. */
     latencyMs?: number;
 }
 
@@ -102,10 +102,13 @@ export async function startRouter(options: RouterOptions = {}): Promise<RunningR
     // The simulated ~1s router round-trip is paid EXACTLY ONCE per reset — the initial provider
     // lookup that finds who runs the contest. After that, bitswap's IWANT takes over peer-to-peer,
     // so every later lookup (a repeat, or a block-CID probe now that chunks are announced too)
-    // answers instantly and never re-adds latency.
-    let paidLatency = false;
+    // answers instantly and never re-adds latency. "Once" is a window, not a single request: the
+    // first provider hit opens it, and every hit that arrives while it is open (a directory join
+    // fires one lookup per contest in the same tick) also answers only when it closes — none of
+    // them may name the provider before the charged round trip would have.
+    let chargeEndsAt: number | undefined;
     const reset = (): void => {
-        paidLatency = false;
+        chargeEndsAt = undefined;
         requests.length = 0;
     };
 
@@ -199,8 +202,11 @@ export async function startRouter(options: RouterOptions = {}): Promise<RunningR
             const bodyOut = JSON.stringify({
                 Providers: (found ?? []).map((p) => ({ Schema: "peer", ID: p.id, Addrs: p.addrs }))
             });
-            const delay = found?.length && !paidLatency ? latencyMs : 0;
-            if (found?.length) paidLatency = true;
+            let delay = 0;
+            if (found?.length) {
+                chargeEndsAt ??= startMs + latencyMs;
+                delay = Math.max(0, chargeEndsAt - startMs);
+            }
             setTimeout(() => {
                 requests.push({ cid, startMs, endMs: performance.now(), startEpochMs, endEpochMs: Date.now() });
                 res.writeHead(200, { "content-type": "application/json" });
