@@ -2,6 +2,9 @@ import localForage from "localforage";
 import { makeMemoryStorage } from "./memory.js";
 import type { LruStorage, SnapshotStorage, StorageOptions, VoteStorage } from "./types.js";
 
+/** Which database of each round-robin LRU is active, keyed by cache: one small database for all. */
+const LRU_ROLES_DATABASE = "pubsub-voting-lru-roles";
+
 /**
  * The browser backend, swapped in for storage/node.ts by the package.json `browser` field
  * remap (same mechanism pkc-js uses for its whole runtime tree, scoped here to one module).
@@ -10,7 +13,9 @@ import type { LruStorage, SnapshotStorage, StorageOptions, VoteStorage } from ".
  * eviction — writes fill the active database, and when it reaches `maxItems` the databases
  * swap roles and the new active one is cleared, so at most the oldest half of entries drops
  * at once. A read hit in the inactive database promotes the entry to the active one, which is
- * what makes the scheme approximate LRU rather than plain FIFO.
+ * what makes the scheme approximate LRU rather than plain FIFO. Unlike pkc-js, each swap also
+ * records which database is now active (in {@link LRU_ROLES_DATABASE}), because a reload cannot
+ * always infer it from the two sizes.
  *
  * `dataPath` is meaningless in the browser (pkc-js's browser `getDefaultDataPath()` is
  * likewise `undefined`): a string is ignored, `false` still selects the in-memory backend.
@@ -34,20 +39,36 @@ class LocalForageLruStorage implements LruStorage {
 
     #init() {
         this.#initialized ??= (async () => {
+            const name2 = `${this.#name}2`;
             const database1 = localForage.createInstance({ name: this.#name });
-            const database2 = localForage.createInstance({ name: `${this.#name}2` });
-            const [size1, size2] = await Promise.all([database1.length(), database2.length()]);
-            // The largest database is the active one, unless it is full (a full database is
-            // always the inactive, about-to-be-dropped half) — pkc-js's exact recovery rule.
-            let [active, inactive] =
-                (size1 >= size2 && size1 !== this.#maxItems) || size2 === this.#maxItems
-                    ? [database1, database2]
-                    : [database2, database1];
+            const database2 = localForage.createInstance({ name: name2 });
+            const roles = localForage.createInstance({ name: LRU_ROLES_DATABASE });
+            const [size1, size2, marked] = await Promise.all([
+                database1.length(),
+                database2.length(),
+                roles.getItem<string>(this.#name)
+            ]);
+            // The half the last rotation made active, as `swap` recorded it. Sizes alone cannot
+            // tell: the retired half is full right after a swap, but the expiry purge removes keys
+            // from both halves, so it can come back below maxItems and still the larger one, and
+            // its next fill would then clear the NEWER half. With no record (a cache written
+            // before it existed) fall back to pkc-js's recovery rule: the largest database is the
+            // active one, unless it is full (a full database is the retired, about-to-drop half).
+            const firstActive =
+                marked === this.#name || marked === name2
+                    ? marked === this.#name
+                    : (size1 >= size2 && size1 !== this.#maxItems) || size2 === this.#maxItems;
+            let [active, inactive] = firstActive ? [database1, database2] : [database2, database1];
             let activeSize = await active.length();
             const swap = async () => {
                 activeSize = 0;
                 [active, inactive] = [inactive, active];
+                // Record the new role only once its clear has landed: the two databases commit
+                // independently, and a record naming a half that still holds the oldest entries
+                // would make the next load trust it and clear the NEWER half on its next fill.
+                // Interrupted in between, the old record still names the full, newer half.
                 await active.clear();
+                await roles.setItem(this.#name, active === database1 ? this.#name : name2);
             };
             return {
                 active: () => active,
@@ -58,7 +79,13 @@ class LocalForageLruStorage implements LruStorage {
                         // removeItem/clear never decrement the counter, so it only ever
                         // over-counts — reconcile at the threshold so a purge-heavy session
                         // cannot swap (and clear) before the active half is actually full.
-                        activeSize = await active.length();
+                        const half = active;
+                        const size = await half.length();
+                        // A concurrent grow() swapped while this one was counting: that half is
+                        // retired and the counter now belongs to the new one. Swapping again
+                        // would flip back and clear the half just retired.
+                        if (active !== half) return;
+                        activeSize = size;
                         if (activeSize >= this.#maxItems) await swap();
                     }
                 },
